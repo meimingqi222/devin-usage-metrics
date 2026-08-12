@@ -1,7 +1,18 @@
 # Rust 构建产物
-/target
+/target/
+/dist/
+/build/
 **/*.rs.bk
 *.pdb
+*.dSYM/
+*.profraw
+*.profdata
+coverage/
+
+# macOS 打包产物
+*.app/
+*.dmg
+*.pkg
 
 # Cargo 锁文件（库项目可选，二进制项目保留 Cargo.lock）
 # 当前为二进制项目，保留 Cargo.lock
@@ -25,9 +36,20 @@ Icon?
 
 # 本地环境 / 密钥
 .env
-.env.local
+.env.*
+!.env.example
 *.pem
 *.key
+*.p12
+*.mobileprovision
+
+# 本地数据库与应用缓存
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+.cache/
 
 # 日志与临时文件
 *.log
