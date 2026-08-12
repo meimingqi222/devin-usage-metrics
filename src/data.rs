@@ -5,11 +5,50 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::local_sources;
+
 const CACHE_TTL_SECS: i64 = 300; // 5 minutes cache TTL
 
 fn cache_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    Path::new(&home).join(".cache/devin-usage-metrics/cache.json")
+    #[cfg(target_os = "windows")]
+    let base = dirs::cache_dir().unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".cache")
+    });
+    #[cfg(not(target_os = "windows"))]
+    let base = dirs::home_dir()
+        .map(|h| h.join(".cache"))
+        .unwrap_or_else(|| PathBuf::from(".cache"));
+    base.join("devin-usage-metrics/cache-v2.json")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentKind {
+    Devin,
+    Amp,
+    Claude,
+    Codex,
+}
+
+impl AgentKind {
+    pub const ALL: [Self; 4] = [Self::Devin, Self::Amp, Self::Claude, Self::Codex];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Devin => "Devin",
+            Self::Amp => "Amp",
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DataError {
+    pub agent: AgentKind,
+    pub message: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -19,7 +58,7 @@ struct CacheFile {
     turns_end: i64,
     sessions: Vec<SessionRec>,
     turns: Vec<TurnRec>,
-    errors: Vec<String>,
+    errors: Vec<DataError>,
 }
 
 #[derive(serde::Serialize)]
@@ -29,7 +68,7 @@ struct CacheFileRef<'a> {
     turns_end: i64,
     sessions: &'a [SessionRec],
     turns: &'a [TurnRec],
-    errors: &'a [String],
+    errors: &'a [DataError],
 }
 
 fn now_timestamp() -> Option<i64> {
@@ -108,6 +147,7 @@ fn save_to_cache(data: &LoadedData) {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionRec {
+    pub agent: AgentKind,
     pub key: String, // "<source>/<id>"
     pub source: String,
     pub id: String,
@@ -142,6 +182,7 @@ impl SessionRec {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TurnRec {
+    pub agent: AgentKind,
     pub session_key: String,
     pub created_at: i64,
     pub input_tokens: f64,
@@ -157,12 +198,22 @@ pub struct LoadedData {
     pub turns: Vec<TurnRec>,
     pub turns_start: i64,
     pub turns_end: i64,
-    pub errors: Vec<String>,
+    pub errors: Vec<DataError>,
 }
 
 pub fn devin_db_paths() -> Vec<(String, PathBuf)> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let base = Path::new(&home).join(".local/share/devin");
+    #[cfg(target_os = "windows")]
+    let base = dirs::data_dir()
+        .map(|d| d.join("devin"))
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .map(|h| h.join("AppData/Roaming/devin"))
+                .unwrap_or_else(|| PathBuf::from("devin"))
+        });
+    #[cfg(not(target_os = "windows"))]
+    let base = dirs::home_dir()
+        .map(|h| h.join(".local/share/devin"))
+        .unwrap_or_else(|| PathBuf::from(".local/share/devin"));
     vec![
         ("cli".into(), base.join("cli/sessions.db")),
         ("cli-next".into(), base.join("cli-next/sessions.db")),
@@ -237,6 +288,7 @@ fn load_sessions_from(conn: &Connection, source: &str, out: &mut Vec<SessionRec>
         let (id, title, wd, model, mode, created, last_act, meta) = row;
         let (real_model, ti, to, tc, msgs) = parse_metadata(&meta);
         out.push(SessionRec {
+            agent: AgentKind::Devin,
             key: format!("{source}/{id}"),
             source: source.to_string(),
             id,
@@ -253,23 +305,6 @@ fn load_sessions_from(conn: &Connection, source: &str, out: &mut Vec<SessionRec>
             agent_messages: msgs,
         });
     }
-}
-
-/// Extract a numeric field value from a metrics snippet like
-/// `"ttft_ms":3253,"total_time_ms":4161,"input_tokens":2470,...`
-fn metric_num(snippet: &str, key: &str) -> f64 {
-    let pat = format!("\"{key}\":");
-    if let Some(pos) = snippet.find(&pat) {
-        let rest = &snippet[pos + pat.len()..];
-        let num: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == 'e' || *c == 'E')
-            .collect();
-        if let Ok(v) = num.parse::<f64>() {
-            return v;
-        }
-    }
-    0.0
 }
 
 /// Load per-turn metrics for sessions overlapping [start, end).
@@ -293,12 +328,20 @@ fn load_turns_from(
         .collect();
     let in_clause = placeholders.join(",");
 
+    let metrics_prefix = "$.metadata.metrics.";
     let sql = format!(
-        "SELECT session_id, created_at, substr(chat_message, instr(chat_message, '\"ttft_ms\"'), 320) \
+        "SELECT session_id, created_at, \
+         json_extract(chat_message, '{metrics_prefix}ttft_ms'), \
+         json_extract(chat_message, '{metrics_prefix}input_tokens'), \
+         json_extract(chat_message, '{metrics_prefix}output_tokens'), \
+         json_extract(chat_message, '{metrics_prefix}cache_read_tokens'), \
+         json_extract(chat_message, '{metrics_prefix}total_time_ms') \
          FROM message_nodes \
          WHERE session_id IN ({}) AND created_at >= ?{} AND created_at < ?{} \
-         AND chat_message LIKE '%\"ttft_ms\"%'",
-        in_clause, session_ids.len() + 1, session_ids.len() + 2
+         AND json_extract(chat_message, '{metrics_prefix}ttft_ms') IS NOT NULL",
+        in_clause,
+        session_ids.len() + 1,
+        session_ids.len() + 2
     );
 
     let mut stmt = match conn.prepare(&sql) {
@@ -321,7 +364,11 @@ fn load_turns_from(
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, i64>(1)?,
-            r.get::<_, String>(2)?,
+            r.get::<_, Option<f64>>(2)?,
+            r.get::<_, Option<f64>>(3)?,
+            r.get::<_, Option<f64>>(4)?,
+            r.get::<_, Option<f64>>(5)?,
+            r.get::<_, Option<f64>>(6)?,
         ))
     });
 
@@ -334,19 +381,20 @@ fn load_turns_from(
     };
 
     for row in rows.flatten() {
-        let (session_id, created_at, snippet) = row;
-        let ttft = metric_num(&snippet, "ttft_ms");
+        let (session_id, created_at, ttft, input, output, cached, total) = row;
+        let ttft = ttft.unwrap_or(0.0);
         if ttft <= 0.0 {
             continue;
         }
         out.push(TurnRec {
+            agent: AgentKind::Devin,
             session_key: format!("{source}/{session_id}"),
             created_at,
-            input_tokens: metric_num(&snippet, "input_tokens"),
-            output_tokens: metric_num(&snippet, "output_tokens"),
-            cache_read_tokens: metric_num(&snippet, "cache_read_tokens"),
+            input_tokens: input.unwrap_or(0.0),
+            output_tokens: output.unwrap_or(0.0),
+            cache_read_tokens: cached.unwrap_or(0.0),
             ttft_ms: ttft,
-            total_time_ms: metric_num(&snippet, "total_time_ms"),
+            total_time_ms: total.unwrap_or(0.0),
         });
     }
 }
@@ -358,13 +406,19 @@ fn load_source(source: String, path: PathBuf, start: i64, end: i64) -> LoadedDat
         ..Default::default()
     };
     if !path.exists() {
-        data.errors.push(format!("{} 不存在", path.display()));
+        data.errors.push(DataError {
+            agent: AgentKind::Devin,
+            message: format!("{} 不存在", path.display()),
+        });
         return data;
     }
     let conn = match open_readonly(&path) {
         Ok(connection) => connection,
         Err(error) => {
-            data.errors.push(format!("打开失败 {error}"));
+            data.errors.push(DataError {
+                agent: AgentKind::Devin,
+                message: format!("打开失败 {error}"),
+            });
             return data;
         }
     };
@@ -382,10 +436,13 @@ fn load_source(source: String, path: PathBuf, start: i64, end: i64) -> LoadedDat
 fn load_uncached(start: i64, end: i64) -> LoadedData {
     let sources = devin_db_paths();
     let parts = std::thread::scope(|scope| {
-        let handles: Vec<_> = sources
+        let mut handles: Vec<_> = sources
             .into_iter()
             .map(|(source, path)| scope.spawn(move || load_source(source, path, start, end)))
             .collect();
+        handles.push(scope.spawn(move || local_sources::load_amp(start, end)));
+        handles.push(scope.spawn(move || local_sources::load_claude(start, end)));
+        handles.push(scope.spawn(move || local_sources::load_codex(start, end)));
         handles
             .into_iter()
             .filter_map(|handle| handle.join().ok())
@@ -420,6 +477,16 @@ pub fn reload_all(start: i64, end: i64) -> LoadedData {
 #[cfg(test)]
 mod tests {
     use super::cache_covers;
+
+    #[test]
+    fn json_extract_available() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        let result: i64 = conn
+            .query_row("SELECT json_extract('{\"a\":5}', '$.a');", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(result, 5);
+    }
 
     #[test]
     fn recent_cache_covers_a_moving_future_end() {

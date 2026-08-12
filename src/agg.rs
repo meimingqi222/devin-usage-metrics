@@ -1,4 +1,4 @@
-use crate::data::LoadedData;
+use crate::data::{AgentKind, LoadedData};
 use chrono::{Datelike, Local, TimeDelta, TimeZone};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -73,6 +73,18 @@ pub fn window_start(kind: PeriodKind) -> i64 {
 }
 
 pub fn build_buckets(data: &LoadedData, kind: PeriodKind) -> Vec<Bucket> {
+    build_buckets_inner(data, kind, None)
+}
+
+pub fn build_buckets_for(data: &LoadedData, kind: PeriodKind, agent: AgentKind) -> Vec<Bucket> {
+    build_buckets_inner(data, kind, Some(agent))
+}
+
+fn build_buckets_inner(
+    data: &LoadedData,
+    kind: PeriodKind,
+    agent: Option<AgentKind>,
+) -> Vec<Bucket> {
     let now = Local::now();
     let today = now.date_naive();
     let mut buckets: Vec<Bucket> = Vec::new();
@@ -158,10 +170,14 @@ pub fn build_buckets(data: &LoadedData, kind: PeriodKind) -> Vec<Bucket> {
     let session_model: std::collections::HashMap<String, String> = data
         .sessions
         .iter()
+        .filter(|session| agent.is_none_or(|agent| session.agent == agent))
         .map(|s| (s.key.clone(), s.display_model()))
         .collect();
 
     for turn in &data.turns {
+        if agent.is_some_and(|agent| turn.agent != agent) {
+            continue;
+        }
         let Some(b) = buckets
             .iter_mut()
             .find(|b| turn.created_at >= b.start && turn.created_at < b.end)

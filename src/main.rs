@@ -1,6 +1,6 @@
-use agg::{build_buckets, window_start, Bucket, PeriodKind};
+use agg::{build_buckets_for, window_start, Bucket, PeriodKind};
 use chrono::TimeZone;
-use data::LoadedData;
+use data::{AgentKind, LoadedData};
 use devin_usage_metrics::{agg, data};
 use gpui::{
     actions, div, prelude::*, px, rgb, size, Animation, AnimationExt as _, App, Application,
@@ -69,6 +69,7 @@ enum Tab {
 
 struct Root {
     data: Arc<LoadedData>,
+    agent: AgentKind,
     tab: Tab,
     period: PeriodKind,
     buckets: Vec<Bucket>,
@@ -88,7 +89,7 @@ impl Root {
         self.selected = None;
         cx.notify();
 
-        let start = window_start(PeriodKind::Month);
+        let start = window_start(self.period);
         let end = chrono::Local::now().timestamp() + 3600;
         let load = cx.background_executor().spawn(async move {
             if force {
@@ -112,12 +113,13 @@ impl Root {
     }
 
     fn rebuild_buckets(&mut self) {
-        self.buckets = build_buckets(&self.data, self.period);
+        self.buckets = build_buckets_for(&self.data, self.period, self.agent);
     }
 
     fn top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tab = self.tab;
         let period = self.period;
+        let agent = self.agent;
         let show_period = tab == Tab::Usage;
         let loaded_at = self.loaded_at.clone();
 
@@ -157,13 +159,44 @@ impl Root {
                 .child(kind.label())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.period = kind;
-                    this.rebuild_buckets();
-                    cx.notify();
+                    let needed = window_start(kind);
+                    if needed < this.data.turns_start {
+                        this.start_load(true, cx);
+                    } else {
+                        this.rebuild_buckets();
+                        cx.notify();
+                    }
                 }))
         };
 
+        let agent_buttons = AgentKind::ALL.into_iter().map(|kind| {
+            let active = agent == kind;
+            div()
+                .id(SharedString::from(format!("agent-{}", kind.label())))
+                .px_2()
+                .py(px(2.))
+                .rounded_sm()
+                .text_xs()
+                .cursor_pointer()
+                .when(active, |d| d.bg(rgb(ACCENT)).text_color(rgb(0x0a0a0c)))
+                .when(!active, |d| {
+                    d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
+                })
+                .child(kind.label())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.agent != kind {
+                        this.agent = kind;
+                        this.selected = None;
+                        this.rebuild_buckets();
+                        cx.notify();
+                    }
+                }))
+        });
+
         div()
             .flex()
+            .w_full()
+            .min_w(px(0.))
             .items_center()
             .gap_3()
             .px_4()
@@ -175,7 +208,16 @@ impl Root {
                     .text_sm()
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(rgb(TEXT))
-                    .child("Devin Usage Metrics"),
+                    .child("Agent Usage Metrics"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .pl_2()
+                    .border_l_1()
+                    .border_color(rgb(BORDER))
+                    .children(agent_buttons),
             )
             .child(tab_btn(Tab::Usage, "用量"))
             .child(tab_btn(Tab::Sessions, "会话"))
@@ -200,6 +242,9 @@ impl Root {
                     .py(px(2.))
                     .rounded_sm()
                     .text_xs()
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .when(!self.loading, |d| {
                         d.cursor_pointer()
                             .text_color(rgb(MUTED))
@@ -207,12 +252,19 @@ impl Root {
                     })
                     .when(self.loading, |d| d.text_color(rgba(MUTED, 0.55)))
                     .child(if self.loading {
+                        loading_dots(5., 1.).into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
+                    .child(if self.loading {
                         "正在刷新…"
                     } else {
                         "重新加载"
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.start_load(true, cx);
+                        if !this.loading {
+                            this.start_load(true, cx);
+                        }
                     })),
             )
             .child(
@@ -224,24 +276,6 @@ impl Root {
     }
 
     fn loading_view(&self) -> impl IntoElement {
-        let dots = (0..3).map(|index| {
-            let offset = index as f32 / 3.0;
-            div()
-                .w(px(10.))
-                .h(px(10.))
-                .rounded_full()
-                .bg(rgba(ACCENT, 0.25))
-                .with_animation(
-                    SharedString::from(format!("loading-dot-{index}")),
-                    Animation::new(Duration::from_millis(900)).repeat(),
-                    move |dot, delta| {
-                        let phase = ((delta + offset) % 1.0) * std::f32::consts::TAU;
-                        let opacity = 0.25 + 0.75 * (phase.sin() * 0.5 + 0.5);
-                        dot.bg(rgba(ACCENT, opacity))
-                    },
-                )
-        });
-
         div()
             .size_full()
             .bg(rgb(BG))
@@ -250,13 +284,13 @@ impl Root {
             .items_center()
             .justify_center()
             .gap_4()
-            .child(div().flex().items_center().gap_2().children(dots))
+            .child(loading_dots(10., 2.))
             .child(
                 div()
                     .text_lg()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT))
-                    .child("正在读取 Devin 用量数据"),
+                    .child("正在读取本地 Agent 用量数据"),
             )
             .child(
                 div()
@@ -268,7 +302,9 @@ impl Root {
 
     fn stat_card(label: &'static str, value: String, color: u32) -> impl IntoElement {
         div()
-            .flex_1()
+            .w(px(140.))
+            .flex_none()
+            .min_w(px(0.))
             .flex()
             .flex_col()
             .gap_1()
@@ -294,18 +330,21 @@ impl Root {
 
     fn usage_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let buckets = &self.buckets;
-        let (mut ti, mut to, mut tc, mut turns, mut sess) = (0.0, 0.0, 0.0, 0u32, 0usize);
+        let (mut ti, mut to, mut tc, mut turns) = (0.0, 0.0, 0.0, 0u32);
+        let mut sessions = std::collections::BTreeSet::new();
         for b in buckets {
             ti += b.input;
             to += b.output;
             tc += b.cached;
             turns += b.turns;
-            sess += b.session_keys.len();
+            sessions.extend(b.session_keys.iter().cloned());
         }
         let total = ti + to + tc;
 
         let cards = div()
             .flex()
+            .w_full()
+            .min_w(px(0.))
             .gap_2()
             .child(Self::stat_card("总 Tokens", fmt_tokens(total), TEXT))
             .child(Self::stat_card("输入（新）", fmt_tokens(ti), C_IN))
@@ -313,7 +352,7 @@ impl Root {
             .child(Self::stat_card("缓存读取", fmt_tokens(tc), C_CACHED))
             .child(Self::stat_card(
                 "轮次 / 会话",
-                format!("{turns} / {sess}"),
+                format!("{turns} / {}", sessions.len()),
                 MUTED,
             ));
 
@@ -323,6 +362,7 @@ impl Root {
         div()
             .id("usage-scroll")
             .size_full()
+            .min_w(px(0.))
             .overflow_scroll()
             .p_4()
             .flex()
@@ -357,7 +397,9 @@ impl Root {
             let label_color = if total <= 0.0 { MUTED } else { TEXT };
             cols.push(
                 div()
-                    .flex_1()
+                    .w(px(47.))
+                    .flex_none()
+                    .min_w(px(0.))
                     .flex()
                     .flex_col()
                     .items_center()
@@ -392,6 +434,8 @@ impl Root {
             );
         }
         div()
+            .w_full()
+            .min_w(px(0.))
             .p_3()
             .rounded_md()
             .bg(rgb(PANEL))
@@ -416,12 +460,22 @@ impl Root {
                     .child(legend("输入", C_IN))
                     .child(legend("输出", C_OUT)),
             )
-            .child(div().flex().items_end().gap_1().children(cols))
+            .child(
+                div()
+                    .flex()
+                    .w_full()
+                    .min_w(px(0.))
+                    .items_end()
+                    .gap_1()
+                    .children(cols),
+            )
     }
 
     fn bucket_table(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let header = div()
             .flex()
+            .w_full()
+            .min_w(px(0.))
             .gap_2()
             .px_2()
             .py_1()
@@ -468,6 +522,8 @@ impl Root {
             rows.push(
                 div()
                     .flex()
+                    .w_full()
+                    .min_w(px(0.))
                     .gap_2()
                     .px_2()
                     .py_1()
@@ -486,10 +542,20 @@ impl Root {
                     .child(cell_r(&fmt_tokens(b.output), 70.))
                     .child(cell_r(&fmt_tokens(b.cached), 76.))
                     .child(cell_r(&fmt_tokens(b.total()), 76.))
-                    .child(div().flex_1().flex().flex_wrap().children(model_bits)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .flex()
+                            .flex_wrap()
+                            .children(model_bits),
+                    ),
             );
         }
         div()
+            .w_full()
+            .min_w(px(0.))
             .p_3()
             .rounded_md()
             .bg(rgb(PANEL))
@@ -523,7 +589,12 @@ impl Root {
             .child(cell_r("消息", 48.))
             .child(cell_r("Tokens", 72.));
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        let mut sessions: Vec<&data::SessionRec> = self.data.sessions.iter().collect();
+        let mut sessions: Vec<&data::SessionRec> = self
+            .data
+            .sessions
+            .iter()
+            .filter(|session| session.agent == self.agent)
+            .collect();
         sessions.sort_by_key(|session| std::cmp::Reverse(session.last_activity_at));
         for s in sessions.into_iter().take(500) {
             let key = s.key.clone();
@@ -564,7 +635,7 @@ impl Root {
                                 .rounded_full()
                                 .bg(rgb(model_color(&s.display_model()))),
                         )
-                        .child(s.id.clone()),
+                        .child(truncate(&s.id, 18)),
                 )
                 .child(div().flex_1().child(truncate(&s.title, 48)))
                 .child(cell(&s.agent_mode, 70.))
@@ -580,7 +651,7 @@ impl Root {
                     this.selected = Some(key.clone());
                     cx.notify();
                 }));
-            if s.source == "cli-next" {
+            if self.agent == AgentKind::Devin && s.source == "cli-next" {
                 row = row.child(div().text_xs().text_color(rgba(MUTED, 0.7)).child("next"));
             }
             rows.push(row.into_any_element());
@@ -588,6 +659,7 @@ impl Root {
         let mut body = div()
             .id("sessions-scroll")
             .size_full()
+            .min_w(px(0.))
             .overflow_scroll()
             .p_4()
             .flex()
@@ -596,8 +668,11 @@ impl Root {
         if let Some(d) = detail {
             body = body.child(d);
         }
+        let empty = rows.is_empty();
         body.child(
             div()
+                .w_full()
+                .min_w(px(0.))
                 .p_3()
                 .rounded_md()
                 .bg(rgb(PANEL))
@@ -606,6 +681,15 @@ impl Root {
                 .flex()
                 .flex_col()
                 .child(header)
+                .when(empty, |panel| {
+                    panel.child(
+                        div()
+                            .p_4()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child(format!("未找到 {} 本地会话数据", self.agent.label())),
+                    )
+                })
                 .children(rows),
         )
     }
@@ -620,7 +704,11 @@ impl Root {
             .iter()
             .filter(|t| t.session_key == key)
             .collect();
-        let mut ttfts: Vec<f64> = turns.iter().map(|t| t.ttft_ms).collect();
+        let mut ttfts: Vec<f64> = turns
+            .iter()
+            .map(|t| t.ttft_ms)
+            .filter(|ttft| *ttft > 0.0)
+            .collect();
         ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let ttft_med = ttfts.get(ttfts.len() / 2).copied().unwrap_or(0.0);
         let total = s.input_tokens + s.output_tokens + s.cached_tokens;
@@ -629,6 +717,11 @@ impl Root {
             format!("adaptive → {}（服务端路由）", s.display_model())
         } else {
             s.display_model()
+        };
+        let model_detail = if adaptive {
+            format!("{}（配置值：{}）", model_text, s.selected_model)
+        } else {
+            model_text
         };
 
         let kv = |k: &str, v: String| {
@@ -685,10 +778,7 @@ impl Root {
                 format!("{} · {} · {}", s.id, s.source, s.agent_mode),
             ))
             .child(kv("工作目录", s.working_directory.clone()))
-            .child(kv(
-                "模型",
-                format!("{}（配置值：{}）", model_text, s.selected_model),
-            ))
+            .child(kv("模型", model_detail))
             .child(kv(
                 "时间",
                 format!(
@@ -709,12 +799,20 @@ impl Root {
             ))
             .child(kv(
                 "活动",
-                format!(
-                    "{:.0} 条 agent 消息 · 窗口内 {} 轮 · TTFT 中位 {:.0} ms",
-                    s.agent_messages,
-                    turns.len(),
-                    ttft_med
-                ),
+                if ttfts.is_empty() {
+                    format!(
+                        "{:.0} 条 agent 消息 · 窗口内 {} 轮",
+                        s.agent_messages,
+                        turns.len()
+                    )
+                } else {
+                    format!(
+                        "{:.0} 条 agent 消息 · 窗口内 {} 轮 · TTFT 中位 {:.0} ms",
+                        s.agent_messages,
+                        turns.len(),
+                        ttft_med
+                    )
+                },
             ))
     }
 }
@@ -747,6 +845,27 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+fn loading_dots(size: f32, gap: f32) -> impl IntoElement {
+    let dots = (0..3).map(|index| {
+        let offset = index as f32 / 3.0;
+        div()
+            .w(px(size))
+            .h(px(size))
+            .rounded_full()
+            .bg(rgba(ACCENT, 0.25))
+            .with_animation(
+                SharedString::from(format!("loading-dot-{size}-{index}")),
+                Animation::new(Duration::from_millis(900)).repeat(),
+                move |dot, delta| {
+                    let phase = ((delta + offset) % 1.0) * std::f32::consts::TAU;
+                    let opacity = 0.25 + 0.75 * (phase.sin() * 0.5 + 0.5);
+                    dot.bg(rgba(ACCENT, opacity))
+                },
+            )
+    });
+    div().flex().items_center().gap(px(gap)).children(dots)
+}
+
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.loading && !self.has_loaded {
@@ -757,9 +876,17 @@ impl Render for Root {
             Tab::Usage => self.usage_view(cx).into_any_element(),
             Tab::Sessions => self.sessions_view(cx).into_any_element(),
         };
-        let errors: Vec<String> = self.data.errors.clone();
+        let errors: Vec<String> = self
+            .data
+            .errors
+            .iter()
+            .filter(|error| error.agent == self.agent)
+            .map(|error| error.message.clone())
+            .collect();
         let mut root = div()
             .size_full()
+            .min_w(px(0.))
+            .overflow_hidden()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
             .flex()
@@ -781,8 +908,11 @@ impl Render for Root {
 
 fn main() {
     Application::new().run(move |cx: &mut App| {
-        // Bind Cmd+Q to quit the application
+        // Bind platform-specific quit shortcut
+        #[cfg(target_os = "macos")]
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        #[cfg(not(target_os = "macos"))]
+        cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
 
         let bounds = Bounds::centered(None, size(px(1180.), px(760.)), cx);
@@ -801,6 +931,7 @@ fn main() {
                 cx.new(|cx| {
                     let mut root = Root {
                         data: Arc::new(LoadedData::default()),
+                        agent: AgentKind::Devin,
                         tab: Tab::Usage,
                         period: PeriodKind::Day,
                         buckets: Vec::new(),

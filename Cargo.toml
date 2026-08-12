@@ -9,14 +9,18 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
+dirs = "5"
+
+[build-dependencies]
+winres = "0.1.12"
 
 [package.metadata.bundle]
-name = "Devin Usage Metrics"
+name = "Agent Usage Metrics"
 identifier = "com.devin.usage-metrics"
-icon = ["assets/icon.icns"]
+icon = ["assets/icon.icns", "assets/icon.ico"]
 category = "Developer Tool"
-short_description = "Devin usage analytics dashboard"
-long_description = "A native macOS app for tracking Devin AI coding agent usage, sessions, and model routing."
+short_description = "Local coding-agent usage analytics dashboard"
+long_description = "A native desktop app for tracking Devin, Amp, Claude Code, and Codex usage and sessions."
 
 [profile.dev]
 debug = 1
