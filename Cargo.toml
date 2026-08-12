@@ -1,0 +1,25 @@
+[package]
+name = "devin-usage-metrics"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpui = "0.2.2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+
+[package.metadata.bundle]
+name = "Devin Usage Metrics"
+identifier = "com.devin.usage-metrics"
+icon = ["assets/icon.icns"]
+category = "Developer Tool"
+short_description = "Devin usage analytics dashboard"
+long_description = "A native macOS app for tracking Devin AI coding agent usage, sessions, and model routing."
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2
