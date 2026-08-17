@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - '*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for release'
+        required: false
+        default: '0.0.1'
 
 permissions:
   contents: write
@@ -54,10 +60,17 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         shell: bash
         run: |
-          cargo install cargo-bundle --locked || true
-          cargo bundle --release --target ${{ matrix.target }}
-          cd target/${{ matrix.target }}/release/bundle/osx
-          zip -r ../../../../../${{ matrix.asset_path }} "Agent Usage Metrics.app"
+          cargo build --release --target ${{ matrix.target }}
+          if cargo install cargo-bundle --locked && cargo bundle --release --target ${{ matrix.target }}; then
+            cd target/${{ matrix.target }}/release/bundle/osx
+            zip -r ../../../../../${{ matrix.asset_path }} "Agent Usage Metrics.app"
+            cd ../../../../..
+          else
+            echo "Bundle failed, falling back to standalone binary zip"
+            cd target/${{ matrix.target }}/release
+            zip -r ../../../${{ matrix.asset_path }} devin-usage-metrics
+            cd ../../..
+          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -87,6 +100,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
           files: release-assets/*
           draft: false
           prerelease: false
