@@ -63,11 +63,16 @@ jobs:
           cargo build --release --target ${{ matrix.target }}
           if cargo install cargo-bundle --locked && cargo bundle --release --target ${{ matrix.target }}; then
             cd target/${{ matrix.target }}/release/bundle/osx
+            codesign --force --deep --sign - "Agent Usage Metrics.app"
+            codesign --verify --deep --strict --verbose=2 "Agent Usage Metrics.app"
             zip -r ../../../../../${{ matrix.asset_path }} "Agent Usage Metrics.app"
             cd ../../../../..
           else
             echo "Bundle failed, falling back to standalone binary zip"
             cd target/${{ matrix.target }}/release
+            chmod +x devin-usage-metrics
+            codesign --force --sign - devin-usage-metrics
+            codesign --verify --strict --verbose=2 devin-usage-metrics
             zip -r ../../../${{ matrix.asset_path }} devin-usage-metrics
             cd ../../..
           fi
