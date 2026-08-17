@@ -10,6 +10,9 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 const MAX_SESSION_FILES: usize = 1500;
 
 #[derive(Default)]
@@ -332,16 +335,68 @@ fn amp_threads_root() -> PathBuf {
 }
 
 fn amp_cli_path() -> PathBuf {
-    let bundled = home_path(&[".amp", "bin", "amp"]);
-    if bundled.exists() {
-        bundled
-    } else {
-        PathBuf::from("amp")
+    #[cfg(target_os = "windows")]
+    {
+        let candidates = [
+            home_path(&[".amp", "bin", "amp.exe"]),
+            home_path(&[".amp", "bin", "amp.bat"]),
+            home_path(&[".amp", "bin", "amp.cmd"]),
+        ];
+        for candidate in candidates {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            let appdata_path = PathBuf::from(appdata);
+            let npm_cmd = appdata_path.join("npm").join("amp.cmd");
+            if npm_cmd.exists() {
+                return npm_cmd;
+            }
+            let npm_exe = appdata_path.join("npm").join("amp.exe");
+            if npm_exe.exists() {
+                return npm_exe;
+            }
+        }
     }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let bundled = home_path(&[".amp", "bin", "amp"]);
+        if bundled.exists() {
+            return bundled;
+        }
+    }
+
+    PathBuf::from("amp")
 }
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 fn amp_cli_json(args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new(amp_cli_path()).args(args).output().ok()?;
+    let cli = amp_cli_path();
+    let is_batch = cfg!(target_os = "windows")
+        && cli
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+            .unwrap_or(false);
+
+    let mut cmd = if is_batch {
+        let mut c = Command::new("cmd.exe");
+        c.arg("/C").arg(&cli).args(args);
+        c
+    } else {
+        let mut c = Command::new(&cli);
+        c.args(args);
+        c
+    };
+
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }
