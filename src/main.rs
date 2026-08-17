@@ -1,11 +1,14 @@
-use agg::{build_buckets_for, window_start, Bucket, PeriodKind};
+#![allow(unexpected_cfgs)]
+
+use agg::{build_buckets_for, window_for, Bucket, PeriodKind};
 use chrono::TimeZone;
 use data::{AgentKind, LoadedData};
-use devin_usage_metrics::{agg, data};
+use devin_usage_metrics::{agg, data, pricing};
 use gpui::{
     actions, div, prelude::*, px, rgb, size, Animation, AnimationExt as _, App, Application,
     Bounds, Context, KeyBinding, Render, SharedString, Task, Window, WindowBounds, WindowOptions,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +24,7 @@ const ACCENT: u32 = 0x4cc2ff;
 const C_IN: u32 = 0x4cc2ff;
 const C_OUT: u32 = 0x3ddc97;
 const C_CACHED: u32 = 0x8b7cf6;
+const C_COST: u32 = 0xfbbf24;
 
 const MODEL_COLORS: [u32; 10] = [
     0xf472b6, 0xfbbf24, 0x60a5fa, 0x34d399, 0xa78bfa, 0xfb923c, 0xf87171, 0x4ade80, 0x22d3ee,
@@ -69,9 +73,12 @@ enum Tab {
 
 struct Root {
     data: Arc<LoadedData>,
+    loaded_agents: HashMap<AgentKind, Arc<LoadedData>>,
     agent: AgentKind,
+    agent_menu_open: bool,
     tab: Tab,
     period: PeriodKind,
+    page: usize,
     buckets: Vec<Bucket>,
     selected: Option<String>,
     loaded_at: String,
@@ -81,6 +88,28 @@ struct Root {
 }
 
 impl Root {
+    fn switch_agent(&mut self, target_agent: AgentKind, cx: &mut Context<Self>) {
+        if self.agent == target_agent && self.has_loaded {
+            self.agent_menu_open = false;
+            cx.notify();
+            return;
+        }
+
+        self.agent = target_agent;
+        self.agent_menu_open = false;
+        self.selected = None;
+        self.page = 0;
+
+        if let Some(cached_data) = self.loaded_agents.get(&target_agent) {
+            self.data = cached_data.clone();
+            self.rebuild_buckets();
+            cx.notify();
+            return;
+        }
+
+        self.start_load(false, cx);
+    }
+
     fn start_load(&mut self, force: bool, cx: &mut Context<Self>) {
         if self.loading {
             return;
@@ -89,19 +118,22 @@ impl Root {
         self.selected = None;
         cx.notify();
 
-        let start = window_start(self.period);
-        let end = chrono::Local::now().timestamp() + 3600;
+        let (start, end) = window_for(self.period, self.page);
+        let agent = self.agent;
+        let previous = self.data.clone();
         let load = cx.background_executor().spawn(async move {
             if force {
-                data::reload_all(start, end)
+                data::reload_agent_from(previous, start, end, agent)
             } else {
-                data::load_all(start, end)
+                data::load_agent(agent, start, end)
             }
         });
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let data = load.await;
             this.update(cx, |this, cx| {
-                this.data = Arc::new(data);
+                let arc_data = Arc::new(data);
+                this.loaded_agents.insert(agent, arc_data.clone());
+                this.data = arc_data;
                 this.loading = false;
                 this.has_loaded = true;
                 this.loaded_at = chrono::Local::now().format("%H:%M:%S").to_string();
@@ -113,12 +145,137 @@ impl Root {
     }
 
     fn rebuild_buckets(&mut self) {
-        self.buckets = build_buckets_for(&self.data, self.period, self.agent);
+        self.buckets = build_buckets_for(&self.data, self.period, self.agent, self.page);
+    }
+
+    /// 判断当前窗口内是否已经有目标 Agent 的数据。
+    /// 不仅检查总范围是否覆盖，还要检查该 Agent 在 [start, end) 内是否有会话重叠。
+    fn has_data_for(&self, start: i64, end: i64, agent: AgentKind) -> bool {
+        if self.data.turns_start == 0 && self.data.turns_end == 0 {
+            return false;
+        }
+        if start < self.data.turns_start || end > self.data.turns_end {
+            return false;
+        }
+        self.data.sessions.iter().any(|s| {
+            s.agent == agent && s.created_at < end && s.last_activity_at >= start
+        })
+    }
+
+    fn page_needs_load(&self) -> bool {
+        let (start, end) = window_for(self.period, self.page);
+        start < self.data.turns_start
+            || end > self.data.turns_end
+            || !self.has_data_for(start, end, self.agent)
+    }
+
+    fn agent_dropdown_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current_agent = self.agent;
+        let items = AgentKind::ALL.into_iter().map(|kind| {
+            let is_selected = kind == current_agent;
+            let count = self
+                .loaded_agents
+                .get(&kind)
+                .map(|d| d.sessions.iter().filter(|s| s.agent == kind).count());
+
+            div()
+                .id(SharedString::from(format!("agent-opt-{}", kind.label())))
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .cursor_pointer()
+                .when(is_selected, |d| {
+                    d.bg(rgba(ACCENT, 0.18)).text_color(rgb(ACCENT))
+                })
+                .when(!is_selected, |d| {
+                    d.text_color(rgb(TEXT)).hover(|h| h.bg(rgb(PANEL2)))
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_sm().child(kind.badge()))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(if is_selected {
+                                    gpui::FontWeight::BOLD
+                                } else {
+                                    gpui::FontWeight::MEDIUM
+                                })
+                                .child(kind.label()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when_some(count, |d, c| {
+                            d.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("{c} 会话")),
+                            )
+                        })
+                        .when(is_selected, |d| {
+                            d.child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(ACCENT))
+                                    .child("✓"),
+                            )
+                        }),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.switch_agent(kind, cx);
+                }))
+        });
+
+        div()
+            .id("agent-dropdown-overlay")
+            .absolute()
+            .inset_0()
+            .child(
+                div()
+                    .id("agent-dropdown-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.agent_menu_open = false;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("agent-dropdown-menu")
+                    .absolute()
+                    .top(px(46.))
+                    .left(px(160.))
+                    .w(px(250.))
+                    .p_1()
+                    .rounded_lg()
+                    .bg(rgb(PANEL))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(items),
+            )
     }
 
     fn top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tab = self.tab;
         let period = self.period;
+        let page = self.page;
         let agent = self.agent;
         let show_period = tab == Tab::Usage;
         let loaded_at = self.loaded_at.clone();
@@ -159,8 +316,8 @@ impl Root {
                 .child(kind.label())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.period = kind;
-                    let needed = window_start(kind);
-                    if needed < this.data.turns_start {
+                    this.page = 0;
+                    if this.page_needs_load() {
                         this.start_load(true, cx);
                     } else {
                         this.rebuild_buckets();
@@ -169,29 +326,106 @@ impl Root {
                 }))
         };
 
-        let agent_buttons = AgentKind::ALL.into_iter().map(|kind| {
-            let active = agent == kind;
-            div()
-                .id(SharedString::from(format!("agent-{}", kind.label())))
-                .px_2()
-                .py(px(2.))
-                .rounded_sm()
-                .text_xs()
-                .cursor_pointer()
-                .when(active, |d| d.bg(rgb(ACCENT)).text_color(rgb(0x0a0a0c)))
-                .when(!active, |d| {
-                    d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
-                })
-                .child(kind.label())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if this.agent != kind {
-                        this.agent = kind;
-                        this.selected = None;
-                        this.rebuild_buckets();
-                        cx.notify();
-                    }
-                }))
-        });
+        let prev_page = div()
+            .id("prev-page")
+            .px_2()
+            .py(px(2.))
+            .rounded_sm()
+            .text_xs()
+            .when(page > 0, |d| {
+                d.cursor_pointer()
+                    .text_color(rgb(MUTED))
+                    .hover(|h| h.bg(rgb(PANEL2)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.page = this.page.saturating_sub(1);
+                        if this.page_needs_load() {
+                            this.start_load(true, cx);
+                        } else {
+                            this.rebuild_buckets();
+                            cx.notify();
+                        }
+                    }))
+            })
+            .when(page == 0, |d| d.text_color(rgba(MUTED, 0.3)).cursor_default())
+            .child("◀ 上一页");
+
+        let next_page = div()
+            .id("next-page")
+            .px_2()
+            .py(px(2.))
+            .rounded_sm()
+            .text_xs()
+            .cursor_pointer()
+            .text_color(rgb(MUTED))
+            .hover(|h| h.bg(rgb(PANEL2)))
+            .child("下一页 ▶")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.page = this.page.saturating_add(1);
+                if this.page_needs_load() {
+                    this.start_load(true, cx);
+                } else {
+                    this.rebuild_buckets();
+                    cx.notify();
+                }
+            }));
+
+        let active_count = self
+            .data
+            .sessions
+            .iter()
+            .filter(|s| s.agent == agent)
+            .count();
+        let count_str = if active_count > 0 {
+            format!(" ({active_count})")
+        } else {
+            String::new()
+        };
+
+        let agent_selector = div()
+            .id("agent-selector-trigger")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(if self.agent_menu_open {
+                rgb(ACCENT)
+            } else {
+                rgb(BORDER)
+            })
+            .bg(if self.agent_menu_open {
+                rgb(PANEL2)
+            } else {
+                rgb(PANEL)
+            })
+            .text_sm()
+            .cursor_pointer()
+            .hover(|h| h.bg(rgb(PANEL2)).border_color(rgb(ACCENT)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(agent.badge())
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(TEXT))
+                            .child(format!("{}{}", agent.label(), count_str)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(if self.agent_menu_open { "▲" } else { "▼" }),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.agent_menu_open = !this.agent_menu_open;
+                cx.notify();
+            }));
 
         div()
             .flex()
@@ -213,11 +447,10 @@ impl Root {
             .child(
                 div()
                     .flex()
-                    .gap_1()
                     .pl_2()
                     .border_l_1()
                     .border_color(rgb(BORDER))
-                    .children(agent_buttons),
+                    .child(agent_selector),
             )
             .child(tab_btn(Tab::Usage, "用量"))
             .child(tab_btn(Tab::Sessions, "会话"))
@@ -232,6 +465,16 @@ impl Root {
                         .child(period_btn(PeriodKind::Day))
                         .child(period_btn(PeriodKind::Week))
                         .child(period_btn(PeriodKind::Month)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .pl_3()
+                        .border_l_1()
+                        .border_color(rgb(BORDER))
+                        .child(prev_page)
+                        .child(next_page),
                 )
             })
             .child(div().flex_1())
@@ -302,9 +545,8 @@ impl Root {
 
     fn stat_card(label: &'static str, value: String, color: u32) -> impl IntoElement {
         div()
-            .w(px(140.))
-            .flex_none()
-            .min_w(px(0.))
+            .flex_1()
+            .min_w(px(140.))
             .flex()
             .flex_col()
             .gap_1()
@@ -330,13 +572,14 @@ impl Root {
 
     fn usage_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let buckets = &self.buckets;
-        let (mut ti, mut to, mut tc, mut turns) = (0.0, 0.0, 0.0, 0u32);
+        let (mut ti, mut to, mut tc, mut turns, mut cost) = (0.0, 0.0, 0.0, 0u32, 0.0);
         let mut sessions = std::collections::BTreeSet::new();
         for b in buckets {
             ti += b.input;
             to += b.output;
             tc += b.cached;
             turns += b.turns;
+            cost += b.cost;
             sessions.extend(b.session_keys.iter().cloned());
         }
         let total = ti + to + tc;
@@ -350,12 +593,28 @@ impl Root {
             .child(Self::stat_card("输入（新）", fmt_tokens(ti), C_IN))
             .child(Self::stat_card("输出", fmt_tokens(to), C_OUT))
             .child(Self::stat_card("缓存读取", fmt_tokens(tc), C_CACHED))
+            .child(Self::stat_card("费用 (USD)", pricing::fmt_cost(cost), C_COST))
             .child(Self::stat_card(
                 "轮次 / 会话",
                 format!("{turns} / {}", sessions.len()),
                 MUTED,
             ));
 
+        let latest_activity = self
+            .data
+            .sessions
+            .iter()
+            .filter(|session| session.agent == self.agent)
+            .map(|session| session.last_activity_at)
+            .max()
+            .map(fmt_ts)
+            .unwrap_or_else(|| "无记录".into());
+        let empty_message = format!(
+            "当前{}窗口没有{}用量；最近记录：{}。可点击“下一页 ▶”查看更早历史。",
+            self.period.label(),
+            self.agent.label(),
+            latest_activity
+        );
         let chart = self.chart();
         let table = self.bucket_table(cx);
 
@@ -369,6 +628,22 @@ impl Root {
             .flex_col()
             .gap_3()
             .child(cards)
+            .when(turns == 0, |d| {
+                d.child(
+                    div()
+                        .w_full()
+                        .min_w(px(0.))
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgb(PANEL))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(empty_message.clone()),
+                )
+            })
             .child(chart)
             .child(table)
     }
@@ -397,8 +672,7 @@ impl Root {
             let label_color = if total <= 0.0 { MUTED } else { TEXT };
             cols.push(
                 div()
-                    .w(px(47.))
-                    .flex_none()
+                    .flex_1()
                     .min_w(px(0.))
                     .flex()
                     .flex_col()
@@ -406,6 +680,10 @@ impl Root {
                     .gap_1()
                     .child(
                         div()
+                            .w_full()
+                            .min_w(px(0.))
+                            .text_center()
+                            .whitespace_nowrap()
                             .text_xs()
                             .text_color(rgb(label_color))
                             .child(if total > 0.0 {
@@ -427,6 +705,10 @@ impl Root {
                     )
                     .child(
                         div()
+                            .w_full()
+                            .min_w(px(0.))
+                            .text_center()
+                            .whitespace_nowrap()
                             .text_xs()
                             .text_color(rgb(MUTED))
                             .child(b.label.clone()),
@@ -462,9 +744,9 @@ impl Root {
             )
             .child(
                 div()
-                    .flex()
                     .w_full()
                     .min_w(px(0.))
+                    .flex()
                     .items_end()
                     .gap_1()
                     .children(cols),
@@ -490,7 +772,16 @@ impl Root {
             .child(cell_r("输出", 70.))
             .child(cell_r("缓存", 76.))
             .child(cell_r("总计", 76.))
-            .child(div().flex_1().child("模型分布"));
+            .child(cell_r("费用", 70.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child("模型分布"),
+            );
         let mut rows: Vec<gpui::Div> = Vec::new();
         for b in self.buckets.iter().rev() {
             let mut models: Vec<(String, f64)> = b
@@ -542,6 +833,7 @@ impl Root {
                     .child(cell_r(&fmt_tokens(b.output), 70.))
                     .child(cell_r(&fmt_tokens(b.cached), 76.))
                     .child(cell_r(&fmt_tokens(b.total()), 76.))
+                    .child(cell_r(&pricing::fmt_cost(b.cost), 70.))
                     .child(
                         div()
                             .flex_1()
@@ -587,7 +879,8 @@ impl Root {
             .child(cell("模式", 70.))
             .child(cell("模型", 190.))
             .child(cell_r("消息", 48.))
-            .child(cell_r("Tokens", 72.));
+            .child(cell_r("Tokens", 72.))
+            .child(cell_r("费用", 64.));
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
         let mut sessions: Vec<&data::SessionRec> = self
             .data
@@ -608,6 +901,28 @@ impl Root {
                 s.selected_model.clone()
             };
             let total = s.input_tokens + s.output_tokens + s.cached_tokens;
+            let cost_str = if s.agent == data::AgentKind::Claude
+                && (s.cache_creation_5m_tokens > 0.0 || s.cache_creation_1h_tokens > 0.0)
+            {
+                pricing::turn_cost_claude(
+                    &s.display_model(),
+                    s.input_tokens,
+                    s.output_tokens,
+                    s.cached_tokens,
+                    s.cache_creation_5m_tokens,
+                    s.cache_creation_1h_tokens,
+                )
+            } else {
+                pricing::turn_cost(
+                    &s.display_model(),
+                    s.input_tokens,
+                    s.output_tokens,
+                    s.cached_tokens,
+                    s.cache_creation_tokens,
+                )
+            }
+            .map(pricing::fmt_cost)
+            .unwrap_or_else(|| "—".into());
             let mut row = div()
                 .id(SharedString::from(format!("srow-{}", key)))
                 .flex()
@@ -647,6 +962,7 @@ impl Root {
                 )
                 .child(cell_r(&format!("{:.0}", s.agent_messages), 48.))
                 .child(cell_r(&fmt_tokens(total), 72.))
+                .child(cell_r(&cost_str, 64.))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.selected = Some(key.clone());
                     cx.notify();
@@ -712,6 +1028,27 @@ impl Root {
         ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let ttft_med = ttfts.get(ttfts.len() / 2).copied().unwrap_or(0.0);
         let total = s.input_tokens + s.output_tokens + s.cached_tokens;
+        // 计算会话级费用：用会话的 display_model 查定价表
+        let session_cost = if s.agent == data::AgentKind::Claude
+            && (s.cache_creation_5m_tokens > 0.0 || s.cache_creation_1h_tokens > 0.0)
+        {
+            pricing::turn_cost_claude(
+                &s.display_model(),
+                s.input_tokens,
+                s.output_tokens,
+                s.cached_tokens,
+                s.cache_creation_5m_tokens,
+                s.cache_creation_1h_tokens,
+            )
+        } else {
+            pricing::turn_cost(
+                &s.display_model(),
+                s.input_tokens,
+                s.output_tokens,
+                s.cached_tokens,
+                s.cache_creation_tokens,
+            )
+        };
         let adaptive = s.selected_model == "adaptive";
         let model_text = if adaptive {
             format!("adaptive → {}（服务端路由）", s.display_model())
@@ -796,6 +1133,13 @@ impl Root {
                     fmt_tokens(s.cached_tokens),
                     fmt_tokens(total)
                 ),
+            ))
+            .child(kv(
+                "费用",
+                match session_cost {
+                    Some(c) => format!("{}（按 {} 定价）", pricing::fmt_cost(c), s.display_model()),
+                    None => "未知（无匹配定价）".into(),
+                },
             ))
             .child(kv(
                 "活动",
@@ -891,6 +1235,7 @@ impl Render for Root {
             .text_color(rgb(TEXT))
             .flex()
             .flex_col()
+            .relative()
             .child(self.top_bar(cx));
         for e in errors {
             root = root.child(
@@ -902,12 +1247,48 @@ impl Render for Root {
                     .child(format!("数据源警告：{e}")),
             );
         }
-        root.child(content).into_any_element()
+        root = root.child(content);
+
+        if self.agent_menu_open {
+            root = root.child(self.agent_dropdown_overlay(cx));
+        }
+
+        root.into_any_element()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_dock_icon() {
+    use objc::{class, msg_send, sel, sel_impl};
+    const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+
+    unsafe {
+        let app: *mut objc::runtime::Object = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            return;
+        }
+        let data: *mut objc::runtime::Object = msg_send![
+            class!(NSData),
+            dataWithBytes: ICON_PNG.as_ptr() as *const std::ffi::c_void
+            length: ICON_PNG.len()
+        ];
+        if data.is_null() {
+            return;
+        }
+        let image: *mut objc::runtime::Object = msg_send![class!(NSImage), alloc];
+        let image: *mut objc::runtime::Object = msg_send![image, initWithData: data];
+        if !image.is_null() {
+            let _: () = msg_send![app, setApplicationIconImage: image];
+            let _: () = msg_send![image, release];
+        }
     }
 }
 
 fn main() {
     Application::new().run(move |cx: &mut App| {
+        #[cfg(target_os = "macos")]
+        set_macos_dock_icon();
+
         // Bind platform-specific quit shortcut
         #[cfg(target_os = "macos")]
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
@@ -931,9 +1312,12 @@ fn main() {
                 cx.new(|cx| {
                     let mut root = Root {
                         data: Arc::new(LoadedData::default()),
+                        loaded_agents: HashMap::new(),
                         agent: AgentKind::Devin,
+                        agent_menu_open: false,
                         tab: Tab::Usage,
                         period: PeriodKind::Day,
+                        page: 0,
                         buckets: Vec::new(),
                         selected: None,
                         loaded_at: "加载中...".into(),
@@ -952,3 +1336,4 @@ fn main() {
         cx.activate(true);
     });
 }
+

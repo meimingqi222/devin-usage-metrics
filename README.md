@@ -2,12 +2,12 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A native desktop app that reads local sessions from Devin, Amp, Claude Code, and Codex and presents token usage, model distribution, and session details. Switch agents from the top bar; all data stays on your machine.
+A native desktop app that reads local sessions from Devin, Amp, Claude Code, Codex, and Antigravity and presents token usage, model distribution, and session details. Switch agents from the top bar; all data stays on your machine.
 
 ## Features
 
 - **Usage view**
-  - Switch between Devin, Amp, Claude Code, and Codex
+  - Switch between Devin, Amp, Claude Code, Codex, and Antigravity
   - Aggregate token usage by day (14 days) / week (12 weeks) / month (6 months)
   - Stat cards for Total Tokens, Input (new), Output, Cached read, and Turns/Sessions
   - Stacked bar chart of token trends (input / output / cached layers)
@@ -22,6 +22,7 @@ A native desktop app that reads local sessions from Devin, Amp, Claude Code, and
   - Amp: `~/.local/share/amp/threads/*.json`
   - Claude Code: `~/.claude/projects/**/*.jsonl` (subagent usage is merged into its parent session)
   - Codex: `~/.codex/{sessions,archived_sessions}/**/*.jsonl` or `$CODEX_HOME`
+  - Antigravity: `~/.gemini/antigravity/conversations/*.db` (protobuf-encoded SQLite)
   - Loads multiple sources in parallel and merges the results
   - 5-minute on-disk cache in the platform cache directory for fast subsequent launches
   - "Reload" bypasses the cache and re-reads every local source
@@ -72,7 +73,7 @@ src/
 ├── main.rs    # GPUI app entry, UI rendering, usage/sessions views
 ├── lib.rs     # Module exports
 ├── data.rs    # Shared records, Devin SQLite reads, on-disk cache
-├── local_sources.rs # Amp, Claude Code, and Codex JSON/JSONL importers
+├── local_sources.rs # Amp, Claude Code, Codex, and Antigravity importers
 └── agg.rs     # Day/week/month bucketing and per-model grouping
 tests/
 └── dump.rs    # End-to-end integration test against real local data

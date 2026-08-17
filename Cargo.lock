@@ -1300,6 +1300,8 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "gpui",
+ "objc",
+ "rayon",
  "rusqlite",
  "serde",
  "serde_json",
