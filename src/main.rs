@@ -1,4 +1,7 @@
 #![allow(unexpected_cfgs)]
+// On Windows, hide the console window in release builds. In debug builds we
+// keep the console so println!/eprintln! output is still visible while developing.
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 use agg::{build_buckets_for, window_for, Bucket, PeriodKind};
 use chrono::TimeZone;
