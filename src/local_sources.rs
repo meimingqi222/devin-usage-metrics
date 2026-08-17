@@ -1382,7 +1382,8 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> (Option<SessionRec
         }
     }
 
-    // 逐个生成步骤的 token 使用量：gen_metadata 表
+    // 模型名从 gen_metadata 的 field 1.field 19 获取（每个生成步骤一条，
+    // 取最后一个非空值；同一会话通常只用一两个模型）。
     let mut session = SessionBuilder {
         id: session_id.clone(),
         ..Default::default()
@@ -1391,37 +1392,50 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> (Option<SessionRec
     session.title = title;
     session.source = "local".into();
     session.created_at = created_at;
-    let key = format!("antigravity/{session_id}");
-    let mut turns = Vec::new();
-    let mut last_activity: i64 = 0;
-
     if let Ok(mut stmt) = conn.prepare("SELECT data FROM gen_metadata ORDER BY idx") {
         let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0));
         if let Ok(rows) = rows {
             for row in rows.flatten() {
-                // gen_metadata 的 field 1 是主消息体
-                let Some(f1) = pb_field(&row, 1) else {
-                    continue;
-                };
-                // token 使用量在 field 4
-                let prompt = pb_path_varint(f1, &[4, 2]).unwrap_or(0) as f64;
-                let output = pb_path_varint(f1, &[4, 3]).unwrap_or(0) as f64;
-                let cached = pb_path_varint(f1, &[4, 5]).unwrap_or(0) as f64;
-                // 模型名在 field 19
-                if let Some(model) = pb_path_string(f1, &[19]) {
-                    if !model.is_empty() {
-                        session.model = model;
+                if let Some(f1) = pb_field(&row, 1) {
+                    if let Some(model) = pb_path_string(f1, &[19]) {
+                        if !model.is_empty() {
+                            session.model = model;
+                        }
                     }
                 }
-                // 时间戳在 field 9.field 4.field 1（Unix 秒）
-                let at = pb_path_varint(f1, &[9, 4, 1]).unwrap_or(0) as i64;
+            }
+        }
+    }
+
+    // 逐个生成步骤的 token 使用量与时间戳：从 steps 表的 metadata 解析。
+    // 旧版 Antigravity 的时间戳在 gen_metadata field 9.4.1，但新版已移除该
+    // 字段；steps.metadata 在新旧两版中都稳定包含时间戳（field 1.1，Unix
+    // 秒）与 token 用量（field 9：1=prompt, 2=output, 3=cached, 5=cache
+    // creation），因此统一从 steps 表读取。
+    let key = format!("antigravity/{session_id}");
+    let mut turns = Vec::new();
+
+    if let Ok(mut stmt) = conn.prepare("SELECT metadata FROM steps ORDER BY idx") {
+        let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0));
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                // token 使用量在 metadata field 9（仅 LLM 生成步骤有此字段）
+                let Some(usage) = pb_field(&row, 9) else {
+                    continue;
+                };
+                let prompt = pb_path_varint(usage, &[1]).unwrap_or(0) as f64;
+                let output = pb_path_varint(usage, &[2]).unwrap_or(0) as f64;
+                let cached = pb_path_varint(usage, &[3]).unwrap_or(0) as f64;
+                let cache_creation = pb_path_varint(usage, &[5]).unwrap_or(0) as f64;
+                // 时间戳在 metadata field 1.field 1（Unix 秒）
+                let at = pb_path_varint(&row, &[1, 1]).unwrap_or(0) as i64;
                 if at > 0 {
                     session.observe_time(at);
-                    last_activity = last_activity.max(at);
                 }
                 session.input_tokens += prompt;
                 session.output_tokens += output;
                 session.cached_tokens += cached;
+                session.cache_creation_tokens += cache_creation;
                 session.agent_messages += 1.0;
                 if at >= start && at < end {
                     turns.push(TurnRec {
@@ -1431,26 +1445,14 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> (Option<SessionRec
                         input_tokens: prompt,
                         output_tokens: output,
                         cache_read_tokens: cached,
-                        cache_creation_tokens: 0.0, cache_creation_5m_tokens: 0.0, cache_creation_1h_tokens: 0.0,
+                        cache_creation_tokens: cache_creation,
+                        cache_creation_5m_tokens: 0.0,
+                        cache_creation_1h_tokens: 0.0,
                         model: String::new(),
                         ttft_ms: 0.0,
                         total_time_ms: 0.0,
                     });
                 }
-            }
-        }
-    }
-
-    // 回退：如果 gen_metadata 中没有时间戳，从 steps 表获取最后活动时间
-    if last_activity == 0 {
-        if let Ok(last_ts) = conn.query_row(
-            "SELECT metadata FROM steps ORDER BY idx DESC LIMIT 1",
-            [],
-            |r| r.get::<_, Vec<u8>>(0),
-        ) {
-            if let Some(ts) = pb_path_varint(&last_ts, &[1, 1]) {
-                last_activity = ts as i64;
-                session.observe_time(last_activity);
             }
         }
     }
