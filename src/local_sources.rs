@@ -1408,10 +1408,26 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> (Option<SessionRec
     }
 
     // 逐个生成步骤的 token 使用量与时间戳：从 steps 表的 metadata 解析。
-    // 旧版 Antigravity 的时间戳在 gen_metadata field 9.4.1，但新版已移除该
-    // 字段；steps.metadata 在新旧两版中都稳定包含时间戳（field 1.1，Unix
-    // 秒）与 token 用量（field 9：1=prompt, 2=output, 3=cached, 5=cache
-    // creation），因此统一从 steps 表读取。
+    // steps.metadata 包含时间戳（field 1.1，Unix 秒）与 token 用量
+    // （field 9，对应 Antigravity 内部的 UsageMetadata proto）。
+    //
+    // 经数据验证的字段映射（与标准 Google AI / Vertex AI proto 编号不同，
+    // Antigravity 使用自定义编号）：
+    //   field 1  = prompt_token_count        (输入，不含 cached)
+    //   field 2  = candidates_token_count    (输出)
+    //   field 3  = cache_creation_token_count (缓存写入)
+    //   field 5  = cached_content_token_count (缓存读取)
+    //   field 10 = thoughts_token_count      (思考 tokens，按 output 价格计费)
+    //
+    // 验证依据：首次调用时 field 3 > 0 且 field 5 = 0（创建缓存），
+    // 后续调用 field 3 较小且 field 5 很大（读取缓存），缓存过期后
+    // field 5 归零、field 3 再次变大——典型的 cache 生命周期模式。
+    //
+    // Google 定价：output 价格包含 thinking tokens，因此 thoughts
+    // 并入 output_tokens 按 output 价格计费。
+    //
+    // 部分新版会话的 steps.metadata 没有 field 9，但有 field 11
+    // （prompt_token_count），此时仅能获取输入 token 数。
     let key = format!("antigravity/{session_id}");
     let mut turns = Vec::new();
 
@@ -1419,39 +1435,64 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> (Option<SessionRec
         let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0));
         if let Ok(rows) = rows {
             for row in rows.flatten() {
-                // token 使用量在 metadata field 9（仅 LLM 生成步骤有此字段）
-                let Some(usage) = pb_field(&row, 9) else {
-                    continue;
-                };
-                let prompt = pb_path_varint(usage, &[1]).unwrap_or(0) as f64;
-                let output = pb_path_varint(usage, &[2]).unwrap_or(0) as f64;
-                let cached = pb_path_varint(usage, &[3]).unwrap_or(0) as f64;
-                let cache_creation = pb_path_varint(usage, &[5]).unwrap_or(0) as f64;
                 // 时间戳在 metadata field 1.field 1（Unix 秒）
                 let at = pb_path_varint(&row, &[1, 1]).unwrap_or(0) as i64;
                 if at > 0 {
                     session.observe_time(at);
                 }
-                session.input_tokens += prompt;
-                session.output_tokens += output;
-                session.cached_tokens += cached;
-                session.cache_creation_tokens += cache_creation;
-                session.agent_messages += 1.0;
-                if at >= start && at < end {
-                    turns.push(TurnRec {
-                        agent: AgentKind::Antigravity,
-                        session_key: key.clone(),
-                        created_at: at,
-                        input_tokens: prompt,
-                        output_tokens: output,
-                        cache_read_tokens: cached,
-                        cache_creation_tokens: cache_creation,
-                        cache_creation_5m_tokens: 0.0,
-                        cache_creation_1h_tokens: 0.0,
-                        model: String::new(),
-                        ttft_ms: 0.0,
-                        total_time_ms: 0.0,
-                    });
+
+                // 优先从 field 9（UsageMetadata）读取完整 token 数据
+                if let Some(usage) = pb_field(&row, 9) {
+                    let prompt = pb_path_varint(usage, &[1]).unwrap_or(0) as f64;
+                    let candidates = pb_path_varint(usage, &[2]).unwrap_or(0) as f64;
+                    let cache_creation = pb_path_varint(usage, &[3]).unwrap_or(0) as f64;
+                    let cached = pb_path_varint(usage, &[5]).unwrap_or(0) as f64;
+                    // field 10 = thoughts_token_count，按 output 价格计费
+                    let thoughts = pb_path_varint(usage, &[10]).unwrap_or(0) as f64;
+                    let output = candidates + thoughts;
+
+                    session.input_tokens += prompt;
+                    session.output_tokens += output;
+                    session.cached_tokens += cached;
+                    session.cache_creation_tokens += cache_creation;
+                    session.agent_messages += 1.0;
+                    if at >= start && at < end {
+                        turns.push(TurnRec {
+                            agent: AgentKind::Antigravity,
+                            session_key: key.clone(),
+                            created_at: at,
+                            input_tokens: prompt,
+                            output_tokens: output,
+                            cache_read_tokens: cached,
+                            cache_creation_tokens: cache_creation,
+                            cache_creation_5m_tokens: 0.0,
+                            cache_creation_1h_tokens: 0.0,
+                            model: String::new(),
+                            ttft_ms: 0.0,
+                            total_time_ms: 0.0,
+                        });
+                    }
+                } else if let Some(prompt) = pb_varint_field(&row, 11) {
+                    // 新版 schema：field 11 = prompt_token_count，无 output/cached
+                    let prompt = prompt as f64;
+                    session.input_tokens += prompt;
+                    session.agent_messages += 1.0;
+                    if at >= start && at < end {
+                        turns.push(TurnRec {
+                            agent: AgentKind::Antigravity,
+                            session_key: key.clone(),
+                            created_at: at,
+                            input_tokens: prompt,
+                            output_tokens: 0.0,
+                            cache_read_tokens: 0.0,
+                            cache_creation_tokens: 0.0,
+                            cache_creation_5m_tokens: 0.0,
+                            cache_creation_1h_tokens: 0.0,
+                            model: String::new(),
+                            ttft_ms: 0.0,
+                            total_time_ms: 0.0,
+                        });
+                    }
                 }
             }
         }
