@@ -30,10 +30,6 @@ jobs:
             os: macos-latest
             artifact_name: devin-usage-metrics-macos-arm64.zip
             asset_path: devin-usage-metrics-macos-arm64.zip
-          - target: x86_64-apple-darwin
-            os: macos-13
-            artifact_name: devin-usage-metrics-macos-x64.zip
-            asset_path: devin-usage-metrics-macos-x64.zip
 
     steps:
       - name: Checkout code
