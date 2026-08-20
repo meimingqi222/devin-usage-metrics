@@ -1,7 +1,10 @@
 #![allow(unexpected_cfgs)]
 // On Windows, hide the console window in release builds. In debug builds we
 // keep the console so println!/eprintln! output is still visible while developing.
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 use agg::{build_buckets_for, window_for, Bucket, PeriodKind};
 use chrono::TimeZone;
@@ -74,6 +77,18 @@ enum Tab {
     Sessions,
 }
 
+/// 会话列表的一行，在数据变化时预计算好展示所需的字符串，
+/// 避免每次 render 都重新排序、查定价表、截断标题。
+struct SessionRow {
+    session: data::SessionRec,
+    time_str: String,
+    id_short: String,
+    title_short: String,
+    model_text: String,
+    cost_str: String,
+    total: f64,
+}
+
 struct Root {
     data: Arc<LoadedData>,
     loaded_agents: HashMap<AgentKind, Arc<LoadedData>>,
@@ -83,11 +98,13 @@ struct Root {
     period: PeriodKind,
     page: usize,
     buckets: Vec<Bucket>,
+    sessions_rows: Vec<SessionRow>,
     selected: Option<String>,
     loaded_at: String,
     loading: bool,
     has_loaded: bool,
     load_task: Option<Task<()>>,
+    load_id: u64,
 }
 
 impl Root {
@@ -106,6 +123,7 @@ impl Root {
         if let Some(cached_data) = self.loaded_agents.get(&target_agent) {
             self.data = cached_data.clone();
             self.rebuild_buckets();
+            self.rebuild_sessions();
             cx.notify();
             return;
         }
@@ -114,9 +132,10 @@ impl Root {
     }
 
     fn start_load(&mut self, force: bool, cx: &mut Context<Self>) {
-        if self.loading {
-            return;
-        }
+        // 序号递增后，上一个加载任务完成时会因 load_id 不匹配而丢弃结果，
+        // 不会覆盖当前 Agent 的界面数据（GPUI 0.2 的 Task 没有 cancel 接口）
+        self.load_id += 1;
+        let load_id = self.load_id;
         self.loading = true;
         self.selected = None;
         cx.notify();
@@ -134,14 +153,22 @@ impl Root {
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let data = load.await;
             this.update(cx, |this, cx| {
+                // 已有更新的加载任务时，直接丢弃本次结果
+                if this.load_id != load_id {
+                    return;
+                }
                 let arc_data = Arc::new(data);
                 this.loaded_agents.insert(agent, arc_data.clone());
-                this.data = arc_data;
                 this.loading = false;
-                this.has_loaded = true;
-                this.loaded_at = chrono::Local::now().format("%H:%M:%S").to_string();
-                this.rebuild_buckets();
-                cx.notify();
+                // 加载期间用户可能已切换到其他 Agent，只缓存结果，不覆盖当前界面
+                if this.agent == agent {
+                    this.data = arc_data;
+                    this.has_loaded = true;
+                    this.loaded_at = chrono::Local::now().format("%H:%M:%S").to_string();
+                    this.rebuild_buckets();
+                    this.rebuild_sessions();
+                    cx.notify();
+                }
             })
             .ok();
         }));
@@ -149,6 +176,61 @@ impl Root {
 
     fn rebuild_buckets(&mut self) {
         self.buckets = build_buckets_for(&self.data, self.period, self.agent, self.page);
+    }
+
+    /// 按当前 Agent 预计算会话列表（排序、截断、费用、模型展示名）。
+    fn rebuild_sessions(&mut self) {
+        let mut rows: Vec<SessionRow> = self
+            .data
+            .sessions
+            .iter()
+            .filter(|s| s.agent == self.agent)
+            .map(|s| {
+                let total = s.input_tokens + s.output_tokens + s.cached_tokens;
+                let cost_str = if s.agent == data::AgentKind::Claude
+                    && (s.cache_creation_5m_tokens > 0.0 || s.cache_creation_1h_tokens > 0.0)
+                {
+                    pricing::turn_cost_claude(
+                        &s.display_model(),
+                        s.input_tokens,
+                        s.output_tokens,
+                        s.cached_tokens,
+                        s.cache_creation_5m_tokens,
+                        s.cache_creation_1h_tokens,
+                    )
+                } else {
+                    pricing::turn_cost(
+                        &s.display_model(),
+                        s.input_tokens,
+                        s.output_tokens,
+                        s.cached_tokens,
+                        s.cache_creation_tokens,
+                    )
+                }
+                .map(pricing::fmt_cost)
+                .unwrap_or_else(|| "—".into());
+                let adaptive = s.selected_model == "adaptive";
+                let model_text = if adaptive {
+                    format!("adaptive → {}", s.display_model())
+                } else if s.selected_model.is_empty() {
+                    s.display_model()
+                } else {
+                    s.selected_model.clone()
+                };
+                SessionRow {
+                    time_str: fmt_ts(s.last_activity_at),
+                    id_short: truncate(&s.id, 18),
+                    title_short: truncate(&s.title, 48),
+                    model_text: truncate(&model_text, 30),
+                    cost_str,
+                    total,
+                    session: s.clone(),
+                }
+            })
+            .collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.session.last_activity_at));
+        rows.truncate(500);
+        self.sessions_rows = rows;
     }
 
     /// 判断当前窗口内是否已经有目标 Agent 的数据。
@@ -160,9 +242,10 @@ impl Root {
         if start < self.data.turns_start || end > self.data.turns_end {
             return false;
         }
-        self.data.sessions.iter().any(|s| {
-            s.agent == agent && s.created_at < end && s.last_activity_at >= start
-        })
+        self.data
+            .sessions
+            .iter()
+            .any(|s| s.agent == agent && s.created_at < end && s.last_activity_at >= start)
     }
 
     fn page_needs_load(&self) -> bool {
@@ -349,7 +432,9 @@ impl Root {
                         }
                     }))
             })
-            .when(page == 0, |d| d.text_color(rgba(MUTED, 0.3)).cursor_default())
+            .when(page == 0, |d| {
+                d.text_color(rgba(MUTED, 0.3)).cursor_default()
+            })
             .child("◀ 上一页");
 
         let next_page = div()
@@ -596,7 +681,11 @@ impl Root {
             .child(Self::stat_card("输入（新）", fmt_tokens(ti), C_IN))
             .child(Self::stat_card("输出", fmt_tokens(to), C_OUT))
             .child(Self::stat_card("缓存读取", fmt_tokens(tc), C_CACHED))
-            .child(Self::stat_card("费用 (USD)", pricing::fmt_cost(cost), C_COST))
+            .child(Self::stat_card(
+                "费用 (USD)",
+                pricing::fmt_cost(cost),
+                C_COST,
+            ))
             .child(Self::stat_card(
                 "轮次 / 会话",
                 format!("{turns} / {}", sessions.len()),
@@ -885,47 +974,11 @@ impl Root {
             .child(cell_r("Tokens", 72.))
             .child(cell_r("费用", 64.));
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        let mut sessions: Vec<&data::SessionRec> = self
-            .data
-            .sessions
-            .iter()
-            .filter(|session| session.agent == self.agent)
-            .collect();
-        sessions.sort_by_key(|session| std::cmp::Reverse(session.last_activity_at));
-        for s in sessions.into_iter().take(500) {
+        for r in &self.sessions_rows {
+            let s = &r.session;
             let key = s.key.clone();
             let is_sel = self.selected.as_deref() == Some(key.as_str());
             let adaptive = s.selected_model == "adaptive";
-            let model_text = if adaptive {
-                format!("adaptive → {}", s.display_model())
-            } else if s.selected_model.is_empty() {
-                s.display_model()
-            } else {
-                s.selected_model.clone()
-            };
-            let total = s.input_tokens + s.output_tokens + s.cached_tokens;
-            let cost_str = if s.agent == data::AgentKind::Claude
-                && (s.cache_creation_5m_tokens > 0.0 || s.cache_creation_1h_tokens > 0.0)
-            {
-                pricing::turn_cost_claude(
-                    &s.display_model(),
-                    s.input_tokens,
-                    s.output_tokens,
-                    s.cached_tokens,
-                    s.cache_creation_5m_tokens,
-                    s.cache_creation_1h_tokens,
-                )
-            } else {
-                pricing::turn_cost(
-                    &s.display_model(),
-                    s.input_tokens,
-                    s.output_tokens,
-                    s.cached_tokens,
-                    s.cache_creation_tokens,
-                )
-            }
-            .map(pricing::fmt_cost)
-            .unwrap_or_else(|| "—".into());
             let mut row = div()
                 .id(SharedString::from(format!("srow-{}", key)))
                 .flex()
@@ -939,7 +992,7 @@ impl Root {
                 .when(is_sel, |d| d.bg(rgb(PANEL2)))
                 .border_b_1()
                 .border_color(rgba(BORDER, 0.4))
-                .child(cell(&fmt_ts(s.last_activity_at), 84.))
+                .child(cell(&r.time_str, 84.))
                 .child(
                     div()
                         .w(px(130.))
@@ -953,19 +1006,19 @@ impl Root {
                                 .rounded_full()
                                 .bg(rgb(model_color(&s.display_model()))),
                         )
-                        .child(truncate(&s.id, 18)),
+                        .child(r.id_short.clone()),
                 )
-                .child(div().flex_1().child(truncate(&s.title, 48)))
+                .child(div().flex_1().child(r.title_short.clone()))
                 .child(cell(&s.agent_mode, 70.))
                 .child(
                     div()
                         .w(px(190.))
                         .text_color(if adaptive { rgb(ACCENT) } else { rgb(TEXT) })
-                        .child(truncate(&model_text, 30)),
+                        .child(r.model_text.clone()),
                 )
                 .child(cell_r(&format!("{:.0}", s.agent_messages), 48.))
-                .child(cell_r(&fmt_tokens(total), 72.))
-                .child(cell_r(&cost_str, 64.))
+                .child(cell_r(&fmt_tokens(r.total), 72.))
+                .child(cell_r(&r.cost_str, 64.))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.selected = Some(key.clone());
                     cx.notify();
@@ -1184,12 +1237,15 @@ fn cell_r(text: &str, w: f32) -> gpui::Div {
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    let t: String = s.chars().take(n).collect();
-    if s.chars().count() > n {
-        format!("{t}…")
-    } else {
-        t
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i >= n {
+            out.push('…');
+            break;
+        }
+        out.push(c);
     }
+    out
 }
 
 fn loading_dots(size: f32, gap: f32) -> impl IntoElement {
@@ -1322,13 +1378,16 @@ fn main() {
                         period: PeriodKind::Day,
                         page: 0,
                         buckets: Vec::new(),
+                        sessions_rows: Vec::new(),
                         selected: None,
                         loaded_at: "加载中...".into(),
                         loading: false,
                         has_loaded: false,
                         load_task: None,
+                        load_id: 0,
                     };
                     root.rebuild_buckets();
+                    root.rebuild_sessions();
                     root.start_load(false, cx);
                     root
                 })
@@ -1339,4 +1398,3 @@ fn main() {
         cx.activate(true);
     });
 }
-

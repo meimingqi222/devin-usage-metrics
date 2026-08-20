@@ -1,8 +1,8 @@
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -129,6 +129,10 @@ struct CacheFile {
     sessions: Vec<SessionRec>,
     turns: Vec<TurnRec>,
     errors: Vec<DataError>,
+    #[serde(default)]
+    file_mtimes: HashMap<String, i64>,
+    #[serde(default)]
+    file_sessions: HashMap<String, String>,
 }
 
 #[derive(serde::Serialize)]
@@ -139,6 +143,8 @@ struct CacheFileRef<'a> {
     sessions: &'a [SessionRec],
     turns: &'a [TurnRec],
     errors: &'a [DataError],
+    file_mtimes: &'a HashMap<String, i64>,
+    file_sessions: &'a HashMap<String, String>,
 }
 
 fn now_timestamp() -> Option<i64> {
@@ -148,13 +154,7 @@ fn now_timestamp() -> Option<i64> {
         .map(|duration| duration.as_secs() as i64)
 }
 
-fn cache_covers_range(
-    cache_start: i64,
-    cache_end: i64,
-    start: i64,
-    end: i64,
-    now: i64,
-) -> bool {
+fn cache_covers_range(cache_start: i64, cache_end: i64, start: i64, end: i64, now: i64) -> bool {
     // `end` is intentionally one hour in the future. A cache produced a few
     // minutes ago cannot cover that moving future boundary byte-for-byte, but
     // it does cover all rows that can exist as of now.
@@ -204,6 +204,8 @@ fn load_agent_cache(
         turns_start: cached.turns_start,
         turns_end: cached.turns_end,
         errors: cached.errors,
+        file_mtimes: cached.file_mtimes,
+        file_sessions: cached.file_sessions,
     })
 }
 
@@ -222,6 +224,8 @@ pub fn save_agent_cache(agent: AgentKind, data: &LoadedData) {
         sessions: &data.sessions,
         turns: &data.turns,
         errors: &data.errors,
+        file_mtimes: &data.file_mtimes,
+        file_sessions: &data.file_sessions,
     };
     let temp_path = path.with_extension(format!("json.tmp-{}", std::process::id()));
     if let Ok(file) = File::create(&temp_path) {
@@ -257,23 +261,18 @@ pub fn load_agent(agent: AgentKind, start: i64, end: i64) -> LoadedData {
     }
 }
 
-fn load_cache(start: i64, end: i64, require_fresh: bool) -> Option<LoadedData> {
+fn load_cache(start: i64, end: i64) -> Option<LoadedData> {
     let file = File::open(cache_path()).ok()?;
     let cached: CacheFile = serde_json::from_reader(BufReader::new(file)).ok()?;
     let now = now_timestamp()?;
-    let covered = if require_fresh {
-        cache_covers(
-            cached.cached_at,
-            cached.turns_start,
-            cached.turns_end,
-            start,
-            end,
-            now,
-        )
-    } else {
-        cache_covers_range(cached.turns_start, cached.turns_end, start, end, now)
-    };
-    if !covered {
+    if !cache_covers(
+        cached.cached_at,
+        cached.turns_start,
+        cached.turns_end,
+        start,
+        end,
+        now,
+    ) {
         return None;
     }
 
@@ -283,15 +282,13 @@ fn load_cache(start: i64, end: i64, require_fresh: bool) -> Option<LoadedData> {
         turns_start: cached.turns_start,
         turns_end: cached.turns_end,
         errors: cached.errors,
+        file_mtimes: cached.file_mtimes,
+        file_sessions: cached.file_sessions,
     })
 }
 
 fn load_from_cache(start: i64, end: i64) -> Option<LoadedData> {
-    load_cache(start, end, true)
-}
-
-fn load_stale_cache(start: i64, end: i64) -> Option<LoadedData> {
-    load_cache(start, end, false)
+    load_cache(start, end)
 }
 
 fn save_to_cache(data: &LoadedData) {
@@ -309,6 +306,8 @@ fn save_to_cache(data: &LoadedData) {
         sessions: &data.sessions,
         turns: &data.turns,
         errors: &data.errors,
+        file_mtimes: &data.file_mtimes,
+        file_sessions: &data.file_sessions,
     };
     let temp_path = path.with_extension(format!("json.tmp-{}", std::process::id()));
     if let Ok(file) = File::create(&temp_path) {
@@ -417,6 +416,14 @@ pub struct LoadedData {
     pub turns_start: i64,
     pub turns_end: i64,
     pub errors: Vec<DataError>,
+    /// 数据文件路径 → mtime（秒）。增量 reload 时跳过 mtime 未变化的文件，
+    /// 其会话结果直接从上次快照恢复，避免全量重解析。
+    #[serde(default)]
+    pub file_mtimes: HashMap<String, i64>,
+    /// 数据文件路径 → 会话 key。记录每个文件解析出的会话，
+    /// 增量 reload 时据此把未变化文件映射回可复用的会话。
+    #[serde(default)]
+    pub file_sessions: HashMap<String, String>,
 }
 
 pub fn devin_db_paths() -> Vec<(String, PathBuf)> {
@@ -713,9 +720,7 @@ fn load_source(
     let ids: Vec<String> = if query_start > start {
         data.sessions
             .iter()
-            .filter(|session| {
-                session.last_activity_at >= query_start && session.created_at < end
-            })
+            .filter(|session| session.last_activity_at >= query_start && session.created_at < end)
             .map(|session| session.id.clone())
             .collect()
     } else {
@@ -749,11 +754,7 @@ fn load_source(
     data
 }
 
-fn load_uncached(
-    start: i64,
-    end: i64,
-    previous: Option<Arc<LoadedData>>,
-) -> LoadedData {
+fn load_uncached(start: i64, end: i64, previous: Option<Arc<LoadedData>>) -> LoadedData {
     let started = Instant::now();
     log_event(format!(
         "load_uncached start={start} end={end} incremental_cache={}",
@@ -770,43 +771,37 @@ fn load_uncached(
             let parts = &parts;
             let previous = previous.clone();
             scope.spawn(move |_| {
-                let data = load_source(
-                    source.clone(),
-                    path,
-                    start,
-                    end,
-                    previous.as_deref(),
-                );
+                let data = load_source(source.clone(), path, start, end, previous.as_deref());
                 parts.lock().unwrap().push(data);
             });
         }
         scope.spawn(|_| {
             let started = Instant::now();
-            let data = local_sources::load_amp(start, end);
+            let data = local_sources::load_amp(start, end, previous.as_deref());
             log_loaded_part("Amp", started, &data);
             parts.lock().unwrap().push(data);
         });
         scope.spawn(|_| {
             let started = Instant::now();
-            let data = local_sources::load_claude(start, end);
+            let data = local_sources::load_claude(start, end, previous.as_deref());
             log_loaded_part("Claude Code", started, &data);
             parts.lock().unwrap().push(data);
         });
         scope.spawn(|_| {
             let started = Instant::now();
-            let data = local_sources::load_codex(start, end);
+            let data = local_sources::load_codex(start, end, previous.as_deref());
             log_loaded_part("Codex", started, &data);
             parts.lock().unwrap().push(data);
         });
         scope.spawn(|_| {
             let started = Instant::now();
-            let data = local_sources::load_antigravity(start, end);
+            let data = local_sources::load_antigravity(start, end, previous.as_deref());
             log_loaded_part("Antigravity", started, &data);
             parts.lock().unwrap().push(data);
         });
         scope.spawn(|_| {
             let started = Instant::now();
-            let data = local_sources::load_grok(start, end);
+            let data = local_sources::load_grok(start, end, previous.as_deref());
             log_loaded_part("Grok Build", started, &data);
             parts.lock().unwrap().push(data);
         });
@@ -828,6 +823,8 @@ fn load_uncached(
         data.sessions.append(&mut part.sessions);
         data.turns.append(&mut part.turns);
         data.errors.append(&mut part.errors);
+        data.file_mtimes.extend(part.file_mtimes);
+        data.file_sessions.extend(part.file_sessions);
     }
     data.turns.sort_by_key(|turn| turn.created_at);
     let save_started = Instant::now();
@@ -856,13 +853,7 @@ fn load_selected_agent(
                 let parts = &parts;
                 let previous = previous.clone();
                 scope.spawn(move |_| {
-                    let data = load_source(
-                        source,
-                        path,
-                        start,
-                        end,
-                        previous.as_deref(),
-                    );
+                    let data = load_source(source, path, start, end, previous.as_deref());
                     parts.lock().unwrap().push(data);
                 });
             }
@@ -882,55 +873,17 @@ fn load_selected_agent(
         data
     } else {
         match agent {
-            AgentKind::Amp => local_sources::load_amp(start, end),
-            AgentKind::Claude => local_sources::load_claude(start, end),
-            AgentKind::Codex => local_sources::load_codex(start, end),
-            AgentKind::Antigravity => local_sources::load_antigravity(start, end),
-            AgentKind::Grok => local_sources::load_grok(start, end),
+            AgentKind::Amp => local_sources::load_amp(start, end, previous.as_deref()),
+            AgentKind::Claude => local_sources::load_claude(start, end, previous.as_deref()),
+            AgentKind::Codex => local_sources::load_codex(start, end, previous.as_deref()),
+            AgentKind::Antigravity => {
+                local_sources::load_antigravity(start, end, previous.as_deref())
+            }
+            AgentKind::Grok => local_sources::load_grok(start, end, previous.as_deref()),
             AgentKind::ZCode => local_sources::load_zcode(start, end),
             AgentKind::Devin => unreachable!(),
         }
     }
-}
-
-fn replace_agent_data(
-    mut base: LoadedData,
-    mut replacement: LoadedData,
-    agent: AgentKind,
-    start: i64,
-    end: i64,
-) -> LoadedData {
-    base.sessions.retain(|session| session.agent != agent);
-    base.turns.retain(|turn| turn.agent != agent);
-    base.errors.retain(|error| error.agent != agent);
-    base.sessions.append(&mut replacement.sessions);
-    base.turns.append(&mut replacement.turns);
-    base.errors.append(&mut replacement.errors);
-    base.turns_start = start;
-    base.turns_end = end;
-    base.turns.sort_by_key(|turn| turn.created_at);
-    base
-}
-
-/// Reload only the currently selected Agent and reuse the other cached data.
-pub fn reload_agent(start: i64, end: i64, agent: AgentKind) -> LoadedData {
-    let Some(previous) = load_stale_cache(start, end).map(Arc::new) else {
-        log_event(format!(
-            "reload_agent agent={} no_incremental_cache fallback=full",
-            agent.label()
-        ));
-        return load_uncached(start, end, None);
-    };
-    let replacement = load_selected_agent(start, end, agent, Some(previous.clone()));
-    let data = replace_agent_data((*previous).clone(), replacement, agent, start, end);
-    save_to_cache(&data);
-    log_event(format!(
-        "reload_agent agent={} incremental=true sessions={} turns={}",
-        agent.label(),
-        data.sessions.len(),
-        data.turns.len()
-    ));
-    data
 }
 
 fn turn_identity(turn: &TurnRec) -> String {
@@ -967,6 +920,8 @@ pub fn reload_agent_from(
     data.errors.retain(|error| error.agent != agent);
     data.sessions.extend(replacement.sessions);
     data.errors.extend(replacement.errors);
+    data.file_mtimes.extend(replacement.file_mtimes);
+    data.file_sessions.extend(replacement.file_sessions);
 
     let mut seen_turns: HashSet<String> = data.turns.iter().map(turn_identity).collect();
     for turn in replacement.turns {
@@ -983,7 +938,6 @@ pub fn reload_agent_from(
         data.turns_end = data.turns_end.max(end);
     }
     data.turns.sort_by_key(|turn| turn.created_at);
-    save_to_cache(&data);
     log_event(format!(
         "reload_agent_from agent={} merged=true range={}..{} sessions={} turns={}",
         agent.label(),
@@ -1008,16 +962,6 @@ pub fn load_all(start: i64, end: i64) -> LoadedData {
         log_event("load_all cache_miss");
         load_uncached(start, end, None)
     }
-}
-
-/// Reload directly from Devin's databases, incrementally updating cached turns.
-pub fn reload_all(start: i64, end: i64) -> LoadedData {
-    let previous = load_stale_cache(start, end).map(Arc::new);
-    log_event(format!(
-        "reload_all force_refresh incremental_cache={}",
-        previous.is_some()
-    ));
-    load_uncached(start, end, previous)
 }
 
 #[cfg(test)]

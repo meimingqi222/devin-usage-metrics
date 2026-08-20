@@ -169,6 +169,115 @@ fn value_number(value: Option<&Value>) -> f64 {
     value.and_then(Value::as_f64).unwrap_or(0.0)
 }
 
+// ── 增量 reload ──────────────────────────────────────────────────────────
+// 上次加载时为每个数据文件记录了 mtime 和解析出的会话 key（LoadedData 的
+// file_mtimes / file_sessions）。reload 时 mtime 未变化的文件直接跳过解析，
+// 其会话与窗口内 turns 从上次快照恢复；只有变化/新增的文件会重新解析。
+
+/// 文件的 mtime（Unix 秒）。文件不存在或 stat 失败时返回 None。
+fn file_mtime_secs(path: &Path) -> Option<i64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
+}
+
+/// 多个文件 mtime 的最大值，作为跨多个物理文件的"文件签名"
+/// （Grok 的 updates.jsonl、Antigravity 的 -wal 附属文件）。
+fn max_mtime(paths: &[&Path]) -> Option<i64> {
+    paths.iter().filter_map(|p| file_mtime_secs(p)).max()
+}
+
+/// 可复用文件的集合：签名 mtime 未变化，且上次快照中记录了该文件的会话 key。
+fn reusable_paths<'f, F>(
+    previous: Option<&LoadedData>,
+    files: &'f [PathBuf],
+    signature: F,
+) -> HashSet<&'f str>
+where
+    F: Fn(&Path) -> Option<i64>,
+{
+    let Some(prev) = previous else {
+        return HashSet::new();
+    };
+    files
+        .iter()
+        .filter_map(|path| {
+            let key = path.to_str()?;
+            let mtime = signature(path)?;
+            if prev.file_sessions.contains_key(key)
+                && prev.file_mtimes.get(key).is_some_and(|m| *m == mtime)
+            {
+                Some(key)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// 一组文件是否全部未变化（用于一个会话跨多个文件的场景，如 Claude subagent）。
+fn all_unchanged(previous: Option<&LoadedData>, paths: &[&PathBuf]) -> bool {
+    let Some(prev) = previous else {
+        return false;
+    };
+    paths.iter().all(|path| {
+        path.to_str()
+            .and_then(|k| prev.file_mtimes.get(k).copied())
+            .zip(file_mtime_secs(path))
+            .is_some_and(|(old, new)| old == new)
+    })
+}
+
+/// 从上次快照恢复可复用会话 key 对应的会话记录和窗口内 turns。
+fn reuse_records(
+    previous: Option<&LoadedData>,
+    agent: AgentKind,
+    start: i64,
+    end: i64,
+    keys: &HashSet<String>,
+) -> (Vec<SessionRec>, Vec<TurnRec>) {
+    let Some(prev) = previous else {
+        return (Vec::new(), Vec::new());
+    };
+    let sessions = prev
+        .sessions
+        .iter()
+        .filter(|s| s.agent == agent && keys.contains(&s.key))
+        .cloned()
+        .collect();
+    let turns = prev
+        .turns
+        .iter()
+        .filter(|t| {
+            t.agent == agent
+                && t.created_at >= start
+                && t.created_at < end
+                && keys.contains(&t.session_key)
+        })
+        .cloned()
+        .collect();
+    (sessions, turns)
+}
+
+/// 记录文件索引（路径 → 签名 mtime / 会话 key），供下次增量 reload 使用。
+/// key 为 None 表示该文件上次没有解析出会话，下次仍会重新解析。
+fn record_index(data: &mut LoadedData, path: &Path, signature: Option<i64>, key: Option<&str>) {
+    let Some(path_str) = path.to_str() else {
+        return;
+    };
+    if let Some(mtime) = signature {
+        data.file_mtimes.insert(path_str.to_owned(), mtime);
+    }
+    if let Some(key) = key {
+        data.file_sessions
+            .insert(path_str.to_owned(), key.to_owned());
+    }
+}
+
 fn timestamp(value: Option<&Value>) -> i64 {
     let Some(value) = value else { return 0 };
     if let Some(number) = value.as_i64() {
@@ -556,8 +665,7 @@ fn load_amp_thread_export(id: &str, updated: i64) -> Option<Value> {
                 let cached_mtime = secs.as_secs() as i64;
                 if cached_mtime >= updated {
                     if let Ok(file) = File::open(&cache_path) {
-                        if let Ok(value) =
-                            serde_json::from_reader::<_, Value>(BufReader::new(file))
+                        if let Ok(value) = serde_json::from_reader::<_, Value>(BufReader::new(file))
                         {
                             return Some(value);
                         }
@@ -582,10 +690,7 @@ fn load_amp_thread_export(id: &str, updated: i64) -> Option<Value> {
     Some(value)
 }
 
-fn load_amp_remote(
-    start: i64,
-    end: i64,
-) -> (Vec<SessionRec>, Vec<TurnRec>, Vec<String>) {
+fn load_amp_remote(start: i64, end: i64) -> (Vec<SessionRec>, Vec<TurnRec>, Vec<String>) {
     let entries = load_amp_thread_list();
     let selected: Vec<&AmpListEntry> = entries
         .iter()
@@ -617,7 +722,7 @@ fn load_amp_remote(
         )
 }
 
-pub(crate) fn load_amp(start: i64, end: i64) -> LoadedData {
+pub(crate) fn load_amp(start: i64, end: i64, previous: Option<&LoadedData>) -> LoadedData {
     let agent = AgentKind::Amp;
     let root = amp_threads_root();
     let mut data = LoadedData {
@@ -628,26 +733,67 @@ pub(crate) fn load_amp(start: i64, end: i64) -> LoadedData {
     let mut skipped = 0usize;
     if root.exists() {
         let files = recent_files(&[root], "json");
-        for result in files
+        let reusable = reusable_paths(previous, &files, file_mtime_secs);
+        let reusable_keys: HashSet<String> = previous
+            .map(|prev| {
+                reusable
+                    .iter()
+                    .filter_map(|path| prev.file_sessions.get(*path))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (reused_sessions, reused_turns) =
+            reuse_records(previous, agent, start, end, &reusable_keys);
+
+        let parse_files: Vec<&PathBuf> = files
+            .iter()
+            .filter(|path| path.to_str().map(|k| !reusable.contains(k)).unwrap_or(true))
+            .collect();
+        let results: Vec<(Option<SessionRec>, Vec<TurnRec>, usize)> = parse_files
             .par_iter()
             .map(|path| parse_amp_file(path, start, end))
-            .collect::<Vec<_>>()
-        {
-            let (session, mut turns, skip) = result;
+            .collect();
+        for (path, (session, mut turns, skip)) in parse_files.iter().zip(results) {
+            record_index(
+                &mut data,
+                path,
+                file_mtime_secs(path),
+                session.as_ref().map(|s| s.key.as_str()),
+            );
             if let Some(session) = session {
                 data.sessions.push(session);
             }
             data.turns.append(&mut turns);
             skipped += skip;
         }
+        // 复用的文件沿用原索引
+        if let Some(prev) = previous {
+            for path in &files {
+                if let Some(key) = path.to_str() {
+                    if reusable.contains(key) {
+                        record_index(
+                            &mut data,
+                            path,
+                            file_mtime_secs(path),
+                            prev.file_sessions.get(key).map(String::as_str),
+                        );
+                    }
+                }
+            }
+        }
+        data.sessions.extend(reused_sessions);
+        data.turns.extend(reused_turns);
     }
 
     // 新版 Amp 将线程保存在服务端，CLI 的 export 是本机可用的读取入口。
     // 列表和导出结果都会缓存到本地，分页时只读取本地缓存。
     let (remote_sessions, remote_turns, failed_ids) = load_amp_remote(start, end);
     let remote_keys: HashSet<String> = remote_sessions.iter().map(|s| s.key.clone()).collect();
-    data.sessions.retain(|session| !remote_keys.contains(&session.key));
-    data.turns.retain(|turn| !remote_keys.contains(&turn.session_key));
+    data.sessions
+        .retain(|session| !remote_keys.contains(&session.key));
+    data.turns
+        .retain(|turn| !remote_keys.contains(&turn.session_key));
     data.sessions.extend(remote_sessions);
     data.turns.extend(remote_turns);
 
@@ -851,7 +997,7 @@ fn parse_claude_file(
     (sessions, turns, 0)
 }
 
-pub(crate) fn load_claude(start: i64, end: i64) -> LoadedData {
+pub(crate) fn load_claude(start: i64, end: i64, previous: Option<&LoadedData>) -> LoadedData {
     let agent = AgentKind::Claude;
     let root = home_path(&[".claude", "projects"]);
     let mut data = LoadedData {
@@ -866,14 +1012,56 @@ pub(crate) fn load_claude(start: i64, end: i64) -> LoadedData {
     }
 
     let files = recent_files(&[root], "jsonl");
+
+    // 一个会话可能跨多个文件（主会话 + subagent）。按会话分组后，
+    // 只有当会话的全部文件都未变化时，才能整体复用上次解析的结果。
+    let mut files_by_key: HashMap<String, Vec<&PathBuf>> = HashMap::new();
+    for path in &files {
+        let id = claude_session_id(path);
+        if id.is_empty() {
+            continue;
+        }
+        files_by_key
+            .entry(format!("claude-code/{id}"))
+            .or_default()
+            .push(path);
+    }
+    let prev_keys: HashSet<&str> = previous
+        .map(|prev| {
+            prev.sessions
+                .iter()
+                .filter(|s| s.agent == agent)
+                .map(|s| s.key.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let reusable_keys: HashSet<String> = files_by_key
+        .iter()
+        .filter(|(key, paths)| prev_keys.contains(key.as_str()) && all_unchanged(previous, paths))
+        .map(|(key, _)| key.clone())
+        .collect();
+    let (reused_sessions, reused_turns) =
+        reuse_records(previous, agent, start, end, &reusable_keys);
+
+    let parse_files: Vec<&PathBuf> = files_by_key
+        .iter()
+        .filter(|(key, _)| !reusable_keys.contains(*key))
+        .flat_map(|(_, paths)| paths.iter().copied())
+        .collect();
     let mut sessions: HashMap<String, SessionBuilder> = HashMap::new();
+    let mut turns = Vec::new();
     let mut skipped = 0usize;
-    for result in files
+    let results: Vec<(HashMap<String, SessionBuilder>, Vec<TurnRec>, usize)> = parse_files
         .par_iter()
         .map(|path| parse_claude_file(path, start, end))
-        .collect::<Vec<_>>()
-    {
-        let (partial, mut turns, skip) = result;
+        .collect();
+    for (path, (partial, mut new_turns, skip)) in parse_files.iter().zip(results) {
+        // 文件内的 sessionId 可能与按路径推导的不同（subagent 场景），
+        // 只在文件恰好对应一个会话时记录映射，否则下次保持重新解析
+        let single_key = match partial.len() {
+            1 => partial.keys().next().map(|id| format!("claude-code/{id}")),
+            _ => None,
+        };
         for (id, session) in partial {
             match sessions.get_mut(&id) {
                 Some(existing) => existing.merge(session),
@@ -882,13 +1070,40 @@ pub(crate) fn load_claude(start: i64, end: i64) -> LoadedData {
                 }
             }
         }
-        data.turns.append(&mut turns);
+        record_index(
+            &mut data,
+            path,
+            file_mtime_secs(path),
+            single_key.as_deref(),
+        );
+        turns.append(&mut new_turns);
         skipped += skip;
+    }
+    // 复用的会话：组内文件沿用原索引
+    if let Some(prev) = previous {
+        for (key, paths) in &files_by_key {
+            if reusable_keys.contains(key) {
+                for path in paths {
+                    let Some(path_key) = path.to_str() else {
+                        continue;
+                    };
+                    record_index(
+                        &mut data,
+                        path,
+                        file_mtime_secs(path),
+                        prev.file_sessions.get(path_key).map(String::as_str),
+                    );
+                }
+            }
+        }
     }
     data.sessions = sessions
         .into_values()
         .map(|session| session.finish(agent))
+        .chain(reused_sessions)
         .collect();
+    data.turns = turns;
+    data.turns.extend(reused_turns);
     if skipped > 0 {
         data.errors
             .push(error(agent, format!("有 {skipped} 个会话文件无法读取")));
@@ -989,7 +1204,9 @@ fn parse_codex_file(path: &Path) -> (HashMap<String, SessionBuilder>, Vec<CodexE
                 if let Some(cwd) = payload.and_then(|p| p.cwd.as_deref()) {
                     session.cwd = cwd.to_owned();
                 }
-                if let Some(source) = payload.and_then(|p| p.source.as_ref()).and_then(Value::as_str)
+                if let Some(source) = payload
+                    .and_then(|p| p.source.as_ref())
+                    .and_then(Value::as_str)
                 {
                     session.source = source.to_owned();
                 }
@@ -1008,7 +1225,10 @@ fn parse_codex_file(path: &Path) -> (HashMap<String, SessionBuilder>, Vec<CodexE
                     .unwrap_or("")
                     .to_owned();
             }
-            "event_msg" => match payload.and_then(|p| p.payload_type.as_deref()).unwrap_or("") {
+            "event_msg" => match payload
+                .and_then(|p| p.payload_type.as_deref())
+                .unwrap_or("")
+            {
                 "user_message" if session.title.is_empty() => {
                     session.title = payload
                         .and_then(|p| p.message.as_deref())
@@ -1056,7 +1276,7 @@ fn parse_codex_file(path: &Path) -> (HashMap<String, SessionBuilder>, Vec<CodexE
     (metas, events, 0)
 }
 
-pub(crate) fn load_codex(start: i64, end: i64) -> LoadedData {
+pub(crate) fn load_codex(start: i64, end: i64, previous: Option<&LoadedData>) -> LoadedData {
     let agent = AgentKind::Codex;
     let base = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -1074,15 +1294,37 @@ pub(crate) fn load_codex(start: i64, end: i64) -> LoadedData {
     }
 
     let files = recent_files(&roots, "jsonl");
+    let reusable = reusable_paths(previous, &files, file_mtime_secs);
+    let reusable_keys: HashSet<String> = previous
+        .map(|prev| {
+            reusable
+                .iter()
+                .filter_map(|path| prev.file_sessions.get(*path))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let (reused_sessions, reused_turns) =
+        reuse_records(previous, agent, start, end, &reusable_keys);
+
+    let parse_files: Vec<&PathBuf> = files
+        .iter()
+        .filter(|path| path.to_str().map(|k| !reusable.contains(k)).unwrap_or(true))
+        .collect();
     let mut metas: HashMap<String, SessionBuilder> = HashMap::new();
     let mut events: Vec<CodexEvent> = Vec::new();
     let mut skipped = 0usize;
-    for result in files
+    let results: Vec<(HashMap<String, SessionBuilder>, Vec<CodexEvent>, usize)> = parse_files
         .par_iter()
         .map(|path| parse_codex_file(path))
-        .collect::<Vec<_>>()
-    {
-        let (partial, partial_events, skip) = result;
+        .collect();
+    for (path, (partial, partial_events, skip)) in parse_files.iter().zip(results) {
+        // 一个文件只对应一个会话时才记录路径 → 会话 key 的映射，
+        // 否则下次无法安全复用，保持重新解析。
+        let single_key = match partial.len() {
+            1 => partial.keys().next().map(|id| format!("codex/{id}")),
+            _ => None,
+        };
         for (id, session) in partial {
             match metas.get_mut(&id) {
                 Some(existing) => existing.merge(session),
@@ -1091,8 +1333,29 @@ pub(crate) fn load_codex(start: i64, end: i64) -> LoadedData {
                 }
             }
         }
+        record_index(
+            &mut data,
+            path,
+            file_mtime_secs(path),
+            single_key.as_deref(),
+        );
         events.extend(partial_events);
         skipped += skip;
+    }
+    // 复用的文件沿用原索引
+    if let Some(prev) = previous {
+        for path in &files {
+            if let Some(key) = path.to_str() {
+                if reusable.contains(key) {
+                    record_index(
+                        &mut data,
+                        path,
+                        file_mtime_secs(path),
+                        prev.file_sessions.get(key).map(String::as_str),
+                    );
+                }
+            }
+        }
     }
 
     // Dedup by (session, cumulative usage signature) in original file order,
@@ -1133,7 +1396,9 @@ pub(crate) fn load_codex(start: i64, end: i64) -> LoadedData {
     data.sessions = metas
         .into_values()
         .map(|session| session.finish(agent))
+        .chain(reused_sessions)
         .collect();
+    data.turns.extend(reused_turns);
     if skipped > 0 {
         data.errors
             .push(error(agent, format!("有 {skipped} 个会话文件无法读取")));
@@ -1323,15 +1588,27 @@ fn antigravity_step_text(payload: &[u8]) -> Option<String> {
     None
 }
 
+/// `parse_antigravity_db` 的结果：区分“真正打不开”和“能读但没有任何可计量的
+/// token 用量”（后者不应被当作读取失败报警）。
+enum AgParse {
+    /// 成功解析出一个会话。
+    Ok(Box<(SessionRec, Vec<TurnRec>)>),
+    /// 文件能读、结构正常，但没有任何可计量的 token 用量（空会话，通常是一次
+    /// 未产生计费生成的失败调用）。
+    Empty,
+    /// 文件打不开或无法解析（连接失败、无可用的会话文件名等）。
+    Error,
+}
+
 /// 解析单个 Antigravity 会话数据库。
-fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> (Option<SessionRec>, Vec<TurnRec>) {
+fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> AgParse {
     let session_id = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_owned();
     if session_id.is_empty() {
-        return (None, Vec::new());
+        return AgParse::Error;
     }
 
     let conn = match rusqlite::Connection::open_with_flags(
@@ -1339,7 +1616,7 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> (Option<SessionRec
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
         Ok(c) => c,
-        Err(_) => return (None, Vec::new()),
+        Err(_) => return AgParse::Error,
     };
     let _ = conn.busy_timeout(std::time::Duration::from_millis(500));
 
@@ -1368,9 +1645,9 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> (Option<SessionRec
 
     // 用户消息（标题）：从 steps 表中找第一个 type=14 的步骤
     let mut title = String::new();
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT step_payload FROM steps WHERE step_type=14 ORDER BY idx LIMIT 5",
-    ) {
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT step_payload FROM steps WHERE step_type=14 ORDER BY idx LIMIT 5")
+    {
         let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0));
         if let Ok(rows) = rows {
             for row in rows.flatten() {
@@ -1499,12 +1776,13 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> (Option<SessionRec
     }
 
     if session.agent_messages == 0.0 {
-        return (None, Vec::new());
+        AgParse::Empty
+    } else {
+        AgParse::Ok(Box::new((session.finish(AgentKind::Antigravity), turns)))
     }
-    (Some(session.finish(AgentKind::Antigravity)), turns)
 }
 
-pub(crate) fn load_antigravity(start: i64, end: i64) -> LoadedData {
+pub(crate) fn load_antigravity(start: i64, end: i64, previous: Option<&LoadedData>) -> LoadedData {
     let agent = AgentKind::Antigravity;
     let root = home_path(&[".gemini", "antigravity", "conversations"]);
     let mut data = LoadedData {
@@ -1535,23 +1813,77 @@ pub(crate) fn load_antigravity(start: i64, end: i64) -> LoadedData {
     });
     files.truncate(MAX_SESSION_FILES);
 
-    let mut skipped = 0usize;
-    for result in files
+    // WAL 未 checkpoint 时主库 mtime 不变，签名要把 -wal 文件算进去
+    let db_signature = |path: &Path| {
+        let wal = path.with_extension("db-wal");
+        max_mtime(&[path, &wal])
+    };
+    let reusable = reusable_paths(previous, &files, db_signature);
+    let reusable_keys: HashSet<String> = previous
+        .map(|prev| {
+            reusable
+                .iter()
+                .filter_map(|path| prev.file_sessions.get(*path))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let (reused_sessions, reused_turns) =
+        reuse_records(previous, agent, start, end, &reusable_keys);
+
+    let parse_files: Vec<&PathBuf> = files
+        .iter()
+        .filter(|path| path.to_str().map(|k| !reusable.contains(k)).unwrap_or(true))
+        .collect();
+    let mut parse_errors = 0usize;
+    let results: Vec<AgParse> = parse_files
         .par_iter()
         .map(|path| parse_antigravity_db(path, start, end))
-        .collect::<Vec<_>>()
-    {
-        let (session, mut turns) = result;
-        if let Some(session) = session {
-            data.sessions.push(session);
-        } else {
-            skipped += 1;
+        .collect();
+    for (path, result) in parse_files.iter().zip(results) {
+        match result {
+            AgParse::Ok(boxed) => {
+                let (session, mut turns) = *boxed;
+                record_index(
+                    &mut data,
+                    path,
+                    db_signature(path),
+                    Some(session.key.as_str()),
+                );
+                data.sessions.push(session);
+                data.turns.append(&mut turns);
+            }
+            // 能读但没有任何可计量的用量（通常是未产生计费生成的失败会话）：
+            // 直接跳过，不作为“无法读取”报警。
+            AgParse::Empty => {
+                record_index(&mut data, path, db_signature(path), None);
+            }
+            AgParse::Error => {
+                record_index(&mut data, path, db_signature(path), None);
+                parse_errors += 1;
+            }
         }
-        data.turns.append(&mut turns);
     }
-    if skipped > 0 {
+    // 复用的文件沿用原索引
+    if let Some(prev) = previous {
+        for path in &files {
+            if let Some(key) = path.to_str() {
+                if reusable.contains(key) {
+                    record_index(
+                        &mut data,
+                        path,
+                        db_signature(path),
+                        prev.file_sessions.get(key).map(String::as_str),
+                    );
+                }
+            }
+        }
+    }
+    data.sessions.extend(reused_sessions);
+    data.turns.extend(reused_turns);
+    if parse_errors > 0 {
         data.errors
-            .push(error(agent, format!("有 {skipped} 个会话文件无法读取")));
+            .push(error(agent, format!("有 {parse_errors} 个会话文件无法读取")));
     }
     data
 }
@@ -1566,7 +1898,12 @@ fn parse_grok_summary(path: &Path) -> Option<(SessionBuilder, PathBuf)> {
         .pointer("/info/id")
         .and_then(Value::as_str)
         .map(String::from)
-        .or_else(|| sess_dir.file_name().and_then(|s| s.to_str()).map(String::from))?;
+        .or_else(|| {
+            sess_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(String::from)
+        })?;
 
     let cwd = val
         .pointer("/info/cwd")
@@ -1671,7 +2008,10 @@ fn parse_grok_session(
             let ts = timestamp(obj.get("timestamp"));
             let turn_ts = if ts > 0 {
                 ts
-            } else if let Some(ms) = obj.pointer("/_meta/agentTimestampMs").and_then(Value::as_i64) {
+            } else if let Some(ms) = obj
+                .pointer("/_meta/agentTimestampMs")
+                .and_then(Value::as_i64)
+            {
                 ms / 1000
             } else {
                 session.created_at
@@ -1683,7 +2023,7 @@ fn parse_grok_session(
             session.cached_tokens += cached;
             session.cache_creation_tokens += cache_creation;
 
-            if turn_ts >= start && turn_ts <= end {
+            if turn_ts >= start && turn_ts < end {
                 turns.push(TurnRec {
                     session_key: format!("grok-build/{}", session.id),
                     created_at: turn_ts,
@@ -1705,7 +2045,7 @@ fn parse_grok_session(
     (Some(session.finish(AgentKind::Grok)), turns)
 }
 
-pub(crate) fn load_grok(start: i64, end: i64) -> LoadedData {
+pub(crate) fn load_grok(start: i64, end: i64, previous: Option<&LoadedData>) -> LoadedData {
     let agent = AgentKind::Grok;
     let root = home_path(&[".grok", "sessions"]);
     let mut data = LoadedData {
@@ -1731,20 +2071,65 @@ pub(crate) fn load_grok(start: i64, end: i64) -> LoadedData {
     });
     summary_files.truncate(MAX_SESSION_FILES);
 
+    // 会话进展写在 updates.jsonl，签名要把两个文件都算进去
+    let grok_signature = |path: &Path| {
+        let updates = path.with_file_name("updates.jsonl");
+        max_mtime(&[path, &updates])
+    };
+    let reusable = reusable_paths(previous, &summary_files, grok_signature);
+    let reusable_keys: HashSet<String> = previous
+        .map(|prev| {
+            reusable
+                .iter()
+                .filter_map(|path| prev.file_sessions.get(*path))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let (reused_sessions, reused_turns) =
+        reuse_records(previous, agent, start, end, &reusable_keys);
+
+    let parse_files: Vec<&PathBuf> = summary_files
+        .iter()
+        .filter(|path| path.to_str().map(|k| !reusable.contains(k)).unwrap_or(true))
+        .collect();
     let mut skipped = 0usize;
-    for result in summary_files
+    let results: Vec<(Option<SessionRec>, Vec<TurnRec>)> = parse_files
         .par_iter()
         .map(|path| parse_grok_session(path, start, end))
-        .collect::<Vec<_>>()
-    {
-        let (session, mut turns) = result;
+        .collect();
+    for (path, (session, mut turns)) in parse_files.iter().zip(results) {
         if let Some(session) = session {
+            record_index(
+                &mut data,
+                path,
+                grok_signature(path),
+                Some(session.key.as_str()),
+            );
             data.sessions.push(session);
         } else {
+            record_index(&mut data, path, grok_signature(path), None);
             skipped += 1;
         }
         data.turns.append(&mut turns);
     }
+    // 复用的文件沿用原索引
+    if let Some(prev) = previous {
+        for path in &summary_files {
+            if let Some(key) = path.to_str() {
+                if reusable.contains(key) {
+                    record_index(
+                        &mut data,
+                        path,
+                        grok_signature(path),
+                        prev.file_sessions.get(key).map(String::as_str),
+                    );
+                }
+            }
+        }
+    }
+    data.sessions.extend(reused_sessions);
+    data.turns.extend(reused_turns);
     if skipped > 0 {
         data.errors
             .push(error(agent, format!("有 {skipped} 个会话文件无法读取")));
@@ -1912,7 +2297,7 @@ pub(crate) fn load_zcode(start: i64, end: i64) -> LoadedData {
                 let cache_cr = cache_creation_tokens.unwrap_or(0.0);
                 let cache_rd = cache_read_tokens.unwrap_or(0.0);
                 let inp = (raw_inp - cache_rd).max(0.0);
-                let model = model_id.unwrap_or_else(|| "glm-5.2".into());
+                let model = model_id.filter(|m| !m.is_empty()).unwrap_or_else(|| "unknown".into());
 
                 let start_sec = started_at
                     .map(|t| if t > 10_000_000_000 { t / 1000 } else { t })
@@ -1943,7 +2328,7 @@ pub(crate) fn load_zcode(start: i64, end: i64) -> LoadedData {
                 }
                 builder.observe_time(start_sec);
 
-                if start_sec >= start && start_sec <= end {
+                if start_sec >= start && start_sec < end {
                     data.turns.push(TurnRec {
                         session_key: format!("zcode/{}", root_id),
                         created_at: start_sec,
@@ -1976,8 +2361,8 @@ pub(crate) fn load_zcode(start: i64, end: i64) -> LoadedData {
 #[cfg(test)]
 mod tests {
     use super::{
-        amp_cache_dir, amp_list_cache_path, content_text, load_amp_thread_export,
-        parse_amp_value, timestamp, AmpListCache, AmpListEntry,
+        amp_cache_dir, amp_list_cache_path, content_text, load_amp_thread_export, parse_amp_value,
+        timestamp, AmpListCache, AmpListEntry,
     };
     use serde_json::json;
     use std::fs::File;

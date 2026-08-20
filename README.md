@@ -2,13 +2,13 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A native desktop app that reads local sessions from Devin, Amp, Claude Code, Codex, and Antigravity and presents token usage, model distribution, and session details. Switch agents from the top bar; all data stays on your machine.
+A native desktop app that reads local sessions from Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, and ZCode and presents token usage, model distribution, and session details. Switch agents from the top bar; all data stays on your machine.
 
 ## Features
 
 - **Usage view**
-  - Switch between Devin, Amp, Claude Code, Codex, and Antigravity
-  - Aggregate token usage by day (14 days) / week (12 weeks) / month (6 months)
+  - Switch between Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, and ZCode
+  - Aggregate token usage by day (15 days) / week (12 weeks) / month (12 months)
   - Stat cards for Total Tokens, Input (new), Output, Cached read, and Turns/Sessions
   - Stacked bar chart of token trends (input / output / cached layers)
   - Per-period detail table with session count, turns, token breakdown, and per-model usage
@@ -23,9 +23,11 @@ A native desktop app that reads local sessions from Devin, Amp, Claude Code, Cod
   - Claude Code: `~/.claude/projects/**/*.jsonl` (subagent usage is merged into its parent session)
   - Codex: `~/.codex/{sessions,archived_sessions}/**/*.jsonl` or `$CODEX_HOME`
   - Antigravity: `~/.gemini/antigravity/conversations/*.db` (protobuf-encoded SQLite)
-  - Loads multiple sources in parallel and merges the results
+  - Grok Build: `~/.grok/sessions/*/summary.json` (with per-session `updates.jsonl` for turn details)
+  - ZCode: `~/.zcode/cli/db/db.sqlite`
+  - Each agent is loaded lazily when first selected, sources parse in parallel
   - 5-minute on-disk cache in the platform cache directory for fast subsequent launches
-  - "Reload" bypasses the cache and re-reads every local source
+  - "Reload" bypasses the cache; unchanged files are detected by mtime and only modified files are re-parsed
 
 ## Tech stack
 
@@ -51,7 +53,7 @@ cargo run
 # Release build
 cargo build --release
 
-# Run tests (the dump integration test requires local session data)
+# Run tests (integration tests skip automatically when no local session data exists)
 cargo test
 ```
 
@@ -73,7 +75,10 @@ src/
 ├── main.rs    # GPUI app entry, UI rendering, usage/sessions views
 ├── lib.rs     # Module exports
 ├── data.rs    # Shared records, Devin SQLite reads, on-disk cache
-├── local_sources.rs # Amp, Claude Code, Codex, and Antigravity importers
+├── local_sources.rs # Amp, Claude Code, Codex, Antigravity, Grok Build, and ZCode importers
+├── pricing.rs # Model pricing table and cost calculation
+├── devin-model-pricing.json    # Official Devin model price list (embedded at compile time)
+├── models-dev-pricing.json     # Non-Devin model prices extracted from models.dev
 └── agg.rs     # Day/week/month bucketing and per-model grouping
 tests/
 └── dump.rs    # End-to-end integration test against real local data

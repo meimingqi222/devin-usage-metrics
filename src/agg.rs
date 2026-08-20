@@ -105,8 +105,11 @@ pub fn window_for(kind: PeriodKind, page: usize) -> (i64, i64) {
         }
         PeriodKind::Month => {
             let current_month = (today.year(), today.month());
-            let (start_year, start_month) =
-                shifted_month(current_month.0, current_month.1, -(n as i32 - 1) - page_offset as i32);
+            let (start_year, start_month) = shifted_month(
+                current_month.0,
+                current_month.1,
+                -(n as i32 - 1) - page_offset as i32,
+            );
             let (end_year, end_month) =
                 shifted_month(current_month.0, current_month.1, 1 - page_offset as i32);
             (
@@ -253,19 +256,19 @@ fn build_buckets_inner(
         b.turns += 1;
         b.session_keys.insert(turn.session_key.clone());
         // 优先使用 turn 自己的模型（Devin 的 generation_model），否则回退到会话 display_model
-        let model = if !turn.model.is_empty() {
-            turn.model.clone()
+        let model: &str = if !turn.model.is_empty() {
+            &turn.model
         } else {
             session_model
                 .get(&turn.session_key)
-                .cloned()
-                .unwrap_or_else(|| "unknown".into())
+                .map(String::as_str)
+                .unwrap_or("unknown")
         };
         // 按模型名查找定价并计算费用
-        let pricing_entry = pricing.find(&model);
-        if let Some(ref p) = pricing_entry {
-            // Claude 区分 5m/1h cache creation，1h 费率 = input × 2
-            let c = if turn.agent == AgentKind::Claude
+        let pricing_entry = pricing.find(model);
+        // Claude 区分 5m/1h cache creation，1h 费率 = input × 2
+        let turn_cost = pricing_entry.map(|p| {
+            if turn.agent == AgentKind::Claude
                 && (turn.cache_creation_5m_tokens > 0.0 || turn.cache_creation_1h_tokens > 0.0)
             {
                 p.cost_claude_cache(
@@ -282,35 +285,36 @@ fn build_buckets_inner(
                     turn.cache_read_tokens,
                     turn.cache_creation_tokens,
                 )
-            };
+            }
+        });
+        if let Some(c) = turn_cost {
             b.cost += c;
         }
-        let mu = b.by_model.entry(model).or_default();
-        mu.input += turn.input_tokens;
-        mu.output += turn.output_tokens;
-        mu.cached += turn.cache_read_tokens;
-        mu.turns += 1;
-        if let Some(ref p) = pricing_entry {
-            let c = if turn.agent == AgentKind::Claude
-                && (turn.cache_creation_5m_tokens > 0.0 || turn.cache_creation_1h_tokens > 0.0)
-            {
-                p.cost_claude_cache(
-                    turn.input_tokens,
-                    turn.output_tokens,
-                    turn.cache_read_tokens,
-                    turn.cache_creation_5m_tokens,
-                    turn.cache_creation_1h_tokens,
-                )
-            } else {
-                p.cost_with_cache_write(
-                    turn.input_tokens,
-                    turn.output_tokens,
-                    turn.cache_read_tokens,
-                    turn.cache_creation_tokens,
-                )
-            };
-            mu.cost += c;
-            mu.priced = true;
+        // BTreeMap::entry 要求拥有 key，用 get_mut 避免每个 turn 都克隆模型名
+        match b.by_model.get_mut(model) {
+            Some(mu) => {
+                mu.input += turn.input_tokens;
+                mu.output += turn.output_tokens;
+                mu.cached += turn.cache_read_tokens;
+                mu.turns += 1;
+                if let Some(c) = turn_cost {
+                    mu.cost += c;
+                    mu.priced = true;
+                }
+            }
+            None => {
+                b.by_model.insert(
+                    model.to_string(),
+                    ModelUsage {
+                        input: turn.input_tokens,
+                        output: turn.output_tokens,
+                        cached: turn.cache_read_tokens,
+                        turns: 1,
+                        cost: turn_cost.unwrap_or(0.0),
+                        priced: pricing_entry.is_some(),
+                    },
+                );
+            }
         }
     }
     buckets
@@ -329,18 +333,10 @@ mod tests {
             assert!(previous_start < previous_end);
             assert_eq!(previous_end, current_start);
 
-            let current_buckets = build_buckets_for(
-                &LoadedData::default(),
-                kind,
-                AgentKind::Devin,
-                0,
-            );
-            let previous_buckets = build_buckets_for(
-                &LoadedData::default(),
-                kind,
-                AgentKind::Devin,
-                1,
-            );
+            let current_buckets =
+                build_buckets_for(&LoadedData::default(), kind, AgentKind::Devin, 0);
+            let previous_buckets =
+                build_buckets_for(&LoadedData::default(), kind, AgentKind::Devin, 1);
             assert_eq!(current_buckets.len(), bucket_count(kind));
             assert_eq!(previous_buckets.len(), bucket_count(kind));
             assert_eq!(current_buckets.first().unwrap().start, current_start);

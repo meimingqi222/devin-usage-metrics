@@ -60,8 +60,7 @@ impl Pricing {
         cached: f64,
         cache_creation: f64,
     ) -> f64 {
-        self.cost(input, output, cached)
-            + (cache_creation / 1_000_000.0) * self.cw
+        self.cost(input, output, cached) + (cache_creation / 1_000_000.0) * self.cw
     }
 
     /// Claude 专用：区分 5m 和 1h cache creation 的费用计算。
@@ -112,7 +111,8 @@ impl PricingTable {
         })
     }
 
-    /// 按模型名查找定价。查找顺序：
+    /// 按模型名查找定价，返回表中条目的引用（表是编译期嵌入的静态数据）。
+    /// 查找顺序：
     /// 1. Devin 表精确匹配（model_uid 完全一致）
     /// 2. models.dev 表精确匹配
     /// 3. Devin label 精确匹配（如 "GPT-5.6 Luna XHigh Thinking"）
@@ -120,7 +120,7 @@ impl PricingTable {
     /// 5. 去掉日期后缀后重试（如 "claude-haiku-4-5-20251001" → "claude-haiku-4-5"）
     /// 6. models.dev 表前缀匹配（如 "gpt-5.1-max" → "gpt-5.1"）
     /// 7. 反向前缀匹配
-    pub fn find(&self, model: &str) -> Option<Pricing> {
+    pub fn find(&self, model: &str) -> Option<&Pricing> {
         let model = model.trim();
         if model.is_empty() {
             return None;
@@ -128,17 +128,17 @@ impl PricingTable {
 
         // 1. Devin 表精确匹配（model_uid）
         if let Some(p) = self.devin.get(model) {
-            return Some(p.clone());
+            return Some(p);
         }
 
         // 2. models.dev 表精确匹配
         if let Some(p) = self.models_dev.get(model) {
-            return Some(p.clone());
+            return Some(p);
         }
 
         // 3. Devin label 精确匹配
         if let Some(p) = self.devin_labels.get(model) {
-            return Some(p.clone());
+            return Some(p);
         }
 
         // 4. 去掉 provider 前缀后重试
@@ -168,103 +168,42 @@ impl PricingTable {
         let stripped_date = strip_date_suffix(model);
         if stripped_date != model {
             if let Some(p) = self.devin.get(stripped_date) {
-                return Some(p.clone());
+                return Some(p);
             }
             if let Some(p) = self.models_dev.get(stripped_date) {
-                return Some(p.clone());
+                return Some(p);
             }
             if let Some(p) = self.devin_labels.get(stripped_date) {
-                return Some(p.clone());
+                return Some(p);
             }
         }
 
         // 6. models.dev 表前缀匹配 — 找最长的键作为前缀
-        let prefix_match = self
+        if let Some((_, p)) = self
             .models_dev
             .iter()
             .filter(|(key, _)| model.starts_with(key.as_str()))
             .max_by_key(|(key, _)| key.len())
-            .map(|(_, v)| v.clone());
-        if prefix_match.is_some() {
-            return prefix_match;
+        {
+            return Some(p);
         }
 
         // 6b. Devin label 前缀匹配 — 如 "GLM-5.2 High" 匹配 label "GLM-5.2"
-        let label_prefix_match = self
+        if let Some((_, p)) = self
             .devin_labels
             .iter()
             .filter(|(label, _)| model.starts_with(label.as_str()))
             .max_by_key(|(label, _)| label.len())
-            .map(|(_, v)| v.clone());
-        if label_prefix_match.is_some() {
-            return label_prefix_match;
+        {
+            return Some(p);
         }
 
         // 7. 反向前缀匹配 — 键以模型名开头
-        let reverse_match = self
-            .models_dev
+        self.models_dev
             .iter()
             .filter(|(key, _)| key.starts_with(stripped_date))
             .max_by_key(|(key, _)| key.len())
-            .map(|(_, v)| v.clone());
-        reverse_match
-    }
-
-    /// 查找定价，返回定价和是否为"估算"（非精确匹配）。
-    pub fn find_with_flag(&self, model: &str) -> Option<(Pricing, bool)> {
-        let model = model.trim();
-        if model.is_empty() {
-            return None;
-        }
-
-        // 精确匹配
-        if let Some(p) = self.devin.get(model) {
-            return Some((p.clone(), false));
-        }
-        if let Some(p) = self.models_dev.get(model) {
-            return Some((p.clone(), false));
-        }
-        if let Some(p) = self.devin_labels.get(model) {
-            return Some((p.clone(), false));
-        }
-
-        // 模糊匹配
-        let stripped_prefix = strip_provider_prefix(model);
-        if stripped_prefix != model {
-            if let Some((p, _)) = self.find_with_flag(stripped_prefix) {
-                return Some((p, true));
-            }
-        }
-        let stripped_date = strip_date_suffix(model);
-        if let Some(p) = self.devin.get(stripped_date) {
-            return Some((p.clone(), true));
-        }
-        if let Some(p) = self.models_dev.get(stripped_date) {
-            return Some((p.clone(), true));
-        }
-        if let Some(p) = self.devin_labels.get(stripped_date) {
-            return Some((p.clone(), true));
-        }
-        if let Some(p) = self.prefix_match(model).or_else(|| self.reverse_match(stripped_date)) {
-            return Some((p, true));
-        }
-        None
-    }
-
-    fn prefix_match(&self, model: &str) -> Option<Pricing> {
-        self.models_dev
-            .iter()
-            .filter(|(key, _)| model.starts_with(key.as_str()))
-            .max_by_key(|(key, _)| key.len())
-            .map(|(_, v)| v.clone())
-    }
-
-    fn reverse_match(&self, model: &str) -> Option<Pricing> {
-        self.models_dev
-            .iter()
-            .filter(|(key, _)| key.starts_with(model))
-            .max_by_key(|(key, _)| key.len())
-            .map(|(_, v)| v.clone())
+            .map(|(_, v)| v)
     }
 }
 
@@ -391,8 +330,12 @@ mod tests {
     fn devin_models_are_priced() {
         let table = PricingTable::instance();
         // Devin 的思考等级变体 — 同一基础模型，不同思考等级
-        let high = table.find("gpt-5-6-luna-high").expect("luna-high 必须有定价");
-        let xhigh = table.find("gpt-5-6-luna-xhigh").expect("luna-xhigh 必须有定价");
+        let high = table
+            .find("gpt-5-6-luna-high")
+            .expect("luna-high 必须有定价");
+        let xhigh = table
+            .find("gpt-5-6-luna-xhigh")
+            .expect("luna-xhigh 必须有定价");
         assert_eq!(high.i, 0.2);
         assert_eq!(high.o, 1.2);
         assert_eq!(high.cr, 0.02);
@@ -478,7 +421,10 @@ mod tests {
 
     #[test]
     fn strip_date_suffix_works() {
-        assert_eq!(strip_date_suffix("claude-haiku-4-5-20251001"), "claude-haiku-4-5");
+        assert_eq!(
+            strip_date_suffix("claude-haiku-4-5-20251001"),
+            "claude-haiku-4-5"
+        );
         assert_eq!(
             strip_date_suffix("claude-sonnet-4-2025-05-14"),
             "claude-sonnet-4"
@@ -505,7 +451,9 @@ mod tests {
         assert_eq!(p.i, 0.0);
         assert_eq!(p.o, 0.0);
         // 也通过 label 查找
-        let p2 = table.find("SWE-1.7 Max").expect("SWE-1.7 Max label 应有定价");
+        let p2 = table
+            .find("SWE-1.7 Max")
+            .expect("SWE-1.7 Max label 应有定价");
         assert_eq!(p2.i, 0.0);
     }
 

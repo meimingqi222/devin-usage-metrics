@@ -12,8 +12,11 @@ fn dump_recent_usage() {
         data.turns.len(),
         data.errors
     );
-    assert!(!data.sessions.is_empty(), "no sessions loaded");
-    assert!(!data.turns.is_empty(), "no turns loaded");
+    // 该测试依赖本机的 Agent 会话数据，干净环境（如 CI）上跳过
+    if data.sessions.is_empty() && data.turns.is_empty() {
+        eprintln!("skip: no local agent session data found");
+        return;
+    }
 
     for agent in data::AgentKind::ALL {
         let sessions = data
@@ -87,7 +90,12 @@ fn dump_recent_usage() {
         println!(
             "WARN 以下模型未找到定价 (共 {}): {}",
             unpriced.len(),
-            unpriced.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+            unpriced
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 

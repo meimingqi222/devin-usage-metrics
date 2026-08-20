@@ -55,3 +55,8 @@ Icon?
 *.log
 *.tmp
 tmp/
+
+# 录屏 / 视频
+*.mov
+*.mp4
+*.webm
