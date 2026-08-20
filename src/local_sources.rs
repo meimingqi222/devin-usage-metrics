@@ -1882,8 +1882,10 @@ pub(crate) fn load_antigravity(start: i64, end: i64, previous: Option<&LoadedDat
     data.sessions.extend(reused_sessions);
     data.turns.extend(reused_turns);
     if parse_errors > 0 {
-        data.errors
-            .push(error(agent, format!("有 {parse_errors} 个会话文件无法读取")));
+        data.errors.push(error(
+            agent,
+            format!("有 {parse_errors} 个会话文件无法读取"),
+        ));
     }
     data
 }
