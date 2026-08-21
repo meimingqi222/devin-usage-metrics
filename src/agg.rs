@@ -264,10 +264,11 @@ fn build_buckets_inner(
                 .map(String::as_str)
                 .unwrap_or("unknown")
         };
-        // 按模型名查找定价并计算费用
+        // 按模型名查找定价并计算费用；agent 自身记录过费用（如 Grok）则直接采用
         let pricing_entry = pricing.find(model);
         // Claude 区分 5m/1h cache creation，1h 费率 = input × 2
-        let turn_cost = pricing_entry.map(|p| {
+        let turn_cost = turn.recorded_cost.or_else(|| {
+            pricing_entry.map(|p| {
             if turn.agent == AgentKind::Claude
                 && (turn.cache_creation_5m_tokens > 0.0 || turn.cache_creation_1h_tokens > 0.0)
             {
@@ -286,6 +287,7 @@ fn build_buckets_inner(
                     turn.cache_creation_tokens,
                 )
             }
+            })
         });
         if let Some(c) = turn_cost {
             b.cost += c;
@@ -311,7 +313,7 @@ fn build_buckets_inner(
                         cached: turn.cache_read_tokens,
                         turns: 1,
                         cost: turn_cost.unwrap_or(0.0),
-                        priced: pricing_entry.is_some(),
+                        priced: turn_cost.is_some(),
                     },
                 );
             }

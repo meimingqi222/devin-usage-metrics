@@ -2,12 +2,12 @@
 
 [English](README.md) | **简体中文**
 
-一个原生桌面应用，用于读取 Devin、Amp、Claude Code、Codex、Antigravity、Grok Build 与 ZCode 在本地留下的会话数据，并展示 token 用量、模型分布与会话详情。可从顶部切换不同 Agent；所有数据均来自本机，不会上传到任何服务器。
+一个原生桌面应用，用于读取 Devin、Amp、Claude Code、Codex、Antigravity、Grok Build、ZCode 与 OpenCode 在本地留下的会话数据，并展示 token 用量、模型分布与会话详情。可从顶部切换不同 Agent；所有数据均来自本机，不会上传到任何服务器。
 
 ## 功能
 
 - **用量视图**
-  - 支持在 Devin、Amp、Claude Code、Codex、Antigravity、Grok Build 与 ZCode 之间切换
+  - 支持在 Devin、Amp、Claude Code、Codex、Antigravity、Grok Build、ZCode 与 OpenCode 之间切换
   - 按日（15 天）/ 周（12 周）/ 月（12 个月）聚合 token 用量
   - 总 Tokens、输入（新）、输出、缓存读取、轮次/会话统计卡片
   - 堆叠柱状图展示 token 用量趋势（输入 / 输出 / 缓存分层）
@@ -25,6 +25,7 @@
   - Antigravity：`~/.gemini/antigravity/conversations/*.db`（protobuf 编码的 SQLite）
   - Grok Build：`~/.grok/sessions/*/summary.json`（轮次明细来自同目录的 `updates.jsonl`）
   - ZCode：`~/.zcode/cli/db/db.sqlite`
+  - OpenCode：`~/.local/share/opencode/opencode.db`（同时覆盖 `opencode` 与 `opencode2`；旧版 `storage/` 下的 JSON 会话已迁移进该库）
   - 各 Agent 按需懒加载，数据源并行解析
   - 使用平台缓存目录中的 5 分钟磁盘缓存，加速二次启动
   - 顶部「重新加载」按钮可强制绕过缓存；通过 mtime 检测未变化的文件，仅重新解析有改动的文件
@@ -75,7 +76,7 @@ src/
 ├── main.rs    # GPUI 应用入口、UI 渲染、用量/会话视图
 ├── lib.rs     # 模块导出
 ├── data.rs    # 公共记录、Devin SQLite 读取、磁盘缓存
-├── local_sources.rs # Amp、Claude Code、Codex、Antigravity、Grok Build 与 ZCode 导入器
+├── local_sources.rs # Amp、Claude Code、Codex、Antigravity、Grok Build、ZCode 与 OpenCode 导入器
 ├── pricing.rs # 模型定价表与费用计算
 ├── devin-model-pricing.json    # Devin 官方模型价格表（编译期嵌入）
 ├── models-dev-pricing.json     # 从 models.dev 提取的非 Devin 模型价格子集

@@ -32,6 +32,7 @@ struct SessionBuilder {
     cache_creation_5m_tokens: f64,
     cache_creation_1h_tokens: f64,
     agent_messages: f64,
+    recorded_cost: Option<f64>,
     seen_messages: HashSet<String>,
 }
 
@@ -79,6 +80,10 @@ impl SessionBuilder {
         self.cache_creation_5m_tokens += other.cache_creation_5m_tokens;
         self.cache_creation_1h_tokens += other.cache_creation_1h_tokens;
         self.agent_messages += other.agent_messages;
+        self.recorded_cost = match (self.recorded_cost, other.recorded_cost) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        };
         self.seen_messages.extend(other.seen_messages);
     }
 
@@ -110,6 +115,7 @@ impl SessionBuilder {
             cache_creation_5m_tokens: self.cache_creation_5m_tokens,
             cache_creation_1h_tokens: self.cache_creation_1h_tokens,
             agent_messages: self.agent_messages,
+            recorded_cost: self.recorded_cost,
         }
     }
 }
@@ -418,6 +424,7 @@ fn parse_amp_value(
                     model: turn_model,
                     ttft_ms: 0.0,
                     total_time_ms: 0.0,
+                    recorded_cost: None,
                 });
             }
         }
@@ -988,6 +995,7 @@ fn parse_claude_file(
                         model: turn_model,
                         ttft_ms: 0.0,
                         total_time_ms: 0.0,
+                        recorded_cost: None,
                     });
                 }
             }
@@ -1389,6 +1397,7 @@ pub(crate) fn load_codex(start: i64, end: i64, previous: Option<&LoadedData>) ->
                 model: String::new(),
                 ttft_ms: 0.0,
                 total_time_ms: 0.0,
+                recorded_cost: None,
             });
         }
     }
@@ -1747,6 +1756,7 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> AgParse {
                             model: String::new(),
                             ttft_ms: 0.0,
                             total_time_ms: 0.0,
+                            recorded_cost: None,
                         });
                     }
                 } else if let Some(prompt) = pb_varint_field(&row, 11) {
@@ -1768,6 +1778,7 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> AgParse {
                             model: String::new(),
                             ttft_ms: 0.0,
                             total_time_ms: 0.0,
+                            recorded_cost: None,
                         });
                     }
                 }
@@ -1999,6 +2010,12 @@ fn parse_grok_session(
             let cache_creation = value_number(usage.get("cacheCreationTokens"));
             let inp = (raw_inp - cached).max(0.0);
             let duration_ms = value_number(usage.get("apiDurationMs"));
+            // Grok 会话自带真实费用（costUsdTicks，1e10 ticks = 1 美元）
+            let recorded_cost = usage
+                .get("costUsdTicks")
+                .and_then(Value::as_f64)
+                .filter(|ticks| *ticks > 0.0)
+                .map(|ticks| ticks / 1e10);
 
             let mut turn_model = session.model.clone();
             if let Some(model_usage) = usage.get("modelUsage").and_then(Value::as_object) {
@@ -2024,6 +2041,9 @@ fn parse_grok_session(
             session.output_tokens += out;
             session.cached_tokens += cached;
             session.cache_creation_tokens += cache_creation;
+            if let Some(c) = recorded_cost {
+                session.recorded_cost = Some(session.recorded_cost.unwrap_or(0.0) + c);
+            }
 
             if turn_ts >= start && turn_ts < end {
                 turns.push(TurnRec {
@@ -2039,6 +2059,7 @@ fn parse_grok_session(
                     cache_creation_1h_tokens: 0.0,
                     ttft_ms: 0.0,
                     total_time_ms: duration_ms,
+                    recorded_cost,
                 });
             }
         }
@@ -2344,6 +2365,7 @@ pub(crate) fn load_zcode(start: i64, end: i64) -> LoadedData {
                         cache_creation_1h_tokens: 0.0,
                         ttft_ms: ttft_ms.unwrap_or(0.0),
                         total_time_ms: duration_ms,
+                        recorded_cost: None,
                     });
                 }
             }
@@ -2358,6 +2380,278 @@ pub(crate) fn load_zcode(start: i64, end: i64) -> LoadedData {
 
     data.sessions = top_sessions;
     data
+}
+
+// ==================== OpenCode ====================
+
+/// opencode 与 opencode2 共用同一个数据目录：旧版 storage/ 下的 JSON 会话
+/// 已迁移进 opencode.db，opencode2 又把 session/message 迁到了 session_v2/
+/// session_message 表。读这一个库即可覆盖两个版本的用量（优先 v2 表）。
+pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
+    use rusqlite::{Connection, OpenFlags};
+
+    let agent = AgentKind::OpenCode;
+    let mut candidates = Vec::new();
+    if let Some(data_dir) = dirs::data_dir() {
+        candidates.push(data_dir.join("opencode").join("opencode.db"));
+    }
+    candidates.push(home_path(&[".local", "share", "opencode", "opencode.db"]));
+
+    let mut data = LoadedData {
+        turns_start: start,
+        turns_end: end,
+        ..Default::default()
+    };
+
+    let db_path = match candidates.into_iter().find(|p| p.exists()) {
+        Some(path) => path,
+        None => {
+            data.errors
+                .push(error(agent, "未找到 ~/.local/share/opencode/opencode.db"));
+            return data;
+        }
+    };
+
+    let conn = match Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            data.errors
+                .push(error(agent, format!("无法打开 OpenCode 数据库: {e}")));
+            return data;
+        }
+    };
+
+    // opencode2 把数据迁到了 session_v2 / session_message 表（旧版 session/message
+    // 的内容也已全部迁移进去），且消息 JSON 里模型字段的位置有变化。
+    // 优先读 v2 表；老版本数据库没有 v2 表时回退到旧表。
+    let has_v2 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('session_v2', 'session_message')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n == 2)
+        .unwrap_or(false);
+
+    let mut session_builders: HashMap<String, SessionBuilder> = HashMap::new();
+    let mut parent_map: HashMap<String, String> = HashMap::new();
+
+    let session_sql = if has_v2 {
+        "SELECT id, parent_id, directory, title, agent, model, time_created, time_updated FROM session_v2"
+    } else {
+        "SELECT id, parent_id, directory, title, agent, model, time_created, time_updated FROM session"
+    };
+    if let Ok(mut stmt) = conn.prepare(session_sql) {
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let parent_id: Option<String> = row.get(1)?;
+            let dir: Option<String> = row.get(2)?;
+            let title: Option<String> = row.get(3)?;
+            let mode: Option<String> = row.get(4)?;
+            let model_json: Option<String> = row.get(5)?;
+            let time_created: Option<i64> = row.get(6)?;
+            let time_updated: Option<i64> = row.get(7)?;
+            Ok((
+                id,
+                parent_id,
+                dir,
+                title,
+                mode,
+                model_json,
+                time_created,
+                time_updated,
+            ))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                let (id, parent_id, dir, title, mode, model_json, time_created, time_updated) = row;
+                if let Some(ref p) = parent_id {
+                    parent_map.insert(id.clone(), p.clone());
+                }
+                // model 列是 JSON，如 {"id":"gpt-5.6-luna","providerID":"opencode-go","variant":"high"}
+                let model = model_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .map(|v| opencode_model_name(
+                        v.get("providerID").and_then(Value::as_str).unwrap_or(""),
+                        v.get("id").and_then(Value::as_str).unwrap_or(""),
+                    ))
+                    .unwrap_or_default();
+                let created_sec = timestamp_ms_to_sec(time_created);
+                let updated_sec = timestamp_ms_to_sec(time_updated);
+
+                session_builders.insert(
+                    id.clone(),
+                    SessionBuilder {
+                        id: id.clone(),
+                        title: title
+                            .map(|t| compact_title(&t))
+                            .unwrap_or_else(|| id.clone()),
+                        cwd: dir.unwrap_or_default(),
+                        model,
+                        mode: mode.unwrap_or_else(|| "build".into()),
+                        source: "local".into(),
+                        created_at: created_sec,
+                        last_activity_at: updated_sec,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+
+    let resolve_root = |mut sid: String| -> String {
+        let mut depth = 0;
+        while let Some(parent) = parent_map.get(&sid) {
+            sid = parent.clone();
+            depth += 1;
+            if depth > 20 {
+                break;
+            }
+        }
+        sid
+    };
+
+    let message_sql = if has_v2 {
+        "SELECT session_id, time_created, data FROM session_message WHERE type = 'assistant'"
+    } else {
+        "SELECT session_id, time_created, data FROM message WHERE json_extract(data, '$.role') = 'assistant'"
+    };
+    if let Ok(mut stmt) = conn.prepare(message_sql) {
+        let rows = stmt.query_map([], |row| {
+            let session_id: String = row.get(0)?;
+            let time_created: Option<i64> = row.get(1)?;
+            let payload: String = row.get(2)?;
+            Ok((session_id, time_created, payload))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                let (session_id, time_created, payload) = row;
+                let Ok(v) = serde_json::from_str::<Value>(&payload) else {
+                    continue;
+                };
+                // 旧表模型在顶层 modelID/providerID；v2 在 data.model.{id, providerID}
+                let (provider, model_id) = if has_v2 {
+                    let m = v.get("model");
+                    (
+                        m.and_then(|m| m.get("providerID")).and_then(Value::as_str),
+                        m.and_then(|m| m.get("id")).and_then(Value::as_str),
+                    )
+                } else {
+                    (
+                        v.get("providerID").and_then(Value::as_str),
+                        v.get("modelID").and_then(Value::as_str),
+                    )
+                };
+                let model = opencode_model_name(
+                    provider.unwrap_or(""),
+                    model_id.unwrap_or(""),
+                );
+                let tokens = v.get("tokens");
+                let out = tokens
+                    .and_then(|t| t.get("output"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let cache_rd = tokens
+                    .and_then(|t| t.get("cache"))
+                    .and_then(|c| c.get("read"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let cache_wr = tokens
+                    .and_then(|t| t.get("cache"))
+                    .and_then(|c| c.get("write"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                // input 为新增输入（不含 cache read），与 Anthropic 风格一致
+                let inp = tokens
+                    .and_then(|t| t.get("input"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    .max(0.0);
+
+                let start_sec = timestamp_ms_to_sec(time_created);
+                let duration_ms = match (
+                    time_created,
+                    v.pointer("/time/completed").and_then(Value::as_i64),
+                ) {
+                    (Some(s), Some(c)) if c >= s => (c - s) as f64,
+                    _ => 0.0,
+                };
+
+                let root_id = resolve_root(session_id);
+                let builder = session_builders.entry(root_id.clone()).or_insert_with(|| SessionBuilder {
+                    id: root_id.clone(),
+                    title: root_id.clone(),
+                    cwd: String::new(),
+                    model: model.clone(),
+                    mode: "build".into(),
+                    source: "local".into(),
+                    created_at: start_sec,
+                    last_activity_at: start_sec,
+                    ..Default::default()
+                });
+                builder.input_tokens += inp;
+                builder.output_tokens += out;
+                builder.cached_tokens += cache_rd;
+                builder.cache_creation_tokens += cache_wr;
+                builder.agent_messages += 1.0;
+                if builder.model.is_empty() {
+                    builder.model = model.clone();
+                }
+                builder.observe_time(start_sec);
+
+                if start_sec >= start && start_sec < end {
+                    data.turns.push(TurnRec {
+                        session_key: format!("opencode/{}", root_id),
+                        created_at: start_sec,
+                        agent: AgentKind::OpenCode,
+                        model,
+                        input_tokens: inp,
+                        output_tokens: out,
+                        cache_read_tokens: cache_rd,
+                        cache_creation_tokens: cache_wr,
+                        cache_creation_5m_tokens: 0.0,
+                        cache_creation_1h_tokens: 0.0,
+                        ttft_ms: 0.0,
+                        total_time_ms: duration_ms,
+                        recorded_cost: None,
+                    });
+                }
+            }
+        }
+    }
+
+    let top_sessions: Vec<SessionRec> = session_builders
+        .into_iter()
+        .filter(|(id, _)| !parent_map.contains_key(id))
+        .map(|(_, builder)| builder.finish(AgentKind::OpenCode))
+        .collect();
+
+    data.sessions = top_sessions;
+    data
+}
+
+/// 拼出 "provider/model" 形式的模型名（pricing 查表时会自动去掉 provider 前缀），
+/// 并去掉 opencode 变体后缀（如 "gemini-3-pro-preview(high)" → "gemini-3-pro-preview"）。
+fn opencode_model_name(provider: &str, model_id: &str) -> String {
+    let base = match model_id.find('(') {
+        Some(idx) => &model_id[..idx],
+        None => model_id,
+    };
+    let base = base.trim();
+    if provider.is_empty() {
+        base.to_string()
+    } else {
+        format!("{provider}/{base}")
+    }
+}
+
+fn timestamp_ms_to_sec(ts: Option<i64>) -> i64 {
+    ts.map(|t| if t > 10_000_000_000 { t / 1000 } else { t })
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -187,28 +187,33 @@ impl Root {
             .filter(|s| s.agent == self.agent)
             .map(|s| {
                 let total = s.input_tokens + s.output_tokens + s.cached_tokens;
-                let cost_str = if s.agent == data::AgentKind::Claude
-                    && (s.cache_creation_5m_tokens > 0.0 || s.cache_creation_1h_tokens > 0.0)
-                {
-                    pricing::turn_cost_claude(
-                        &s.display_model(),
-                        s.input_tokens,
-                        s.output_tokens,
-                        s.cached_tokens,
-                        s.cache_creation_5m_tokens,
-                        s.cache_creation_1h_tokens,
-                    )
+                // 优先使用会话自身记录的费用（如 Grok），否则按定价表计算
+                let cost_str = if let Some(c) = s.recorded_cost {
+                    pricing::fmt_cost(c)
                 } else {
-                    pricing::turn_cost(
-                        &s.display_model(),
-                        s.input_tokens,
-                        s.output_tokens,
-                        s.cached_tokens,
-                        s.cache_creation_tokens,
-                    )
-                }
-                .map(pricing::fmt_cost)
-                .unwrap_or_else(|| "—".into());
+                    if s.agent == data::AgentKind::Claude
+                        && (s.cache_creation_5m_tokens > 0.0 || s.cache_creation_1h_tokens > 0.0)
+                    {
+                        pricing::turn_cost_claude(
+                            &s.display_model(),
+                            s.input_tokens,
+                            s.output_tokens,
+                            s.cached_tokens,
+                            s.cache_creation_5m_tokens,
+                            s.cache_creation_1h_tokens,
+                        )
+                    } else {
+                        pricing::turn_cost(
+                            &s.display_model(),
+                            s.input_tokens,
+                            s.output_tokens,
+                            s.cached_tokens,
+                            s.cache_creation_tokens,
+                        )
+                    }
+                    .map(pricing::fmt_cost)
+                    .unwrap_or_else(|| "—".into())
+                };
                 let adaptive = s.selected_model == "adaptive";
                 let model_text = if adaptive {
                     format!("adaptive → {}", s.display_model())
@@ -1084,27 +1089,29 @@ impl Root {
         ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let ttft_med = ttfts.get(ttfts.len() / 2).copied().unwrap_or(0.0);
         let total = s.input_tokens + s.output_tokens + s.cached_tokens;
-        // 计算会话级费用：用会话的 display_model 查定价表
-        let session_cost = if s.agent == data::AgentKind::Claude
-            && (s.cache_creation_5m_tokens > 0.0 || s.cache_creation_1h_tokens > 0.0)
-        {
-            pricing::turn_cost_claude(
-                &s.display_model(),
-                s.input_tokens,
-                s.output_tokens,
-                s.cached_tokens,
-                s.cache_creation_5m_tokens,
-                s.cache_creation_1h_tokens,
-            )
-        } else {
-            pricing::turn_cost(
-                &s.display_model(),
-                s.input_tokens,
-                s.output_tokens,
-                s.cached_tokens,
-                s.cache_creation_tokens,
-            )
-        };
+        // 会话级费用：优先用会话自身记录的金额，否则用 display_model 查定价表
+        let session_cost = s.recorded_cost.or_else(|| {
+            if s.agent == data::AgentKind::Claude
+                && (s.cache_creation_5m_tokens > 0.0 || s.cache_creation_1h_tokens > 0.0)
+            {
+                pricing::turn_cost_claude(
+                    &s.display_model(),
+                    s.input_tokens,
+                    s.output_tokens,
+                    s.cached_tokens,
+                    s.cache_creation_5m_tokens,
+                    s.cache_creation_1h_tokens,
+                )
+            } else {
+                pricing::turn_cost(
+                    &s.display_model(),
+                    s.input_tokens,
+                    s.output_tokens,
+                    s.cached_tokens,
+                    s.cache_creation_tokens,
+                )
+            }
+        });
         let adaptive = s.selected_model == "adaptive";
         let model_text = if adaptive {
             format!("adaptive → {}（服务端路由）", s.display_model())

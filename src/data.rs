@@ -77,10 +77,11 @@ pub enum AgentKind {
     Antigravity,
     Grok,
     ZCode,
+    OpenCode,
 }
 
 impl AgentKind {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Devin,
         Self::Amp,
         Self::Claude,
@@ -88,6 +89,7 @@ impl AgentKind {
         Self::Antigravity,
         Self::Grok,
         Self::ZCode,
+        Self::OpenCode,
     ];
 
     pub fn label(self) -> &'static str {
@@ -99,6 +101,7 @@ impl AgentKind {
             Self::Antigravity => "Antigravity",
             Self::Grok => "Grok Build",
             Self::ZCode => "ZCode",
+            Self::OpenCode => "OpenCode",
         }
     }
 
@@ -111,6 +114,7 @@ impl AgentKind {
             Self::Antigravity => "🪐",
             Self::Grok => "🔴",
             Self::ZCode => "🔷",
+            Self::OpenCode => "🟠",
         }
     }
 }
@@ -367,6 +371,10 @@ pub struct SessionRec {
     #[serde(default)]
     pub cache_creation_1h_tokens: f64,
     pub agent_messages: f64,
+    /// Agent 会话自身记录的费用（美元），如 Grok 的 costUsdTicks。
+    /// 有值时优先展示，不再按定价表计算。
+    #[serde(default)]
+    pub recorded_cost: Option<f64>,
 }
 
 impl SessionRec {
@@ -407,6 +415,10 @@ pub struct TurnRec {
     pub model: String,
     pub ttft_ms: f64,
     pub total_time_ms: f64,
+    /// Agent 自身记录的该轮费用（美元），如 Grok 的 costUsdTicks / 1e10。
+    /// 有值时聚合费用优先用它，而不是按定价表计算。
+    #[serde(default)]
+    pub recorded_cost: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -538,6 +550,7 @@ fn load_sessions_from(conn: &Connection, source: &str, out: &mut Vec<SessionRec>
             cache_creation_5m_tokens: 0.0,
             cache_creation_1h_tokens: 0.0,
             agent_messages: msgs,
+            recorded_cost: None,
         });
     }
 }
@@ -640,6 +653,7 @@ fn load_turns_from(
             model,
             ttft_ms: ttft,
             total_time_ms: metrics.total_time_ms.unwrap_or(0.0),
+            recorded_cost: None,
         });
     }
 }
@@ -811,6 +825,12 @@ fn load_uncached(start: i64, end: i64, previous: Option<Arc<LoadedData>>) -> Loa
             log_loaded_part("ZCode", started, &data);
             parts.lock().unwrap().push(data);
         });
+        scope.spawn(|_| {
+            let started = Instant::now();
+            let data = local_sources::load_opencode(start, end);
+            log_loaded_part("OpenCode", started, &data);
+            parts.lock().unwrap().push(data);
+        });
     });
     let parts = parts.into_inner().unwrap();
 
@@ -881,6 +901,7 @@ fn load_selected_agent(
             }
             AgentKind::Grok => local_sources::load_grok(start, end, previous.as_deref()),
             AgentKind::ZCode => local_sources::load_zcode(start, end),
+            AgentKind::OpenCode => local_sources::load_opencode(start, end),
             AgentKind::Devin => unreachable!(),
         }
     }

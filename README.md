@@ -2,12 +2,12 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A native desktop app that reads local sessions from Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, and ZCode and presents token usage, model distribution, and session details. Switch agents from the top bar; all data stays on your machine.
+A native desktop app that reads local sessions from Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, and OpenCode and presents token usage, model distribution, and session details. Switch agents from the top bar; all data stays on your machine.
 
 ## Features
 
 - **Usage view**
-  - Switch between Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, and ZCode
+  - Switch between Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, and OpenCode
   - Aggregate token usage by day (15 days) / week (12 weeks) / month (12 months)
   - Stat cards for Total Tokens, Input (new), Output, Cached read, and Turns/Sessions
   - Stacked bar chart of token trends (input / output / cached layers)
@@ -25,6 +25,7 @@ A native desktop app that reads local sessions from Devin, Amp, Claude Code, Cod
   - Antigravity: `~/.gemini/antigravity/conversations/*.db` (protobuf-encoded SQLite)
   - Grok Build: `~/.grok/sessions/*/summary.json` (with per-session `updates.jsonl` for turn details)
   - ZCode: `~/.zcode/cli/db/db.sqlite`
+  - OpenCode: `~/.local/share/opencode/opencode.db` (covers both `opencode` and `opencode2`; legacy `storage/` JSON sessions have been migrated into this database)
   - Each agent is loaded lazily when first selected, sources parse in parallel
   - 5-minute on-disk cache in the platform cache directory for fast subsequent launches
   - "Reload" bypasses the cache; unchanged files are detected by mtime and only modified files are re-parsed
@@ -75,7 +76,7 @@ src/
 ├── main.rs    # GPUI app entry, UI rendering, usage/sessions views
 ├── lib.rs     # Module exports
 ├── data.rs    # Shared records, Devin SQLite reads, on-disk cache
-├── local_sources.rs # Amp, Claude Code, Codex, Antigravity, Grok Build, and ZCode importers
+├── local_sources.rs # Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, and OpenCode importers
 ├── pricing.rs # Model pricing table and cost calculation
 ├── devin-model-pricing.json    # Official Devin model price list (embedded at compile time)
 ├── models-dev-pricing.json     # Non-Devin model prices extracted from models.dev
