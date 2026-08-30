@@ -114,12 +114,43 @@ fn save_config(lang: Lang) {
     let config = ConfigFile {
         lang: lang.code().to_string(),
     };
-    if let Ok(text) = serde_json::to_string_pretty(&config) {
-        let _ = std::fs::write(path, text);
+    let Ok(text) = serde_json::to_string_pretty(&config) else {
+        return;
+    };
+    // 与 data.rs 的缓存写盘一致：先写临时文件再 rename，避免留下半截 config
+    let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    if std::fs::write(&temp, text).is_ok() {
+        if replace_config_file(&temp, &path).is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+    } else {
+        let _ = std::fs::remove_file(&temp);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn replace_config_file(temp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(temp, path)
+}
+
+#[cfg(target_os = "windows")]
+fn replace_config_file(temp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    // Windows 的 std::fs::rename 不覆盖已有文件。配置很小；删除旧文件后立即
+    // 提升同目录临时文件，确保第二次及后续语言切换仍能持久化。
+    match std::fs::rename(temp, path) {
+        Ok(()) => Ok(()),
+        Err(_) if path.exists() => {
+            std::fs::remove_file(path)?;
+            std::fs::rename(temp, path)
+        }
+        Err(error) => Err(error),
     }
 }
 
 /// 带参数文案：把模板中的 {0} {1} … 依次替换为 args。
+///
+/// 逐个 `replace` 实现，因此参数值本身不得含 `{0}` 这类占位符字面量，
+/// 否则会被后续参数二次替换。当前调用方传的都是数字、路径与模型名。
 pub fn tf(key: Key, args: &[&str]) -> String {
     let mut out = t(key).to_string();
     for (index, arg) in args.iter().enumerate() {
@@ -143,7 +174,6 @@ pub enum Key {
     Loading,
     DataAsOf,
     SessionsCount,
-    LangLabel,
 
     // 加载页
     LoadingData,
@@ -212,6 +242,130 @@ pub enum Key {
     ErrDbOpen,
     ErrRemoteExport,
     ErrAndMore,
+    CliUnpricedModels,
+    CliPartialCostShort,
+    CliPartialCostDetail,
+    CliUntilBeforeSince,
+    CliNextDayFailed,
+    CliMissingValue,
+    CliInvalidDays,
+    CliDaysPositive,
+    CliUnsupportedFormat,
+    CliUnknownArgument,
+    CliUnsupportedAgent,
+    CliInvalidDate,
+    CliLocalDateFailed,
+    CliFatal,
+    CliHelp,
+    CliDate,
+    CliAgent,
+    CliModels,
+    CliInput,
+    CliOutput,
+    CliCacheCreate,
+    CliCacheRead,
+    CliTotalTokens,
+    CliCostUsd,
+    CliTotal,
+    CliAll,
+}
+
+impl Key {
+    /// 全部文案 key，供测试遍历。用 `&[Key]` 而非 `[Key; N]`，新增 key 时不必同步改长度。
+    pub const ALL: &[Key] = &[
+        Key::Usage,
+        Key::Sessions,
+        Key::PeriodDay,
+        Key::PeriodWeek,
+        Key::PeriodMonth,
+        Key::PrevPage,
+        Key::NextPage,
+        Key::Reload,
+        Key::Reloading,
+        Key::Loading,
+        Key::DataAsOf,
+        Key::SessionsCount,
+        Key::LoadingData,
+        Key::LoadingCacheHint,
+        Key::StatTotalTokens,
+        Key::StatInput,
+        Key::StatOutput,
+        Key::StatCached,
+        Key::StatCost,
+        Key::StatTurnsSessions,
+        Key::NoRecord,
+        Key::EmptyWindow,
+        Key::ChartTitle,
+        Key::LegendCached,
+        Key::LegendIn,
+        Key::LegendOut,
+        Key::ThPeriod,
+        Key::ThSessions,
+        Key::ThTurns,
+        Key::ThInput,
+        Key::ThOutput,
+        Key::ThCache,
+        Key::ThTotal,
+        Key::ThCost,
+        Key::ThModelMix,
+        Key::ThLastActive,
+        Key::ThSession,
+        Key::ThTitle,
+        Key::ThMode,
+        Key::ThModel,
+        Key::ThMsgs,
+        Key::ThTokens,
+        Key::ThWindowCost,
+        Key::SessionsNotFound,
+        Key::AdaptiveRouted,
+        Key::AdaptiveShort,
+        Key::ConfigValue,
+        Key::KvSession,
+        Key::KvWorkdir,
+        Key::KvModel,
+        Key::KvTime,
+        Key::KvActivity,
+        Key::CreatedLastActive,
+        Key::TokenBreakdown,
+        Key::PerTurnPriced,
+        Key::UnknownUnpriced,
+        Key::ActivityNoTtft,
+        Key::ActivityTtft,
+        Key::DataWarning,
+        Key::ErrNotExist,
+        Key::ErrOpenFailed,
+        Key::ErrNotFound,
+        Key::ErrSessionsUnreadable,
+        Key::ErrDbOpen,
+        Key::ErrRemoteExport,
+        Key::ErrAndMore,
+        Key::CliUnpricedModels,
+        Key::CliPartialCostShort,
+        Key::CliPartialCostDetail,
+        Key::CliUntilBeforeSince,
+        Key::CliNextDayFailed,
+        Key::CliMissingValue,
+        Key::CliInvalidDays,
+        Key::CliDaysPositive,
+        Key::CliUnsupportedFormat,
+        Key::CliUnknownArgument,
+        Key::CliUnsupportedAgent,
+        Key::CliInvalidDate,
+        Key::CliLocalDateFailed,
+        Key::CliFatal,
+        Key::CliHelp,
+        Key::CliDate,
+        Key::CliAgent,
+        Key::CliModels,
+        Key::CliInput,
+        Key::CliOutput,
+        Key::CliCacheCreate,
+        Key::CliCacheRead,
+        Key::CliTotalTokens,
+        Key::CliCostUsd,
+        Key::CliTotal,
+        Key::CliAll,
+    ];
 }
 
 /// 当前语言的文案。返回 'static，可直接传给接受 &'static str 的接口。
@@ -236,7 +390,6 @@ fn zh(key: Key) -> &'static str {
         Key::Loading => "加载中...",
         Key::DataAsOf => "数据截至 {0}",
         Key::SessionsCount => "{0} 会话",
-        Key::LangLabel => "语言",
         Key::LoadingData => "正在读取本地 Agent 用量数据",
         Key::LoadingCacheHint => "首次读取完成后，后续启动会使用 5 分钟缓存",
         Key::StatTotalTokens => "总 Tokens",
@@ -291,6 +444,37 @@ fn zh(key: Key) -> &'static str {
         Key::ErrDbOpen => "无法打开 {0} 数据库: {1}",
         Key::ErrRemoteExport => "有 {0} 个远程线程导出失败: {1}",
         Key::ErrAndMore => " 等 {0} 个",
+        Key::CliUnpricedModels => "警告：以下模型未找到定价，Cost 未包含它们：{0}",
+        Key::CliPartialCostShort => "≥{0}",
+        Key::CliPartialCostDetail => "{0}（仅 {1}/{2} 轮可定价，实际费用不低于此值）",
+        Key::CliUntilBeforeSince => "--until {0} 不能早于 --since {1}",
+        Key::CliNextDayFailed => "无法计算 {0} 的下一天",
+        Key::CliMissingValue => "{0} 缺少值",
+        Key::CliInvalidDays => "无效的 --days：{0}",
+        Key::CliDaysPositive => "--days 必须大于 0 且处于有效日期范围内",
+        Key::CliUnsupportedFormat => "不支持的格式：{0}",
+        Key::CliUnknownArgument => "未知参数：{0}",
+        Key::CliUnsupportedAgent => "不支持的 Agent：{0}",
+        Key::CliInvalidDate => "无效日期：{0}，应为 YYYY-MM-DD 或 YYYYMMDD",
+        Key::CliLocalDateFailed => "无法解析本地日期：{0}",
+        Key::CliFatal => "错误：{0}\n使用 --cli --help 查看帮助。",
+        Key::CliHelp => {
+            "Agent Usage Metrics CLI\n\n\
+用法：\n  devin-usage-metrics --cli [选项]\n\n\
+选项：\n  --agent <name>       Agent 或 all，默认 claude\n  --days <n>           最近 N 天，默认 30\n  --since <date>       起始日期（YYYY-MM-DD 或 YYYYMMDD）\n  --until <date>       结束日期，包含当天\n  --format table|csv   输出格式，默认 table\n  --by-agent           增加按 Agent 分项\n  --refresh            忽略缓存，重新读取本地数据\n  -h, --help           显示帮助\n\n\
+示例：\n  devin-usage-metrics --cli --agent claude --since 2026-08-20 --until 2026-08-30 --refresh\n  devin-usage-metrics --cli --agent all --by-agent --since 2026-08-20 --until 2026-08-30\n  devin-usage-metrics --cli --agent claude --days 30 --format csv"
+        }
+        Key::CliDate => "日期",
+        Key::CliAgent => "Agent",
+        Key::CliModels => "模型",
+        Key::CliInput => "输入",
+        Key::CliOutput => "输出",
+        Key::CliCacheCreate => "缓存写入",
+        Key::CliCacheRead => "缓存读取",
+        Key::CliTotalTokens => "总 Tokens",
+        Key::CliCostUsd => "费用 (USD)",
+        Key::CliTotal => "合计",
+        Key::CliAll => "全部",
     }
 }
 
@@ -308,7 +492,6 @@ fn en(key: Key) -> &'static str {
         Key::Loading => "Loading...",
         Key::DataAsOf => "Data as of {0}",
         Key::SessionsCount => "{0} sessions",
-        Key::LangLabel => "Language",
         Key::LoadingData => "Reading local agent usage data",
         Key::LoadingCacheHint => "After the first read, subsequent launches use a 5-minute cache",
         Key::StatTotalTokens => "Total Tokens",
@@ -366,6 +549,41 @@ fn en(key: Key) -> &'static str {
         Key::ErrDbOpen => "Failed to open {0} database: {1}",
         Key::ErrRemoteExport => "{0} remote threads failed to export: {1}",
         Key::ErrAndMore => " and {0} more",
+        Key::CliUnpricedModels => {
+            "Warning: no pricing found for these models; Cost excludes them: {0}"
+        }
+        Key::CliPartialCostShort => "≥{0}",
+        Key::CliPartialCostDetail => {
+            "{0} (only {1}/{2} turns are priced; actual cost is at least this amount)"
+        }
+        Key::CliUntilBeforeSince => "--until {0} cannot be earlier than --since {1}",
+        Key::CliNextDayFailed => "Cannot calculate the day after {0}",
+        Key::CliMissingValue => "{0} requires a value",
+        Key::CliInvalidDays => "Invalid --days value: {0}",
+        Key::CliDaysPositive => "--days must be positive and within the supported date range",
+        Key::CliUnsupportedFormat => "Unsupported format: {0}",
+        Key::CliUnknownArgument => "Unknown argument: {0}",
+        Key::CliUnsupportedAgent => "Unsupported agent: {0}",
+        Key::CliInvalidDate => "Invalid date: {0}; expected YYYY-MM-DD or YYYYMMDD",
+        Key::CliLocalDateFailed => "Cannot resolve local date: {0}",
+        Key::CliFatal => "Error: {0}\nRun --cli --help for usage.",
+        Key::CliHelp => {
+            "Agent Usage Metrics CLI\n\n\
+Usage:\n  devin-usage-metrics --cli [options]\n\n\
+Options:\n  --agent <name>       Agent or all; default: claude\n  --days <n>           Most recent N days; default: 30\n  --since <date>       Start date (YYYY-MM-DD or YYYYMMDD)\n  --until <date>       Inclusive end date\n  --format table|csv   Output format; default: table\n  --by-agent           Include per-agent rows\n  --refresh            Ignore cache and reload local data\n  -h, --help           Show help\n\n\
+Examples:\n  devin-usage-metrics --cli --agent claude --since 2026-08-20 --until 2026-08-30 --refresh\n  devin-usage-metrics --cli --agent all --by-agent --since 2026-08-20 --until 2026-08-30\n  devin-usage-metrics --cli --agent claude --days 30 --format csv"
+        }
+        Key::CliDate => "Date",
+        Key::CliAgent => "Agent",
+        Key::CliModels => "Models",
+        Key::CliInput => "Input",
+        Key::CliOutput => "Output",
+        Key::CliCacheCreate => "Cache Create",
+        Key::CliCacheRead => "Cache Read",
+        Key::CliTotalTokens => "Total Tokens",
+        Key::CliCostUsd => "Cost (USD)",
+        Key::CliTotal => "Total",
+        Key::CliAll => "All",
     }
 }
 
@@ -375,85 +593,50 @@ mod tests {
 
     #[test]
     fn all_keys_are_non_empty_in_both_languages() {
-        // 用枚举全量遍历保证新增 Key 忘记补文案时编译/测试立刻失败
-        let all = [
-            Key::Usage,
-            Key::Sessions,
-            Key::PeriodDay,
-            Key::PeriodWeek,
-            Key::PeriodMonth,
-            Key::PrevPage,
-            Key::NextPage,
-            Key::Reload,
-            Key::Reloading,
-            Key::Loading,
-            Key::DataAsOf,
-            Key::SessionsCount,
-            Key::LangLabel,
-            Key::LoadingData,
-            Key::LoadingCacheHint,
-            Key::StatTotalTokens,
-            Key::StatInput,
-            Key::StatOutput,
-            Key::StatCached,
-            Key::StatCost,
-            Key::StatTurnsSessions,
-            Key::NoRecord,
-            Key::EmptyWindow,
-            Key::ChartTitle,
-            Key::LegendCached,
-            Key::LegendIn,
-            Key::LegendOut,
-            Key::ThPeriod,
-            Key::ThSessions,
-            Key::ThTurns,
-            Key::ThInput,
-            Key::ThOutput,
-            Key::ThCache,
-            Key::ThTotal,
-            Key::ThCost,
-            Key::ThModelMix,
-            Key::ThLastActive,
-            Key::ThSession,
-            Key::ThTitle,
-            Key::ThMode,
-            Key::ThModel,
-            Key::ThMsgs,
-            Key::ThTokens,
-            Key::ThWindowCost,
-            Key::SessionsNotFound,
-            Key::AdaptiveRouted,
-            Key::AdaptiveShort,
-            Key::ConfigValue,
-            Key::KvSession,
-            Key::KvWorkdir,
-            Key::KvModel,
-            Key::KvTime,
-            Key::KvActivity,
-            Key::CreatedLastActive,
-            Key::TokenBreakdown,
-            Key::PerTurnPriced,
-            Key::UnknownUnpriced,
-            Key::ActivityNoTtft,
-            Key::ActivityTtft,
-            Key::DataWarning,
-            Key::ErrNotExist,
-            Key::ErrOpenFailed,
-            Key::ErrNotFound,
-            Key::ErrSessionsUnreadable,
-            Key::ErrDbOpen,
-            Key::ErrRemoteExport,
-            Key::ErrAndMore,
-        ];
-        for key in all {
+        // zh()/en() 的 match 不带 `_ =>`，编译器已保证每个 key 都有分支；
+        // 这里只补查编译器查不到的那类错误：分支写了，但文案是空串。
+        for &key in Key::ALL {
             assert!(!zh(key).is_empty(), "zh 缺少文案: {key:?}");
             assert!(!en(key).is_empty(), "en 缺少文案: {key:?}");
         }
     }
 
     #[test]
+    fn both_languages_use_the_same_placeholders() {
+        // tf() 按位置逐个替换，某一侧漏写 {n} 或写错下标会静默错位；
+        // 占位符集合一致是 tf 能正确填充的前提，编译器查不到。
+        for &key in Key::ALL {
+            assert_eq!(
+                placeholders(zh(key)),
+                placeholders(en(key)),
+                "{key:?} 的中英文占位符不一致"
+            );
+        }
+    }
+
+    fn placeholders(template: &str) -> Vec<u32> {
+        let mut found: Vec<u32> = template
+            .match_indices('{')
+            .filter_map(|(index, _)| {
+                template[index + 1..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
+    #[test]
     fn tf_fills_positional_args() {
-        assert_eq!(tf(Key::SessionsCount, &["12"]), format!("{} 会话", 12));
+        // 不依赖全局 LANG：只验证实参填进去了、占位符没残留
+        let filled = tf(Key::SessionsCount, &["12"]);
+        assert!(filled.contains("12"), "未填入实参: {filled}");
+        assert!(!filled.contains("{0}"), "占位符未替换干净: {filled}");
     }
 
     #[test]

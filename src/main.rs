@@ -195,16 +195,21 @@ impl Root {
             .map(|s| {
                 let total = s.input_tokens + s.output_tokens + s.cached_tokens;
                 // 与每日汇总一致：当前加载窗口内按实际 turn 模型逐轮计价。
-                let cost_str = agg::cost_for_turns(
+                let cost_summary = agg::cost_summary_for_turns(
                     turns_by_session
                         .get(s.key.as_str())
                         .into_iter()
                         .flatten()
                         .copied(),
                     &s.display_model(),
-                )
-                .map(pricing::fmt_cost)
-                .unwrap_or_else(|| "—".into());
+                );
+                let cost_str = match cost_summary.cost {
+                    Some(cost) if cost_summary.is_partial() => {
+                        i18n::tf(i18n::Key::CliPartialCostShort, &[&pricing::fmt_cost(cost)])
+                    }
+                    Some(cost) => pricing::fmt_cost(cost),
+                    None => "—".into(),
+                };
                 let adaptive = s.selected_model == "adaptive";
                 let model_text = if adaptive {
                     i18n::tf(i18n::Key::AdaptiveShort, &[&s.display_model()])
@@ -1032,7 +1037,7 @@ impl Root {
         ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let ttft_med = ttfts.get(ttfts.len() / 2).copied().unwrap_or(0.0);
         let total = s.input_tokens + s.output_tokens + s.cached_tokens;
-        let session_cost = agg::cost_for_session_turns(&self.data, s);
+        let cost_summary = agg::cost_summary_for_turns(turns.iter().copied(), &s.display_model());
         let adaptive = s.selected_model == "adaptive";
         let model_text = if adaptive {
             i18n::tf(i18n::Key::AdaptiveRouted, &[&s.display_model()])
@@ -1124,10 +1129,18 @@ impl Root {
             ))
             .child(kv(
                 i18n::t(i18n::Key::ThWindowCost),
-                match session_cost {
+                match cost_summary.cost {
+                    Some(c) if cost_summary.is_partial() => i18n::tf(
+                        i18n::Key::CliPartialCostDetail,
+                        &[
+                            &pricing::fmt_cost(c),
+                            &cost_summary.priced_turns.to_string(),
+                            &cost_summary.total_turns.to_string(),
+                        ],
+                    ),
                     Some(c) => i18n::tf(
                         i18n::Key::PerTurnPriced,
-                        &[&pricing::fmt_cost(c), &turns.len().to_string()],
+                        &[&pricing::fmt_cost(c), &cost_summary.total_turns.to_string()],
                     ),
                     None => i18n::t(i18n::Key::UnknownUnpriced).into(),
                 },
@@ -1293,7 +1306,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "--cli") {
         if let Err(error) = cli::run(args.into_iter().skip(1).collect()) {
-            eprintln!("错误：{error}\n使用 --cli --help 查看帮助。");
+            eprintln!("{}", i18n::tf(i18n::Key::CliFatal, &[&error]));
             std::process::exit(2);
         }
         return;

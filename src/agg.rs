@@ -183,9 +183,32 @@ pub fn cost_for_turns<'a>(
     turns: impl Iterator<Item = &'a crate::data::TurnRec>,
     fallback_model: &str,
 ) -> Option<f64> {
+    cost_summary_for_turns(turns, fallback_model).cost
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TurnCostSummary {
+    pub cost: Option<f64>,
+    pub priced_turns: usize,
+    pub total_turns: usize,
+}
+
+impl TurnCostSummary {
+    pub fn is_partial(self) -> bool {
+        self.priced_turns > 0 && self.priced_turns < self.total_turns
+    }
+}
+
+/// 返回费用以及已定价/总轮数，避免把混合模型会话的部分费用误报成完整费用。
+pub fn cost_summary_for_turns<'a>(
+    turns: impl Iterator<Item = &'a crate::data::TurnRec>,
+    fallback_model: &str,
+) -> TurnCostSummary {
     let mut total = 0.0;
-    let mut has_priced_turn = false;
+    let mut priced_turns = 0;
+    let mut total_turns = 0;
     for turn in turns {
+        total_turns += 1;
         let model = if turn.model.is_empty() {
             fallback_model
         } else {
@@ -193,10 +216,14 @@ pub fn cost_for_turns<'a>(
         };
         if let Some(cost) = cost_for_turn(turn, model) {
             total += cost;
-            has_priced_turn = true;
+            priced_turns += 1;
         }
     }
-    has_priced_turn.then_some(total)
+    TurnCostSummary {
+        cost: (priced_turns > 0).then_some(total),
+        priced_turns,
+        total_turns,
+    }
 }
 
 /// 当前已加载窗口内，一个会话对聚合费用的贡献。
@@ -495,6 +522,13 @@ mod tests {
         let direct = cost_for_session_turns(&data, &data.sessions[0]);
         assert_eq!(grouped, direct);
         assert_eq!(grouped, Some(100.0 / 1e6 * 4.4));
+        let summary = cost_summary_for_turns(
+            data.turns.iter().filter(|turn| turn.session_key == "cli/a"),
+            &data.sessions[0].display_model(),
+        );
+        assert!(summary.is_partial());
+        assert_eq!(summary.priced_turns, 1);
+        assert_eq!(summary.total_turns, 2);
         assert_eq!(agg_group(&data, "cli/b"), Some(200.0 / 1e6 * 4.4),);
     }
 

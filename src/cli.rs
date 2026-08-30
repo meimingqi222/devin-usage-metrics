@@ -1,8 +1,10 @@
 use crate::agg;
 use crate::data::{self, AgentKind, LoadedData};
+use crate::i18n;
 use chrono::{Local, NaiveDate, TimeDelta, TimeZone};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {
@@ -69,18 +71,19 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     };
     let today = Local::now().date_naive();
     let until = options.until.unwrap_or(today);
-    let since = options
-        .since
-        .unwrap_or_else(|| until - TimeDelta::days(options.days - 1));
+    let since = resolve_since(until, options.since, options.days)?;
     if until < since {
-        return Err(format!("--until {until} 不能早于 --since {since}"));
+        return Err(i18n::tf(
+            i18n::Key::CliUntilBeforeSince,
+            &[&until.to_string(), &since.to_string()],
+        ));
     }
 
     let start = local_day_start(since)?;
     let end = local_day_start(
         until
             .succ_opt()
-            .ok_or_else(|| format!("无法计算 {until} 的下一天"))?,
+            .ok_or_else(|| i18n::tf(i18n::Key::CliNextDayFailed, &[&until.to_string()]))?,
     )?;
     let loaded = match (options.agent, options.refresh) {
         (Some(agent), true) => {
@@ -113,14 +116,37 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         .collect();
     if !unpriced.is_empty() {
         eprintln!(
-            "警告：以下模型未找到定价，Cost 未包含它们：{}",
-            unpriced.into_iter().collect::<Vec<_>>().join(", ")
+            "{}",
+            i18n::tf(
+                i18n::Key::CliUnpricedModels,
+                &[&unpriced.into_iter().collect::<Vec<_>>().join(", ")]
+            )
         );
     }
     for error in loaded.errors {
-        eprintln!("数据源警告：{}", error.message);
+        eprintln!("{}", i18n::tf(i18n::Key::DataWarning, &[&error.message]));
     }
     Ok(())
+}
+
+fn resolve_since(
+    until: NaiveDate,
+    explicit_since: Option<NaiveDate>,
+    days: i64,
+) -> Result<NaiveDate, String> {
+    if let Some(since) = explicit_since {
+        return Ok(since);
+    }
+    if days <= 0 {
+        return Err(i18n::t(i18n::Key::CliDaysPositive).to_string());
+    }
+    let offset = days
+        .checked_sub(1)
+        .and_then(TimeDelta::try_days)
+        .ok_or_else(|| i18n::t(i18n::Key::CliDaysPositive).to_string())?;
+    until
+        .checked_sub_signed(offset)
+        .ok_or_else(|| i18n::t(i18n::Key::CliDaysPositive).to_string())
 }
 
 fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
@@ -133,27 +159,35 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         match args[i].as_str() {
             "--agent" => {
                 i += 1;
-                let value = args.get(i).ok_or("--agent 缺少值")?;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| i18n::tf(i18n::Key::CliMissingValue, &["--agent"]))?;
                 options.agent = parse_agent(value)?;
             }
             "--since" => {
                 i += 1;
-                let value = args.get(i).ok_or("--since 缺少值")?;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| i18n::tf(i18n::Key::CliMissingValue, &["--since"]))?;
                 options.since = Some(parse_date(value)?);
             }
             "--until" => {
                 i += 1;
-                let value = args.get(i).ok_or("--until 缺少值")?;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| i18n::tf(i18n::Key::CliMissingValue, &["--until"]))?;
                 options.until = Some(parse_date(value)?);
             }
             "--days" => {
                 i += 1;
-                let value = args.get(i).ok_or("--days 缺少值")?;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| i18n::tf(i18n::Key::CliMissingValue, &["--days"]))?;
                 options.days = value
                     .parse::<i64>()
-                    .map_err(|_| format!("无效的 --days：{value}"))?;
+                    .map_err(|_| i18n::tf(i18n::Key::CliInvalidDays, &[value]))?;
                 if options.days <= 0 {
-                    return Err("--days 必须大于 0".into());
+                    return Err(i18n::t(i18n::Key::CliDaysPositive).into());
                 }
             }
             "--format" => {
@@ -161,13 +195,17 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 options.format = match args.get(i).map(String::as_str) {
                     Some("table") => OutputFormat::Table,
                     Some("csv") => OutputFormat::Csv,
-                    Some(value) => return Err(format!("不支持的格式：{value}")),
-                    None => return Err("--format 缺少值".into()),
+                    Some(value) => {
+                        return Err(i18n::tf(i18n::Key::CliUnsupportedFormat, &[value]));
+                    }
+                    None => {
+                        return Err(i18n::tf(i18n::Key::CliMissingValue, &["--format"]));
+                    }
                 };
             }
             "--refresh" => options.refresh = true,
             "--by-agent" => options.by_agent = true,
-            value => return Err(format!("未知参数：{value}")),
+            value => return Err(i18n::tf(i18n::Key::CliUnknownArgument, &[value])),
         }
         i += 1;
     }
@@ -186,14 +224,14 @@ fn parse_agent(value: &str) -> Result<Option<AgentKind>, String> {
         "zcode" | "z-code" => Ok(Some(AgentKind::ZCode)),
         "opencode" | "open-code" => Ok(Some(AgentKind::OpenCode)),
         "pi" | "pi-agent" => Ok(Some(AgentKind::Pi)),
-        _ => Err(format!("不支持的 Agent：{value}")),
+        _ => Err(i18n::tf(i18n::Key::CliUnsupportedAgent, &[value])),
     }
 }
 
 fn parse_date(value: &str) -> Result<NaiveDate, String> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d")
         .or_else(|_| NaiveDate::parse_from_str(value, "%Y%m%d"))
-        .map_err(|_| format!("无效日期：{value}，应为 YYYY-MM-DD 或 YYYYMMDD"))
+        .map_err(|_| i18n::tf(i18n::Key::CliInvalidDate, &[value]))
 }
 
 fn local_day_start(date: NaiveDate) -> Result<i64, String> {
@@ -201,7 +239,7 @@ fn local_day_start(date: NaiveDate) -> Result<i64, String> {
         .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
         .earliest()
         .map(|value| value.timestamp())
-        .ok_or_else(|| format!("无法解析本地日期：{date}"))
+        .ok_or_else(|| i18n::tf(i18n::Key::CliLocalDateFailed, &[&date.to_string()]))
 }
 
 fn summarize(
@@ -276,7 +314,7 @@ fn print_table(rows: &BTreeMap<NaiveDate, DailyUsage>) {
         ]);
     }
     body.push(vec![
-        "Total".into(),
+        i18n::t(i18n::Key::CliTotal).into(),
         String::new(),
         format_integer(total.input),
         format_integer(total.output),
@@ -286,24 +324,24 @@ fn print_table(rows: &BTreeMap<NaiveDate, DailyUsage>) {
         format!("${:.2}", total.cost),
     ]);
     let headers = [
-        "Date",
-        "Models",
-        "Input",
-        "Output",
-        "Cache Create",
-        "Cache Read",
-        "Total Tokens",
-        "Cost (USD)",
+        i18n::t(i18n::Key::CliDate),
+        i18n::t(i18n::Key::CliModels),
+        i18n::t(i18n::Key::CliInput),
+        i18n::t(i18n::Key::CliOutput),
+        i18n::t(i18n::Key::CliCacheCreate),
+        i18n::t(i18n::Key::CliCacheRead),
+        i18n::t(i18n::Key::CliTotalTokens),
+        i18n::t(i18n::Key::CliCostUsd),
     ];
     let widths: Vec<usize> = headers
         .iter()
         .enumerate()
         .map(|(index, header)| {
             body.iter()
-                .map(|row| row[index].chars().count())
+                .map(|row| UnicodeWidthStr::width(row[index].as_str()))
                 .max()
                 .unwrap_or(0)
-                .max(header.len())
+                .max(UnicodeWidthStr::width(*header))
         })
         .collect();
     let separator = widths
@@ -325,28 +363,36 @@ fn print_by_agent_table(
     agent_rows: &[(AgentKind, BTreeMap<NaiveDate, DailyUsage>)],
 ) {
     let headers = [
-        "Date",
-        "Agent",
-        "Models",
-        "Input",
-        "Output",
-        "Cache Create",
-        "Cache Read",
-        "Total Tokens",
-        "Cost (USD)",
+        i18n::t(i18n::Key::CliDate),
+        i18n::t(i18n::Key::CliAgent),
+        i18n::t(i18n::Key::CliModels),
+        i18n::t(i18n::Key::CliInput),
+        i18n::t(i18n::Key::CliOutput),
+        i18n::t(i18n::Key::CliCacheCreate),
+        i18n::t(i18n::Key::CliCacheRead),
+        i18n::t(i18n::Key::CliTotalTokens),
+        i18n::t(i18n::Key::CliCostUsd),
     ];
     let mut body = Vec::new();
     let mut total = DailyUsage::default();
     for (date, row) in rows {
         total.merge(row);
-        body.push(usage_cells(date.to_string(), "All", row));
+        body.push(usage_cells(
+            date.to_string(),
+            i18n::t(i18n::Key::CliAll),
+            row,
+        ));
         for (agent, per_agent) in agent_rows {
             if let Some(agent_row) = per_agent.get(date) {
                 body.push(usage_cells(String::new(), agent.label(), agent_row));
             }
         }
     }
-    body.push(usage_cells("Total".into(), "All", &total));
+    body.push(usage_cells(
+        i18n::t(i18n::Key::CliTotal).into(),
+        i18n::t(i18n::Key::CliAll),
+        &total,
+    ));
     print_grid(&headers, &body, 3);
 }
 
@@ -370,10 +416,10 @@ fn print_grid(headers: &[&str], body: &[Vec<String>], numeric_start: usize) {
         .enumerate()
         .map(|(index, header)| {
             body.iter()
-                .map(|row| row[index].chars().count())
+                .map(|row| UnicodeWidthStr::width(row[index].as_str()))
                 .max()
                 .unwrap_or(0)
-                .max(header.len())
+                .max(UnicodeWidthStr::width(*header))
         })
         .collect();
     let separator = widths
@@ -403,10 +449,12 @@ fn print_row_aligned<T: AsRef<str>>(row: &[T], widths: &[usize], numeric_start: 
         .iter()
         .enumerate()
         .map(|(index, value)| {
+            let value = value.as_ref();
+            let padding = widths[index].saturating_sub(UnicodeWidthStr::width(value));
             if index >= numeric_start {
-                format!(" {:>width$} ", value.as_ref(), width = widths[index])
+                format!(" {}{value} ", " ".repeat(padding))
             } else {
-                format!(" {:<width$} ", value.as_ref(), width = widths[index])
+                format!(" {value}{} ", " ".repeat(padding))
             }
         })
         .collect::<Vec<_>>();
@@ -507,12 +555,7 @@ fn format_integer(value: f64) -> String {
 }
 
 fn print_help() {
-    println!(
-        "Agent Usage Metrics CLI\n\n\
-用法：\n  devin-usage-metrics --cli [选项]\n\n\
-选项：\n  --agent <name>       Agent 或 all，默认 claude\n  --days <n>           最近 N 天，默认 30\n  --since <date>       起始日期（YYYY-MM-DD 或 YYYYMMDD）\n  --until <date>       结束日期，包含当天\n  --format table|csv   输出格式，默认 table\n  --by-agent           增加按 Agent 分项\n  --refresh            忽略缓存，重新读取本地数据\n  -h, --help           显示帮助\n\n\
-示例：\n  devin-usage-metrics --cli --agent claude --since 2026-08-20 --until 2026-08-30 --refresh\n  devin-usage-metrics --cli --agent all --by-agent --since 2026-08-20 --until 2026-08-30\n  devin-usage-metrics --cli --agent claude --days 30 --format csv"
-    );
+    println!("{}", i18n::t(i18n::Key::CliHelp));
 }
 
 #[cfg(test)]
@@ -527,6 +570,17 @@ mod tests {
         assert_eq!(parse_agent("open_code").unwrap(), Some(AgentKind::OpenCode));
         assert_eq!(parse_agent("pi-agent").unwrap(), Some(AgentKind::Pi));
         assert_eq!(parse_agent("all").unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_days_outside_supported_date_range() {
+        let until = NaiveDate::from_ymd_opt(2026, 8, 30).unwrap();
+        assert!(resolve_since(until, None, i64::MAX).is_err());
+        assert!(resolve_since(until, None, 0).is_err());
+        assert_eq!(
+            resolve_since(until, None, 30).unwrap().to_string(),
+            "2026-08-01"
+        );
     }
 
     #[test]

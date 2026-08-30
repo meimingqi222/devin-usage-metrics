@@ -2,12 +2,13 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A native desktop app that reads local sessions from Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, and pi-agent and presents token usage, model distribution, and session details. Switch agents from the top bar; all data stays on your machine.
+A native desktop app that reads local sessions from Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, and pi-agent and presents token usage, model distribution, and session details. Switch agents from the left sidebar, in a Chinese or English interface; all data stays on your machine.
 
 ## Features
 
 - **Usage view**
-  - Switch between Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, and pi-agent
+  - Left sidebar with every supported agent (Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, pi-agent) and its session count
+  - Chinese and English interface, defaulting to the system language; switch from the top bar and the choice is remembered
   - Aggregate token usage by day (15 days) / week (12 weeks) / month (12 months)
   - Stat cards for Total Tokens, Input (new), Output, Cached read, and Turns/Sessions
   - Stacked bar chart of token trends (input / output / cached layers)
@@ -30,6 +31,23 @@ A native desktop app that reads local sessions from Devin, Amp, Claude Code, Cod
   - Each agent is loaded lazily when first selected, sources parse in parallel
   - 5-minute on-disk cache in the platform cache directory for fast subsequent launches
   - "Reload" bypasses the cache; unchanged files are detected by mtime and only modified files are re-parsed
+
+## Interface language
+
+The UI is available in Simplified Chinese and English. The language is resolved once at startup:
+
+1. `config.json` in the platform config directory, if it holds a valid `lang`
+2. otherwise the system locale (a `zh` prefix selects Chinese, anything else English)
+
+| Platform | Config file |
+| --- | --- |
+| macOS | `~/Library/Application Support/devin-usage-metrics/config.json` |
+| Linux | `~/.config/devin-usage-metrics/config.json` |
+| Windows | `%APPDATA%\devin-usage-metrics\config.json` |
+
+Clicking 中 / EN in the top bar writes that file immediately, so the choice survives restarts. The same setting applies to human-readable `--cli` output; CSV column names remain stable English identifiers for scripts.
+
+Known limitation: data-source error messages are produced while loading and stored alongside the cache, so they keep the language of the run that loaded them until the next reload.
 
 ## Tech stack
 
@@ -90,6 +108,8 @@ src/
 ├── data.rs    # Shared records, Devin SQLite reads, on-disk cache
 ├── local_sources.rs # Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, and pi-agent importers
 ├── pricing.rs # Model pricing table and cost calculation
+├── i18n.rs    # Chinese/English UI strings, language detection and preference file
+├── cli.rs     # --cli mode: daily usage rollup, table and CSV output
 ├── devin-model-pricing.json    # Official Devin model price list (embedded at compile time)
 ├── models-dev-pricing.json     # Non-Devin model prices extracted from models.dev
 └── agg.rs     # Day/week/month bucketing and per-model grouping

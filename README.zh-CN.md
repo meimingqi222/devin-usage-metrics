@@ -2,12 +2,13 @@
 
 [English](README.md) | **简体中文**
 
-一个原生桌面应用，用于读取 Devin、Amp、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode 与 pi-agent 在本地留下的会话数据，并展示 token 用量、模型分布与会话详情。可从顶部切换不同 Agent；所有数据均来自本机，不会上传到任何服务器。
+一个原生桌面应用，用于读取 Devin、Amp、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode 与 pi-agent 在本地留下的会话数据，并展示 token 用量、模型分布与会话详情。从左侧边栏切换 Agent，界面支持中英双语；所有数据均来自本机，不会上传到任何服务器。
 
 ## 功能
 
 - **用量视图**
-  - 支持在 Devin、Amp、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode 与 pi-agent 之间切换
+  - 左侧边栏常驻全部受支持的 Agent（Devin、Amp、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode、pi-agent）及其会话数
+  - 中英双语界面，默认跟随系统语言；顶栏点「中 / EN」即时切换并记住选择
   - 按日（15 天）/ 周（12 周）/ 月（12 个月）聚合 token 用量
   - 总 Tokens、输入（新）、输出、缓存读取、轮次/会话统计卡片
   - 堆叠柱状图展示 token 用量趋势（输入 / 输出 / 缓存分层）
@@ -30,6 +31,23 @@
   - 各 Agent 按需懒加载，数据源并行解析
   - 使用平台缓存目录中的 5 分钟磁盘缓存，加速二次启动
   - 顶部「重新加载」按钮可强制绕过缓存；通过 mtime 检测未变化的文件，仅重新解析有改动的文件
+
+## 界面语言
+
+界面支持简体中文与英文，语言在启动时解析一次：
+
+1. 若配置目录下的 `config.json` 含有效 `lang`，以它为准
+2. 否则跟随系统 locale（`zh` 前缀选中文，其余一律英文）
+
+| 平台 | 配置文件 |
+| --- | --- |
+| macOS | `~/Library/Application Support/devin-usage-metrics/config.json` |
+| Linux | `~/.config/devin-usage-metrics/config.json` |
+| Windows | `%APPDATA%\devin-usage-metrics\config.json` |
+
+顶栏点击「中 / EN」会立即写入该文件，重启后保持。同一设置也作用于 `--cli` 的人类可读输出；CSV 列名为方便脚本处理，固定使用稳定的英文标识符。
+
+已知限制：数据源错误消息在加载阶段生成，并随缓存一起落盘，因此会保留加载它那一次运行的语言，直到下次重新加载。
 
 ## 技术栈
 
@@ -90,6 +108,8 @@ src/
 ├── data.rs    # 公共记录、Devin SQLite 读取、磁盘缓存
 ├── local_sources.rs # Amp、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode 与 pi-agent 导入器
 ├── pricing.rs # 模型定价表与费用计算
+├── i18n.rs    # 中英双语文案、系统语言探测与偏好读写
+├── cli.rs     # --cli 模式：按日用量汇总、表格与 CSV 输出
 ├── devin-model-pricing.json    # Devin 官方模型价格表（编译期嵌入）
 ├── models-dev-pricing.json     # 从 models.dev 提取的非 Devin 模型价格子集
 └── agg.rs     # 按日/周/月的桶聚合与模型分组
