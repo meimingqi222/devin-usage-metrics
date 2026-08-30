@@ -12,8 +12,8 @@ use data::{AgentKind, LoadedData};
 use devin_usage_metrics::{agg, cli, data, i18n, pricing};
 use gpui::{
     actions, div, point, prelude::*, px, rgb, size, Animation, AnimationExt as _, App, Application,
-    Bounds, Context, KeyBinding, Render, SharedString, Task, TitlebarOptions, Window, WindowBounds,
-    WindowControlArea, WindowOptions,
+    Bounds, Context, KeyBinding, MouseButton, Render, SharedString, Task, TitlebarOptions, Window,
+    WindowBounds, WindowControlArea, WindowOptions,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -327,7 +327,7 @@ impl Root {
             .children(items)
     }
 
-    fn top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn top_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tab = self.tab;
         let period = self.period;
         let page = self.page;
@@ -348,6 +348,9 @@ impl Root {
                     d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
                 })
                 .child(name)
+                // Windows 会把 Drag 区域整体命中为 HTCAPTION，按钮的 mousedown
+                // 需要阻断传播，否则点击会进入系统标题栏拖拽循环而失效
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.tab = kind;
                     cx.notify();
@@ -368,6 +371,7 @@ impl Root {
                     d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
                 })
                 .child(kind.label())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.period = kind;
                     this.page = 0;
@@ -395,6 +399,7 @@ impl Root {
                     d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
                 })
                 .child(target.short_label())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     i18n::set_lang(target);
                     this.rebuild_buckets();
@@ -426,6 +431,7 @@ impl Root {
             .when(page == 0, |d| {
                 d.text_color(rgba(MUTED, 0.3)).cursor_default()
             })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(i18n::t(i18n::Key::PrevPage));
 
         let next_page = div()
@@ -437,6 +443,7 @@ impl Root {
             .cursor_pointer()
             .text_color(rgb(MUTED))
             .hover(|h| h.bg(rgb(PANEL2)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(i18n::t(i18n::Key::NextPage))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.page = this.page.saturating_add(1);
@@ -510,6 +517,7 @@ impl Root {
                     } else {
                         i18n::t(i18n::Key::Reload)
                     })
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| {
                         if !this.loading {
                             this.start_load(true, cx);
@@ -533,6 +541,63 @@ impl Root {
                     .child(lang_btn(i18n::Lang::Zh))
                     .child(lang_btn(i18n::Lang::En)),
             )
+            // Windows 没有系统标题栏按钮（窗口样式不含 WS_CAPTION），
+            // 在顶栏右端自绘 最小化/最大化/关闭
+            .when(cfg!(target_os = "windows"), |bar| {
+                bar.child(self.windows_caption_buttons(window))
+            })
+    }
+
+    /// Windows 专用的窗口控制按钮。不要挂 on_click：这些区域会被系统
+    /// 命中为 HTMINBUTTON/HTMAXBUTTON/HTCLOSE，松开鼠标时由 GPUI 执行
+    /// 最小化/最大化/WM_CLOSE（关闭已通过 on_window_should_close 退出）。
+    /// `.occlude()` 把按钮区域从父级的 Drag 命中测试中挖出来，否则整条
+    /// 顶栏都会被当作标题栏拖拽区。
+    fn windows_caption_buttons(&self, window: &mut Window) -> impl IntoElement {
+        // Win11 为 Segoe Fluent Icons；若需支持 Win10 改为 "Segoe MDL2 Assets"
+        const ICON_FONT: &str = "Segoe Fluent Icons";
+        let caption_button = |id: &'static str, icon: &str, area: WindowControlArea, danger: bool| {
+            div()
+                .id(id)
+                .occlude()
+                .window_control_area(area)
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(46.))
+                .h_full()
+                .text_size(px(10.))
+                .font_family(ICON_FONT)
+                .text_color(rgb(MUTED))
+                .hover(|s| {
+                    if danger {
+                        s.bg(rgb(0xe81123)).text_color(rgb(0xffffff))
+                    } else {
+                        s.bg(rgb(PANEL2)).text_color(rgb(TEXT))
+                    }
+                })
+                .child(icon.to_string())
+        };
+        div()
+            .flex()
+            .h_full()
+            .child(caption_button(
+                "win-min",
+                "\u{e921}",
+                WindowControlArea::Min,
+                false,
+            ))
+            .child(if window.is_maximized() {
+                caption_button("win-restore", "\u{e923}", WindowControlArea::Max, false)
+            } else {
+                caption_button("win-max", "\u{e922}", WindowControlArea::Max, false)
+            })
+            .child(caption_button(
+                "win-close",
+                "\u{e8bb}",
+                WindowControlArea::Close,
+                true,
+            ))
     }
 
     fn loading_view(&self) -> impl IntoElement {
@@ -1222,7 +1287,7 @@ fn loading_dots(size: f32, gap: f32) -> impl IntoElement {
 }
 
 impl Render for Root {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.loading && !self.has_loaded {
             return self.loading_view().into_any_element();
         }
@@ -1245,7 +1310,7 @@ impl Render for Root {
             .flex()
             .flex_col()
             .relative()
-            .child(self.top_bar(cx));
+            .child(self.top_bar(window, cx));
         for e in errors {
             right = right.child(
                 div()
