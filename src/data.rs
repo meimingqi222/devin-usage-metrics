@@ -1,3 +1,4 @@
+use crate::i18n;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -10,6 +11,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::local_sources;
 
 const CACHE_TTL_SECS: i64 = 300; // 5 minutes cache TTL
+const CACHE_SCHEMA_VERSION: u32 = 5;
 
 fn cache_path() -> PathBuf {
     #[cfg(target_os = "windows")]
@@ -67,9 +69,12 @@ fn log_loaded_part(source: &str, started: Instant, data: &LoadedData) {
     ));
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
+    #[default]
     Devin,
     Amp,
     Claude,
@@ -78,10 +83,11 @@ pub enum AgentKind {
     Grok,
     ZCode,
     OpenCode,
+    Pi,
 }
 
 impl AgentKind {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Devin,
         Self::Amp,
         Self::Claude,
@@ -90,6 +96,7 @@ impl AgentKind {
         Self::Grok,
         Self::ZCode,
         Self::OpenCode,
+        Self::Pi,
     ];
 
     pub fn label(self) -> &'static str {
@@ -102,19 +109,7 @@ impl AgentKind {
             Self::Grok => "Grok Build",
             Self::ZCode => "ZCode",
             Self::OpenCode => "OpenCode",
-        }
-    }
-
-    pub fn badge(self) -> &'static str {
-        match self {
-            Self::Devin => "🤖",
-            Self::Amp => "⚡",
-            Self::Claude => "🟣",
-            Self::Codex => "🟢",
-            Self::Antigravity => "🪐",
-            Self::Grok => "🔴",
-            Self::ZCode => "🔷",
-            Self::OpenCode => "🟠",
+            Self::Pi => "pi-agent",
         }
     }
 }
@@ -127,6 +122,8 @@ pub struct DataError {
 
 #[derive(serde::Deserialize)]
 struct CacheFile {
+    #[serde(default)]
+    schema_version: u32,
     cached_at: i64,
     turns_start: i64,
     turns_end: i64,
@@ -141,6 +138,7 @@ struct CacheFile {
 
 #[derive(serde::Serialize)]
 struct CacheFileRef<'a> {
+    schema_version: u32,
     cached_at: i64,
     turns_start: i64,
     turns_end: i64,
@@ -185,6 +183,9 @@ fn load_agent_cache(
 ) -> Option<LoadedData> {
     let file = File::open(agent_cache_path(agent)).ok()?;
     let cached: CacheFile = serde_json::from_reader(BufReader::new(file)).ok()?;
+    if cached.schema_version != CACHE_SCHEMA_VERSION {
+        return None;
+    }
     let now = now_timestamp()?;
     let covered = if require_fresh {
         cache_covers(
@@ -222,6 +223,7 @@ pub fn save_agent_cache(agent: AgentKind, data: &LoadedData) {
         return;
     };
     let cache = CacheFileRef {
+        schema_version: CACHE_SCHEMA_VERSION,
         cached_at,
         turns_start: data.turns_start,
         turns_end: data.turns_end,
@@ -268,6 +270,9 @@ pub fn load_agent(agent: AgentKind, start: i64, end: i64) -> LoadedData {
 fn load_cache(start: i64, end: i64) -> Option<LoadedData> {
     let file = File::open(cache_path()).ok()?;
     let cached: CacheFile = serde_json::from_reader(BufReader::new(file)).ok()?;
+    if cached.schema_version != CACHE_SCHEMA_VERSION {
+        return None;
+    }
     let now = now_timestamp()?;
     if !cache_covers(
         cached.cached_at,
@@ -304,6 +309,7 @@ fn save_to_cache(data: &LoadedData) {
         return;
     };
     let cache = CacheFileRef {
+        schema_version: CACHE_SCHEMA_VERSION,
         cached_at,
         turns_start: data.turns_start,
         turns_end: data.turns_end,
@@ -326,6 +332,8 @@ fn save_to_cache(data: &LoadedData) {
 
 #[derive(serde::Deserialize)]
 struct DevinChatMessage {
+    #[serde(default)]
+    message_id: Option<String>,
     metadata: Option<DevinMetadata>,
 }
 
@@ -334,6 +342,8 @@ struct DevinMetadata {
     metrics: Option<DevinMetrics>,
     #[serde(default)]
     generation_model: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -342,10 +352,11 @@ struct DevinMetrics {
     input_tokens: Option<f64>,
     output_tokens: Option<f64>,
     cache_read_tokens: Option<f64>,
+    cache_creation_tokens: Option<f64>,
     total_time_ms: Option<f64>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionRec {
     pub agent: AgentKind,
     pub key: String, // "<source>/<id>"
@@ -393,7 +404,7 @@ impl SessionRec {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TurnRec {
     pub agent: AgentKind,
     pub session_key: String,
@@ -620,6 +631,9 @@ fn load_turns_from(
         }
     };
 
+    // Devin 会把同一次响应以多个 message_nodes 兄弟节点持久化；这些节点共享
+    // message_id/request_id。优先用稳定的 message_id 去重，避免依赖批量写入时间戳。
+    let mut seen_message_ids = HashSet::new();
     for row in rows.flatten() {
         let (session_id, created_at, chat_message) = row;
         let Ok(message) = serde_json::from_str::<DevinChatMessage>(&chat_message) else {
@@ -635,6 +649,17 @@ fn load_turns_from(
         if ttft <= 0.0 {
             continue;
         }
+        let source_id = message
+            .message_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .or_else(|| metadata.request_id.as_deref().filter(|id| !id.is_empty()));
+        if let Some(source_id) = source_id {
+            let scoped_id = format!("{session_id}\0{source_id}");
+            if !seen_message_ids.insert(scoped_id) {
+                continue;
+            }
+        }
         let model = metadata
             .generation_model
             .as_deref()
@@ -647,7 +672,7 @@ fn load_turns_from(
             input_tokens: metrics.input_tokens.unwrap_or(0.0),
             output_tokens: metrics.output_tokens.unwrap_or(0.0),
             cache_read_tokens: metrics.cache_read_tokens.unwrap_or(0.0),
-            cache_creation_tokens: 0.0,
+            cache_creation_tokens: metrics.cache_creation_tokens.unwrap_or(0.0),
             cache_creation_5m_tokens: 0.0,
             cache_creation_1h_tokens: 0.0,
             model,
@@ -660,14 +685,23 @@ fn load_turns_from(
 
 fn turn_key(turn: &TurnRec) -> String {
     format!(
-        "{}:{}:{:x}:{:x}:{:x}:{:x}",
+        "{}:{}:{}:{}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+        turn.agent.label(),
         turn.session_key,
         turn.created_at,
+        turn.model,
         turn.input_tokens.to_bits(),
         turn.output_tokens.to_bits(),
         turn.cache_read_tokens.to_bits(),
-        turn.ttft_ms.to_bits()
+        turn.cache_creation_tokens.to_bits(),
+        turn.ttft_ms.to_bits(),
+        turn.total_time_ms.to_bits(),
     )
+}
+
+fn dedup_cached_turns(turns: &mut Vec<TurnRec>) {
+    let mut seen = HashSet::new();
+    turns.retain(|turn| seen.insert(turn_key(turn)));
 }
 
 fn load_source(
@@ -685,7 +719,7 @@ fn load_source(
     if !path.exists() {
         data.errors.push(DataError {
             agent: AgentKind::Devin,
-            message: format!("{} 不存在", path.display()),
+            message: i18n::tf(i18n::Key::ErrNotExist, &[&path.display().to_string()]),
         });
         return data;
     }
@@ -694,7 +728,7 @@ fn load_source(
         Err(error) => {
             data.errors.push(DataError {
                 agent: AgentKind::Devin,
-                message: format!("打开失败 {error}"),
+                message: i18n::tf(i18n::Key::ErrOpenFailed, &[&error.to_string()]),
             });
             return data;
         }
@@ -710,7 +744,7 @@ fn load_source(
         .map(|session| session.id.clone())
         .collect();
     let prefix = format!("{source}/");
-    let cached_turns: Vec<TurnRec> = previous
+    let mut cached_turns: Vec<TurnRec> = previous
         .into_iter()
         .flat_map(|cached| cached.turns.iter())
         .filter(|turn| {
@@ -721,6 +755,8 @@ fn load_source(
         })
         .cloned()
         .collect();
+    // 旧版本可能已经把重复节点写入缓存；先稳定清理缓存自身，再做增量合并。
+    dedup_cached_turns(&mut cached_turns);
     let cached_count = cached_turns.len();
     let query_start = cached_turns
         .iter()
@@ -744,10 +780,12 @@ fn load_source(
     load_turns_from(&conn, &source, &ids, query_start, end, &mut data.turns);
     let queried_turns = data.turns.len();
     if !cached_turns.is_empty() {
-        let mut seen: HashSet<String> = cached_turns.iter().map(turn_key).collect();
+        let seen: HashSet<String> = cached_turns.iter().map(turn_key).collect();
         let mut merged = cached_turns;
         for turn in data.turns.drain(..) {
-            if seen.insert(turn_key(&turn)) {
+            // 查询窗口包含最新缓存时间点；这里只排除与缓存重叠的记录。查询结果
+            // 已按 message_id 去重，不能再把两个指标恰好相同的真实请求合并掉。
+            if !seen.contains(&turn_key(&turn)) {
                 merged.push(turn);
             }
         }
@@ -831,6 +869,12 @@ fn load_uncached(start: i64, end: i64, previous: Option<Arc<LoadedData>>) -> Loa
             log_loaded_part("OpenCode", started, &data);
             parts.lock().unwrap().push(data);
         });
+        scope.spawn(|_| {
+            let started = Instant::now();
+            let data = local_sources::load_pi(start, end);
+            log_loaded_part("pi-agent", started, &data);
+            parts.lock().unwrap().push(data);
+        });
     });
     let parts = parts.into_inner().unwrap();
 
@@ -902,22 +946,10 @@ fn load_selected_agent(
             AgentKind::Grok => local_sources::load_grok(start, end, previous.as_deref()),
             AgentKind::ZCode => local_sources::load_zcode(start, end),
             AgentKind::OpenCode => local_sources::load_opencode(start, end),
+            AgentKind::Pi => local_sources::load_pi(start, end),
             AgentKind::Devin => unreachable!(),
         }
     }
-}
-
-fn turn_identity(turn: &TurnRec) -> String {
-    format!(
-        "{}:{}:{}:{:.0}:{:.0}:{:.0}:{:.0}",
-        turn.agent.label(),
-        turn.session_key,
-        turn.created_at,
-        turn.input_tokens,
-        turn.output_tokens,
-        turn.cache_read_tokens,
-        turn.cache_creation_tokens,
-    )
 }
 
 /// 以当前内存快照为基底，只重新加载指定 Agent 的目标时间窗口。
@@ -944,9 +976,9 @@ pub fn reload_agent_from(
     data.file_mtimes.extend(replacement.file_mtimes);
     data.file_sessions.extend(replacement.file_sessions);
 
-    let mut seen_turns: HashSet<String> = data.turns.iter().map(turn_identity).collect();
+    let mut seen_turns: HashSet<String> = data.turns.iter().map(turn_key).collect();
     for turn in replacement.turns {
-        if seen_turns.insert(turn_identity(&turn)) {
+        if seen_turns.insert(turn_key(&turn)) {
             data.turns.push(turn);
         }
     }
@@ -985,13 +1017,18 @@ pub fn load_all(start: i64, end: i64) -> LoadedData {
     }
 }
 
+/// 忽略聚合缓存并重新读取全部 Agent 数据源。
+pub fn reload_all(start: i64, end: i64) -> LoadedData {
+    load_uncached(start, end, None)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::cache_covers;
+    use super::{cache_covers, dedup_cached_turns, load_turns_from, AgentKind, TurnRec};
+    use rusqlite::{params, Connection};
 
     #[test]
     fn json_extract_available() {
-        use rusqlite::Connection;
         let conn = Connection::open_in_memory().unwrap();
         let result: i64 = conn
             .query_row("SELECT json_extract('{\"a\":5}', '$.a');", [], |r| r.get(0))
@@ -1023,5 +1060,73 @@ mod tests {
             cached_at + 4_000,
             cached_at + 301,
         ));
+    }
+
+    #[test]
+    fn devin_turns_read_cache_creation_and_dedup_by_message_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE message_nodes (session_id TEXT, created_at INTEGER, chat_message TEXT)",
+            [],
+        )
+        .unwrap();
+        let message = |message_id: &str| {
+            serde_json::json!({
+                "message_id": message_id,
+                "metadata": {
+                    "generation_model": "gpt-5-6-luna-high",
+                    "metrics": {
+                        "ttft_ms": 5291,
+                        "input_tokens": 3,
+                        "output_tokens": 310,
+                        "cache_read_tokens": null,
+                        "cache_creation_tokens": 95970,
+                        "total_time_ms": 6000
+                    }
+                }
+            })
+            .to_string()
+        };
+        for message_id in ["same-response", "same-response", "other-response"] {
+            conn.execute(
+                "INSERT INTO message_nodes VALUES (?1, ?2, ?3)",
+                params!["session-1", 100_i64, message(message_id)],
+            )
+            .unwrap();
+        }
+
+        let mut turns = Vec::new();
+        load_turns_from(&conn, "cli", &["session-1".to_string()], 0, 200, &mut turns);
+
+        // 相同 message_id 的兄弟节点只保留一次；指标相同但 message_id 不同的
+        // 两次真实请求必须同时保留。
+        assert_eq!(turns.len(), 2);
+        assert!(turns
+            .iter()
+            .all(|turn| turn.cache_creation_tokens == 95_970.0));
+    }
+
+    #[test]
+    fn old_cached_devin_duplicates_are_removed_with_full_metric_key() {
+        let base = TurnRec {
+            agent: AgentKind::Devin,
+            session_key: "cli/session-1".into(),
+            created_at: 100,
+            input_tokens: 3.0,
+            output_tokens: 310.0,
+            cache_read_tokens: 0.0,
+            cache_creation_tokens: 95_970.0,
+            model: "gpt-5-6-luna-high".into(),
+            ttft_ms: 5291.0,
+            total_time_ms: 6000.0,
+            ..Default::default()
+        };
+        let mut different_cache_write = base.clone();
+        different_cache_write.cache_creation_tokens += 1.0;
+        let mut turns = vec![base.clone(), base, different_cache_write];
+
+        dedup_cached_turns(&mut turns);
+
+        assert_eq!(turns.len(), 2);
     }
 }

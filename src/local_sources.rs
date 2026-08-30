@@ -1,4 +1,5 @@
 use crate::data::{AgentKind, DataError, LoadedData, SessionRec, TurnRec};
+use crate::i18n;
 use chrono::DateTime;
 use rayon::prelude::*;
 use serde_json::Value;
@@ -33,7 +34,6 @@ struct SessionBuilder {
     cache_creation_1h_tokens: f64,
     agent_messages: f64,
     recorded_cost: Option<f64>,
-    seen_messages: HashSet<String>,
 }
 
 impl SessionBuilder {
@@ -84,7 +84,6 @@ impl SessionBuilder {
             (Some(a), Some(b)) => Some(a + b),
             (a, b) => a.or(b),
         };
-        self.seen_messages.extend(other.seen_messages);
     }
 
     fn finish(self, agent: AgentKind) -> SessionRec {
@@ -807,20 +806,25 @@ pub(crate) fn load_amp(start: i64, end: i64, previous: Option<&LoadedData>) -> L
     if skipped > 0 || !failed_ids.is_empty() {
         let mut msg = String::new();
         if skipped > 0 {
-            msg.push_str(&format!("有 {skipped} 个本地 Amp 会话无法读取"));
+            msg.push_str(&i18n::tf(
+                i18n::Key::ErrSessionsUnreadable,
+                &[&skipped.to_string()],
+            ));
         }
         if !failed_ids.is_empty() {
             if !msg.is_empty() {
                 msg.push('；');
             }
             let shown: Vec<&str> = failed_ids.iter().take(5).map(String::as_str).collect();
-            msg.push_str(&format!(
-                "{} 个远程线程导出失败: {}",
-                failed_ids.len(),
-                shown.join(", ")
+            msg.push_str(&i18n::tf(
+                i18n::Key::ErrRemoteExport,
+                &[&failed_ids.len().to_string(), &shown.join(", ")],
             ));
             if failed_ids.len() > 5 {
-                msg.push_str(&format!(" 等 {} 个", failed_ids.len()));
+                msg.push_str(&i18n::tf(
+                    i18n::Key::ErrAndMore,
+                    &[&failed_ids.len().to_string()],
+                ));
             }
         }
         data.errors.push(error(agent, msg));
@@ -901,13 +905,17 @@ fn parse_claude_file(
     end: i64,
 ) -> (HashMap<String, SessionBuilder>, Vec<TurnRec>, usize) {
     let mut sessions: HashMap<String, SessionBuilder> = HashMap::new();
-    let mut turns = Vec::new();
+    // Claude Code 会为同一次响应写入多条相同 message.id 的增量记录：
+    // 第一条通常只有 1~9 个 output token，最后一条才是最终累计 usage。
+    // 先按 id 保留最后一条，解析完成后再汇总，避免把增量首帧当成整轮用量。
+    let mut latest_turns: HashMap<String, (String, TurnRec)> = HashMap::new();
+    let mut anonymous_turns: Vec<(String, TurnRec)> = Vec::new();
     let fallback_id = claude_session_id(path);
     if fallback_id.is_empty() {
-        return (sessions, turns, 0);
+        return (sessions, Vec::new(), 0);
     }
     let Ok(file) = File::open(path) else {
-        return (sessions, turns, 1);
+        return (sessions, Vec::new(), 1);
     };
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         let Ok(value) = serde_json::from_str::<ClaudeLine>(&line) else {
@@ -951,9 +959,6 @@ fn parse_claude_file(
                     .and_then(|m| m.id.as_deref())
                     .or(value.request_id.as_deref())
                     .unwrap_or("");
-                if !message_id.is_empty() && !session.seen_messages.insert(message_id.to_owned()) {
-                    continue;
-                }
                 // cache_creation: 优先用 5m/1h 拆分，否则用合并值（旧格式归入 5m）
                 let (cc_5m, cc_1h) = if let Some(cc) = usage.cache_creation.as_ref() {
                     (
@@ -969,37 +974,49 @@ fn parse_claude_file(
                 let input = usage.input_tokens.unwrap_or(0.0);
                 let output = usage.output_tokens.unwrap_or(0.0);
                 let cached = usage.cache_read_input_tokens.unwrap_or(0.0);
-                session.input_tokens += input;
-                session.output_tokens += output;
-                session.cached_tokens += cached;
-                session.cache_creation_tokens += cache_creation;
-                session.cache_creation_5m_tokens += cc_5m;
-                session.cache_creation_1h_tokens += cc_1h;
                 let turn_model = value
                     .message
                     .as_ref()
                     .and_then(|m| m.model.as_deref())
                     .unwrap_or("")
                     .to_owned();
-                if at >= start && at < end {
-                    turns.push(TurnRec {
-                        agent: AgentKind::Claude,
-                        session_key: format!("claude-code/{id}"),
-                        created_at: at,
-                        input_tokens: input,
-                        output_tokens: output,
-                        cache_read_tokens: cached,
-                        cache_creation_tokens: cache_creation,
-                        cache_creation_5m_tokens: cc_5m,
-                        cache_creation_1h_tokens: cc_1h,
-                        model: turn_model,
-                        ttft_ms: 0.0,
-                        total_time_ms: 0.0,
-                        recorded_cost: None,
-                    });
+                let turn = TurnRec {
+                    agent: AgentKind::Claude,
+                    session_key: format!("claude-code/{id}"),
+                    created_at: at,
+                    input_tokens: input,
+                    output_tokens: output,
+                    cache_read_tokens: cached,
+                    cache_creation_tokens: cache_creation,
+                    cache_creation_5m_tokens: cc_5m,
+                    cache_creation_1h_tokens: cc_1h,
+                    model: turn_model,
+                    ttft_ms: 0.0,
+                    total_time_ms: 0.0,
+                    recorded_cost: None,
+                };
+                if message_id.is_empty() {
+                    anonymous_turns.push((id, turn));
+                } else {
+                    latest_turns.insert(message_id.to_owned(), (id, turn));
                 }
             }
             _ => {}
+        }
+    }
+
+    let mut turns = Vec::with_capacity(latest_turns.len() + anonymous_turns.len());
+    for (id, turn) in latest_turns.into_values().chain(anonymous_turns) {
+        if let Some(session) = sessions.get_mut(&id) {
+            session.input_tokens += turn.input_tokens;
+            session.output_tokens += turn.output_tokens;
+            session.cached_tokens += turn.cache_read_tokens;
+            session.cache_creation_tokens += turn.cache_creation_tokens;
+            session.cache_creation_5m_tokens += turn.cache_creation_5m_tokens;
+            session.cache_creation_1h_tokens += turn.cache_creation_1h_tokens;
+        }
+        if turn.created_at >= start && turn.created_at < end {
+            turns.push(turn);
         }
     }
     (sessions, turns, 0)
@@ -1014,8 +1031,10 @@ pub(crate) fn load_claude(start: i64, end: i64, previous: Option<&LoadedData>) -
         ..Default::default()
     };
     if !root.exists() {
-        data.errors
-            .push(error(agent, format!("未找到 {}", root.display())));
+        data.errors.push(error(
+            agent,
+            i18n::tf(i18n::Key::ErrNotFound, &[&root.display().to_string()]),
+        ));
         return data;
     }
 
@@ -1113,8 +1132,10 @@ pub(crate) fn load_claude(start: i64, end: i64, previous: Option<&LoadedData>) -
     data.turns = turns;
     data.turns.extend(reused_turns);
     if skipped > 0 {
-        data.errors
-            .push(error(agent, format!("有 {skipped} 个会话文件无法读取")));
+        data.errors.push(error(
+            agent,
+            i18n::tf(i18n::Key::ErrSessionsUnreadable, &[&skipped.to_string()]),
+        ));
     }
     data
 }
@@ -1296,8 +1317,10 @@ pub(crate) fn load_codex(start: i64, end: i64, previous: Option<&LoadedData>) ->
         ..Default::default()
     };
     if !roots.iter().any(|root| root.exists()) {
-        data.errors
-            .push(error(agent, format!("未找到 {}", roots[0].display())));
+        data.errors.push(error(
+            agent,
+            i18n::tf(i18n::Key::ErrNotFound, &[&roots[0].display().to_string()]),
+        ));
         return data;
     }
 
@@ -1409,8 +1432,10 @@ pub(crate) fn load_codex(start: i64, end: i64, previous: Option<&LoadedData>) ->
         .collect();
     data.turns.extend(reused_turns);
     if skipped > 0 {
-        data.errors
-            .push(error(agent, format!("有 {skipped} 个会话文件无法读取")));
+        data.errors.push(error(
+            agent,
+            i18n::tf(i18n::Key::ErrSessionsUnreadable, &[&skipped.to_string()]),
+        ));
     }
     data
 }
@@ -1802,8 +1827,10 @@ pub(crate) fn load_antigravity(start: i64, end: i64, previous: Option<&LoadedDat
         ..Default::default()
     };
     if !root.exists() {
-        data.errors
-            .push(error(agent, format!("未找到 {}", root.display())));
+        data.errors.push(error(
+            agent,
+            i18n::tf(i18n::Key::ErrNotFound, &[&root.display().to_string()]),
+        ));
         return data;
     }
 
@@ -1895,7 +1922,10 @@ pub(crate) fn load_antigravity(start: i64, end: i64, previous: Option<&LoadedDat
     if parse_errors > 0 {
         data.errors.push(error(
             agent,
-            format!("有 {parse_errors} 个会话文件无法读取"),
+            i18n::tf(
+                i18n::Key::ErrSessionsUnreadable,
+                &[&parse_errors.to_string()],
+            ),
         ));
     }
     data
@@ -2077,8 +2107,10 @@ pub(crate) fn load_grok(start: i64, end: i64, previous: Option<&LoadedData>) -> 
         ..Default::default()
     };
     if !root.exists() {
-        data.errors
-            .push(error(agent, format!("未找到 {}", root.display())));
+        data.errors.push(error(
+            agent,
+            i18n::tf(i18n::Key::ErrNotFound, &[&root.display().to_string()]),
+        ));
         return data;
     }
 
@@ -2154,8 +2186,10 @@ pub(crate) fn load_grok(start: i64, end: i64, previous: Option<&LoadedData>) -> 
     data.sessions.extend(reused_sessions);
     data.turns.extend(reused_turns);
     if skipped > 0 {
-        data.errors
-            .push(error(agent, format!("有 {skipped} 个会话文件无法读取")));
+        data.errors.push(error(
+            agent,
+            i18n::tf(i18n::Key::ErrSessionsUnreadable, &[&skipped.to_string()]),
+        ));
     }
     data
 }
@@ -2185,8 +2219,10 @@ pub(crate) fn load_zcode(start: i64, end: i64) -> LoadedData {
 
     let db_path = candidates.into_iter().find(|p| p.exists());
     let Some(path) = db_path else {
-        data.errors
-            .push(error(agent, "未找到 ~/.zcode/cli/db/db.sqlite"));
+        data.errors.push(error(
+            agent,
+            i18n::tf(i18n::Key::ErrNotFound, &["~/.zcode/cli/db/db.sqlite"]),
+        ));
         return data;
     };
 
@@ -2196,8 +2232,10 @@ pub(crate) fn load_zcode(start: i64, end: i64) -> LoadedData {
     ) {
         Ok(c) => c,
         Err(e) => {
-            data.errors
-                .push(error(agent, format!("无法打开 ZCode 数据库: {e}")));
+            data.errors.push(error(
+                agent,
+                i18n::tf(i18n::Key::ErrDbOpen, &["ZCode", &e.to_string()]),
+            ));
             return data;
         }
     };
@@ -2406,8 +2444,13 @@ pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
     let db_path = match candidates.into_iter().find(|p| p.exists()) {
         Some(path) => path,
         None => {
-            data.errors
-                .push(error(agent, "未找到 ~/.local/share/opencode/opencode.db"));
+            data.errors.push(error(
+                agent,
+                i18n::tf(
+                    i18n::Key::ErrNotFound,
+                    &["~/.local/share/opencode/opencode.db"],
+                ),
+            ));
             return data;
         }
     };
@@ -2418,8 +2461,10 @@ pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
     ) {
         Ok(c) => c,
         Err(e) => {
-            data.errors
-                .push(error(agent, format!("无法打开 OpenCode 数据库: {e}")));
+            data.errors.push(error(
+                agent,
+                i18n::tf(i18n::Key::ErrDbOpen, &["OpenCode", &e.to_string()]),
+            ));
             return data;
         }
     };
@@ -2475,10 +2520,12 @@ pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
                 let model = model_json
                     .as_deref()
                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                    .map(|v| opencode_model_name(
-                        v.get("providerID").and_then(Value::as_str).unwrap_or(""),
-                        v.get("id").and_then(Value::as_str).unwrap_or(""),
-                    ))
+                    .map(|v| {
+                        opencode_model_name(
+                            v.get("providerID").and_then(Value::as_str).unwrap_or(""),
+                            v.get("id").and_then(Value::as_str).unwrap_or(""),
+                        )
+                    })
                     .unwrap_or_default();
                 let created_sec = timestamp_ms_to_sec(time_created);
                 let updated_sec = timestamp_ms_to_sec(time_updated);
@@ -2546,10 +2593,7 @@ pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
                         v.get("modelID").and_then(Value::as_str),
                     )
                 };
-                let model = opencode_model_name(
-                    provider.unwrap_or(""),
-                    model_id.unwrap_or(""),
-                );
+                let model = opencode_model_name(provider.unwrap_or(""), model_id.unwrap_or(""));
                 let tokens = v.get("tokens");
                 let out = tokens
                     .and_then(|t| t.get("output"))
@@ -2582,17 +2626,20 @@ pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
                 };
 
                 let root_id = resolve_root(session_id);
-                let builder = session_builders.entry(root_id.clone()).or_insert_with(|| SessionBuilder {
-                    id: root_id.clone(),
-                    title: root_id.clone(),
-                    cwd: String::new(),
-                    model: model.clone(),
-                    mode: "build".into(),
-                    source: "local".into(),
-                    created_at: start_sec,
-                    last_activity_at: start_sec,
-                    ..Default::default()
-                });
+                let builder =
+                    session_builders
+                        .entry(root_id.clone())
+                        .or_insert_with(|| SessionBuilder {
+                            id: root_id.clone(),
+                            title: root_id.clone(),
+                            cwd: String::new(),
+                            model: model.clone(),
+                            mode: "build".into(),
+                            source: "local".into(),
+                            created_at: start_sec,
+                            last_activity_at: start_sec,
+                            ..Default::default()
+                        });
                 builder.input_tokens += inp;
                 builder.output_tokens += out;
                 builder.cached_tokens += cache_rd;
@@ -2649,6 +2696,131 @@ fn opencode_model_name(provider: &str, model_id: &str) -> String {
     }
 }
 
+// ==================== pi-agent ====================
+
+fn parse_pi_file(path: &Path, start: i64, end: i64) -> Option<(SessionRec, Vec<TurnRec>)> {
+    let file = File::open(path).ok()?;
+    let fallback_id = path.file_stem()?.to_string_lossy().into_owned();
+    let mut session = SessionBuilder {
+        id: fallback_id,
+        source: "local".into(),
+        ..Default::default()
+    };
+    let mut turns = Vec::new();
+
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let at = timestamp(value.get("timestamp"));
+        session.observe_time(at);
+        match value.get("type").and_then(Value::as_str).unwrap_or("") {
+            "session" => {
+                if let Some(id) = value.get("id").and_then(Value::as_str) {
+                    session.id = id.to_owned();
+                }
+                if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
+                    session.cwd = cwd.to_owned();
+                }
+            }
+            "thinking_level_change" => {
+                if let Some(level) = value.get("thinkingLevel").and_then(Value::as_str) {
+                    session.mode = level.to_owned();
+                }
+            }
+            "message" => {
+                let Some(message) = value.get("message") else {
+                    continue;
+                };
+                match message.get("role").and_then(Value::as_str).unwrap_or("") {
+                    "user" if session.title.is_empty() => {
+                        if let Some(content) = message.get("content") {
+                            session.title = content_text(content);
+                        }
+                    }
+                    "assistant" => {
+                        let Some(usage) = message.get("usage") else {
+                            continue;
+                        };
+                        let input = value_number(usage.get("input"));
+                        let output = value_number(usage.get("output"));
+                        let cache_read = value_number(usage.get("cacheRead"));
+                        let cache_write = value_number(usage.get("cacheWrite"));
+                        let cost = usage
+                            .get("cost")
+                            .and_then(|cost| cost.get("total"))
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0);
+                        let raw_model = message
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        let model = format!("[pi] {raw_model}");
+                        session.model = model.clone();
+                        session.input_tokens += input;
+                        session.output_tokens += output;
+                        session.cached_tokens += cache_read;
+                        session.cache_creation_tokens += cache_write;
+                        session.agent_messages += 1.0;
+                        session.recorded_cost = Some(session.recorded_cost.unwrap_or(0.0) + cost);
+
+                        if at >= start && at < end {
+                            turns.push(TurnRec {
+                                agent: AgentKind::Pi,
+                                session_key: format!("pi-agent/{}", session.id),
+                                created_at: at,
+                                input_tokens: input,
+                                output_tokens: output,
+                                cache_read_tokens: cache_read,
+                                cache_creation_tokens: cache_write,
+                                model,
+                                recorded_cost: Some(cost),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if session.title.is_empty() {
+        session.title = session.id.clone();
+    }
+    Some((session.finish(AgentKind::Pi), turns))
+}
+
+pub(crate) fn load_pi(start: i64, end: i64) -> LoadedData {
+    let agent = AgentKind::Pi;
+    let root = home_path(&[".pi", "agent", "sessions"]);
+    let mut data = LoadedData {
+        turns_start: start,
+        turns_end: end,
+        ..Default::default()
+    };
+    if !root.exists() {
+        data.errors.push(error(
+            agent,
+            i18n::tf(i18n::Key::ErrNotFound, &[&root.display().to_string()]),
+        ));
+        return data;
+    }
+
+    let files = recent_files(&[root], "jsonl");
+    let parsed: Vec<_> = files
+        .par_iter()
+        .filter_map(|path| parse_pi_file(path, start, end))
+        .collect();
+    for (session, mut turns) in parsed {
+        data.sessions.push(session);
+        data.turns.append(&mut turns);
+    }
+    data.turns.sort_by_key(|turn| turn.created_at);
+    data
+}
+
 fn timestamp_ms_to_sec(ts: Option<i64>) -> i64 {
     ts.map(|t| if t > 10_000_000_000 { t / 1000 } else { t })
         .unwrap_or(0)
@@ -2658,11 +2830,11 @@ fn timestamp_ms_to_sec(ts: Option<i64>) -> i64 {
 mod tests {
     use super::{
         amp_cache_dir, amp_list_cache_path, content_text, load_amp_thread_export, parse_amp_value,
-        timestamp, AmpListCache, AmpListEntry,
+        parse_claude_file, parse_pi_file, timestamp, AmpListCache, AmpListEntry,
     };
     use serde_json::json;
     use std::fs::File;
-    use std::io::BufWriter;
+    use std::io::{BufWriter, Write};
 
     #[test]
     fn parses_iso_and_millisecond_timestamps() {
@@ -2708,6 +2880,97 @@ mod tests {
         assert_eq!(turns[0].output_tokens, 240.0);
         assert_eq!(turns[0].cache_creation_tokens, 300.0);
         assert_eq!(turns[0].cache_read_tokens, 600.0);
+    }
+
+    #[test]
+    fn claude_duplicate_message_keeps_final_cumulative_usage() {
+        let path = std::env::temp_dir().join(format!(
+            "claude-usage-final-record-{}.jsonl",
+            std::process::id()
+        ));
+        let file = File::create(&path).unwrap();
+        let mut writer = BufWriter::new(file);
+        for output in [3, 250] {
+            writeln!(
+                writer,
+                "{}",
+                json!({
+                    "type": "assistant",
+                    "sessionId": "session-1",
+                    "timestamp": "2026-08-28T00:23:33.297Z",
+                    "message": {
+                        "id": "msg-1",
+                        "model": "claude-opus-5",
+                        "usage": {
+                            "input_tokens": 2,
+                            "output_tokens": output,
+                            "cache_creation_input_tokens": 5201,
+                            "cache_read_input_tokens": 50478
+                        }
+                    }
+                })
+            )
+            .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let (sessions, turns, skipped) = parse_claude_file(&path, 0, i64::MAX);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(skipped, 0);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].output_tokens, 250.0);
+        assert_eq!(sessions["session-1"].output_tokens, 250.0);
+        assert_eq!(sessions["session-1"].cache_creation_tokens, 5201.0);
+    }
+
+    #[test]
+    fn parses_pi_usage_and_recorded_cost() {
+        let path = std::env::temp_dir().join(format!(
+            "pi-usage-recorded-cost-{}.jsonl",
+            std::process::id()
+        ));
+        let file = File::create(&path).unwrap();
+        let mut writer = BufWriter::new(file);
+        for value in [
+            json!({
+                "type": "session",
+                "id": "pi-session-1",
+                "timestamp": "2026-08-21T08:56:34.036Z",
+                "cwd": "/tmp/project"
+            }),
+            json!({
+                "type": "message",
+                "timestamp": "2026-08-21T08:57:42.237Z",
+                "message": {
+                    "role": "assistant",
+                    "model": "openrouter/free",
+                    "usage": {
+                        "input": 2039,
+                        "output": 156,
+                        "cacheRead": 320,
+                        "cacheWrite": 10,
+                        "cost": { "total": 0.125 }
+                    }
+                }
+            }),
+        ] {
+            writeln!(writer, "{value}").unwrap();
+        }
+        writer.flush().unwrap();
+
+        let (session, turns) = parse_pi_file(&path, 0, i64::MAX).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(session.id, "pi-session-1");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].model, "[pi] openrouter/free");
+        assert_eq!(turns[0].input_tokens, 2039.0);
+        assert_eq!(turns[0].output_tokens, 156.0);
+        assert_eq!(turns[0].cache_read_tokens, 320.0);
+        assert_eq!(turns[0].cache_creation_tokens, 10.0);
+        assert_eq!(turns[0].recorded_cost, Some(0.125));
+        assert_eq!(session.recorded_cost, Some(0.125));
     }
 
     /// 验证线程导出缓存：写入后能从本地文件读回，不需要 CLI 调用。

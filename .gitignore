@@ -60,3 +60,6 @@ tmp/
 *.mov
 *.mp4
 *.webm
+
+# ZCode 本地会话目录
+.zcode/

@@ -9,10 +9,11 @@
 use agg::{build_buckets_for, window_for, Bucket, PeriodKind};
 use chrono::TimeZone;
 use data::{AgentKind, LoadedData};
-use devin_usage_metrics::{agg, data, pricing};
+use devin_usage_metrics::{agg, cli, data, i18n, pricing};
 use gpui::{
-    actions, div, prelude::*, px, rgb, size, Animation, AnimationExt as _, App, Application,
-    Bounds, Context, KeyBinding, Render, SharedString, Task, Window, WindowBounds, WindowOptions,
+    actions, div, point, prelude::*, px, rgb, size, Animation, AnimationExt as _, App, Application,
+    Bounds, Context, KeyBinding, Render, SharedString, Task, TitlebarOptions, Window, WindowBounds,
+    WindowControlArea, WindowOptions,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -71,7 +72,7 @@ fn model_color(name: &str) -> u32 {
     MODEL_COLORS[h % MODEL_COLORS.len()]
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Tab {
     Usage,
     Sessions,
@@ -93,7 +94,6 @@ struct Root {
     data: Arc<LoadedData>,
     loaded_agents: HashMap<AgentKind, Arc<LoadedData>>,
     agent: AgentKind,
-    agent_menu_open: bool,
     tab: Tab,
     period: PeriodKind,
     page: usize,
@@ -110,13 +110,11 @@ struct Root {
 impl Root {
     fn switch_agent(&mut self, target_agent: AgentKind, cx: &mut Context<Self>) {
         if self.agent == target_agent && self.has_loaded {
-            self.agent_menu_open = false;
             cx.notify();
             return;
         }
 
         self.agent = target_agent;
-        self.agent_menu_open = false;
         self.selected = None;
         self.page = 0;
 
@@ -187,36 +185,13 @@ impl Root {
             .filter(|s| s.agent == self.agent)
             .map(|s| {
                 let total = s.input_tokens + s.output_tokens + s.cached_tokens;
-                // 优先使用会话自身记录的费用（如 Grok），否则按定价表计算
-                let cost_str = if let Some(c) = s.recorded_cost {
-                    pricing::fmt_cost(c)
-                } else {
-                    if s.agent == data::AgentKind::Claude
-                        && (s.cache_creation_5m_tokens > 0.0 || s.cache_creation_1h_tokens > 0.0)
-                    {
-                        pricing::turn_cost_claude(
-                            &s.display_model(),
-                            s.input_tokens,
-                            s.output_tokens,
-                            s.cached_tokens,
-                            s.cache_creation_5m_tokens,
-                            s.cache_creation_1h_tokens,
-                        )
-                    } else {
-                        pricing::turn_cost(
-                            &s.display_model(),
-                            s.input_tokens,
-                            s.output_tokens,
-                            s.cached_tokens,
-                            s.cache_creation_tokens,
-                        )
-                    }
+                // 与每日汇总一致：当前加载窗口内按实际 turn 模型逐轮计价。
+                let cost_str = agg::cost_for_session_turns(&self.data, s)
                     .map(pricing::fmt_cost)
-                    .unwrap_or_else(|| "—".into())
-                };
+                    .unwrap_or_else(|| "—".into());
                 let adaptive = s.selected_model == "adaptive";
                 let model_text = if adaptive {
-                    format!("adaptive → {}", s.display_model())
+                    i18n::tf(i18n::Key::AdaptiveShort, &[&s.display_model()])
                 } else if s.selected_model.is_empty() {
                     s.display_model()
                 } else {
@@ -260,69 +235,48 @@ impl Root {
             || !self.has_data_for(start, end, self.agent)
     }
 
-    fn agent_dropdown_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current_agent = self.agent;
+    /// 左侧边栏：应用名 + 全部 agent 的常驻切换列表。
+    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let items = AgentKind::ALL.into_iter().map(|kind| {
-            let is_selected = kind == current_agent;
+            let is_selected = kind == self.agent;
             let count = self
                 .loaded_agents
                 .get(&kind)
                 .map(|d| d.sessions.iter().filter(|s| s.agent == kind).count());
 
             div()
-                .id(SharedString::from(format!("agent-opt-{}", kind.label())))
+                .id(SharedString::from(format!("agent-{}", kind.label())))
                 .flex()
                 .items_center()
-                .justify_between()
+                .gap_2()
                 .px_3()
                 .py_2()
+                .mx_2()
                 .rounded_md()
                 .cursor_pointer()
-                .when(is_selected, |d| {
-                    d.bg(rgba(ACCENT, 0.18)).text_color(rgb(ACCENT))
-                })
-                .when(!is_selected, |d| {
-                    d.text_color(rgb(TEXT)).hover(|h| h.bg(rgb(PANEL2)))
-                })
+                .when(is_selected, |d| d.bg(rgba(ACCENT, 0.18)))
+                .when(!is_selected, |d| d.hover(|h| h.bg(rgb(PANEL2))))
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().text_sm().child(kind.badge()))
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(if is_selected {
-                                    gpui::FontWeight::BOLD
-                                } else {
-                                    gpui::FontWeight::MEDIUM
-                                })
-                                .child(kind.label()),
-                        ),
+                        .w(px(7.))
+                        .h(px(7.))
+                        .rounded_full()
+                        .bg(rgb(model_color(kind.label()))),
                 )
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .when_some(count, |d, c| {
-                            d.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child(format!("{c} 会话")),
-                            )
+                        .flex_1()
+                        .text_sm()
+                        .font_weight(if is_selected {
+                            gpui::FontWeight::BOLD
+                        } else {
+                            gpui::FontWeight::MEDIUM
                         })
-                        .when(is_selected, |d| {
-                            d.child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(ACCENT))
-                                    .child("✓"),
-                            )
-                        }),
+                        .text_color(if is_selected { rgb(ACCENT) } else { rgb(TEXT) })
+                        .child(kind.label()),
+                )
+                .children(
+                    count.map(|c| div().text_xs().text_color(rgb(MUTED)).child(c.to_string())),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.switch_agent(kind, cx);
@@ -330,51 +284,39 @@ impl Root {
         });
 
         div()
-            .id("agent-dropdown-overlay")
-            .absolute()
-            .inset_0()
+            .flex_shrink_0()
+            .w(px(160.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            // 顶部留出 macOS 红绿灯按钮的悬浮空间
+            .pt(px(40.))
+            .bg(rgb(PANEL))
             .child(
                 div()
-                    .id("agent-dropdown-backdrop")
-                    .absolute()
-                    .inset_0()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.agent_menu_open = false;
-                        cx.notify();
-                    })),
+                    .px_4()
+                    .pb_2()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(TEXT))
+                    .window_control_area(WindowControlArea::Drag)
+                    .child("Agent Usage Metrics"),
             )
-            .child(
-                div()
-                    .id("agent-dropdown-menu")
-                    .absolute()
-                    .top(px(46.))
-                    .left(px(160.))
-                    .w(px(250.))
-                    .p_1()
-                    .rounded_lg()
-                    .bg(rgb(PANEL))
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .shadow_lg()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .children(items),
-            )
+            .children(items)
     }
 
     fn top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tab = self.tab;
         let period = self.period;
         let page = self.page;
-        let agent = self.agent;
         let show_period = tab == Tab::Usage;
         let loaded_at = self.loaded_at.clone();
 
         let tab_btn = |kind: Tab, name: &'static str| {
             let active = tab == kind;
             div()
-                .id(SharedString::from(format!("tab-{name}")))
+                .id(SharedString::from(format!("tab-{kind:?}")))
                 .px_3()
                 .py_1()
                 .rounded_md()
@@ -394,7 +336,7 @@ impl Root {
         let period_btn = |kind: PeriodKind| {
             let active = period == kind;
             div()
-                .id(SharedString::from(format!("period-{}", kind.label())))
+                .id(SharedString::from(format!("period-{kind:?}")))
                 .px_2()
                 .py(px(2.))
                 .rounded_sm()
@@ -414,6 +356,29 @@ impl Root {
                         this.rebuild_buckets();
                         cx.notify();
                     }
+                }))
+        };
+
+        // 顶栏语言切换：与周期按钮同款的紧凑两段式
+        let lang_btn = |target: i18n::Lang| {
+            let active = i18n::lang() == target;
+            div()
+                .id(SharedString::from(format!("lang-{}", target.short_label())))
+                .px_2()
+                .py(px(2.))
+                .rounded_sm()
+                .text_xs()
+                .cursor_pointer()
+                .when(active, |d| d.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
+                .when(!active, |d| {
+                    d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
+                })
+                .child(target.short_label())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    i18n::set_lang(target);
+                    this.rebuild_buckets();
+                    this.rebuild_sessions();
+                    cx.notify();
                 }))
         };
 
@@ -440,7 +405,7 @@ impl Root {
             .when(page == 0, |d| {
                 d.text_color(rgba(MUTED, 0.3)).cursor_default()
             })
-            .child("◀ 上一页");
+            .child(i18n::t(i18n::Key::PrevPage));
 
         let next_page = div()
             .id("next-page")
@@ -451,7 +416,7 @@ impl Root {
             .cursor_pointer()
             .text_color(rgb(MUTED))
             .hover(|h| h.bg(rgb(PANEL2)))
-            .child("下一页 ▶")
+            .child(i18n::t(i18n::Key::NextPage))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.page = this.page.saturating_add(1);
                 if this.page_needs_load() {
@@ -462,64 +427,6 @@ impl Root {
                 }
             }));
 
-        let active_count = self
-            .data
-            .sessions
-            .iter()
-            .filter(|s| s.agent == agent)
-            .count();
-        let count_str = if active_count > 0 {
-            format!(" ({active_count})")
-        } else {
-            String::new()
-        };
-
-        let agent_selector = div()
-            .id("agent-selector-trigger")
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(if self.agent_menu_open {
-                rgb(ACCENT)
-            } else {
-                rgb(BORDER)
-            })
-            .bg(if self.agent_menu_open {
-                rgb(PANEL2)
-            } else {
-                rgb(PANEL)
-            })
-            .text_sm()
-            .cursor_pointer()
-            .hover(|h| h.bg(rgb(PANEL2)).border_color(rgb(ACCENT)))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(agent.badge())
-                    .child(
-                        div()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(TEXT))
-                            .child(format!("{}{}", agent.label(), count_str)),
-                    ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(if self.agent_menu_open { "▲" } else { "▼" }),
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.agent_menu_open = !this.agent_menu_open;
-                cx.notify();
-            }));
-
         div()
             .flex()
             .w_full()
@@ -528,25 +435,10 @@ impl Root {
             .gap_3()
             .px_4()
             .h(px(48.))
-            .border_b_1()
-            .border_color(rgb(BORDER))
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(TEXT))
-                    .child("Agent Usage Metrics"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .pl_2()
-                    .border_l_1()
-                    .border_color(rgb(BORDER))
-                    .child(agent_selector),
-            )
-            .child(tab_btn(Tab::Usage, "用量"))
-            .child(tab_btn(Tab::Sessions, "会话"))
+            // 一体化标题栏：顶栏区域负责窗口拖拽，内部按钮点击不受影响
+            .window_control_area(WindowControlArea::Drag)
+            .child(tab_btn(Tab::Usage, i18n::t(i18n::Key::Usage)))
+            .child(tab_btn(Tab::Sessions, i18n::t(i18n::Key::Sessions)))
             .when(show_period, |d| {
                 d.child(
                     div()
@@ -593,9 +485,9 @@ impl Root {
                         div().into_any_element()
                     })
                     .child(if self.loading {
-                        "正在刷新…"
+                        i18n::t(i18n::Key::Reloading)
                     } else {
-                        "重新加载"
+                        i18n::t(i18n::Key::Reload)
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
                         if !this.loading {
@@ -607,7 +499,18 @@ impl Root {
                 div()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child(format!("数据截至 {}", loaded_at)),
+                    .child(i18n::tf(i18n::Key::DataAsOf, &[&loaded_at])),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pl_3()
+                    .border_l_1()
+                    .border_color(rgb(BORDER))
+                    .child(lang_btn(i18n::Lang::Zh))
+                    .child(lang_btn(i18n::Lang::En)),
             )
     }
 
@@ -626,13 +529,13 @@ impl Root {
                     .text_lg()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT))
-                    .child("正在读取本地 Agent 用量数据"),
+                    .child(i18n::t(i18n::Key::LoadingData)),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child("首次读取完成后，后续启动会使用 5 分钟缓存"),
+                    .child(i18n::t(i18n::Key::LoadingCacheHint)),
             )
     }
 
@@ -682,17 +585,33 @@ impl Root {
             .w_full()
             .min_w(px(0.))
             .gap_2()
-            .child(Self::stat_card("总 Tokens", fmt_tokens(total), TEXT))
-            .child(Self::stat_card("输入（新）", fmt_tokens(ti), C_IN))
-            .child(Self::stat_card("输出", fmt_tokens(to), C_OUT))
-            .child(Self::stat_card("缓存读取", fmt_tokens(tc), C_CACHED))
             .child(Self::stat_card(
-                "费用 (USD)",
+                i18n::t(i18n::Key::StatTotalTokens),
+                fmt_tokens(total),
+                TEXT,
+            ))
+            .child(Self::stat_card(
+                i18n::t(i18n::Key::StatInput),
+                fmt_tokens(ti),
+                C_IN,
+            ))
+            .child(Self::stat_card(
+                i18n::t(i18n::Key::StatOutput),
+                fmt_tokens(to),
+                C_OUT,
+            ))
+            .child(Self::stat_card(
+                i18n::t(i18n::Key::StatCached),
+                fmt_tokens(tc),
+                C_CACHED,
+            ))
+            .child(Self::stat_card(
+                i18n::t(i18n::Key::StatCost),
                 pricing::fmt_cost(cost),
                 C_COST,
             ))
             .child(Self::stat_card(
-                "轮次 / 会话",
+                i18n::t(i18n::Key::StatTurnsSessions),
                 format!("{turns} / {}", sessions.len()),
                 MUTED,
             ));
@@ -705,25 +624,25 @@ impl Root {
             .map(|session| session.last_activity_at)
             .max()
             .map(fmt_ts)
-            .unwrap_or_else(|| "无记录".into());
-        let empty_message = format!(
-            "当前{}窗口没有{}用量；最近记录：{}。可点击“下一页 ▶”查看更早历史。",
-            self.period.label(),
-            self.agent.label(),
-            latest_activity
+            .unwrap_or_else(|| i18n::t(i18n::Key::NoRecord).into());
+        let empty_message = i18n::tf(
+            i18n::Key::EmptyWindow,
+            &[self.period.label(), self.agent.label(), &latest_activity],
         );
         let chart = self.chart();
         let table = self.bucket_table(cx);
 
+        // 统计卡与图表固定，仅底部明细表格独立滚动
         div()
-            .id("usage-scroll")
-            .size_full()
+            .id("usage-layout")
+            .flex_1()
             .min_w(px(0.))
-            .overflow_scroll()
+            .min_h(px(0.))
             .p_4()
             .flex()
             .flex_col()
             .gap_3()
+            .overflow_hidden()
             .child(cards)
             .when(turns == 0, |d| {
                 d.child(
@@ -742,7 +661,15 @@ impl Root {
                 )
             })
             .child(chart)
-            .child(table)
+            .child(
+                div()
+                    .id("bucket-table-scroll")
+                    .flex_1()
+                    .min_w(px(0.))
+                    .min_h(px(0.))
+                    .overflow_scroll()
+                    .child(table),
+            )
     }
 
     fn chart(&self) -> impl IntoElement {
@@ -833,11 +760,11 @@ impl Root {
                             .text_sm()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT))
-                            .child("Token 用量趋势"),
+                            .child(i18n::t(i18n::Key::ChartTitle)),
                     )
-                    .child(legend("缓存", C_CACHED))
-                    .child(legend("输入", C_IN))
-                    .child(legend("输出", C_OUT)),
+                    .child(legend(i18n::t(i18n::Key::LegendCached), C_CACHED))
+                    .child(legend(i18n::t(i18n::Key::LegendIn), C_IN))
+                    .child(legend(i18n::t(i18n::Key::LegendOut), C_OUT)),
             )
             .child(
                 div()
@@ -862,14 +789,14 @@ impl Root {
             .text_color(rgb(MUTED))
             .border_b_1()
             .border_color(rgb(BORDER))
-            .child(cell("周期", 90.))
-            .child(cell_r("会话", 44.))
-            .child(cell_r("轮次", 52.))
-            .child(cell_r("输入", 70.))
-            .child(cell_r("输出", 70.))
-            .child(cell_r("缓存", 76.))
-            .child(cell_r("总计", 76.))
-            .child(cell_r("费用", 70.))
+            .child(cell(i18n::t(i18n::Key::ThPeriod), 90.))
+            .child(cell_r(i18n::t(i18n::Key::ThSessions), 60.))
+            .child(cell_r(i18n::t(i18n::Key::ThTurns), 52.))
+            .child(cell_r(i18n::t(i18n::Key::ThInput), 70.))
+            .child(cell_r(i18n::t(i18n::Key::ThOutput), 70.))
+            .child(cell_r(i18n::t(i18n::Key::ThCache), 76.))
+            .child(cell_r(i18n::t(i18n::Key::ThTotal), 76.))
+            .child(cell_r(i18n::t(i18n::Key::ThCost), 70.))
             .child(
                 div()
                     .flex_1()
@@ -877,7 +804,7 @@ impl Root {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .child("模型分布"),
+                    .child(i18n::t(i18n::Key::ThModelMix)),
             );
         let mut rows: Vec<gpui::Div> = Vec::new();
         for b in self.buckets.iter().rev() {
@@ -924,7 +851,7 @@ impl Root {
                     .border_b_1()
                     .border_color(rgba(BORDER, 0.5))
                     .child(div().w(px(90.)).child(format!("{} {}", b.label, b.sub)))
-                    .child(cell_r(&format!("{}", b.session_keys.len()), 44.))
+                    .child(cell_r(&format!("{}", b.session_keys.len()), 60.))
                     .child(cell_r(&format!("{}", b.turns), 52.))
                     .child(cell_r(&fmt_tokens(b.input), 70.))
                     .child(cell_r(&fmt_tokens(b.output), 70.))
@@ -970,14 +897,14 @@ impl Root {
             .text_color(rgb(MUTED))
             .border_b_1()
             .border_color(rgb(BORDER))
-            .child(cell("最后活跃", 84.))
-            .child(cell("会话", 130.))
-            .child(div().flex_1().child("标题"))
-            .child(cell("模式", 70.))
-            .child(cell("模型", 190.))
-            .child(cell_r("消息", 48.))
-            .child(cell_r("Tokens", 72.))
-            .child(cell_r("费用", 64.));
+            .child(cell(i18n::t(i18n::Key::ThLastActive), 84.))
+            .child(cell(i18n::t(i18n::Key::ThSession), 130.))
+            .child(div().flex_1().child(i18n::t(i18n::Key::ThTitle)))
+            .child(cell(i18n::t(i18n::Key::ThMode), 70.))
+            .child(cell(i18n::t(i18n::Key::ThModel), 190.))
+            .child(cell_r(i18n::t(i18n::Key::ThMsgs), 48.))
+            .child(cell_r(i18n::t(i18n::Key::ThTokens), 72.))
+            .child(cell_r(i18n::t(i18n::Key::ThWindowCost), 64.));
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
         for r in &self.sessions_rows {
             let s = &r.session;
@@ -1064,7 +991,7 @@ impl Root {
                             .p_4()
                             .text_sm()
                             .text_color(rgb(MUTED))
-                            .child(format!("未找到 {} 本地会话数据", self.agent.label())),
+                            .child(i18n::tf(i18n::Key::SessionsNotFound, &[self.agent.label()])),
                     )
                 })
                 .children(rows),
@@ -1089,37 +1016,15 @@ impl Root {
         ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let ttft_med = ttfts.get(ttfts.len() / 2).copied().unwrap_or(0.0);
         let total = s.input_tokens + s.output_tokens + s.cached_tokens;
-        // 会话级费用：优先用会话自身记录的金额，否则用 display_model 查定价表
-        let session_cost = s.recorded_cost.or_else(|| {
-            if s.agent == data::AgentKind::Claude
-                && (s.cache_creation_5m_tokens > 0.0 || s.cache_creation_1h_tokens > 0.0)
-            {
-                pricing::turn_cost_claude(
-                    &s.display_model(),
-                    s.input_tokens,
-                    s.output_tokens,
-                    s.cached_tokens,
-                    s.cache_creation_5m_tokens,
-                    s.cache_creation_1h_tokens,
-                )
-            } else {
-                pricing::turn_cost(
-                    &s.display_model(),
-                    s.input_tokens,
-                    s.output_tokens,
-                    s.cached_tokens,
-                    s.cache_creation_tokens,
-                )
-            }
-        });
+        let session_cost = agg::cost_for_session_turns(&self.data, s);
         let adaptive = s.selected_model == "adaptive";
         let model_text = if adaptive {
-            format!("adaptive → {}（服务端路由）", s.display_model())
+            i18n::tf(i18n::Key::AdaptiveRouted, &[&s.display_model()])
         } else {
             s.display_model()
         };
         let model_detail = if adaptive {
-            format!("{}（配置值：{}）", model_text, s.selected_model)
+            i18n::tf(i18n::Key::ConfigValue, &[&model_text, &s.selected_model])
         } else {
             model_text
         };
@@ -1174,50 +1079,61 @@ impl Root {
                     ),
             )
             .child(kv(
-                "会话",
+                i18n::t(i18n::Key::KvSession),
                 format!("{} · {} · {}", s.id, s.source, s.agent_mode),
             ))
-            .child(kv("工作目录", s.working_directory.clone()))
-            .child(kv("模型", model_detail))
             .child(kv(
-                "时间",
-                format!(
-                    "{} 创建，最后活跃 {}",
-                    fmt_ts(s.created_at),
-                    fmt_ts(s.last_activity_at)
+                i18n::t(i18n::Key::KvWorkdir),
+                s.working_directory.clone(),
+            ))
+            .child(kv(i18n::t(i18n::Key::KvModel), model_detail))
+            .child(kv(
+                i18n::t(i18n::Key::KvTime),
+                i18n::tf(
+                    i18n::Key::CreatedLastActive,
+                    &[&fmt_ts(s.created_at), &fmt_ts(s.last_activity_at)],
                 ),
             ))
             .child(kv(
-                "Tokens",
-                format!(
-                    "输入 {} · 输出 {} · 缓存 {} · 共 {}",
-                    fmt_tokens(s.input_tokens),
-                    fmt_tokens(s.output_tokens),
-                    fmt_tokens(s.cached_tokens),
-                    fmt_tokens(total)
+                i18n::t(i18n::Key::ThTokens),
+                i18n::tf(
+                    i18n::Key::TokenBreakdown,
+                    &[
+                        &fmt_tokens(s.input_tokens),
+                        &fmt_tokens(s.output_tokens),
+                        &fmt_tokens(s.cached_tokens),
+                        &fmt_tokens(total),
+                    ],
                 ),
             ))
             .child(kv(
-                "费用",
+                i18n::t(i18n::Key::ThWindowCost),
                 match session_cost {
-                    Some(c) => format!("{}（按 {} 定价）", pricing::fmt_cost(c), s.display_model()),
-                    None => "未知（无匹配定价）".into(),
+                    Some(c) => i18n::tf(
+                        i18n::Key::PerTurnPriced,
+                        &[&pricing::fmt_cost(c), &turns.len().to_string()],
+                    ),
+                    None => i18n::t(i18n::Key::UnknownUnpriced).into(),
                 },
             ))
             .child(kv(
-                "活动",
+                i18n::t(i18n::Key::KvActivity),
                 if ttfts.is_empty() {
-                    format!(
-                        "{:.0} 条 agent 消息 · 窗口内 {} 轮",
-                        s.agent_messages,
-                        turns.len()
+                    i18n::tf(
+                        i18n::Key::ActivityNoTtft,
+                        &[
+                            &format!("{:.0}", s.agent_messages),
+                            &turns.len().to_string(),
+                        ],
                     )
                 } else {
-                    format!(
-                        "{:.0} 条 agent 消息 · 窗口内 {} 轮 · TTFT 中位 {:.0} ms",
-                        s.agent_messages,
-                        turns.len(),
-                        ttft_med
+                    i18n::tf(
+                        i18n::Key::ActivityTtft,
+                        &[
+                            &format!("{:.0}", s.agent_messages),
+                            &turns.len().to_string(),
+                            &format!("{:.0}", ttft_med),
+                        ],
                     )
                 },
             ))
@@ -1293,33 +1209,36 @@ impl Render for Root {
             .filter(|error| error.agent == self.agent)
             .map(|error| error.message.clone())
             .collect();
-        let mut root = div()
+        let mut right = div()
+            .flex_1()
+            .min_w(px(0.))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .relative()
+            .child(self.top_bar(cx));
+        for e in errors {
+            right = right.child(
+                div()
+                    .px_4()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(0xf87171))
+                    .child(i18n::tf(i18n::Key::DataWarning, &[&e])),
+            );
+        }
+        right = right.child(content);
+
+        div()
             .size_full()
             .min_w(px(0.))
             .overflow_hidden()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
             .flex()
-            .flex_col()
-            .relative()
-            .child(self.top_bar(cx));
-        for e in errors {
-            root = root.child(
-                div()
-                    .px_4()
-                    .py_1()
-                    .text_xs()
-                    .text_color(rgb(0xf87171))
-                    .child(format!("数据源警告：{e}")),
-            );
-        }
-        root = root.child(content);
-
-        if self.agent_menu_open {
-            root = root.child(self.agent_dropdown_overlay(cx));
-        }
-
-        root.into_any_element()
+            .child(self.sidebar(cx))
+            .child(right)
+            .into_any_element()
     }
 }
 
@@ -1351,7 +1270,19 @@ fn set_macos_dock_icon() {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--cli") {
+        if let Err(error) = cli::run(args.into_iter().skip(1).collect()) {
+            eprintln!("错误：{error}\n使用 --cli --help 查看帮助。");
+            std::process::exit(2);
+        }
+        return;
+    }
+
     Application::new().run(move |cx: &mut App| {
+        // 在打开窗口前确定语言：配置文件 > 系统 locale
+        i18n::init();
+
         #[cfg(target_os = "macos")]
         set_macos_dock_icon();
 
@@ -1366,6 +1297,13 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // 隐藏系统标题栏，内容延伸到窗口顶部（红绿灯悬浮在侧边栏上），
+                // 实现 macOS 一体化工具栏外观
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Agent Usage Metrics".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(16.), px(16.))),
+                }),
                 ..Default::default()
             },
             |window, cx| {
@@ -1380,14 +1318,13 @@ fn main() {
                         data: Arc::new(LoadedData::default()),
                         loaded_agents: HashMap::new(),
                         agent: AgentKind::Devin,
-                        agent_menu_open: false,
                         tab: Tab::Usage,
                         period: PeriodKind::Day,
                         page: 0,
                         buckets: Vec::new(),
                         sessions_rows: Vec::new(),
                         selected: None,
-                        loaded_at: "加载中...".into(),
+                        loaded_at: i18n::t(i18n::Key::Loading).into(),
                         loading: false,
                         has_loaded: false,
                         load_task: None,

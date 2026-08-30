@@ -17,6 +17,7 @@ use serde::Deserialize;
 
 const DEVIN_PRICING_JSON: &str = include_str!("devin-model-pricing.json");
 const MODELS_DEV_PRICING_JSON: &str = include_str!("models-dev-pricing.json");
+const GPT_5_6_LONG_CONTEXT_THRESHOLD: f64 = 272_000.0;
 
 /// 单个模型的定价信息，所有字段均为"美元 / 百万 token"。
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -25,7 +26,7 @@ pub struct Pricing {
     pub i: f64,
     /// 输出 token 单价
     pub o: f64,
-    /// 缓存写入 token 单价（Devin 的 metrics 不区分缓存写入，此字段暂不参与计算）
+    /// 缓存写入 token 单价（Devin 不区分 TTL，统一按此费率计算）
     #[serde(default)]
     pub cw: f64,
     /// 缓存读取 token 单价
@@ -83,6 +84,42 @@ impl Pricing {
     }
 }
 
+/// GPT-5.6 标准（非 Fast）模型超过 272K prompt 后使用的整轮费率。
+/// prompt 包含普通输入、cache read 与 cache write。
+fn gpt_5_6_long_context_pricing(model: &str) -> Option<Pricing> {
+    let model = model.trim().to_ascii_lowercase();
+    if model.contains("-priority") || model.contains(" thinking fast") || model.contains("-fast") {
+        return None;
+    }
+
+    let rates = if model.contains("gpt-5-6-luna")
+        || model.contains("gpt-5.6-luna")
+        || model.contains("gpt-5.6 luna")
+    {
+        (0.4, 1.8, 0.04, 0.5)
+    } else if model.contains("gpt-5-6-sol")
+        || model.contains("gpt-5.6-sol")
+        || model.contains("gpt-5.6 sol")
+    {
+        (10.0, 45.0, 1.0, 12.5)
+    } else if model.contains("gpt-5-6-terra")
+        || model.contains("gpt-5.6-terra")
+        || model.contains("gpt-5.6 terra")
+    {
+        (4.0, 18.0, 0.4, 5.0)
+    } else {
+        return None;
+    };
+
+    Some(Pricing {
+        i: rates.0,
+        o: rates.1,
+        cr: rates.2,
+        cw: rates.3,
+        l: None,
+    })
+}
+
 /// 嵌入的定价表，运行期只读。
 pub struct PricingTable {
     devin: HashMap<String, Pricing>,
@@ -100,7 +137,10 @@ impl PricingTable {
             // 构建 label → Pricing 反向索引，Devin 的 real_model 字段存的是 label
             let devin_labels: HashMap<String, Pricing> = devin
                 .values()
-                .filter_map(|p| p.l.as_ref().map(|label| (label.clone(), p.clone())))
+                .filter_map(|p| {
+                    p.l.as_ref()
+                        .map(|label| (label.to_ascii_lowercase(), p.clone()))
+                })
                 .collect();
             let models_dev = parse_pricing_json(MODELS_DEV_PRICING_JSON);
             PricingTable {
@@ -121,7 +161,11 @@ impl PricingTable {
     /// 6. models.dev 表前缀匹配（如 "gpt-5.1-max" → "gpt-5.1"）
     /// 7. 反向前缀匹配
     pub fn find(&self, model: &str) -> Option<&Pricing> {
-        let model = model.trim();
+        let normalized = model.trim().to_ascii_lowercase();
+        self.find_normalized(&normalized)
+    }
+
+    fn find_normalized(&self, model: &str) -> Option<&Pricing> {
         if model.is_empty() {
             return None;
         }
@@ -144,13 +188,13 @@ impl PricingTable {
         // 4. 去掉 provider 前缀后重试
         let stripped_prefix = strip_provider_prefix(model);
         if stripped_prefix != model {
-            if let Some(p) = self.find(stripped_prefix) {
+            if let Some(p) = self.find_normalized(stripped_prefix) {
                 return Some(p);
             }
             // 同时尝试 Fireworks p→. 归一化
             let normalized = normalize_fireworks_p(stripped_prefix);
             if normalized != stripped_prefix {
-                if let Some(p) = self.find(&normalized) {
+                if let Some(p) = self.find_normalized(&normalized) {
                     return Some(p);
                 }
             }
@@ -159,7 +203,7 @@ impl PricingTable {
         // 4b. 尝试 Fireworks p→. 归一化（即使没有 provider 前缀）
         let normalized = normalize_fireworks_p(model);
         if normalized != model {
-            if let Some(p) = self.find(&normalized) {
+            if let Some(p) = self.find_normalized(&normalized) {
                 return Some(p);
             }
         }
@@ -176,6 +220,11 @@ impl PricingTable {
             if let Some(p) = self.devin_labels.get(stripped_date) {
                 return Some(p);
             }
+        }
+
+        // Flash 没有已确认的独立价格，不能通过前缀静默套用 glm-5.3。
+        if stripped_date == "glm-5.3-flash" {
+            return None;
         }
 
         // 6. models.dev 表前缀匹配 — 找最长的键作为前缀
@@ -209,7 +258,10 @@ impl PricingTable {
 
 fn parse_pricing_json(json: &str) -> HashMap<String, Pricing> {
     match serde_json::from_str::<HashMap<String, Pricing>>(json) {
-        Ok(map) => map,
+        Ok(map) => map
+            .into_iter()
+            .map(|(key, value)| (key.to_ascii_lowercase(), value))
+            .collect(),
         Err(e) => {
             eprintln!("WARN 定价表解析失败: {e}");
             HashMap::new()
@@ -295,6 +347,25 @@ pub fn turn_cost(
         .map(|p| p.cost_with_cache_write(input, output, cached, cache_creation))
 }
 
+/// 计算单次请求费用。与聚合用量不同，这里会按该请求的 prompt 总量应用
+/// GPT-5.6 的 272K 长上下文阶梯价。
+pub fn single_turn_cost(
+    model: &str,
+    input: f64,
+    output: f64,
+    cached: f64,
+    cache_creation: f64,
+) -> Option<f64> {
+    let base = PricingTable::instance().find(model)?;
+    let prompt = input + cached + cache_creation;
+    if prompt > GPT_5_6_LONG_CONTEXT_THRESHOLD {
+        if let Some(long_context) = gpt_5_6_long_context_pricing(model) {
+            return Some(long_context.cost_with_cache_write(input, output, cached, cache_creation));
+        }
+    }
+    Some(base.cost_with_cache_write(input, output, cached, cache_creation))
+}
+
 /// Claude 专用：区分 5m/1h cache creation 的费用计算。
 pub fn turn_cost_claude(
     model: &str,
@@ -345,11 +416,12 @@ mod tests {
     }
 
     #[test]
-    fn devin_swe_models_are_free() {
+    fn devin_swe_models_are_priced() {
         let table = PricingTable::instance();
         let swe = table.find("swe-1-7").expect("swe-1-7 必须有定价");
-        assert_eq!(swe.i, 0.0);
-        assert_eq!(swe.o, 0.0);
+        assert_eq!(swe.i, 0.5);
+        assert_eq!(swe.o, 2.5);
+        assert_eq!(swe.cr, 0.2);
     }
 
     #[test]
@@ -420,6 +492,58 @@ mod tests {
     }
 
     #[test]
+    fn luna_long_context_uses_per_turn_threshold_and_rates() {
+        let at_threshold =
+            single_turn_cost("gpt-5-6-luna-high", 3.0, 1_000.0, 271_000.0, 997.0).unwrap();
+        let expected_standard =
+            (3.0 * 0.2 + 1_000.0 * 1.2 + 271_000.0 * 0.02 + 997.0 * 0.25) / 1_000_000.0;
+        assert!((at_threshold - expected_standard).abs() < 1e-12);
+
+        let above_threshold =
+            single_turn_cost("gpt-5-6-luna-high", 3.0, 1_000.0, 271_000.0, 998.0).unwrap();
+        let expected_long =
+            (3.0 * 0.4 + 1_000.0 * 1.8 + 271_000.0 * 0.04 + 998.0 * 0.5) / 1_000_000.0;
+        assert!((above_threshold - expected_long).abs() < 1e-12);
+    }
+
+    #[test]
+    fn exact_fast_label_keeps_fast_pricing_above_272k() {
+        let cost = single_turn_cost(
+            "GPT-5.6 Luna High Thinking Fast",
+            0.0,
+            1_000_000.0,
+            300_000.0,
+            0.0,
+        )
+        .unwrap();
+        // Fast 是独立定价，不应被非 Fast label 前缀或长上下文阶梯覆盖。
+        assert!((cost - 2.412).abs() < 1e-12);
+    }
+
+    #[test]
+    fn luna_max_and_fast_max_are_priced() {
+        let table = PricingTable::instance();
+        let standard = table.find("gpt-5-6-luna-max").expect("Luna Max 必须有定价");
+        assert_eq!(
+            (standard.i, standard.o, standard.cw, standard.cr),
+            (0.2, 1.2, 0.25, 0.02)
+        );
+        let fast = table
+            .find("gpt-5-6-luna-max-priority")
+            .expect("Luna Max Fast 必须有定价");
+        assert_eq!((fast.i, fast.o, fast.cw, fast.cr), (0.4, 2.4, 0.5, 0.04));
+    }
+
+    #[test]
+    fn lookup_is_case_insensitive_but_glm_flash_does_not_fall_back() {
+        let table = PricingTable::instance();
+        assert!(table.find("CLAUDE-OPUS-5").is_some());
+        assert!(table.find("GLM-5.2 High").is_some());
+        assert!(table.find("GLM-5.3-Flash").is_none());
+        assert!(table.find("glm-5.3-flash").is_none());
+    }
+
+    #[test]
     fn strip_date_suffix_works() {
         assert_eq!(
             strip_date_suffix("claude-haiku-4-5-20251001"),
@@ -445,16 +569,16 @@ mod tests {
     }
 
     #[test]
-    fn devin_swe_1_7_max_is_free() {
+    fn devin_swe_1_7_max_is_priced() {
         let table = PricingTable::instance();
         let p = table.find("swe-1-7-max").expect("swe-1-7-max 应有定价");
-        assert_eq!(p.i, 0.0);
-        assert_eq!(p.o, 0.0);
+        assert_eq!(p.i, 0.5);
+        assert_eq!(p.o, 2.5);
         // 也通过 label 查找
         let p2 = table
             .find("SWE-1.7 Max")
             .expect("SWE-1.7 Max label 应有定价");
-        assert_eq!(p2.i, 0.0);
+        assert_eq!(p2.i, 0.5);
     }
 
     #[test]

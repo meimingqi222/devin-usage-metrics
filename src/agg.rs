@@ -13,9 +13,9 @@ pub enum PeriodKind {
 impl PeriodKind {
     pub fn label(&self) -> &'static str {
         match self {
-            PeriodKind::Day => "日",
-            PeriodKind::Week => "周",
-            PeriodKind::Month => "月",
+            PeriodKind::Day => crate::i18n::t(crate::i18n::Key::PeriodDay),
+            PeriodKind::Week => crate::i18n::t(crate::i18n::Key::PeriodWeek),
+            PeriodKind::Month => crate::i18n::t(crate::i18n::Key::PeriodMonth),
         }
     }
 }
@@ -138,6 +138,67 @@ pub fn build_buckets_for(
     build_buckets_inner(data, kind, Some(agent), page)
 }
 
+/// 使用与图表聚合完全相同的口径计算单轮费用。
+pub fn cost_for_turn(turn: &crate::data::TurnRec, model: &str) -> Option<f64> {
+    if let Some(cost) = turn.recorded_cost {
+        return Some(cost);
+    }
+    let pricing = PricingTable::instance();
+    if turn.agent == AgentKind::Claude
+        && (turn.cache_creation_5m_tokens > 0.0 || turn.cache_creation_1h_tokens > 0.0)
+    {
+        return pricing.find(model).map(|p| {
+            p.cost_claude_cache(
+                turn.input_tokens,
+                turn.output_tokens,
+                turn.cache_read_tokens,
+                turn.cache_creation_5m_tokens,
+                turn.cache_creation_1h_tokens,
+            )
+        });
+    }
+    if turn.agent == AgentKind::Devin {
+        crate::pricing::single_turn_cost(
+            model,
+            turn.input_tokens,
+            turn.output_tokens,
+            turn.cache_read_tokens,
+            turn.cache_creation_tokens,
+        )
+    } else {
+        crate::pricing::turn_cost(
+            model,
+            turn.input_tokens,
+            turn.output_tokens,
+            turn.cache_read_tokens,
+            turn.cache_creation_tokens,
+        )
+    }
+}
+
+/// 当前已加载窗口内，一个会话对聚合费用的贡献。
+/// 每轮使用自己的实际模型和阶梯作用域；至少一轮可定价时返回累计金额。
+pub fn cost_for_session_turns(data: &LoadedData, session: &crate::data::SessionRec) -> Option<f64> {
+    let mut total = 0.0;
+    let mut has_priced_turn = false;
+    for turn in data
+        .turns
+        .iter()
+        .filter(|turn| turn.agent == session.agent && turn.session_key == session.key)
+    {
+        let model = if turn.model.is_empty() {
+            session.display_model()
+        } else {
+            turn.model.clone()
+        };
+        if let Some(cost) = cost_for_turn(turn, &model) {
+            total += cost;
+            has_priced_turn = true;
+        }
+    }
+    has_priced_turn.then_some(total)
+}
+
 fn build_buckets_inner(
     data: &LoadedData,
     kind: PeriodKind,
@@ -238,7 +299,14 @@ fn build_buckets_inner(
         .map(|s| (s.key.clone(), s.display_model()))
         .collect();
 
-    let pricing = PricingTable::instance();
+    // adaptive 会话的 key 集合：其流量是服务端路由的，在模型分布里单独标注
+    let session_adaptive: std::collections::HashSet<String> = data
+        .sessions
+        .iter()
+        .filter(|session| agent.is_none_or(|agent| session.agent == agent))
+        .filter(|s| s.selected_model == "adaptive")
+        .map(|s| s.key.clone())
+        .collect();
 
     for turn in &data.turns {
         if agent.is_some_and(|agent| turn.agent != agent) {
@@ -264,36 +332,24 @@ fn build_buckets_inner(
                 .map(String::as_str)
                 .unwrap_or("unknown")
         };
+        // adaptive 会话路由到的模型加 (adaptive) 后缀，与主动选型的流量区分；
+        // compactor / unknown 是内部流程标记，不是路由结果，不加后缀
+        let label = if session_adaptive.contains(&turn.session_key)
+            && model != "compactor"
+            && model != "unknown"
+        {
+            format!("{model}(adaptive)")
+        } else {
+            model.to_string()
+        };
         // 按模型名查找定价并计算费用；agent 自身记录过费用（如 Grok）则直接采用
-        let pricing_entry = pricing.find(model);
-        // Claude 区分 5m/1h cache creation，1h 费率 = input × 2
-        let turn_cost = turn.recorded_cost.or_else(|| {
-            pricing_entry.map(|p| {
-            if turn.agent == AgentKind::Claude
-                && (turn.cache_creation_5m_tokens > 0.0 || turn.cache_creation_1h_tokens > 0.0)
-            {
-                p.cost_claude_cache(
-                    turn.input_tokens,
-                    turn.output_tokens,
-                    turn.cache_read_tokens,
-                    turn.cache_creation_5m_tokens,
-                    turn.cache_creation_1h_tokens,
-                )
-            } else {
-                p.cost_with_cache_write(
-                    turn.input_tokens,
-                    turn.output_tokens,
-                    turn.cache_read_tokens,
-                    turn.cache_creation_tokens,
-                )
-            }
-            })
-        });
+        // （定价按原始模型名查，label 只是展示键）
+        let turn_cost = cost_for_turn(turn, model);
         if let Some(c) = turn_cost {
             b.cost += c;
         }
         // BTreeMap::entry 要求拥有 key，用 get_mut 避免每个 turn 都克隆模型名
-        match b.by_model.get_mut(model) {
+        match b.by_model.get_mut(&label) {
             Some(mu) => {
                 mu.input += turn.input_tokens;
                 mu.output += turn.output_tokens;
@@ -306,7 +362,7 @@ fn build_buckets_inner(
             }
             None => {
                 b.by_model.insert(
-                    model.to_string(),
+                    label,
                     ModelUsage {
                         input: turn.input_tokens,
                         output: turn.output_tokens,
@@ -346,5 +402,99 @@ mod tests {
             assert_eq!(previous_buckets.first().unwrap().start, previous_start);
             assert_eq!(previous_buckets.last().unwrap().end, previous_end);
         }
+    }
+
+    #[test]
+    fn adaptive_sessions_are_labeled_in_model_breakdown() {
+        let start = window_start(PeriodKind::Day, 0) + 3600;
+        let mk_turn = |model: &str| crate::data::TurnRec {
+            agent: AgentKind::Devin,
+            session_key: "cli/s1".into(),
+            created_at: start,
+            input_tokens: 1000.0,
+            output_tokens: 100.0,
+            cache_read_tokens: 0.0,
+            model: model.into(),
+            ..Default::default()
+        };
+        let data = LoadedData {
+            sessions: vec![crate::data::SessionRec {
+                agent: AgentKind::Devin,
+                key: "cli/s1".into(),
+                source: "cli".into(),
+                id: "s1".into(),
+                title: String::new(),
+                working_directory: String::new(),
+                selected_model: "adaptive".into(),
+                real_model: Some("glm-5-2".into()),
+                agent_mode: String::new(),
+                created_at: start,
+                last_activity_at: start,
+                ..Default::default()
+            }],
+            turns: vec![mk_turn("glm-5-2"), mk_turn("compactor")],
+            ..Default::default()
+        };
+
+        let buckets = build_buckets_for(&data, PeriodKind::Day, AgentKind::Devin, 0);
+        let by_model = &buckets.first().unwrap().by_model;
+        // 路由流量带 (adaptive) 后缀，compactor 不加
+        assert!(by_model.contains_key("glm-5-2(adaptive)"));
+        assert!(by_model.contains_key("compactor"));
+        assert!(!by_model.contains_key("glm-5-2"));
+        // 定价仍按原始模型名计算（glm-5-2: input $1.4/M + output $4.4/M）
+        let mu = &by_model["glm-5-2(adaptive)"];
+        assert!(mu.priced);
+        let expected = 1000.0 / 1e6 * 1.4 + 100.0 / 1e6 * 4.4;
+        assert!((mu.cost - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn long_context_tier_is_devin_only() {
+        let make_turn = |agent| crate::data::TurnRec {
+            agent,
+            model: "gpt-5.6-sol".into(),
+            input_tokens: 300_000.0,
+            ..Default::default()
+        };
+        let devin = cost_for_turn(&make_turn(AgentKind::Devin), "gpt-5.6-sol").unwrap();
+        let codex = cost_for_turn(&make_turn(AgentKind::Codex), "gpt-5.6-sol").unwrap();
+        assert!((devin - 3.0).abs() < 1e-12);
+        assert!((codex - 1.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn session_cost_sums_actual_turn_models_and_tiers() {
+        let session = crate::data::SessionRec {
+            agent: AgentKind::Devin,
+            key: "cli/mixed".into(),
+            selected_model: "adaptive".into(),
+            ..Default::default()
+        };
+        let make_turn = |model: &str, input: f64| crate::data::TurnRec {
+            agent: AgentKind::Devin,
+            session_key: session.key.clone(),
+            model: model.into(),
+            input_tokens: input,
+            ..Default::default()
+        };
+        let data = LoadedData {
+            sessions: vec![session.clone()],
+            turns: vec![
+                make_turn("gpt-5-6-luna-high", 300_000.0),
+                make_turn("gpt-5-6-luna-high", 100_000.0),
+                crate::data::TurnRec {
+                    agent: AgentKind::Codex,
+                    session_key: session.key.clone(),
+                    model: "gpt-5.6-sol".into(),
+                    input_tokens: 1_000_000.0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let cost = cost_for_session_turns(&data, &session).unwrap();
+        let expected = 300_000.0 * 0.4 / 1e6 + 100_000.0 * 0.2 / 1e6;
+        assert!((cost - expected).abs() < 1e-12);
     }
 }
