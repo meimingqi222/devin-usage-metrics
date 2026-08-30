@@ -590,10 +590,15 @@ fn load_turns_from(
     // 不在 SQLite 中解析 chat_message：它通常是几十 KB 的大 JSON，SQLite 的
     // json_extract 会重复扫描整段内容。只按会话和时间筛选，metrics 交给 Rust
     // 的反序列化器提取需要的字段。
+    // LIKE 在 SQLite 的 C 层完成大 JSON 正文扫描：没有真实 metrics 的节点不再
+    // 物化成 Rust 字符串。用 "ttft_ms" 而不是 "metrics"——后者作为 key 在所有
+    // 节点上都存在（值为 null），没有筛选力；ttft_ms 只出现在有真实指标的节点，
+    // 实测命中率约 56%。正文恰好含该字样的误报交给 Rust 侧过滤，不影响正确性。
     let sql = format!(
         "SELECT session_id, created_at, chat_message \
          FROM message_nodes \
-         WHERE session_id IN ({}) AND created_at >= ?{} AND created_at < ?{}",
+         WHERE session_id IN ({}) AND created_at >= ?{} AND created_at < ?{} \
+           AND chat_message LIKE '%\"ttft_ms\"%'",
         in_clause,
         session_ids.len() + 1,
         session_ids.len() + 2
@@ -636,6 +641,11 @@ fn load_turns_from(
     let mut seen_message_ids = HashSet::new();
     for row in rows.flatten() {
         let (session_id, created_at, chat_message) = row;
+        // SQL 已用 LIKE 预筛（见上），这里是第二道保险：跳过 ttft_ms 不在场的
+        // 节点；正文恰好含该字样的误报会被 metrics: None / ttft <= 0 正常过滤。
+        if !chat_message.contains("\"ttft_ms\"") {
+            continue;
+        }
         let Ok(message) = serde_json::from_str::<DevinChatMessage>(&chat_message) else {
             continue;
         };
@@ -1104,6 +1114,41 @@ mod tests {
         assert!(turns
             .iter()
             .all(|turn| turn.cache_creation_tokens == 95_970.0));
+    }
+
+    #[test]
+    fn devin_nodes_without_metrics_are_skipped_cheaply() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE message_nodes (session_id TEXT, created_at INTEGER, chat_message TEXT)",
+            [],
+        )
+        .unwrap();
+        // 无 metrics 的普通节点
+        let user_node = serde_json::json!({
+            "message_id": "user-1",
+            "metadata": { "finish_reason": null }
+        })
+        .to_string();
+        // 正文恰好含 "metrics" 字样但没有真正的 metrics 字段——快筛的误报
+        // 必须仍被完整解析路径正常过滤，不能产生 turn
+        let false_positive = serde_json::json!({
+            "message_id": "user-2",
+            "metadata": { "text": "the word \"metrics\" appears here" }
+        })
+        .to_string();
+        for node in [&user_node, &false_positive] {
+            conn.execute(
+                "INSERT INTO message_nodes VALUES (?1, ?2, ?3)",
+                params!["session-1", 100_i64, node],
+            )
+            .unwrap();
+        }
+
+        let mut turns = Vec::new();
+        load_turns_from(&conn, "cli", &["session-1".to_string()], 0, 200, &mut turns);
+
+        assert!(turns.is_empty());
     }
 
     #[test]

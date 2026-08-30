@@ -176,27 +176,40 @@ pub fn cost_for_turn(turn: &crate::data::TurnRec, model: &str) -> Option<f64> {
     }
 }
 
-/// 当前已加载窗口内，一个会话对聚合费用的贡献。
-/// 每轮使用自己的实际模型和阶梯作用域；至少一轮可定价时返回累计金额。
-pub fn cost_for_session_turns(data: &LoadedData, session: &crate::data::SessionRec) -> Option<f64> {
+/// 一组 turn 的费用合计（使用与图表聚合完全相同的口径）。
+/// `fallback_model` 用于 turn 未记录模型时（Devin 的 generation_model 为空）。
+/// 至少一轮可定价时返回累计金额。
+pub fn cost_for_turns<'a>(
+    turns: impl Iterator<Item = &'a crate::data::TurnRec>,
+    fallback_model: &str,
+) -> Option<f64> {
     let mut total = 0.0;
     let mut has_priced_turn = false;
-    for turn in data
-        .turns
-        .iter()
-        .filter(|turn| turn.agent == session.agent && turn.session_key == session.key)
-    {
+    for turn in turns {
         let model = if turn.model.is_empty() {
-            session.display_model()
+            fallback_model
         } else {
-            turn.model.clone()
+            turn.model.as_str()
         };
-        if let Some(cost) = cost_for_turn(turn, &model) {
+        if let Some(cost) = cost_for_turn(turn, model) {
             total += cost;
             has_priced_turn = true;
         }
     }
     has_priced_turn.then_some(total)
+}
+
+/// 当前已加载窗口内，一个会话对聚合费用的贡献。
+/// 每轮使用自己的实际模型和阶梯作用域；至少一轮可定价时返回累计金额。
+/// 调用方在遍历全部会话时应先用 session_key 预分组（见 rebuild_sessions），
+/// 避免每个会话都线性扫全部 turns。
+pub fn cost_for_session_turns(data: &LoadedData, session: &crate::data::SessionRec) -> Option<f64> {
+    cost_for_turns(
+        data.turns
+            .iter()
+            .filter(|turn| turn.agent == session.agent && turn.session_key == session.key),
+        &session.display_model(),
+    )
 }
 
 fn build_buckets_inner(
@@ -447,6 +460,63 @@ mod tests {
         assert!(mu.priced);
         let expected = 1000.0 / 1e6 * 1.4 + 100.0 / 1e6 * 4.4;
         assert!((mu.cost - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_for_turns_matches_cost_for_session_turns() {
+        let turn = |session_key: &str, model: &str, output: f64| crate::data::TurnRec {
+            agent: AgentKind::Devin,
+            session_key: session_key.into(),
+            created_at: 100,
+            output_tokens: output,
+            model: model.into(),
+            ..Default::default()
+        };
+        let session = |key: &str| crate::data::SessionRec {
+            agent: AgentKind::Devin,
+            key: key.into(),
+            source: "cli".into(),
+            id: key.into(),
+            real_model: Some("glm-5-2".into()),
+            ..Default::default()
+        };
+        let data = LoadedData {
+            sessions: vec![session("cli/a"), session("cli/b")],
+            turns: vec![
+                turn("cli/a", "glm-5-2", 100.0),
+                turn("cli/b", "glm-5-2", 200.0),
+                turn("cli/a", "compactor", 50.0),
+            ],
+            ..Default::default()
+        };
+
+        // 预分组路径与单会话路径口径一致（glm-5-2 output $4.4/M；compactor 无定价不计入）
+        let grouped = agg_group(&data, "cli/a");
+        let direct = cost_for_session_turns(&data, &data.sessions[0]);
+        assert_eq!(grouped, direct);
+        assert_eq!(grouped, Some(100.0 / 1e6 * 4.4));
+        assert_eq!(agg_group(&data, "cli/b"), Some(200.0 / 1e6 * 4.4),);
+    }
+
+    /// 模拟 rebuild_sessions 里的预分组调用方式
+    fn agg_group(data: &LoadedData, key: &str) -> Option<f64> {
+        use std::collections::HashMap;
+        let mut groups: HashMap<&str, Vec<&crate::data::TurnRec>> = HashMap::new();
+        for turn in &data.turns {
+            groups
+                .entry(turn.session_key.as_str())
+                .or_default()
+                .push(turn);
+        }
+        cost_for_turns(
+            groups.get(key).into_iter().flatten().copied(),
+            &data
+                .sessions
+                .iter()
+                .find(|s| s.key == key)
+                .unwrap()
+                .display_model(),
+        )
     }
 
     #[test]

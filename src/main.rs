@@ -178,6 +178,15 @@ impl Root {
 
     /// 按当前 Agent 预计算会话列表（排序、截断、费用、模型展示名）。
     fn rebuild_sessions(&mut self) {
+        // 先按 session_key 分组，费用合计从 O(会话数 × 轮次数) 降到 O(会话数 + 轮次数)
+        let mut turns_by_session: HashMap<&str, Vec<&data::TurnRec>> = HashMap::new();
+        for turn in self.data.turns.iter().filter(|t| t.agent == self.agent) {
+            turns_by_session
+                .entry(turn.session_key.as_str())
+                .or_default()
+                .push(turn);
+        }
+
         let mut rows: Vec<SessionRow> = self
             .data
             .sessions
@@ -186,9 +195,16 @@ impl Root {
             .map(|s| {
                 let total = s.input_tokens + s.output_tokens + s.cached_tokens;
                 // 与每日汇总一致：当前加载窗口内按实际 turn 模型逐轮计价。
-                let cost_str = agg::cost_for_session_turns(&self.data, s)
-                    .map(pricing::fmt_cost)
-                    .unwrap_or_else(|| "—".into());
+                let cost_str = agg::cost_for_turns(
+                    turns_by_session
+                        .get(s.key.as_str())
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                    &s.display_model(),
+                )
+                .map(pricing::fmt_cost)
+                .unwrap_or_else(|| "—".into());
                 let adaptive = s.selected_model == "adaptive";
                 let model_text = if adaptive {
                     i18n::tf(i18n::Key::AdaptiveShort, &[&s.display_model()])
@@ -1270,6 +1286,10 @@ fn set_macos_dock_icon() {
 }
 
 fn main() {
+    // 语言必须在任何文案生成前确定：配置文件 > 系统 locale。
+    // 必须在 --cli 分支之前，否则 CLI 会停在 LANG 的静态默认值上。
+    i18n::init();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "--cli") {
         if let Err(error) = cli::run(args.into_iter().skip(1).collect()) {
@@ -1280,9 +1300,6 @@ fn main() {
     }
 
     Application::new().run(move |cx: &mut App| {
-        // 在打开窗口前确定语言：配置文件 > 系统 locale
-        i18n::init();
-
         #[cfg(target_os = "macos")]
         set_macos_dock_icon();
 
