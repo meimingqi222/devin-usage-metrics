@@ -13,6 +13,7 @@ dirs = "5"
 rayon = "1"
 sys-locale = "0.3"
 unicode-width = "0.2"
+ureq = { version = "3", features = ["json"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"

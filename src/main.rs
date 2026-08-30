@@ -9,11 +9,11 @@
 use agg::{build_buckets_for, window_for, Bucket, PeriodKind};
 use chrono::TimeZone;
 use data::{AgentKind, LoadedData};
-use devin_usage_metrics::{agg, cli, data, i18n, pricing};
+use devin_usage_metrics::{agg, cli, data, i18n, pricing, quota};
 use gpui::{
-    actions, div, point, prelude::*, px, rgb, size, Animation, AnimationExt as _, App, Application,
-    Bounds, Context, KeyBinding, MouseButton, Render, SharedString, Task, TitlebarOptions, Window,
-    WindowBounds, WindowControlArea, WindowOptions,
+    actions, div, point, prelude::*, px, relative, rgb, size, Animation, AnimationExt as _, App,
+    Application, Bounds, Context, KeyBinding, MouseButton, Render, SharedString, Task,
+    TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -76,6 +76,15 @@ fn model_color(name: &str) -> u32 {
 enum Tab {
     Usage,
     Sessions,
+    Quota,
+}
+
+/// 订阅配额卡片：一个账号一条，结果在后台查询完成后整体替换。
+struct QuotaCard {
+    key: String,
+    provider: quota::Provider,
+    label: String,
+    result: Result<quota::QuotaResult, String>,
 }
 
 /// 会话列表的一行，在数据变化时预计算好展示所需的字符串，
@@ -105,6 +114,14 @@ struct Root {
     has_loaded: bool,
     load_task: Option<Task<()>>,
     load_id: u64,
+    quota_cards: Vec<QuotaCard>,
+    quota_loading: bool,
+    quota_load_id: u64,
+    quota_task: Option<Task<()>>,
+    quota_tick_task: Option<Task<()>>,
+    quota_adding: bool,
+    quota_updated_at: String,
+    quota_message: Option<String>,
 }
 
 impl Root {
@@ -174,6 +191,117 @@ impl Root {
 
     fn rebuild_buckets(&mut self) {
         self.buckets = build_buckets_for(&self.data, self.period, self.agent, self.page);
+    }
+
+    fn switch_tab(&mut self, kind: Tab, cx: &mut Context<Self>) {
+        self.tab = kind;
+        // 首次进入 Quota Tab 时自动拉取一次
+        if kind == Tab::Quota && !self.quota_loading && self.quota_updated_at.is_empty() {
+            self.start_quota_load(cx);
+        }
+        cx.notify();
+    }
+
+    /// 后台发现账号并逐个查询配额（含必要的 token 刷新），完成后整体替换卡片。
+    fn start_quota_load(&mut self, cx: &mut Context<Self>) {
+        self.quota_load_id += 1;
+        let load_id = self.quota_load_id;
+        self.quota_loading = true;
+        self.quota_message = None;
+        cx.notify();
+
+        let load = cx.background_executor().spawn(async move {
+            let accounts = quota::discover_accounts();
+            accounts
+                .iter()
+                .map(|account| QuotaCard {
+                    key: account.key.clone(),
+                    provider: account.provider,
+                    label: account.label.clone(),
+                    result: quota::fetch_account(account),
+                })
+                .collect::<Vec<_>>()
+        });
+        self.quota_task = Some(cx.spawn(async move |this, cx| {
+            let cards = load.await;
+            this.update(cx, |this, cx| {
+                if this.quota_load_id != load_id {
+                    return;
+                }
+                this.quota_loading = false;
+                this.quota_cards = cards;
+                this.quota_updated_at = chrono::Local::now().format("%H:%M:%S").to_string();
+                if this.tab == Tab::Quota {
+                    cx.notify();
+                }
+                this.quota_tick(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// 每 30 秒重绘一次，驱动重置倒计时；离开 Quota Tab 或清空后自动停止。
+    fn quota_tick(&mut self, cx: &mut Context<Self>) {
+        let timer = cx.background_executor().timer(Duration::from_secs(30));
+        self.quota_tick_task = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                if this.tab == Tab::Quota && !this.quota_cards.is_empty() {
+                    cx.notify();
+                    this.quota_tick(cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// 从剪贴板读取 Devin Cookie，验证后保存并重新查询。
+    fn add_devin_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        if self.quota_adding {
+            return;
+        }
+        let cookie = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .map(|text| text.trim().to_string())
+            .unwrap_or_default();
+        if cookie.is_empty() {
+            self.quota_message = Some(i18n::t(i18n::Key::QuotaErrClipboard).into());
+            cx.notify();
+            return;
+        }
+        self.quota_adding = true;
+        self.quota_message = None;
+        cx.notify();
+        self.quota_task = Some(cx.spawn(async move |this, cx| {
+            let cookie_for_check = cookie.clone();
+            let validate = cx
+                .background_executor()
+                .spawn(async move { quota::validate_devin_cookie(&cookie_for_check) });
+            let res = validate.await;
+            this.update(cx, |this, cx| {
+                this.quota_adding = false;
+                match res {
+                    Ok((label, org)) => {
+                        quota::save_devin_account(&label, &cookie, Some(&org));
+                        this.start_quota_load(cx);
+                    }
+                    Err(e) => {
+                        this.quota_message =
+                            Some(i18n::tf(i18n::Key::QuotaErrCookieInvalid, &[&e]));
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn remove_quota_account(&mut self, key: &str, cx: &mut Context<Self>) {
+        if let Some(idx) = key.strip_prefix("devin-").and_then(|s| s.parse::<usize>().ok()) {
+            quota::remove_devin_account(idx);
+        }
+        self.start_quota_load(cx);
     }
 
     /// 按当前 Agent 预计算会话列表（排序、截断、费用、模型展示名）。
@@ -257,9 +385,14 @@ impl Root {
     }
 
     /// 左侧边栏：应用名 + 全部 agent 的常驻切换列表。
+    /// 已安装的 agent 排在上方（正常样式），未安装的排在下方（灰色样式）。
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let items = AgentKind::ALL.into_iter().map(|kind| {
+        let mut sorted_agents = AgentKind::ALL.to_vec();
+        sorted_agents.sort_by_key(|kind| if kind.is_installed() { 0 } else { 1 });
+
+        let items = sorted_agents.into_iter().map(|kind| {
             let is_selected = kind == self.agent;
+            let installed = kind.is_installed();
             let count = self
                 .loaded_agents
                 .get(&kind)
@@ -277,12 +410,17 @@ impl Root {
                 .cursor_pointer()
                 .when(is_selected, |d| d.bg(rgba(ACCENT, 0.18)))
                 .when(!is_selected, |d| d.hover(|h| h.bg(rgb(PANEL2))))
+                .when(!installed, |d| d.opacity(0.45))
                 .child(
                     div()
                         .w(px(7.))
                         .h(px(7.))
                         .rounded_full()
-                        .bg(rgb(model_color(kind.label()))),
+                        .bg(rgb(if installed {
+                            model_color(kind.label())
+                        } else {
+                            MUTED
+                        })),
                 )
                 .child(
                     div()
@@ -293,7 +431,13 @@ impl Root {
                         } else {
                             gpui::FontWeight::MEDIUM
                         })
-                        .text_color(if is_selected { rgb(ACCENT) } else { rgb(TEXT) })
+                        .text_color(if is_selected {
+                            rgb(ACCENT)
+                        } else if installed {
+                            rgb(TEXT)
+                        } else {
+                            rgb(MUTED)
+                        })
                         .child(kind.label()),
                 )
                 .children(
@@ -332,7 +476,9 @@ impl Root {
         let period = self.period;
         let page = self.page;
         let show_period = tab == Tab::Usage;
+        let show_quota = tab == Tab::Quota;
         let loaded_at = self.loaded_at.clone();
+        let quota_updated_at = self.quota_updated_at.clone();
 
         let tab_btn = |kind: Tab, name: &'static str| {
             let active = tab == kind;
@@ -352,8 +498,7 @@ impl Root {
                 // 需要阻断传播，否则点击会进入系统标题栏拖拽循环而失效
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.tab = kind;
-                    cx.notify();
+                    this.switch_tab(kind, cx);
                 }))
         };
 
@@ -467,6 +612,7 @@ impl Root {
             .window_control_area(WindowControlArea::Drag)
             .child(tab_btn(Tab::Usage, i18n::t(i18n::Key::Usage)))
             .child(tab_btn(Tab::Sessions, i18n::t(i18n::Key::Sessions)))
+            .child(tab_btn(Tab::Quota, i18n::t(i18n::Key::QuotaTab)))
             .when(show_period, |d| {
                 d.child(
                     div()
@@ -488,6 +634,76 @@ impl Root {
                         .border_color(rgb(BORDER))
                         .child(prev_page)
                         .child(next_page),
+                )
+            })
+            .when(show_quota, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .pl_3()
+                        .border_l_1()
+                        .border_color(rgb(BORDER))
+                        .child(
+                            div()
+                                .id("quota-refresh")
+                                .px_2()
+                                .py(px(2.))
+                                .rounded_sm()
+                                .text_xs()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .when(!self.quota_loading, |b| {
+                                    b.cursor_pointer()
+                                        .text_color(rgb(MUTED))
+                                        .hover(|h| h.bg(rgb(PANEL2)))
+                                })
+                                .when(self.quota_loading, |b| b.text_color(rgba(MUTED, 0.55)))
+                                .child(if self.quota_loading {
+                                    loading_dots(5., 1.).into_any_element()
+                                } else {
+                                    div().into_any_element()
+                                })
+                                .child(if self.quota_loading {
+                                    i18n::t(i18n::Key::QuotaRefreshing)
+                                } else {
+                                    i18n::t(i18n::Key::QuotaRefresh)
+                                })
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if !this.quota_loading {
+                                        this.start_quota_load(cx);
+                                    }
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("quota-add-devin")
+                                .px_2()
+                                .py(px(2.))
+                                .rounded_sm()
+                                .text_xs()
+                                .when(!self.quota_adding, |b| {
+                                    b.cursor_pointer()
+                                        .text_color(rgb(MUTED))
+                                        .hover(|h| h.bg(rgb(PANEL2)))
+                                })
+                                .when(self.quota_adding, |b| b.text_color(rgba(MUTED, 0.55)))
+                                .child(if self.quota_adding {
+                                    i18n::t(i18n::Key::QuotaValidatingCookie)
+                                } else {
+                                    i18n::t(i18n::Key::QuotaAddDevin)
+                                })
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.add_devin_from_clipboard(cx);
+                                })),
+                        ),
                 )
             })
             .child(div().flex_1())
@@ -524,12 +740,22 @@ impl Root {
                         }
                     })),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(i18n::tf(i18n::Key::DataAsOf, &[&loaded_at])),
-            )
+            .when(!show_quota, |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(i18n::tf(i18n::Key::DataAsOf, &[&loaded_at])),
+                )
+            })
+            .when(show_quota && !quota_updated_at.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(i18n::tf(i18n::Key::QuotaUpdated, &[&quota_updated_at])),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1232,6 +1458,254 @@ impl Root {
                 },
             ))
     }
+
+    /// 订阅用量视图：每个账号一张卡片，展示各配额窗口的用量进度条与重置倒计时。
+    fn quota_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut body = div()
+            .id("quota-scroll")
+            .size_full()
+            .min_w(px(0.))
+            .overflow_scroll()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_3();
+
+        if let Some(msg) = &self.quota_message {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xf87171))
+                    .child(msg.clone()),
+            );
+        }
+
+        if self.quota_loading && self.quota_cards.is_empty() {
+            return body.child(
+                div()
+                    .p_4()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(loading_dots(6., 1.5))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child(i18n::t(i18n::Key::QuotaLoading)),
+                    ),
+            );
+        }
+
+        if self.quota_cards.is_empty() {
+            return body.child(
+                div()
+                    .p_4()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child(i18n::t(i18n::Key::QuotaNoAccounts)),
+            );
+        }
+
+        let cards: Vec<gpui::Div> = self
+            .quota_cards
+            .iter()
+            .map(|card| self.quota_card(card, cx))
+            .collect();
+        body.child(div().flex().flex_wrap().gap_3().children(cards))
+    }
+
+    fn quota_card(&self, card: &QuotaCard, cx: &mut Context<Self>) -> gpui::Div {
+        let removable = card.key.starts_with("devin-");
+        let key = card.key.clone();
+        let mut header = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(7.))
+                    .h(px(7.))
+                    .rounded_full()
+                    .bg(rgb(provider_color(card.provider))),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child(card.provider.label()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(card.label.clone()),
+            );
+        if removable {
+            header = header.child(
+                div()
+                    .id(SharedString::from(format!("quota-rm-{}", card.key)))
+                    .px_1()
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(rgb(MUTED))
+                    .hover(|h| h.text_color(rgb(0xf87171)))
+                    .child(i18n::t(i18n::Key::QuotaRemove))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.remove_quota_account(&key, cx);
+                    })),
+            );
+        }
+
+        let mut d = div()
+            .w(px(320.))
+            .p_3()
+            .rounded_md()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(header);
+
+        match &card.result {
+            Err(e) => {
+                d = d.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xf87171))
+                        .child(i18n::tf(i18n::Key::QuotaError, &[e])),
+                );
+            }
+            Ok(result) => {
+                if let Some(plan) = &result.plan {
+                    d = d.child(div().flex().child(
+                        div()
+                            .px_2()
+                            .py(px(1.))
+                            .rounded_sm()
+                            .bg(rgb(PANEL2))
+                            .text_xs()
+                            .text_color(rgb(ACCENT))
+                            .child(plan.clone()),
+                    ));
+                }
+                for w in &result.windows {
+                    let color = pct_color(w.used_percent);
+                    let bar_pct = w.used_percent.clamp(0.0, 100.0) as f32 / 100.0;
+                    let mut win = div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .text_xs()
+                                        .text_color(rgb(TEXT))
+                                        .child(window_label_text(&w.label)),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(color))
+                                        .child(format!("{:.0}%", w.used_percent)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .h(px(6.))
+                                .rounded_full()
+                                .bg(rgb(PANEL2))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(relative(bar_pct))
+                                        .rounded_full()
+                                        .bg(rgb(color)),
+                                ),
+                        );
+                    if let Some(ts) = w.resets_at {
+                        let countdown = quota::fmt_countdown(ts);
+                        if !countdown.is_empty() {
+                            win = win.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(i18n::tf(i18n::Key::QuotaResetsIn, &[&countdown])),
+                            );
+                        }
+                    }
+                    d = d.child(win);
+                }
+                if result.windows.is_empty() {
+                    d = d.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(i18n::t(i18n::Key::NoRecord)),
+                    );
+                }
+                if let Some(extra) = &result.extra {
+                    d = d.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(i18n::tf(i18n::Key::QuotaExtra, &[extra])),
+                    );
+                }
+            }
+        }
+        d
+    }
+}
+
+fn provider_color(provider: quota::Provider) -> u32 {
+    match provider {
+        quota::Provider::Claude => 0xd97757,
+        quota::Provider::Codex => 0x3ddc97,
+        quota::Provider::Grok => 0xe6e6ee,
+        quota::Provider::Devin => 0x4cc2ff,
+    }
+}
+
+/// 进度条阈值配色：<50% 绿、<80% 黄、否则红。
+fn pct_color(pct: f64) -> u32 {
+    if pct < 50.0 {
+        0x34d399
+    } else if pct < 80.0 {
+        0xfbbf24
+    } else {
+        0xf87171
+    }
+}
+
+fn window_label_text(label: &quota::WindowLabel) -> String {
+    match label {
+        quota::WindowLabel::FiveHour => i18n::t(i18n::Key::QuotaWindowFiveHour).into(),
+        quota::WindowLabel::SevenDay => i18n::t(i18n::Key::QuotaWindowSevenDay).into(),
+        quota::WindowLabel::SevenDayOauthApps => i18n::t(i18n::Key::QuotaWindowSevenDayApps).into(),
+        quota::WindowLabel::SevenDayOpus => i18n::t(i18n::Key::QuotaWindowSevenDayOpus).into(),
+        quota::WindowLabel::SevenDaySonnet => i18n::t(i18n::Key::QuotaWindowSevenDaySonnet).into(),
+        quota::WindowLabel::Daily => i18n::t(i18n::Key::QuotaWindowDaily).into(),
+        quota::WindowLabel::Weekly => i18n::t(i18n::Key::QuotaWindowWeekly).into(),
+        quota::WindowLabel::Monthly => i18n::t(i18n::Key::QuotaWindowMonthly).into(),
+        quota::WindowLabel::Custom(name) => name.clone(),
+    }
 }
 
 fn legend(name: &'static str, color: u32) -> impl IntoElement {
@@ -1295,6 +1769,7 @@ impl Render for Root {
         let content = match self.tab {
             Tab::Usage => self.usage_view(cx).into_any_element(),
             Tab::Sessions => self.sessions_view(cx).into_any_element(),
+            Tab::Quota => self.quota_view(cx).into_any_element(),
         };
         let errors: Vec<String> = self
             .data
@@ -1424,6 +1899,14 @@ fn main() {
                         has_loaded: false,
                         load_task: None,
                         load_id: 0,
+                        quota_cards: Vec::new(),
+                        quota_loading: false,
+                        quota_load_id: 0,
+                        quota_task: None,
+                        quota_tick_task: None,
+                        quota_adding: false,
+                        quota_updated_at: String::new(),
+                        quota_message: None,
                     };
                     root.rebuild_buckets();
                     root.rebuild_sessions();

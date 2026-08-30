@@ -112,6 +112,43 @@ impl AgentKind {
             Self::Pi => "pi-agent",
         }
     }
+
+    /// 检查该 agent 是否在本地安装过（数据目录存在）。
+    pub fn is_installed(self) -> bool {
+        let home = || dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        match self {
+            Self::Devin => devin_db_paths().iter().any(|(_, p)| p.exists()),
+            Self::Amp => {
+                let root = std::env::var_os("AMP_DATA_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| home().join(".local/share/amp"))
+                    .join("threads");
+                root.exists()
+            }
+            Self::Claude => home().join(".claude/projects").exists(),
+            Self::Codex => {
+                let base = std::env::var_os("CODEX_HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| home().join(".codex"));
+                base.join("sessions").exists() || base.join("archived_sessions").exists()
+            }
+            Self::Antigravity => home().join(".gemini/antigravity/conversations").exists(),
+            Self::Grok => home().join(".grok/sessions").exists(),
+            Self::ZCode => {
+                home().join(".zcode/cli/db/db.sqlite").exists()
+                    || home()
+                        .join("Library/Application Support/zcode/cli/db/db.sqlite")
+                        .exists()
+            }
+            Self::OpenCode => {
+                dirs::data_dir()
+                    .map(|d| d.join("opencode/opencode.db").exists())
+                    .unwrap_or(false)
+                    || home().join(".local/share/opencode/opencode.db").exists()
+            }
+            Self::Pi => home().join(".pi/agent/sessions").exists(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
