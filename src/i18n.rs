@@ -293,6 +293,22 @@ pub enum Key {
     CliCostUsd,
     CliTotal,
     CliAll,
+
+    // 多设备同步
+    DevicesSection,
+    AllDevices,
+    ThisDevice,
+    SyncOn,
+    SyncOff,
+    SyncExporting,
+    SyncExported,
+    SyncExportFailed,
+    SyncImporting,
+    SyncNoRemote,
+    SyncLastExport,
+    SyncRemoteCount,
+    SyncDirLabel,
+    SyncDirNotSet,
 }
 
 impl Key {
@@ -412,6 +428,20 @@ impl Key {
         Key::CliCostUsd,
         Key::CliTotal,
         Key::CliAll,
+        Key::DevicesSection,
+        Key::AllDevices,
+        Key::ThisDevice,
+        Key::SyncOn,
+        Key::SyncOff,
+        Key::SyncExporting,
+        Key::SyncExported,
+        Key::SyncExportFailed,
+        Key::SyncImporting,
+        Key::SyncNoRemote,
+        Key::SyncLastExport,
+        Key::SyncRemoteCount,
+        Key::SyncDirLabel,
+        Key::SyncDirNotSet,
     ];
 }
 
@@ -545,6 +575,21 @@ fn zh(key: Key) -> &'static str {
         Key::CliCostUsd => "费用 (USD)",
         Key::CliTotal => "合计",
         Key::CliAll => "全部",
+        // 多设备同步
+        Key::DevicesSection => "设备",
+        Key::AllDevices => "所有设备",
+        Key::ThisDevice => "本机",
+        Key::SyncOn => "同步已开",
+        Key::SyncOff => "同步已关",
+        Key::SyncExporting => "同步中…",
+        Key::SyncExported => "已同步",
+        Key::SyncExportFailed => "同步失败：{0}",
+        Key::SyncImporting => "导入其他设备…",
+        Key::SyncNoRemote => "暂无其他设备数据",
+        Key::SyncLastExport => "上次同步 {0}",
+        Key::SyncRemoteCount => "已发现 {0} 台其他设备",
+        Key::SyncDirLabel => "同步目录",
+        Key::SyncDirNotSet => "未配置（使用默认）",
     }
 }
 
@@ -677,6 +722,21 @@ Examples:\n  devin-usage-metrics --cli --agent claude --since 2026-08-20 --until
         Key::CliCostUsd => "Cost (USD)",
         Key::CliTotal => "Total",
         Key::CliAll => "All",
+        // 多设备同步
+        Key::DevicesSection => "Devices",
+        Key::AllDevices => "All Devices",
+        Key::ThisDevice => "This Device",
+        Key::SyncOn => "Sync On",
+        Key::SyncOff => "Sync Off",
+        Key::SyncExporting => "Syncing…",
+        Key::SyncExported => "Synced",
+        Key::SyncExportFailed => "Sync failed: {0}",
+        Key::SyncImporting => "Importing other devices…",
+        Key::SyncNoRemote => "No other device data",
+        Key::SyncLastExport => "Last sync {0}",
+        Key::SyncRemoteCount => "Found {0} other device(s)",
+        Key::SyncDirLabel => "Sync folder",
+        Key::SyncDirNotSet => "Not set (using default)",
     }
 }
 

@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-一个原生桌面应用，用于读取 Devin、Amp、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode 与 pi-agent 在本地留下的会话数据，并展示 token 用量、模型分布与会话详情。从左侧边栏切换 Agent，界面支持中英双语；所有数据均来自本机，不会上传到任何服务器。
+一个原生桌面应用，用于读取 Devin、Amp、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode 与 pi-agent 在本地留下的会话数据，并展示 token 用量、模型分布与会话详情。从左侧边栏切换 Agent，界面支持中英双语；所有数据均来自本机，不会上传到任何服务器。多设备用户可通过 iCloud Drive 等共享文件夹自动同步并汇总查看所有设备的数据。
 
 ## 功能
 
@@ -18,6 +18,13 @@
   - 显示标题、工作目录、agent 模式、所选模型、消息数、总 tokens
   - 自动识别 `adaptive` 路由模型并显示真实模型
   - 点击任一会话查看详情：TTFT 中位数、轮次数、agent 消息数、时间区间等
+- **多设备同步**
+  - 通过 iCloud Drive（macOS）或用户配置的共享目录在多台设备间同步用量数据
+  - 同步默认关闭，顶栏点「同步已关 / 同步已开」一键开关，开启后完全自动
+  - 开启后后台每 60 秒自动导出本机数据 + 导入其他设备数据，无需手动操作
+  - 每台设备自动生成稳定设备 ID，数据包以设备 ID 命名写入共享目录
+  - 侧边栏「设备」区可切换查看单设备或汇总所有设备
+  - 无中央服务器，同步完全依赖用户已有的云盘，数据不经过任何第三方
 - **数据源**
   - Devin：`~/.local/share/devin/{cli,cli-next}/sessions.db`（Windows 使用平台数据目录）
   - Amp：`~/.local/share/amp/threads/*.json`
@@ -103,16 +110,17 @@ cargo bundle --release
 
 ```
 src/
-├── main.rs    # GPUI 应用入口、UI 渲染、用量/会话视图
+├── main.rs    # GPUI 应用入口、UI 渲染、用量/会话/配额视图、多设备同步交互
 ├── lib.rs     # 模块导出
-├── data.rs    # 公共记录、Devin SQLite 读取、磁盘缓存
+├── data.rs    # 公共记录、Devin SQLite 读取、磁盘缓存、设备标识管理
 ├── local_sources.rs # Amp、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode 与 pi-agent 导入器
+├── sync.rs    # 多设备同步：iCloud Drive 路径检测、数据包导出/导入、合并
 ├── pricing.rs # 模型定价表与费用计算
 ├── i18n.rs    # 中英双语文案、系统语言探测与偏好读写
 ├── cli.rs     # --cli 模式：按日用量汇总、表格与 CSV 输出
 ├── devin-model-pricing.json    # Devin 官方模型价格表（编译期嵌入）
 ├── models-dev-pricing.json     # 从 models.dev 提取的非 Devin 模型价格子集
-└── agg.rs     # 按日/周/月的桶聚合与模型分组
+└── agg.rs     # 按日/周/月的桶聚合与模型分组（支持按设备过滤）
 tests/
 └── dump.rs    # 端到端集成测试，校验真实数据加载与聚合
 assets/
@@ -123,7 +131,8 @@ assets/
 
 - 应用以只读方式打开 Devin 数据库，并且只读取其他 Agent 的 JSON/JSONL 文件
 - 缓存文件以原子 rename 写入，避免半截文件
-- 不发起任何网络请求，所有展示均来自本机
+- 不发起任何网络请求，所有展示均来自本机及用户配置的共享同步目录
+- 多设备同步不经过任何中央服务器，数据包仅写入用户自己的 iCloud Drive 或共享文件夹
 
 ## 许可证
 

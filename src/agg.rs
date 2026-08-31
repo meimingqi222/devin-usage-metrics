@@ -126,7 +126,7 @@ pub fn window_start(kind: PeriodKind, page: usize) -> i64 {
 }
 
 pub fn build_buckets(data: &LoadedData, kind: PeriodKind) -> Vec<Bucket> {
-    build_buckets_inner(data, kind, None, 0)
+    build_buckets_inner(data, kind, None, None, 0)
 }
 
 pub fn build_buckets_for(
@@ -135,7 +135,18 @@ pub fn build_buckets_for(
     agent: AgentKind,
     page: usize,
 ) -> Vec<Bucket> {
-    build_buckets_inner(data, kind, Some(agent), page)
+    build_buckets_inner(data, kind, Some(agent), None, page)
+}
+
+/// 按 agent + 设备过滤聚合。device 为 None 时汇总所有设备。
+pub fn build_buckets_for_device(
+    data: &LoadedData,
+    kind: PeriodKind,
+    agent: AgentKind,
+    device: Option<&str>,
+    page: usize,
+) -> Vec<Bucket> {
+    build_buckets_inner(data, kind, Some(agent), device, page)
 }
 
 /// 使用与图表聚合完全相同的口径计算单轮费用。
@@ -243,6 +254,7 @@ fn build_buckets_inner(
     data: &LoadedData,
     kind: PeriodKind,
     agent: Option<AgentKind>,
+    device: Option<&str>,
     page: usize,
 ) -> Vec<Bucket> {
     let today = Local::now().date_naive();
@@ -336,6 +348,7 @@ fn build_buckets_inner(
         .sessions
         .iter()
         .filter(|session| agent.is_none_or(|agent| session.agent == agent))
+        .filter(|session| device.is_none_or(|d| session.device_id == d))
         .map(|s| (s.key.clone(), s.display_model()))
         .collect();
 
@@ -344,12 +357,16 @@ fn build_buckets_inner(
         .sessions
         .iter()
         .filter(|session| agent.is_none_or(|agent| session.agent == agent))
+        .filter(|session| device.is_none_or(|d| session.device_id == d))
         .filter(|s| s.selected_model == "adaptive")
         .map(|s| s.key.clone())
         .collect();
 
     for turn in &data.turns {
         if agent.is_some_and(|agent| turn.agent != agent) {
+            continue;
+        }
+        if device.is_some_and(|d| turn.device_id != d) {
             continue;
         }
         let Some(b) = buckets

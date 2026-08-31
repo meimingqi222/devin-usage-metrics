@@ -6,10 +6,10 @@
     windows_subsystem = "windows"
 )]
 
-use agg::{build_buckets_for, window_for, Bucket, PeriodKind};
+use agg::{build_buckets_for_device, window_for, Bucket, PeriodKind};
 use chrono::TimeZone;
 use data::{AgentKind, LoadedData};
-use devin_usage_metrics::{agg, cli, data, i18n, pricing, quota};
+use devin_usage_metrics::{agg, cli, data, i18n, pricing, quota, sync};
 use gpui::{
     actions, div, point, prelude::*, px, relative, rgb, size, Animation, AnimationExt as _, App,
     Application, Bounds, Context, KeyBinding, MouseButton, Render, SharedString, Task,
@@ -122,6 +122,23 @@ struct Root {
     quota_adding: bool,
     quota_updated_at: String,
     quota_message: Option<String>,
+    // 多设备同步
+    /// None = 汇总所有设备；Some(id) = 只看指定设备
+    device_filter: Option<String>,
+    /// 从同步目录导入的其他设备数据（全部 agent）
+    remote_data: Arc<LoadedData>,
+    /// 同步目录中发现的设备列表
+    known_devices: Vec<sync::RemoteDevice>,
+    /// 是否正在导出/导入
+    sync_busy: bool,
+    /// 上次同步时间（HH:MM:SS）
+    sync_last_at: String,
+    /// 同步状态消息（错误等）
+    sync_message: Option<String>,
+    /// 同步是否已开启（持久化在 sync.json）
+    sync_enabled: bool,
+    /// 自动同步定时任务
+    sync_tick_task: Option<Task<()>>,
 }
 
 impl Root {
@@ -167,12 +184,33 @@ impl Root {
         });
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let data = load.await;
+            // force 加载（reload）完成后，若同步已开启则后台导出本机数据到同步目录
+            let export_task = if force && sync::is_enabled() {
+                let export_data = LoadedData {
+                    sessions: data.sessions.iter().filter(|s| {
+                        s.device_id.is_empty() || s.device_id == data::device_id()
+                    }).cloned().collect(),
+                    turns: data.turns.iter().filter(|t| {
+                        t.device_id.is_empty() || t.device_id == data::device_id()
+                    }).cloned().collect(),
+                    turns_start: data.turns_start,
+                    turns_end: data.turns_end,
+                    ..Default::default()
+                };
+                Some(cx.background_executor().spawn(async move {
+                    let _ = sync::export_local(&export_data);
+                }))
+            } else {
+                None
+            };
             this.update(cx, |this, cx| {
                 // 已有更新的加载任务时，直接丢弃本次结果
                 if this.load_id != load_id {
                     return;
                 }
-                let arc_data = Arc::new(data);
+                // 合并远程设备中该 agent 的数据
+                let merged = this.merge_remote_for_agent(data, agent);
+                let arc_data = Arc::new(merged);
                 this.loaded_agents.insert(agent, arc_data.clone());
                 this.loading = false;
                 // 加载期间用户可能已切换到其他 Agent，只缓存结果，不覆盖当前界面
@@ -186,11 +224,46 @@ impl Root {
                 }
             })
             .ok();
+            // 等待导出完成（不阻塞 UI，因为已在 update 之后）
+            if let Some(t) = export_task {
+                t.await;
+            }
         }));
     }
 
+    /// 把远程数据中指定 agent 的部分合并进本机数据。
+    fn merge_remote_for_agent(&self, local: LoadedData, agent: AgentKind) -> LoadedData {
+        if self.remote_data.sessions.is_empty() && self.remote_data.turns.is_empty() {
+            return local;
+        }
+        let remote_agent = LoadedData {
+            sessions: self
+                .remote_data
+                .sessions
+                .iter()
+                .filter(|s| s.agent == agent)
+                .cloned()
+                .collect(),
+            turns: self
+                .remote_data
+                .turns
+                .iter()
+                .filter(|t| t.agent == agent)
+                .cloned()
+                .collect(),
+            ..Default::default()
+        };
+        sync::merge_local_with_remote(&local, &remote_agent)
+    }
+
     fn rebuild_buckets(&mut self) {
-        self.buckets = build_buckets_for(&self.data, self.period, self.agent, self.page);
+        self.buckets = build_buckets_for_device(
+            &self.data,
+            self.period,
+            self.agent,
+            self.device_filter.as_deref(),
+            self.page,
+        );
     }
 
     fn switch_tab(&mut self, kind: Tab, cx: &mut Context<Self>) {
@@ -200,6 +273,165 @@ impl Root {
             self.start_quota_load(cx);
         }
         cx.notify();
+    }
+
+    /// 切换设备筛选。None = 汇总所有设备。
+    fn switch_device(&mut self, device_id: Option<String>, cx: &mut Context<Self>) {
+        if self.device_filter == device_id {
+            cx.notify();
+            return;
+        }
+        self.device_filter = device_id;
+        self.rebuild_buckets();
+        self.rebuild_sessions();
+        cx.notify();
+    }
+
+    /// 开启/关闭自动同步。切换后立即持久化，开启时立即执行一次同步并启动定时任务。
+    fn toggle_sync(&mut self, cx: &mut Context<Self>) {
+        self.sync_enabled = !self.sync_enabled;
+        let cfg = sync::SyncConfig {
+            enabled: self.sync_enabled,
+            sync_dir: sync::read_config().sync_dir,
+        };
+        sync::save_config(&cfg);
+
+        if self.sync_enabled {
+            // 开启：立即同步一次，然后启动定时任务
+            self.start_sync(cx);
+        } else {
+            // 关闭：停止定时任务，清空远程数据
+            self.sync_tick_task = None;
+            self.remote_data = Arc::new(LoadedData::default());
+            self.known_devices = Vec::new();
+            self.sync_message = None;
+            self.remerge_all_agents();
+            self.rebuild_buckets();
+            self.rebuild_sessions();
+        }
+        cx.notify();
+    }
+
+    /// 启动自动同步定时任务：每 SYNC_INTERVAL_SECS 秒自动导出+导入。
+    /// 仅在 sync_enabled 为 true 时持续运行；关闭后任务自然停止。
+    fn sync_tick(&mut self, cx: &mut Context<Self>) {
+        let timer = cx
+            .background_executor()
+            .timer(Duration::from_secs(sync::SYNC_INTERVAL_SECS));
+        self.sync_tick_task = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                // 只有同步仍处于开启状态且没有正在进行的同步时，才触发下一轮
+                if this.sync_enabled && !this.sync_busy {
+                    this.start_sync(cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// 触发一次完整的同步：导出本机数据 → 导入其他设备数据 → 重新合并已加载的 agent。
+    /// 完成后若同步仍开启，自动安排下一次定时同步。
+    fn start_sync(&mut self, cx: &mut Context<Self>) {
+        if self.sync_busy {
+            return;
+        }
+        self.sync_busy = true;
+        self.sync_message = None;
+        cx.notify();
+
+        // 导出当前已加载的全量数据（合并所有已加载 agent）
+        let export_data = {
+            let mut combined = LoadedData::default();
+            for arc in self.loaded_agents.values() {
+                // 只取本机部分（远程部分会被 export_local 过滤掉，但提前过滤减少体积）
+                combined.sessions.extend(arc.sessions.iter().filter(|s| {
+                    s.device_id.is_empty() || s.device_id == data::device_id()
+                }).cloned());
+                combined.turns.extend(arc.turns.iter().filter(|t| {
+                    t.device_id.is_empty() || t.device_id == data::device_id()
+                }).cloned());
+            }
+            combined.turns_start = self.data.turns_start;
+            combined.turns_end = self.data.turns_end;
+            combined
+        };
+
+        let export_task = cx.background_executor().spawn(async move {
+            sync::export_local(&export_data)
+        });
+
+        self.load_task = Some(cx.spawn(async move |this, cx| {
+            // 1. 导出
+            let export_result = export_task.await;
+            // 2. 导入（无论导出是否成功都尝试导入，以便读取其他设备数据）
+            let (remote, devices) = cx
+                .background_executor()
+                .spawn(async move { sync::import_remote() })
+                .await;
+
+            this.update(cx, |this, cx| {
+                this.sync_busy = false;
+                this.remote_data = Arc::new(remote);
+                this.known_devices = devices;
+                this.sync_last_at =
+                    chrono::Local::now().format("%H:%M:%S").to_string();
+
+                match export_result {
+                    Ok(_) => {}
+                    Err(e) => {
+                        this.sync_message =
+                            Some(i18n::tf(i18n::Key::SyncExportFailed, &[&e]));
+                    }
+                }
+
+                // 3. 重新合并所有已加载的 agent
+                this.remerge_all_agents();
+                this.rebuild_buckets();
+                this.rebuild_sessions();
+
+                // 4. 自动模式下安排下一次定时同步
+                if this.sync_enabled {
+                    this.sync_tick(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// 用最新的 remote_data 重新合并所有已加载 agent 的缓存数据。
+    /// 本机部分从合并前的数据中提取（device_id 为空或等于本机 ID 的记录）。
+    fn remerge_all_agents(&mut self) {
+        let local_id = data::device_id();
+        let mut updated: HashMap<AgentKind, Arc<LoadedData>> = HashMap::new();
+        for (agent, arc) in &self.loaded_agents {
+            // 提取本机部分
+            let local_only = LoadedData {
+                sessions: arc
+                    .sessions
+                    .iter()
+                    .filter(|s| s.device_id.is_empty() || s.device_id == local_id)
+                    .cloned()
+                    .collect(),
+                turns: arc
+                    .turns
+                    .iter()
+                    .filter(|t| t.device_id.is_empty() || t.device_id == local_id)
+                    .cloned()
+                    .collect(),
+                turns_start: arc.turns_start,
+                turns_end: arc.turns_end,
+                ..Default::default()
+            };
+            let merged = self.merge_remote_for_agent(local_only, *agent);
+            updated.insert(*agent, Arc::new(merged));
+        }
+        self.loaded_agents = updated;
+        // 刷新当前 agent 的显示数据
+        if let Some(arc) = self.loaded_agents.get(&self.agent) {
+            self.data = arc.clone();
+        }
     }
 
     /// 后台发现账号并逐个查询配额（含必要的 token 刷新），完成后整体替换卡片。
@@ -304,11 +536,18 @@ impl Root {
         self.start_quota_load(cx);
     }
 
-    /// 按当前 Agent 预计算会话列表（排序、截断、费用、模型展示名）。
+    /// 按当前 Agent + 设备筛选预计算会话列表（排序、截断、费用、模型展示名）。
     fn rebuild_sessions(&mut self) {
+        let device = self.device_filter.clone();
         // 先按 session_key 分组，费用合计从 O(会话数 × 轮次数) 降到 O(会话数 + 轮次数)
         let mut turns_by_session: HashMap<&str, Vec<&data::TurnRec>> = HashMap::new();
-        for turn in self.data.turns.iter().filter(|t| t.agent == self.agent) {
+        for turn in self
+            .data
+            .turns
+            .iter()
+            .filter(|t| t.agent == self.agent)
+            .filter(|t| device.as_deref().is_none_or(|d| t.device_id == d))
+        {
             turns_by_session
                 .entry(turn.session_key.as_str())
                 .or_default()
@@ -320,6 +559,7 @@ impl Root {
             .sessions
             .iter()
             .filter(|s| s.agent == self.agent)
+            .filter(|s| device.as_deref().is_none_or(|d| s.device_id == d))
             .map(|s| {
                 let total = s.input_tokens + s.output_tokens + s.cached_tokens;
                 // 与每日汇总一致：当前加载窗口内按实际 turn 模型逐轮计价。
@@ -448,6 +688,98 @@ impl Root {
                 }))
         });
 
+        // ── 设备选择区 ──
+        let local_id = data::device_id();
+        let local_name = data::device_name();
+        let current_filter = self.device_filter.clone();
+
+        // 构建设备列表：本机 + 远程（去重）
+        let mut device_items: Vec<(String, String, bool)> =
+            vec![(local_id.clone(), local_name, true)];
+        for d in &self.known_devices {
+            if !d.is_local && !device_items.iter().any(|(id, _, _)| id == &d.device_id) {
+                device_items.push((d.device_id.clone(), d.device_name.clone(), false));
+            }
+        }
+
+        // "所有设备" 选项
+        let all_selected = current_filter.is_none();
+        let all_devices_btn = div()
+            .id("device-all")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .mx_2()
+            .rounded_md()
+            .cursor_pointer()
+            .when(all_selected, |d| d.bg(rgba(ACCENT, 0.18)))
+            .when(!all_selected, |d| d.hover(|h| h.bg(rgb(PANEL2))))
+            .child(
+                div()
+                    .flex_1()
+                    .text_sm()
+                    .font_weight(if all_selected {
+                        gpui::FontWeight::BOLD
+                    } else {
+                        gpui::FontWeight::MEDIUM
+                    })
+                    .text_color(if all_selected {
+                        rgb(ACCENT)
+                    } else {
+                        rgb(TEXT)
+                    })
+                    .child(i18n::t(i18n::Key::AllDevices)),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.switch_device(None, cx);
+            }));
+
+        // 各设备选项
+        let device_btns = device_items.iter().map(|(id, name, is_local)| {
+            let id_clone = id.clone();
+            let selected = current_filter.as_deref() == Some(id.as_str());
+            div()
+                .id(SharedString::from(format!("device-{id}")))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .mx_2()
+                .rounded_md()
+                .cursor_pointer()
+                .when(selected, |d| d.bg(rgba(ACCENT, 0.18)))
+                .when(!selected, |d| d.hover(|h| h.bg(rgb(PANEL2))))
+                .child(
+                    div()
+                        .w(px(7.))
+                        .h(px(7.))
+                        .rounded_full()
+                        .bg(rgb(if *is_local { 0x3ddc97 } else { 0x4cc2ff })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .font_weight(if selected {
+                            gpui::FontWeight::BOLD
+                        } else {
+                            gpui::FontWeight::MEDIUM
+                        })
+                        .text_color(if selected {
+                            rgb(ACCENT)
+                        } else {
+                            rgb(TEXT)
+                        })
+                        .child(truncate(name, 16)),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.switch_device(Some(id_clone.clone()), cx);
+                }))
+        });
+
         div()
             .flex_shrink_0()
             .w(px(160.))
@@ -469,6 +801,18 @@ impl Root {
                     .child("Agent Usage Metrics"),
             )
             .children(items)
+            // 设备选择区
+            .child(
+                div()
+                    .pt_2()
+                    .pb_1()
+                    .px_4()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(i18n::t(i18n::Key::DevicesSection)),
+            )
+            .child(all_devices_btn)
+            .children(device_btns)
     }
 
     fn top_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -738,6 +1082,49 @@ impl Root {
                         if !this.loading {
                             this.start_load(true, cx);
                         }
+                    })),
+            )
+            // 多设备同步开关
+            .child(
+                div()
+                    .id("sync-toggle")
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_sm()
+                    .text_xs()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .text_color(if self.sync_enabled {
+                        rgb(0x3ddc97)
+                    } else {
+                        rgb(MUTED)
+                    })
+                    .hover(|h| h.bg(rgb(PANEL2)))
+                    .child(
+                        div()
+                            .w(px(7.))
+                            .h(px(7.))
+                            .rounded_full()
+                            .bg(rgb(if self.sync_enabled {
+                                0x3ddc97
+                            } else {
+                                MUTED
+                            })),
+                    )
+                    .child(if self.sync_enabled {
+                        if self.sync_busy {
+                            i18n::t(i18n::Key::SyncExporting)
+                        } else {
+                            i18n::t(i18n::Key::SyncOn)
+                        }
+                    } else {
+                        i18n::t(i18n::Key::SyncOff)
+                    })
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_sync(cx);
                     })),
             )
             .when(!show_quota, |d| {
@@ -1884,6 +2271,14 @@ fn main() {
                 });
 
                 cx.new(|cx| {
+                    // 读取同步配置：决定启动时是否导入远程数据、是否启动定时任务
+                    let sync_cfg = sync::read_config();
+                    // 同步开启时才导入远程数据；关闭时保持空，避免读到历史残留
+                    let (remote, devices) = if sync_cfg.enabled {
+                        sync::import_remote()
+                    } else {
+                        (LoadedData::default(), Vec::new())
+                    };
                     let mut root = Root {
                         data: Arc::new(LoadedData::default()),
                         loaded_agents: HashMap::new(),
@@ -1907,10 +2302,22 @@ fn main() {
                         quota_adding: false,
                         quota_updated_at: String::new(),
                         quota_message: None,
+                        device_filter: None,
+                        remote_data: Arc::new(remote),
+                        known_devices: devices,
+                        sync_busy: false,
+                        sync_last_at: String::new(),
+                        sync_message: None,
+                        sync_enabled: sync_cfg.enabled,
+                        sync_tick_task: None,
                     };
                     root.rebuild_buckets();
                     root.rebuild_sessions();
                     root.start_load(false, cx);
+                    // 同步已开启：启动后立即同步一次，定时任务会在同步完成后自动接续
+                    if root.sync_enabled {
+                        root.start_sync(cx);
+                    }
                     root
                 })
             },

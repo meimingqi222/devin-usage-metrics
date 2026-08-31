@@ -11,7 +11,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::local_sources;
 
 const CACHE_TTL_SECS: i64 = 300; // 5 minutes cache TTL
-const CACHE_SCHEMA_VERSION: u32 = 5;
+const CACHE_SCHEMA_VERSION: u32 = 6;
 
 fn cache_path() -> PathBuf {
     #[cfg(target_os = "windows")]
@@ -46,7 +46,7 @@ fn log_path() -> PathBuf {
     cache_path().with_file_name("load.log")
 }
 
-fn log_event(message: impl AsRef<str>) {
+pub(crate) fn log_event(message: impl AsRef<str>) {
     let path = log_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -191,6 +191,157 @@ fn now_timestamp() -> Option<i64> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_secs() as i64)
+}
+
+// ── 设备标识 ──────────────────────────────────────────────────────────
+// 本机数据在加载出口处统一打上设备 ID / 名称，多设备合并时据此区分来源。
+
+/// 设备 ID 的持久化文件路径，与 config.json 同目录。
+fn device_id_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        dirs::config_dir().map(|d| d.join("devin-usage-metrics/device.json"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        dirs::config_dir().map(|d| d.join("devin-usage-metrics\\device.json"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        dirs::config_dir().map(|d| d.join("devin-usage-metrics/device.json"))
+    }
+}
+
+/// 读取或生成本机稳定设备 ID（UUID v4 字符串），首次调用时落盘。
+pub fn device_id() -> String {
+    if let Some(path) = device_id_path() {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            #[derive(serde::Deserialize)]
+            struct DeviceFile {
+                id: String,
+            }
+            if let Ok(df) = serde_json::from_str::<DeviceFile>(&text) {
+                if !df.id.is_empty() {
+                    return df.id;
+                }
+            }
+        }
+        // 生成新 UUID v4（不引入 uuid crate，用随机字节手写）
+        let id = random_uuid_v4();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        let payload = serde_json::json!({ "id": id }).to_string();
+        if std::fs::write(&temp, &payload).is_ok() {
+            let _ = std::fs::rename(&temp, &path);
+        } else {
+            let _ = std::fs::remove_file(&temp);
+        }
+        return id;
+    }
+    // 兜底：用 hostname 哈希，保证有非空标识
+    hostname()
+        .map(|h| format!("fallback-{:x}", fnv1a(h.as_bytes())))
+        .unwrap_or_else(|| "fallback-unknown".into())
+}
+
+/// 本机设备名称（hostname），用于 UI 展示。
+pub fn device_name() -> String {
+    hostname().unwrap_or_else(|| "This Device".into())
+}
+
+fn hostname() -> Option<String> {
+    std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()).or_else(|| {
+        #[cfg(unix)]
+        {
+            // 读取 /etc/hostname 作为更稳定的来源
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        }
+        #[cfg(not(unix))]
+        {
+            std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty())
+        }
+    })
+}
+
+/// 用系统随机源生成 UUID v4 字符串。
+fn random_uuid_v4() -> String {
+    let mut bytes = [0u8; 16];
+    // 优先用 /dev/urandom，Windows 用 SystemTime 凑合
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut bytes))
+            .is_err()
+        {
+            fill_random_from_time(&mut bytes);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        fill_random_from_time(&mut bytes);
+    }
+    // RFC 4122 v4 标记位
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11],
+        bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
+fn fill_random_from_time(bytes: &mut [u8; 16]) {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = nanos.to_le_bytes();
+    // 16 字节，循环填充
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = n[i % n.len()];
+    }
+    // 混入进程 id 和地址扰动
+    let pid = std::process::id() as u128;
+    let pid_bytes = pid.to_le_bytes();
+    for (i, b) in pid_bytes.iter().enumerate() {
+        bytes[i % 16] ^= b;
+    }
+}
+
+fn fnv1a(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// 给本机加载的数据打上设备标签：device_id 为空的记录填本机 ID/名称。
+/// 远程导入的数据已带各自设备 ID，不会被覆盖。
+pub fn stamp_device(data: &mut LoadedData) {
+    let id = device_id();
+    let name = device_name();
+    for s in &mut data.sessions {
+        if s.device_id.is_empty() {
+            s.device_id = id.clone();
+            s.device_name = name.clone();
+        }
+    }
+    for t in &mut data.turns {
+        if t.device_id.is_empty() {
+            t.device_id = id.clone();
+            t.device_name = name.clone();
+        }
+    }
 }
 
 fn cache_covers_range(cache_start: i64, cache_end: i64, start: i64, end: i64, now: i64) -> bool {
@@ -423,6 +574,12 @@ pub struct SessionRec {
     /// 有值时优先展示，不再按定价表计算。
     #[serde(default)]
     pub recorded_cost: Option<f64>,
+    /// 该会话来源设备的稳定 ID（本机数据在加载出口处统一打标）
+    #[serde(default)]
+    pub device_id: String,
+    /// 该会话来源设备的人类可读名称（hostname）
+    #[serde(default)]
+    pub device_name: String,
 }
 
 impl SessionRec {
@@ -467,6 +624,12 @@ pub struct TurnRec {
     /// 有值时聚合费用优先用它，而不是按定价表计算。
     #[serde(default)]
     pub recorded_cost: Option<f64>,
+    /// 该轮来源设备的稳定 ID（本机数据在加载出口处统一打标）
+    #[serde(default)]
+    pub device_id: String,
+    /// 该轮来源设备的人类可读名称（hostname）
+    #[serde(default)]
+    pub device_name: String,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -599,6 +762,7 @@ fn load_sessions_from(conn: &Connection, source: &str, out: &mut Vec<SessionRec>
             cache_creation_1h_tokens: 0.0,
             agent_messages: msgs,
             recorded_cost: None,
+        ..Default::default()
         });
     }
 }
@@ -726,6 +890,7 @@ fn load_turns_from(
             ttft_ms: ttft,
             total_time_ms: metrics.total_time_ms.unwrap_or(0.0),
             recorded_cost: None,
+        ..Default::default()
         });
     }
 }
@@ -938,6 +1103,7 @@ fn load_uncached(start: i64, end: i64, previous: Option<Arc<LoadedData>>) -> Loa
         data.file_sessions.extend(part.file_sessions);
     }
     data.turns.sort_by_key(|turn| turn.created_at);
+    stamp_device(&mut data);
     let save_started = Instant::now();
     save_to_cache(&data);
     log_event(format!(
@@ -981,9 +1147,10 @@ fn load_selected_agent(
             data.errors.append(&mut part.errors);
         }
         data.turns.sort_by_key(|turn| turn.created_at);
+        stamp_device(&mut data);
         data
     } else {
-        match agent {
+        let mut data = match agent {
             AgentKind::Amp => local_sources::load_amp(start, end, previous.as_deref()),
             AgentKind::Claude => local_sources::load_claude(start, end, previous.as_deref()),
             AgentKind::Codex => local_sources::load_codex(start, end, previous.as_deref()),
@@ -995,7 +1162,9 @@ fn load_selected_agent(
             AgentKind::OpenCode => local_sources::load_opencode(start, end),
             AgentKind::Pi => local_sources::load_pi(start, end),
             AgentKind::Devin => unreachable!(),
-        }
+        };
+        stamp_device(&mut data);
+        data
     }
 }
 

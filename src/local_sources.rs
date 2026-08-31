@@ -115,6 +115,7 @@ impl SessionBuilder {
             cache_creation_1h_tokens: self.cache_creation_1h_tokens,
             agent_messages: self.agent_messages,
             recorded_cost: self.recorded_cost,
+            ..Default::default()
         }
     }
 }
@@ -424,6 +425,7 @@ fn parse_amp_value(
                     ttft_ms: 0.0,
                     total_time_ms: 0.0,
                     recorded_cost: None,
+                ..Default::default()
                 });
             }
         }
@@ -994,6 +996,7 @@ fn parse_claude_file(
                     ttft_ms: 0.0,
                     total_time_ms: 0.0,
                     recorded_cost: None,
+                ..Default::default()
                 };
                 if message_id.is_empty() {
                     anonymous_turns.push((id, turn));
@@ -1421,6 +1424,7 @@ pub(crate) fn load_codex(start: i64, end: i64, previous: Option<&LoadedData>) ->
                 ttft_ms: 0.0,
                 total_time_ms: 0.0,
                 recorded_cost: None,
+            ..Default::default()
             });
         }
     }
@@ -1782,6 +1786,7 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> AgParse {
                             ttft_ms: 0.0,
                             total_time_ms: 0.0,
                             recorded_cost: None,
+                        ..Default::default()
                         });
                     }
                 } else if let Some(prompt) = pb_varint_field(&row, 11) {
@@ -1804,6 +1809,7 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> AgParse {
                             ttft_ms: 0.0,
                             total_time_ms: 0.0,
                             recorded_cost: None,
+                        ..Default::default()
                         });
                     }
                 }
@@ -2090,6 +2096,7 @@ fn parse_grok_session(
                     ttft_ms: 0.0,
                     total_time_ms: duration_ms,
                     recorded_cost,
+                ..Default::default()
                 });
             }
         }
@@ -2404,6 +2411,7 @@ pub(crate) fn load_zcode(start: i64, end: i64) -> LoadedData {
                         ttft_ms: ttft_ms.unwrap_or(0.0),
                         total_time_ms: duration_ms,
                         recorded_cost: None,
+                    ..Default::default()
                     });
                 }
             }
@@ -2665,6 +2673,7 @@ pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
                         ttft_ms: 0.0,
                         total_time_ms: duration_ms,
                         recorded_cost: None,
+                    ..Default::default()
                     });
                 }
             }

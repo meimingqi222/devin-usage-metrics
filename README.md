@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A native desktop app that reads local sessions from Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, and pi-agent and presents token usage, model distribution, and session details. Switch agents from the left sidebar, in a Chinese or English interface; all data stays on your machine.
+A native desktop app that reads local sessions from Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, and pi-agent and presents token usage, model distribution, and session details. Switch agents from the left sidebar, in a Chinese or English interface; all data stays on your machine. Multi-device users can sync and aggregate data across machines via iCloud Drive or any shared folder — no central server required.
 
 ## Features
 
@@ -18,6 +18,13 @@ A native desktop app that reads local sessions from Devin, Amp, Claude Code, Cod
   - Shows title, working directory, agent mode, selected model, message count, total tokens
   - Resolves `adaptive` routing to the real backing model
   - Click any session for details: median TTFT, turn count, agent messages, time span
+- **Multi-device sync**
+  - Sync usage data across machines via iCloud Drive (macOS) or a user-configured shared folder
+  - Sync is off by default; toggle it from the top bar ("Sync Off / Sync On"), then it runs fully automatically
+  - Once enabled, the app auto-exports local data and imports other devices' data every 60 seconds in the background — no manual action needed
+  - Each device auto-generates a stable device ID; data packages are named by device ID in the shared folder
+  - The sidebar "Devices" section lets you view a single device or aggregate all devices
+  - No central server — sync relies entirely on your existing cloud storage, data never touches a third party
 - **Data sources**
   - Devin: `~/.local/share/devin/{cli,cli-next}/sessions.db` (platform data directory on Windows)
   - Amp: `~/.local/share/amp/threads/*.json`
@@ -103,16 +110,17 @@ The resulting `.app` appears under `target/release/bundle/osx/` and uses `assets
 
 ```
 src/
-├── main.rs    # GPUI app entry, UI rendering, usage/sessions views
+├── main.rs    # GPUI app entry, UI rendering, usage/sessions/quota views, multi-device sync UI
 ├── lib.rs     # Module exports
-├── data.rs    # Shared records, Devin SQLite reads, on-disk cache
+├── data.rs    # Shared records, Devin SQLite reads, on-disk cache, device identity
 ├── local_sources.rs # Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, and pi-agent importers
+├── sync.rs    # Multi-device sync: iCloud Drive path detection, package export/import, merging
 ├── pricing.rs # Model pricing table and cost calculation
 ├── i18n.rs    # Chinese/English UI strings, language detection and preference file
 ├── cli.rs     # --cli mode: daily usage rollup, table and CSV output
 ├── devin-model-pricing.json    # Official Devin model price list (embedded at compile time)
 ├── models-dev-pricing.json     # Non-Devin model prices extracted from models.dev
-└── agg.rs     # Day/week/month bucketing and per-model grouping
+└── agg.rs     # Day/week/month bucketing and per-model grouping (with per-device filtering)
 tests/
 └── dump.rs    # End-to-end integration test against real local data
 assets/
@@ -123,7 +131,8 @@ assets/
 
 - Opens Devin databases read-only and only reads the other agents' JSON/JSONL files
 - Cache file is written via atomic rename to avoid partial files
-- Makes no network requests; everything shown comes from the local machine
+- Makes no network requests; everything shown comes from the local machine and the user's configured shared sync folder
+- Multi-device sync never goes through a central server — data packages are written only to your own iCloud Drive or shared folder
 
 ## License
 
