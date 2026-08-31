@@ -6,18 +6,22 @@
     windows_subsystem = "windows"
 )]
 
+mod text_input;
+
 use agg::{build_buckets_for_device, window_for, Bucket, PeriodKind};
 use chrono::TimeZone;
 use data::{AgentKind, LoadedData};
 use devin_usage_metrics::{agg, cli, data, i18n, pricing, quota, sync};
 use gpui::{
     actions, div, point, prelude::*, px, relative, rgb, size, Animation, AnimationExt as _, App,
-    Application, Bounds, Context, KeyBinding, MouseButton, Render, SharedString, Task,
-    TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions,
+    Application, Bounds, Context, Entity, FocusHandle, KeyBinding, KeyDownEvent, MouseButton,
+    Render, SharedString, Task, TitlebarOptions, Window, WindowBounds, WindowControlArea,
+    WindowOptions,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use text_input::TextInput;
 
 actions!(main, [Quit]);
 
@@ -79,6 +83,14 @@ enum Tab {
     Quota,
 }
 
+/// 左侧边栏可折叠的分区。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SidebarSection {
+    Agents,
+    Devices,
+    Sync,
+}
+
 /// 订阅配额卡片：一个账号一条，结果在后台查询完成后整体替换。
 struct QuotaCard {
     key: String,
@@ -131,14 +143,43 @@ struct Root {
     known_devices: Vec<sync::RemoteDevice>,
     /// 是否正在导出/导入
     sync_busy: bool,
+    /// 用来丢弃过期的同步任务结果（关掉同步或新一轮开始时递增）
+    sync_id: u64,
     /// 上次同步时间（HH:MM:SS）
     sync_last_at: String,
-    /// 同步状态消息（错误等）
+    /// 同步失败原因（成功时为 None）
     sync_message: Option<String>,
     /// 同步是否已开启（持久化在 sync.json）
     sync_enabled: bool,
+    /// 当前配置的同步目录（空串 = 使用默认目录），持久化在 sync.json
+    sync_dir: String,
+    /// 文件夹选择对话框任务（短暂的，单独持有避免覆盖 load_task）
+    sync_pick_task: Option<Task<()>>,
+    /// 同步后端类型
+    sync_backend: sync::SyncBackend,
+    /// WebDAV 服务器 URL
+    webdav_url: String,
+    /// WebDAV 用户名
+    webdav_username: String,
+    /// WebDAV 密码是否已存入钥匙串
+    webdav_password_set: bool,
+    /// 同步设置弹窗是否打开
+    sync_config_open: bool,
+    /// 弹窗输入框（内容在打开时从配置填入，保存时读回）
+    modal_url_input: Entity<TextInput>,
+    modal_username_input: Entity<TextInput>,
+    modal_password_input: Entity<TextInput>,
+    modal_dir_input: Entity<TextInput>,
+    /// 弹窗的键盘焦点句柄（Esc 关闭）
+    modal_focus: FocusHandle,
+    /// 左侧边栏各分区展开状态
+    section_agents_open: bool,
+    section_devices_open: bool,
+    section_sync_open: bool,
     /// 自动同步定时任务
     sync_tick_task: Option<Task<()>>,
+    /// 正在进行的一次导出+导入（与 load_task 分开，避免点重新加载打断同步）
+    sync_task: Option<Task<()>>,
 }
 
 impl Root {
@@ -184,25 +225,6 @@ impl Root {
         });
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let data = load.await;
-            // force 加载（reload）完成后，若同步已开启则后台导出本机数据到同步目录
-            let export_task = if force && sync::is_enabled() {
-                let export_data = LoadedData {
-                    sessions: data.sessions.iter().filter(|s| {
-                        s.device_id.is_empty() || s.device_id == data::device_id()
-                    }).cloned().collect(),
-                    turns: data.turns.iter().filter(|t| {
-                        t.device_id.is_empty() || t.device_id == data::device_id()
-                    }).cloned().collect(),
-                    turns_start: data.turns_start,
-                    turns_end: data.turns_end,
-                    ..Default::default()
-                };
-                Some(cx.background_executor().spawn(async move {
-                    let _ = sync::export_local(&export_data);
-                }))
-            } else {
-                None
-            };
             this.update(cx, |this, cx| {
                 // 已有更新的加载任务时，直接丢弃本次结果
                 if this.load_id != load_id {
@@ -222,12 +244,16 @@ impl Root {
                     this.rebuild_sessions();
                     cx.notify();
                 }
+                // 首次本地加载完成后再启动同步，避免冷启动时并发扫描同一数据源；
+                // 手动重新加载后也立即同步。
+                if this.sync_enabled
+                    && !this.sync_busy
+                    && (force || this.sync_last_at.is_empty())
+                {
+                    this.start_sync(cx);
+                }
             })
             .ok();
-            // 等待导出完成（不阻塞 UI，因为已在 update 之后）
-            if let Some(t) = export_task {
-                t.await;
-            }
         }));
     }
 
@@ -287,29 +313,236 @@ impl Root {
         cx.notify();
     }
 
+    /// 从 Root 当前状态构造完整的 SyncConfig。
+    fn build_sync_config(&self) -> sync::SyncConfig {
+        sync::SyncConfig {
+            enabled: self.sync_enabled,
+            sync_dir: self.sync_dir.clone(),
+            backend: self.sync_backend,
+            webdav_url: self.webdav_url.clone(),
+            webdav_username: self.webdav_username.clone(),
+        }
+    }
+
     /// 开启/关闭自动同步。切换后立即持久化，开启时立即执行一次同步并启动定时任务。
     fn toggle_sync(&mut self, cx: &mut Context<Self>) {
         self.sync_enabled = !self.sync_enabled;
-        let cfg = sync::SyncConfig {
-            enabled: self.sync_enabled,
-            sync_dir: sync::read_config().sync_dir,
-        };
-        sync::save_config(&cfg);
+        sync::save_config(&self.build_sync_config());
 
         if self.sync_enabled {
             // 开启：立即同步一次，然后启动定时任务
             self.start_sync(cx);
         } else {
-            // 关闭：停止定时任务，清空远程数据
+            // 关闭：停止定时任务，丢弃进行中的同步结果
+            self.sync_id += 1;
             self.sync_tick_task = None;
+            self.sync_task = None;
+            self.sync_busy = false;
             self.remote_data = Arc::new(LoadedData::default());
             self.known_devices = Vec::new();
             self.sync_message = None;
+            self.sync_last_at.clear();
             self.remerge_all_agents();
             self.rebuild_buckets();
             self.rebuild_sessions();
         }
         cx.notify();
+    }
+
+    /// 打开系统文件夹选择对话框，让用户挑选同步目录。
+    /// 选中后持久化到 sync.json，并在同步已开启时立即用新目录同步一次。
+    fn pick_sync_dir(&mut self, cx: &mut Context<Self>) {
+        let pick = cx.background_executor().spawn(async move {
+            rfd::AsyncFileDialog::new()
+                .set_title("Sync folder")
+                .pick_folder()
+                .await
+                .map(|h| h.path().to_path_buf())
+        });
+        let prev_dir = self.sync_dir.clone();
+        self.sync_pick_task = Some(cx.spawn(async move |this, cx| {
+            let chosen = pick.await;
+            this.update(cx, |this, cx| {
+                let Some(path) = chosen else { return };
+                let dir_str = path.to_string_lossy().to_string();
+                // 没有变化就不重复写盘/同步
+                if dir_str == prev_dir {
+                    return;
+                }
+                this.sync_dir = dir_str.clone();
+                this.modal_dir_input.update(cx, |input, cx| {
+                    input.set_text(dir_str, cx);
+                });
+                sync::save_config(&this.build_sync_config());
+                if this.sync_enabled {
+                    this.start_sync(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// 把同步目录重置为默认（清空 sync_dir，回落到 default_sync_dir）。
+    fn reset_sync_dir(&mut self, cx: &mut Context<Self>) {
+        if self.sync_dir.is_empty() {
+            return;
+        }
+        self.sync_dir = String::new();
+        self.modal_dir_input.update(cx, |input, cx| {
+            input.set_text("", cx);
+        });
+        sync::save_config(&self.build_sync_config());
+        if self.sync_enabled {
+            self.start_sync(cx);
+        }
+        cx.notify();
+    }
+
+    /// 弹窗里切换后端：只改编辑态，点保存才写盘。
+    fn set_sync_backend(&mut self, backend: sync::SyncBackend, cx: &mut Context<Self>) {
+        if self.sync_backend == backend {
+            return;
+        }
+        self.sync_backend = backend;
+        cx.notify();
+    }
+
+    /// 侧边栏切换后端：立即写盘。指纹含目的地，换后端会重新上传。
+    fn commit_sync_backend(&mut self, backend: sync::SyncBackend, cx: &mut Context<Self>) {
+        if self.sync_backend == backend {
+            return;
+        }
+        self.sync_backend = backend;
+        sync::save_config(&self.build_sync_config());
+        if self.sync_enabled {
+            self.start_sync(cx);
+        }
+        cx.notify();
+    }
+
+    fn fill_modal_inputs(&mut self, cfg: &sync::SyncConfig, cx: &mut Context<Self>) {
+        self.modal_url_input.update(cx, |input, cx| {
+            input.set_placeholder(i18n::t(i18n::Key::SyncWebDavUrlPlaceholder));
+            input.set_text(cfg.webdav_url.clone(), cx);
+        });
+        self.modal_username_input.update(cx, |input, cx| {
+            input.set_placeholder(i18n::t(i18n::Key::SyncWebDavUsernamePlaceholder));
+            input.set_text(cfg.webdav_username.clone(), cx);
+        });
+        self.modal_password_input.update(cx, |input, cx| {
+            input.set_placeholder("password");
+            input.set_text("", cx);
+        });
+        self.modal_dir_input.update(cx, |input, cx| {
+            input.set_placeholder(i18n::t(i18n::Key::SyncDirNotSet));
+            input.set_text(cfg.sync_dir.clone(), cx);
+        });
+    }
+
+    fn read_modal_inputs(&self, cx: &App) -> (String, String, String, String) {
+        (
+            self.modal_url_input.read(cx).text(),
+            self.modal_username_input.read(cx).text(),
+            self.modal_password_input.read(cx).text(),
+            self.modal_dir_input.read(cx).text(),
+        )
+    }
+
+    /// 打开同步设置弹窗，从当前配置初始化编辑值。
+    fn open_sync_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cfg = sync::read_config();
+        self.sync_backend = cfg.backend;
+        self.sync_dir = cfg.sync_dir.clone();
+        self.webdav_url = cfg.webdav_url.clone();
+        self.webdav_username = cfg.webdav_username.clone();
+        self.webdav_password_set = sync::has_webdav_password();
+        self.fill_modal_inputs(&cfg, cx);
+        self.sync_config_open = true;
+        window.focus(&self.modal_focus);
+        cx.notify();
+    }
+
+    /// 关闭弹窗并丢弃修改（重新加载已保存的配置）。
+    fn cancel_sync_config(&mut self, cx: &mut Context<Self>) {
+        let cfg = sync::read_config();
+        self.sync_backend = cfg.backend;
+        self.sync_dir = cfg.sync_dir.clone();
+        self.webdav_url = cfg.webdav_url.clone();
+        self.webdav_username = cfg.webdav_username.clone();
+        self.webdav_password_set = sync::has_webdav_password();
+        self.fill_modal_inputs(&cfg, cx);
+        self.sync_config_open = false;
+        cx.notify();
+    }
+
+    /// 保存弹窗中的同步设置。
+    fn save_sync_config(&mut self, cx: &mut Context<Self>) {
+        let (url, username, password, dir) = self.read_modal_inputs(cx);
+        self.webdav_url = url;
+        self.webdav_username = username;
+        self.sync_dir = dir;
+        if !password.is_empty() {
+            if let Err(e) = sync::save_webdav_password(&password) {
+                self.sync_message = Some(e);
+                cx.notify();
+                return;
+            }
+            self.webdav_password_set = true;
+        }
+        sync::save_config(&self.build_sync_config());
+        self.modal_password_input.update(cx, |input, cx| {
+            input.set_text("", cx);
+        });
+        self.sync_config_open = false;
+        if self.sync_enabled {
+            self.start_sync(cx);
+        }
+        cx.notify();
+    }
+
+    /// 从剪贴板读取 WebDAV 密码，填入弹窗的密码框。
+    fn paste_modal_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let password = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .map(|text| text.trim().to_string())
+            .unwrap_or_default();
+        if !password.is_empty() {
+            self.modal_password_input.update(cx, |input, cx| {
+                input.set_text(password, cx);
+            });
+            self.modal_password_input.read(cx).focus(window);
+        }
+        cx.notify();
+    }
+
+    /// 清除钥匙串中的 WebDAV 密码。
+    fn clear_webdav_password(&mut self, cx: &mut Context<Self>) {
+        sync::delete_webdav_password();
+        self.webdav_password_set = false;
+        self.modal_password_input.update(cx, |input, cx| {
+            input.set_text("", cx);
+        });
+        cx.notify();
+    }
+
+    /// 折叠/展开侧边栏分区。
+    fn toggle_section(&mut self, section: SidebarSection, cx: &mut Context<Self>) {
+        match section {
+            SidebarSection::Agents => self.section_agents_open = !self.section_agents_open,
+            SidebarSection::Devices => self.section_devices_open = !self.section_devices_open,
+            SidebarSection::Sync => self.section_sync_open = !self.section_sync_open,
+        }
+        cx.notify();
+    }
+
+    /// Esc 关闭同步设置弹窗。捕获阶段处理，这样输入框聚焦时也能关掉。
+    fn handle_modal_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if event.keystroke.key.eq_ignore_ascii_case("escape") {
+            self.cancel_sync_config(cx);
+            cx.stop_propagation();
+        }
     }
 
     /// 启动自动同步定时任务：每 SYNC_INTERVAL_SECS 秒自动导出+导入。
@@ -330,65 +563,84 @@ impl Root {
         }));
     }
 
+    fn sync_toggle_label(&self) -> &'static str {
+        if !self.sync_enabled {
+            i18n::t(i18n::Key::SyncOff)
+        } else if self.sync_busy {
+            i18n::t(i18n::Key::SyncExporting)
+        } else if self.sync_message.is_some() {
+            i18n::t(i18n::Key::SyncFailed)
+        } else if !self.sync_last_at.is_empty() {
+            i18n::t(i18n::Key::SyncExported)
+        } else {
+            i18n::t(i18n::Key::SyncOn)
+        }
+    }
+
+    fn sync_status_detail(&self) -> Option<String> {
+        if !self.sync_enabled || self.sync_busy {
+            return None;
+        }
+        if let Some(msg) = &self.sync_message {
+            return Some(msg.clone());
+        }
+        if !self.sync_last_at.is_empty() {
+            return Some(i18n::tf(i18n::Key::SyncLastExport, &[&self.sync_last_at]));
+        }
+        None
+    }
+
     /// 触发一次完整的同步：导出本机数据 → 导入其他设备数据 → 重新合并已加载的 agent。
     /// 完成后若同步仍开启，自动安排下一次定时同步。
     fn start_sync(&mut self, cx: &mut Context<Self>) {
         if self.sync_busy {
             return;
         }
+        self.sync_id += 1;
+        let sync_id = self.sync_id;
         self.sync_busy = true;
         self.sync_message = None;
         cx.notify();
 
-        // 导出当前已加载的全量数据（合并所有已加载 agent）
-        let export_data = {
-            let mut combined = LoadedData::default();
-            for arc in self.loaded_agents.values() {
-                // 只取本机部分（远程部分会被 export_local 过滤掉，但提前过滤减少体积）
-                combined.sessions.extend(arc.sessions.iter().filter(|s| {
-                    s.device_id.is_empty() || s.device_id == data::device_id()
-                }).cloned());
-                combined.turns.extend(arc.turns.iter().filter(|t| {
-                    t.device_id.is_empty() || t.device_id == data::device_id()
-                }).cloned());
-            }
-            combined.turns_start = self.data.turns_start;
-            combined.turns_end = self.data.turns_end;
-            combined
-        };
-
+        // 导出本机已安装的全部 agent，时间窗口固定为最近 12 个月，
+        // 与界面上的日/周/月选择无关，避免窄窗口覆盖掉远端更早的数据。
+        let (start, end) = window_for(PeriodKind::Month, 0);
         let export_task = cx.background_executor().spawn(async move {
-            sync::export_local(&export_data)
+            let export_data = collect_local_export(start, end);
+            sync::export_local(export_data)
         });
 
-        self.load_task = Some(cx.spawn(async move |this, cx| {
+        self.sync_task = Some(cx.spawn(async move |this, cx| {
             // 1. 导出
             let export_result = export_task.await;
             // 2. 导入（无论导出是否成功都尝试导入，以便读取其他设备数据）
-            let (remote, devices) = cx
+            let (remote, devices, import_error) = cx
                 .background_executor()
                 .spawn(async move { sync::import_remote() })
                 .await;
 
             this.update(cx, |this, cx| {
+                if this.sync_id != sync_id {
+                    return;
+                }
                 this.sync_busy = false;
-                this.remote_data = Arc::new(remote);
-                this.known_devices = devices;
                 this.sync_last_at =
                     chrono::Local::now().format("%H:%M:%S").to_string();
 
-                match export_result {
-                    Ok(_) => {}
-                    Err(e) => {
-                        this.sync_message =
-                            Some(i18n::tf(i18n::Key::SyncExportFailed, &[&e]));
-                    }
-                }
+                this.sync_message = match (export_result.as_ref(), import_error.as_ref()) {
+                    (Err(e), _) => Some(e.clone()),
+                    (Ok(_), Some(e)) => Some(e.clone()),
+                    (Ok(_), None) => None,
+                };
 
-                // 3. 重新合并所有已加载的 agent
-                this.remerge_all_agents();
-                this.rebuild_buckets();
-                this.rebuild_sessions();
+                // 导入失败时保留上次成功的远程数据，避免设备列表被清空。
+                if import_error.is_none() {
+                    this.remote_data = Arc::new(remote);
+                    this.known_devices = devices;
+                    this.remerge_all_agents();
+                    this.rebuild_buckets();
+                    this.rebuild_sessions();
+                }
 
                 // 4. 自动模式下安排下一次定时同步
                 if this.sync_enabled {
@@ -626,6 +878,7 @@ impl Root {
 
     /// 左侧边栏：应用名 + 全部 agent 的常驻切换列表。
     /// 已安装的 agent 排在上方（正常样式），未安装的排在下方（灰色样式）。
+    /// 左侧边栏：应用名 + 可滚动/可折叠的分区（agents、设备、同步设置）。
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut sorted_agents = AgentKind::ALL.to_vec();
         sorted_agents.sort_by_key(|kind| if kind.is_installed() { 0 } else { 1 });
@@ -643,9 +896,8 @@ impl Root {
                 .flex()
                 .items_center()
                 .gap_2()
-                .px_3()
+                .px_2()
                 .py_2()
-                .mx_2()
                 .rounded_md()
                 .cursor_pointer()
                 .when(is_selected, |d| d.bg(rgba(ACCENT, 0.18)))
@@ -702,20 +954,66 @@ impl Root {
             }
         }
 
-        // "所有设备" 选项
+        // 各设备选项
+        let device_btns = device_items.into_iter().map(|(id, name, is_local)| {
+            let id_clone = id.clone();
+            let selected = current_filter.as_deref() == Some(id.as_str());
+            div()
+                .id(SharedString::from(format!("device-{id}")))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .when(selected, |d| d.bg(rgba(ACCENT, 0.18)))
+                .when(!selected, |d| d.hover(|h| h.bg(rgb(PANEL2))))
+                .child(
+                    div()
+                        .w(px(7.))
+                        .h(px(7.))
+                        .rounded_full()
+                        .bg(rgb(if is_local { 0x3ddc97 } else { 0x4cc2ff })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .w(px(0.))
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_sm()
+                        .font_weight(if selected {
+                            gpui::FontWeight::BOLD
+                        } else {
+                            gpui::FontWeight::MEDIUM
+                        })
+                        .text_color(if selected {
+                            rgb(ACCENT)
+                        } else {
+                            rgb(TEXT)
+                        })
+                        .child(truncate(&name, 14)),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.switch_device(Some(id_clone.clone()), cx);
+                }))
+        });
+
         let all_selected = current_filter.is_none();
-        let all_devices_btn = div()
+        let all_btn = div()
             .id("device-all")
             .flex()
             .items_center()
             .gap_2()
-            .px_3()
+            .px_2()
             .py_1()
-            .mx_2()
             .rounded_md()
             .cursor_pointer()
             .when(all_selected, |d| d.bg(rgba(ACCENT, 0.18)))
             .when(!all_selected, |d| d.hover(|h| h.bg(rgb(PANEL2))))
+            .child(div().w(px(7.)).h(px(7.)))
             .child(
                 div()
                     .flex_1()
@@ -732,61 +1030,197 @@ impl Root {
                     })
                     .child(i18n::t(i18n::Key::AllDevices)),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(|this, _, _, cx| {
                 this.switch_device(None, cx);
             }));
 
-        // 各设备选项
-        let device_btns = device_items.iter().map(|(id, name, is_local)| {
-            let id_clone = id.clone();
-            let selected = current_filter.as_deref() == Some(id.as_str());
+        let section_header = |section: SidebarSection, title: &'static str, open: bool| {
+            let arrow = if open { "▾" } else { "▸" };
             div()
-                .id(SharedString::from(format!("device-{id}")))
-                .flex()
-                .items_center()
-                .gap_2()
+                .id(SharedString::from(format!("section-{section:?}")))
+                .pt_3()
+                .pb_1()
                 .px_3()
-                .py_1()
-                .mx_2()
-                .rounded_md()
+                .text_xs()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(rgb(MUTED))
                 .cursor_pointer()
-                .when(selected, |d| d.bg(rgba(ACCENT, 0.18)))
-                .when(!selected, |d| d.hover(|h| h.bg(rgb(PANEL2))))
-                .child(
-                    div()
-                        .w(px(7.))
-                        .h(px(7.))
-                        .rounded_full()
-                        .bg(rgb(if *is_local { 0x3ddc97 } else { 0x4cc2ff })),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_sm()
-                        .font_weight(if selected {
-                            gpui::FontWeight::BOLD
-                        } else {
-                            gpui::FontWeight::MEDIUM
-                        })
-                        .text_color(if selected {
-                            rgb(ACCENT)
-                        } else {
-                            rgb(TEXT)
-                        })
-                        .child(truncate(name, 16)),
-                )
+                .hover(|h| h.text_color(rgb(TEXT)))
+                .child(format!("{arrow}  {title}"))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.switch_device(Some(id_clone.clone()), cx);
+                    this.toggle_section(section, cx);
                 }))
-        });
+        };
+
+        let agents_header = section_header(SidebarSection::Agents, i18n::t(i18n::Key::AgentsSection), self.section_agents_open);
+        let devices_header = section_header(SidebarSection::Devices, i18n::t(i18n::Key::DevicesSection), self.section_devices_open);
+        let sync_header = section_header(SidebarSection::Sync, i18n::t(i18n::Key::SyncDirLabel), self.section_sync_open);
+
+        let sync_backend_btns = div()
+            .flex()
+            .gap_1()
+            .px_2()
+            .pt_1()
+            .child(
+                div()
+                    .id("sync-backend-local")
+                    .flex_1()
+                    .text_center()
+                    .py(px(2.))
+                    .text_xs()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(self.sync_backend == sync::SyncBackend::Local, |d| {
+                        d.bg(rgb(PANEL2)).text_color(rgb(TEXT))
+                    })
+                    .when(self.sync_backend != sync::SyncBackend::Local, |d| {
+                        d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
+                    })
+                    .child(i18n::t(i18n::Key::SyncBackendLocal))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.commit_sync_backend(sync::SyncBackend::Local, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id("sync-backend-webdav")
+                    .flex_1()
+                    .text_center()
+                    .py(px(2.))
+                    .text_xs()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(self.sync_backend == sync::SyncBackend::WebDav, |d| {
+                        d.bg(rgb(PANEL2)).text_color(rgb(TEXT))
+                    })
+                    .when(self.sync_backend != sync::SyncBackend::WebDav, |d| {
+                        d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
+                    })
+                    .child(i18n::t(i18n::Key::SyncBackendWebDav))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.commit_sync_backend(sync::SyncBackend::WebDav, cx);
+                    })),
+            );
+
+        let sync_config_btn = div()
+            .id("sync-config-open")
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .text_xs()
+            .text_color(rgb(MUTED))
+            .cursor_pointer()
+            .hover(|h| h.bg(rgb(PANEL2)))
+            .child(i18n::t(i18n::Key::SyncConfigConfigure))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_sync_config(window, cx);
+            }));
+
+        // 可滚动内容区
+        let content = div()
+            .id("sidebar-scroll")
+            .flex_1()
+            .min_w(px(0.))
+            .overflow_scroll()
+            .flex()
+            .flex_col()
+            .child(agents_header)
+            .when(self.section_agents_open, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .pl(px(12.))
+                        .pr_2()
+                        .children(items),
+                )
+            })
+            .child(devices_header)
+            .when(self.section_devices_open, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .pl(px(12.))
+                        .pr_2()
+                        .child(all_btn)
+                        .children(device_btns),
+                )
+            })
+            .child(sync_header)
+            .when(self.section_sync_open, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .pl(px(12.))
+                        .pr_2()
+                        .child(sync_backend_btns)
+                        .child(sync_config_btn),
+                )
+            });
+
+        // 同步开关（移到侧边栏底部），下面一行显示上次时间或失败原因
+        let sync_failed = self.sync_enabled && self.sync_message.is_some();
+        let sync_color = if sync_failed {
+            rgb(0xf87171)
+        } else if self.sync_enabled {
+            rgb(0x3ddc97)
+        } else {
+            rgb(MUTED)
+        };
+        let sync_detail = self.sync_status_detail();
+        let sync_toggle = div()
+            .mt_auto()
+            .mx_2()
+            .mb_2()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("sync-toggle")
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .text_xs()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .text_color(sync_color)
+                    .hover(|h| h.bg(rgb(PANEL2)))
+                    .child(
+                        div()
+                            .w(px(7.))
+                            .h(px(7.))
+                            .rounded_full()
+                            .bg(sync_color),
+                    )
+                    .child(self.sync_toggle_label())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_sync(cx);
+                    })),
+            )
+            .children(sync_detail.map(|detail| {
+                div()
+                    .px_3()
+                    .pt(px(1.))
+                    .text_xs()
+                    .text_color(if sync_failed {
+                        rgb(0xf87171)
+                    } else {
+                        rgb(MUTED)
+                    })
+                    .child(detail)
+            }));
 
         div()
+            .id("sidebar")
             .flex_shrink_0()
             .w(px(160.))
             .h_full()
             .flex()
             .flex_col()
-            .gap_1()
             // 顶部留出 macOS 红绿灯按钮的悬浮空间
             .pt(px(40.))
             .bg(rgb(PANEL))
@@ -800,21 +1234,293 @@ impl Root {
                     .window_control_area(WindowControlArea::Drag)
                     .child("Agent Usage Metrics"),
             )
-            .children(items)
-            // 设备选择区
-            .child(
-                div()
-                    .pt_2()
-                    .pb_1()
-                    .px_4()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(i18n::t(i18n::Key::DevicesSection)),
-            )
-            .child(all_devices_btn)
-            .children(device_btns)
+            .child(content)
+            .child(sync_toggle)
     }
 
+    /// 弹窗中的文本输入框。
+    fn sync_config_input(
+        &self,
+        input: Entity<TextInput>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let focused = input.read(cx).is_focused(window);
+        let focus_input = input.clone();
+        div()
+            .w_full()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .text_xs()
+            .cursor_text()
+            .when(focused, |d| {
+                d.bg(rgb(PANEL2)).border_1().border_color(rgb(ACCENT))
+            })
+            .when(!focused, |d| d.bg(rgb(0x101014)).hover(|h| h.bg(rgb(PANEL2))))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_, _, window, cx| {
+                    focus_input.read(cx).focus(window);
+                    cx.stop_propagation();
+                }),
+            )
+            .child(input)
+    }
+
+    /// 弹窗中后端切换的小按钮。
+    fn sync_config_backend_btn(
+        &self,
+        backend: sync::SyncBackend,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.sync_backend == backend;
+        div()
+            .id(SharedString::from(format!("modal-backend-{backend:?}")))
+            .flex_1()
+            .text_center()
+            .py(px(2.))
+            .text_xs()
+            .rounded_sm()
+            .cursor_pointer()
+            .when(active, |d| d.bg(rgb(ACCENT)).text_color(rgb(0x0a0a0c)))
+            .when(!active, |d| {
+                d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
+            })
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_sync_backend(backend, cx);
+            }))
+    }
+
+    /// 同步设置弹窗（URL/用户名/密码/目录等配置）。
+    fn sync_config_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let url_input = self.sync_config_input(self.modal_url_input.clone(), window, cx);
+        let username_input =
+            self.sync_config_input(self.modal_username_input.clone(), window, cx);
+        let password_input =
+            self.sync_config_input(self.modal_password_input.clone(), window, cx);
+        let local_dir_input = self.sync_config_input(self.modal_dir_input.clone(), window, cx);
+
+        let local_form = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(i18n::t(i18n::Key::SyncDirLabel)),
+            )
+            .child(local_dir_input)
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("modal-pick-dir")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .cursor_pointer()
+                            .hover(|h| h.bg(rgb(PANEL2)))
+                            .child(i18n::t(i18n::Key::SyncDirPick))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.pick_sync_dir(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("modal-reset-dir")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .cursor_pointer()
+                            .hover(|h| h.bg(rgb(PANEL2)))
+                            .child(i18n::t(i18n::Key::SyncDirReset))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.reset_sync_dir(cx);
+                            })),
+                    ),
+            );
+
+        let webdav_form = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(i18n::t(i18n::Key::SyncWebDavUrl)),
+            )
+            .child(url_input)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(i18n::t(i18n::Key::SyncWebDavUsername)),
+            )
+            .child(username_input)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(i18n::t(i18n::Key::SyncWebDavPassword)),
+            )
+            .child(password_input)
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("modal-paste-password")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .cursor_pointer()
+                            .hover(|h| h.bg(rgb(PANEL2)))
+                            .child(i18n::t(i18n::Key::SyncWebDavPaste))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.paste_modal_password(window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("modal-clear-password")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .cursor_pointer()
+                            .hover(|h| h.bg(rgb(PANEL2)))
+                            .child(i18n::t(i18n::Key::SyncWebDavPasswordClear))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.clear_webdav_password(cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(if self.webdav_password_set {
+                        rgb(0x3ddc97)
+                    } else {
+                        rgb(MUTED)
+                    })
+                    .child(if self.webdav_password_set {
+                        i18n::t(i18n::Key::SyncWebDavPasswordSet).to_string()
+                    } else {
+                        i18n::t(i18n::Key::SyncWebDavPasswordNotSet).to_string()
+                    }),
+            );
+
+        let local_btn = self.sync_config_backend_btn(
+            sync::SyncBackend::Local,
+            i18n::t(i18n::Key::SyncBackendLocal),
+            cx,
+        );
+        let webdav_btn = self.sync_config_backend_btn(
+            sync::SyncBackend::WebDav,
+            i18n::t(i18n::Key::SyncBackendWebDav),
+            cx,
+        );
+
+        let card = div()
+            .w(px(360.))
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .shadow_md()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(TEXT))
+                    .child(i18n::t(i18n::Key::SyncConfigTitle)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(local_btn)
+                    .child(webdav_btn),
+            )
+            .child(if self.sync_backend == sync::SyncBackend::Local {
+                local_form
+            } else {
+                webdav_form
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("modal-cancel")
+                            .px_4()
+                            .py_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .cursor_pointer()
+                            .hover(|h| h.bg(rgb(PANEL2)))
+                            .child(i18n::t(i18n::Key::SyncConfigCancel))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cancel_sync_config(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("modal-save")
+                            .px_4()
+                            .py_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(0x0a0a0c))
+                            .bg(rgb(ACCENT))
+                            .cursor_pointer()
+                            .hover(|h| h.bg(rgb(0x6ad4ff)))
+                            .child(i18n::t(i18n::Key::SyncConfigSave))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.save_sync_config(cx);
+                            })),
+                    ),
+            );
+
+        div()
+            .id("sync-config-overlay")
+            .absolute()
+            .top(px(0.))
+            .bottom(px(0.))
+            .left(px(0.))
+            .right(px(0.))
+            .bg(rgba(0x000000, 0.55))
+            .flex()
+            .items_center()
+            .justify_center()
+            .track_focus(&self.modal_focus)
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                this.handle_modal_key(event, cx);
+            }))
+            .child(card)
+    }
     fn top_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tab = self.tab;
         let period = self.period;
@@ -1084,49 +1790,7 @@ impl Root {
                         }
                     })),
             )
-            // 多设备同步开关
-            .child(
-                div()
-                    .id("sync-toggle")
-                    .px_2()
-                    .py(px(2.))
-                    .rounded_sm()
-                    .text_xs()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .cursor_pointer()
-                    .text_color(if self.sync_enabled {
-                        rgb(0x3ddc97)
-                    } else {
-                        rgb(MUTED)
-                    })
-                    .hover(|h| h.bg(rgb(PANEL2)))
-                    .child(
-                        div()
-                            .w(px(7.))
-                            .h(px(7.))
-                            .rounded_full()
-                            .bg(rgb(if self.sync_enabled {
-                                0x3ddc97
-                            } else {
-                                MUTED
-                            })),
-                    )
-                    .child(if self.sync_enabled {
-                        if self.sync_busy {
-                            i18n::t(i18n::Key::SyncExporting)
-                        } else {
-                            i18n::t(i18n::Key::SyncOn)
-                        }
-                    } else {
-                        i18n::t(i18n::Key::SyncOff)
-                    })
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_sync(cx);
-                    })),
-            )
+            // 多设备同步开关已移到侧边栏底部
             .when(!show_quota, |d| {
                 d.child(
                     div()
@@ -2095,6 +2759,32 @@ fn window_label_text(label: &quota::WindowLabel) -> String {
     }
 }
 
+/// 为本机同步包收集数据。每个 Agent 都通过带新鲜度检查的加载入口读取，
+/// 避免长期运行时反复导出启动时的内存快照。
+fn collect_local_export(start: i64, end: i64) -> LoadedData {
+    let local_id = data::device_id();
+    let mut combined = LoadedData {
+        turns_start: start,
+        turns_end: end,
+        ..Default::default()
+    };
+    for kind in AgentKind::ALL {
+        if !kind.is_installed() {
+            continue;
+        }
+        let mut agent_data = data::load_agent_for_sync(kind, start, end);
+        agent_data
+            .sessions
+            .retain(|s| s.device_id.is_empty() || s.device_id == local_id);
+        agent_data
+            .turns
+            .retain(|t| t.device_id.is_empty() || t.device_id == local_id);
+        combined.sessions.append(&mut agent_data.sessions);
+        combined.turns.append(&mut agent_data.turns);
+    }
+    combined
+}
+
 fn legend(name: &'static str, color: u32) -> impl IntoElement {
     div()
         .flex()
@@ -2194,6 +2884,9 @@ impl Render for Root {
             .flex()
             .child(self.sidebar(cx))
             .child(right)
+            .when(self.sync_config_open, |d| {
+                d.child(self.sync_config_modal(window, cx))
+            })
             .into_any_element()
     }
 }
@@ -2249,6 +2942,7 @@ fn main() {
         #[cfg(not(target_os = "macos"))]
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
+        text_input::bind_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1180.), px(760.)), cx);
         cx.open_window(
@@ -2273,12 +2967,7 @@ fn main() {
                 cx.new(|cx| {
                     // 读取同步配置：决定启动时是否导入远程数据、是否启动定时任务
                     let sync_cfg = sync::read_config();
-                    // 同步开启时才导入远程数据；关闭时保持空，避免读到历史残留
-                    let (remote, devices) = if sync_cfg.enabled {
-                        sync::import_remote()
-                    } else {
-                        (LoadedData::default(), Vec::new())
-                    };
+                    let local_id = data::device_id();
                     let mut root = Root {
                         data: Arc::new(LoadedData::default()),
                         loaded_agents: HashMap::new(),
@@ -2302,22 +2991,35 @@ fn main() {
                         quota_adding: false,
                         quota_updated_at: String::new(),
                         quota_message: None,
-                        device_filter: None,
-                        remote_data: Arc::new(remote),
-                        known_devices: devices,
+                        device_filter: Some(local_id),
+                        remote_data: Arc::new(LoadedData::default()),
+                        known_devices: Vec::new(),
                         sync_busy: false,
+                        sync_id: 0,
                         sync_last_at: String::new(),
                         sync_message: None,
                         sync_enabled: sync_cfg.enabled,
+                        sync_dir: sync_cfg.sync_dir,
+                        sync_pick_task: None,
+                        sync_backend: sync_cfg.backend,
+                        webdav_url: sync_cfg.webdav_url,
+                        webdav_username: sync_cfg.webdav_username,
+                        webdav_password_set: sync::has_webdav_password(),
+                        sync_config_open: false,
+                        modal_url_input: cx.new(|cx| TextInput::new(cx, "", "", false)),
+                        modal_username_input: cx.new(|cx| TextInput::new(cx, "", "", false)),
+                        modal_password_input: cx.new(|cx| TextInput::new(cx, "", "", true)),
+                        modal_dir_input: cx.new(|cx| TextInput::new(cx, "", "", false)),
+                        modal_focus: cx.focus_handle(),
+                        section_agents_open: true,
+                        section_devices_open: true,
+                        section_sync_open: true,
                         sync_tick_task: None,
+                        sync_task: None,
                     };
                     root.rebuild_buckets();
                     root.rebuild_sessions();
                     root.start_load(false, cx);
-                    // 同步已开启：启动后立即同步一次，定时任务会在同步完成后自动接续
-                    if root.sync_enabled {
-                        root.start_sync(cx);
-                    }
                     root
                 })
             },

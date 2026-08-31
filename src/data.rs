@@ -1,4 +1,5 @@
 use crate::i18n;
+use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -215,6 +216,23 @@ fn device_id_path() -> Option<PathBuf> {
 /// 读取或生成本机稳定设备 ID（UUID v4 字符串），首次调用时落盘。
 pub fn device_id() -> String {
     if let Some(path) = device_id_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // A separate stable lock file avoids the rename/inode locking trap and
+        // serializes first creation across processes.
+        let lock_path = path.with_file_name("device.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .ok()
+            .filter(|file| file.lock_exclusive().is_ok());
+        if lock.is_none() {
+            return fallback_device_id();
+        }
         if let Ok(text) = std::fs::read_to_string(&path) {
             #[derive(serde::Deserialize)]
             struct DeviceFile {
@@ -228,19 +246,34 @@ pub fn device_id() -> String {
         }
         // 生成新 UUID v4（不引入 uuid crate，用随机字节手写）
         let id = random_uuid_v4();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        let temp = path.with_extension(format!(
+            "json.tmp-{}-{}",
+            std::process::id(),
+            now_timestamp().unwrap_or(0)
+        ));
         let payload = serde_json::json!({ "id": id }).to_string();
         if std::fs::write(&temp, &payload).is_ok() {
+            // The lock guarantees no competing creator. If replacement fails,
+            // re-read the winner rather than returning an unpersisted ID.
             let _ = std::fs::rename(&temp, &path);
         } else {
             let _ = std::fs::remove_file(&temp);
         }
-        return id;
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Some(saved) = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("id")?.as_str().map(str::to_owned))
+            {
+                return saved;
+            }
+        }
+        return fallback_device_id();
     }
     // 兜底：用 hostname 哈希，保证有非空标识
+    fallback_device_id()
+}
+
+fn fallback_device_id() -> String {
     hostname()
         .map(|h| format!("fallback-{:x}", fnv1a(h.as_bytes())))
         .unwrap_or_else(|| "fallback-unknown".into())
@@ -252,68 +285,28 @@ pub fn device_name() -> String {
 }
 
 fn hostname() -> Option<String> {
-    std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()).or_else(|| {
-        #[cfg(unix)]
-        {
-            // 读取 /etc/hostname 作为更稳定的来源
-            std::fs::read_to_string("/etc/hostname")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        }
-        #[cfg(not(unix))]
-        {
-            std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty())
-        }
-    })
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            #[cfg(unix)]
+            {
+                // 读取 /etc/hostname 作为更稳定的来源
+                std::fs::read_to_string("/etc/hostname")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            }
+            #[cfg(not(unix))]
+            {
+                std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty())
+            }
+        })
 }
 
 /// 用系统随机源生成 UUID v4 字符串。
 fn random_uuid_v4() -> String {
-    let mut bytes = [0u8; 16];
-    // 优先用 /dev/urandom，Windows 用 SystemTime 凑合
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        if std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut bytes))
-            .is_err()
-        {
-            fill_random_from_time(&mut bytes);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        fill_random_from_time(&mut bytes);
-    }
-    // RFC 4122 v4 标记位
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5], bytes[6], bytes[7],
-        bytes[8], bytes[9], bytes[10], bytes[11],
-        bytes[12], bytes[13], bytes[14], bytes[15]
-    )
-}
-
-fn fill_random_from_time(bytes: &mut [u8; 16]) {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let n = nanos.to_le_bytes();
-    // 16 字节，循环填充
-    for (i, b) in bytes.iter_mut().enumerate() {
-        *b = n[i % n.len()];
-    }
-    // 混入进程 id 和地址扰动
-    let pid = std::process::id() as u128;
-    let pid_bytes = pid.to_le_bytes();
-    for (i, b) in pid_bytes.iter().enumerate() {
-        bytes[i % 16] ^= b;
-    }
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn fnv1a(data: &[u8]) -> u64 {
@@ -453,6 +446,12 @@ pub fn load_agent(agent: AgentKind, start: i64, end: i64) -> LoadedData {
         ));
         data
     }
+}
+
+/// 同步导出用。复用五分钟内的新鲜缓存；缓存过期后按各 Agent 的增量加载逻辑
+/// 检查本地数据源，确保周期同步能发现新会话。
+pub fn load_agent_for_sync(agent: AgentKind, start: i64, end: i64) -> LoadedData {
+    load_agent(agent, start, end)
 }
 
 fn load_cache(start: i64, end: i64) -> Option<LoadedData> {
@@ -762,7 +761,7 @@ fn load_sessions_from(conn: &Connection, source: &str, out: &mut Vec<SessionRec>
             cache_creation_1h_tokens: 0.0,
             agent_messages: msgs,
             recorded_cost: None,
-        ..Default::default()
+            ..Default::default()
         });
     }
 }
@@ -890,7 +889,7 @@ fn load_turns_from(
             ttft_ms: ttft,
             total_time_ms: metrics.total_time_ms.unwrap_or(0.0),
             recorded_cost: None,
-        ..Default::default()
+            ..Default::default()
         });
     }
 }

@@ -21,8 +21,9 @@ A native desktop app that reads local sessions from Devin, Amp, Claude Code, Cod
 - **Multi-device sync**
   - Sync usage data across machines via iCloud Drive (macOS) or a user-configured shared folder
   - Sync is off by default; toggle it from the top bar ("Sync Off / Sync On"), then it runs fully automatically
-  - Once enabled, the app auto-exports local data and imports other devices' data every 60 seconds in the background — no manual action needed
-  - Each device auto-generates a stable device ID; data packages are named by device ID in the shared folder
+  - Once enabled, the app auto-exports local data and imports other devices' data every 15 minutes in the background. Startup and a manual reload also sync immediately.
+  - Each device auto-generates a stable device ID. Sync data uses compressed, content-addressed shards with an atomic per-device head, so large histories do not require one ever-growing package.
+  - Existing v1 packages are imported automatically during migration. Upgrade every actively syncing client before relying on v2 because older releases cannot read the new format.
   - The sidebar "Devices" section lets you view a single device or aggregate all devices
   - No central server — sync relies entirely on your existing cloud storage, data never touches a third party
 - **Data sources**
@@ -114,7 +115,8 @@ src/
 ├── lib.rs     # Module exports
 ├── data.rs    # Shared records, Devin SQLite reads, on-disk cache, device identity
 ├── local_sources.rs # Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, and pi-agent importers
-├── sync.rs    # Multi-device sync: iCloud Drive path detection, package export/import, merging
+├── sync.rs    # Multi-device sync orchestration, storage transports, and v1 migration
+├── sync/v2.rs # Content-addressed, compressed and integrity-checked sync protocol
 ├── pricing.rs # Model pricing table and cost calculation
 ├── i18n.rs    # Chinese/English UI strings, language detection and preference file
 ├── cli.rs     # --cli mode: daily usage rollup, table and CSV output
