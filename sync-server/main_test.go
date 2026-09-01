@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,7 +12,21 @@ import (
 	"time"
 )
 
-const testToken = "test-token-with-at-least-twenty-four-characters"
+const testAuthSecret = "test-auth-secret-with-at-least-thirty-two-characters"
+const testTenant = "github-123"
+
+func newTestCore(root string, quota int64) *server {
+	return &server{
+		root:           root,
+		githubClientID: "test-client-id",
+		authSecret:     []byte(testAuthSecret),
+		githubOAuthURL: "http://127.0.0.1:1",
+		githubAPIURL:   "http://127.0.0.1:1",
+		httpClient:     http.DefaultClient,
+		quotaBytes:     quota,
+		grace:          time.Hour,
+	}
+}
 
 func newTestServer(t *testing.T) http.Handler {
 	return newTestServerWithQuota(t, 0)
@@ -19,8 +34,10 @@ func newTestServer(t *testing.T) http.Handler {
 
 func newTestServerWithQuota(t *testing.T, quota int64) http.Handler {
 	t.Helper()
-	s := &server{root: t.TempDir(), tokens: map[string]string{testToken: "tester"}, quotaBytes: quota, grace: time.Hour}
+	s := newTestCore(t.TempDir(), quota)
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/auth/github/device", s.githubDevice)
+	mux.HandleFunc("POST /v1/auth/github/token", s.githubToken)
 	mux.HandleFunc("GET /v1/objects", s.list)
 	mux.HandleFunc("GET /v1/usage", s.usage)
 	mux.HandleFunc("POST /v1/gc", s.gc)
@@ -30,7 +47,8 @@ func newTestServerWithQuota(t *testing.T, quota int64) http.Handler {
 
 func request(handler http.Handler, method, target, body string, headers map[string]string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, target, strings.NewReader(body))
-	r.Header.Set("Authorization", "Bearer "+testToken)
+	token, _ := issueSession([]byte(testAuthSecret), sessionClaims{Tenant: testTenant, Login: "octo", Expires: time.Now().Add(time.Hour).Unix()})
+	r.Header.Set("Authorization", "Bearer "+token)
 	for key, value := range headers {
 		r.Header.Set(key, value)
 	}
@@ -54,7 +72,7 @@ func TestQuotaStillAllowsUsageAndRejectsNewWrite(t *testing.T) {
 
 func TestGCMarksHeadManifestReferencesAndRemovesOldOrphan(t *testing.T) {
 	dir := t.TempDir()
-	s := &server{root: dir, tokens: map[string]string{testToken: "tester"}, grace: time.Hour}
+	s := newTestCore(dir, 0)
 	tenant := filepath.Join(dir, "tester")
 	if err := os.MkdirAll(tenant, 0o700); err != nil {
 		t.Fatal(err)
@@ -94,7 +112,7 @@ func TestGCMarksHeadManifestReferencesAndRemovesOldOrphan(t *testing.T) {
 
 func TestGCRemovesLegacyOnlyAfterEveryDeviceMigratesForFourteenDays(t *testing.T) {
 	dir := t.TempDir()
-	s := &server{root: dir, tokens: map[string]string{testToken: "tester"}, grace: time.Hour}
+	s := newTestCore(dir, 0)
 	tenant := filepath.Join(dir, "tester")
 	if err := os.MkdirAll(tenant, 0o700); err != nil {
 		t.Fatal(err)
@@ -129,7 +147,7 @@ func TestGCRemovesLegacyOnlyAfterEveryDeviceMigratesForFourteenDays(t *testing.T
 
 func TestGCKeepsLegacyUntilEveryDeviceHasCompletedMigrationGrace(t *testing.T) {
 	dir := t.TempDir()
-	s := &server{root: dir, tokens: map[string]string{testToken: "tester"}, grace: time.Hour}
+	s := newTestCore(dir, 0)
 	tenant := filepath.Join(dir, "tester")
 	if err := os.MkdirAll(tenant, 0o700); err != nil {
 		t.Fatal(err)
@@ -168,7 +186,7 @@ func TestGCKeepsLegacyUntilEveryDeviceHasCompletedMigrationGrace(t *testing.T) {
 
 func TestGCExpiresV3ObjectsOutsideRetention(t *testing.T) {
 	dir := t.TempDir()
-	s := &server{root: dir, tokens: map[string]string{testToken: "tester"}, grace: time.Hour}
+	s := newTestCore(dir, 0)
 	tenant := filepath.Join(dir, "tester")
 	if err := os.MkdirAll(tenant, 0o700); err != nil {
 		t.Fatal(err)
@@ -234,5 +252,76 @@ func TestTenantAndAuthenticationIsolation(t *testing.T) {
 	handler.ServeHTTP(w, r)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("missing auth status=%d", w.Code)
+	}
+}
+
+func TestGitHubDeviceLoginMapsSameAccountToStableTenant(t *testing.T) {
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login/device/code":
+			if err := r.ParseForm(); err != nil || r.Form.Get("client_id") != "test-client-id" || r.Form.Get("scope") != "read:user" {
+				t.Fatalf("unexpected device request: form=%v err=%v", r.Form, err)
+			}
+			_, _ = w.Write([]byte(`{"device_code":"device-code","user_code":"ABCD-EFGH","verification_uri":"https://github.com/login/device","expires_in":900,"interval":1}`))
+		case "/login/oauth/access_token":
+			if err := r.ParseForm(); err != nil || r.Form.Get("device_code") != "device-code" {
+				t.Fatalf("unexpected token request: form=%v err=%v", r.Form, err)
+			}
+			_, _ = w.Write([]byte(`{"access_token":"github-access-token"}`))
+		case "/user":
+			if got := r.Header.Get("Authorization"); got != "Bearer github-access-token" {
+				t.Fatalf("unexpected GitHub authorization: %q", got)
+			}
+			_, _ = w.Write([]byte(`{"id":42,"login":"octocat"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer github.Close()
+
+	s := newTestCore(t.TempDir(), 0)
+	s.githubOAuthURL = github.URL
+	s.githubAPIURL = github.URL
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/auth/github/device", s.githubDevice)
+	mux.HandleFunc("POST /v1/auth/github/token", s.githubToken)
+	mux.HandleFunc("GET /v1/objects", s.list)
+
+	deviceRequest := httptest.NewRequest(http.MethodPost, "/v1/auth/github/device", nil)
+	deviceResponse := httptest.NewRecorder()
+	mux.ServeHTTP(deviceResponse, deviceRequest)
+	if deviceResponse.Code != http.StatusOK {
+		t.Fatalf("device flow start status=%d body=%s", deviceResponse.Code, deviceResponse.Body.String())
+	}
+	var device githubDeviceCode
+	if err := json.Unmarshal(deviceResponse.Body.Bytes(), &device); err != nil || device.DeviceCode != "device-code" {
+		t.Fatalf("device response=%s err=%v", deviceResponse.Body.String(), err)
+	}
+
+	tokenRequest := httptest.NewRequest(http.MethodPost, "/v1/auth/github/token", strings.NewReader(`{"device_code":"device-code"}`))
+	tokenRequest.Header.Set("Content-Type", "application/json")
+	tokenResponse := httptest.NewRecorder()
+	mux.ServeHTTP(tokenResponse, tokenRequest)
+	if tokenResponse.Code != http.StatusOK {
+		t.Fatalf("device flow completion status=%d body=%s", tokenResponse.Code, tokenResponse.Body.String())
+	}
+	var session struct {
+		SyncToken string `json:"sync_token"`
+		Login     string `json:"login"`
+	}
+	if err := json.Unmarshal(tokenResponse.Body.Bytes(), &session); err != nil || session.SyncToken == "" || session.Login != "octocat" {
+		t.Fatalf("session response=%s err=%v", tokenResponse.Body.String(), err)
+	}
+	claims, err := parseSession(s.authSecret, session.SyncToken)
+	if err != nil || claims.Tenant != "github-42" {
+		t.Fatalf("claims=%+v err=%v", claims, err)
+	}
+
+	objectRequest := httptest.NewRequest(http.MethodGet, "/v1/objects", nil)
+	objectRequest.Header.Set("Authorization", "Bearer "+session.SyncToken)
+	objectResponse := httptest.NewRecorder()
+	mux.ServeHTTP(objectResponse, objectRequest)
+	if objectResponse.Code != http.StatusOK {
+		t.Fatalf("session cannot access stable tenant: status=%d body=%s", objectResponse.Code, objectResponse.Body.String())
 	}
 }

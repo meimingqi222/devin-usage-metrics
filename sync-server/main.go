@@ -4,8 +4,9 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,30 +31,44 @@ const v3Retention = 366 * 24 * time.Hour
 const v2MigrationGrace = 14 * 24 * time.Hour
 
 type server struct {
-	root       string
-	tokens     map[string]string
-	quotaBytes int64
-	grace      time.Duration
-	mu         sync.Mutex
+	root           string
+	githubClientID string
+	authSecret     []byte
+	githubOAuthURL string
+	githubAPIURL   string
+	httpClient     *http.Client
+	quotaBytes     int64
+	grace          time.Duration
+	mu             sync.Mutex
 }
 
 func main() {
 	root := envOr("SYNC_DATA_DIR", "./data")
-	tokens, err := parseTokens(os.Getenv("SYNC_AUTH_SECRET"))
-	if err != nil {
-		log.Fatal(err)
+	githubClientID := os.Getenv("GITHUB_CLIENT_ID")
+	if githubClientID == "" {
+		log.Fatal("GITHUB_CLIENT_ID is required")
+	}
+	authSecret := []byte(os.Getenv("SYNC_AUTH_SECRET"))
+	if len(authSecret) < 32 {
+		log.Fatal("SYNC_AUTH_SECRET is required and must be at least 32 characters")
 	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		log.Fatalf("create data directory: %v", err)
 	}
 	s := &server{
-		root:       root,
-		tokens:     tokens,
-		quotaBytes: intEnv("SYNC_QUOTA_BYTES", defaultQuotaBytes),
-		grace:      durationEnv("SYNC_GC_GRACE", defaultGrace),
+		root:           root,
+		githubClientID: githubClientID,
+		authSecret:     authSecret,
+		githubOAuthURL: envOr("GITHUB_OAUTH_URL", "https://github.com"),
+		githubAPIURL:   envOr("GITHUB_API_URL", "https://api.github.com"),
+		httpClient:     &http.Client{Timeout: 15 * time.Second},
+		quotaBytes:     intEnv("SYNC_QUOTA_BYTES", defaultQuotaBytes),
+		grace:          durationEnv("SYNC_GC_GRACE", defaultGrace),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
+	mux.HandleFunc("POST /v1/auth/github/device", s.githubDevice)
+	mux.HandleFunc("POST /v1/auth/github/token", s.githubToken)
 	mux.HandleFunc("GET /v1/objects", s.list)
 	mux.HandleFunc("GET /v1/usage", s.usage)
 	mux.HandleFunc("POST /v1/gc", s.gc)
@@ -96,29 +112,6 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// SYNC_AUTH_SECRET is comma-separated token:user pairs. User names become directory
-// names, so restrict them to a conservative identifier set.
-func parseTokens(raw string) (map[string]string, error) {
-	tokens := make(map[string]string)
-	for _, entry := range strings.Split(raw, ",") {
-		if entry == "" {
-			continue
-		}
-		parts := strings.SplitN(entry, ":", 2)
-		if len(parts) != 2 || len(parts[0]) < 24 || !validTenant(parts[1]) {
-			return nil, errors.New("SYNC_AUTH_SECRET must contain token:user entries; tokens need at least 24 characters")
-		}
-		if _, exists := tokens[parts[0]]; exists {
-			return nil, errors.New("SYNC_AUTH_SECRET contains a duplicate token")
-		}
-		tokens[parts[0]] = parts[1]
-	}
-	if len(tokens) == 0 {
-		return nil, errors.New("SYNC_AUTH_SECRET is required; generate a random token for each user")
-	}
-	return tokens, nil
-}
-
 func validTenant(value string) bool {
 	if value == "" || len(value) > 64 {
 		return false
@@ -139,13 +132,55 @@ func (s *server) tenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 		http.Error(w, "missing bearer token", http.StatusUnauthorized)
 		return "", false
 	}
-	for token, tenant := range s.tokens {
-		if subtle.ConstantTimeCompare([]byte(given), []byte(token)) == 1 {
-			return tenant, true
-		}
+	claims, err := parseSession(s.authSecret, given)
+	if err != nil || !validTenant(claims.Tenant) {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		http.Error(w, "invalid or expired session", http.StatusUnauthorized)
+		return "", false
 	}
-	http.Error(w, "invalid bearer token", http.StatusUnauthorized)
-	return "", false
+	return claims.Tenant, true
+}
+
+type sessionClaims struct {
+	Tenant  string `json:"tenant"`
+	Login   string `json:"login"`
+	Expires int64  `json:"expires"`
+}
+
+func issueSession(secret []byte, claims sessionClaims) (string, error) {
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", err
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(encoded))
+	return encoded + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+}
+
+func parseSession(secret []byte, token string) (sessionClaims, error) {
+	var claims sessionClaims
+	parts := strings.Split(token, ".")
+	if len(parts) != 2 {
+		return claims, errors.New("malformed session")
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return claims, err
+	}
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(parts[0]))
+	if !hmac.Equal(signature, mac.Sum(nil)) {
+		return claims, errors.New("invalid session signature")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil || json.Unmarshal(payload, &claims) != nil {
+		return claims, errors.New("invalid session payload")
+	}
+	if claims.Expires <= time.Now().Unix() {
+		return claims, errors.New("expired session")
+	}
+	return claims, nil
 }
 
 func objectName(path string) (string, bool) {
@@ -159,6 +194,141 @@ func objectName(path string) (string, bool) {
 func (s *server) health(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = io.WriteString(w, `{"ok":true}`)
+}
+
+type githubDeviceCode struct {
+	DeviceCode      string `json:"device_code"`
+	UserCode        string `json:"user_code"`
+	VerificationURI string `json:"verification_uri"`
+	ExpiresIn       int    `json:"expires_in"`
+	Interval        int    `json:"interval"`
+}
+
+func (s *server) githubDevice(w http.ResponseWriter, _ *http.Request) {
+	response, err := s.githubForm("/login/device/code", url.Values{
+		"client_id": {s.githubClientID},
+		"scope":     {"read:user"},
+	})
+	if err != nil {
+		http.Error(w, "start GitHub login", http.StatusBadGateway)
+		return
+	}
+	var device githubDeviceCode
+	if json.Unmarshal(response, &device) != nil || device.DeviceCode == "" || device.UserCode == "" || device.VerificationURI == "" {
+		http.Error(w, "invalid GitHub device response", http.StatusBadGateway)
+		return
+	}
+	if device.Interval < 1 {
+		device.Interval = 5
+	}
+	writeJSON(w, http.StatusOK, device)
+}
+
+func (s *server) githubToken(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		DeviceCode string `json:"device_code"`
+	}
+	if json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&request) != nil || request.DeviceCode == "" {
+		http.Error(w, "device_code is required", http.StatusBadRequest)
+		return
+	}
+	response, err := s.githubForm("/login/oauth/access_token", url.Values{
+		"client_id":   {s.githubClientID},
+		"device_code": {request.DeviceCode},
+		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
+	})
+	if err != nil {
+		http.Error(w, "complete GitHub login", http.StatusBadGateway)
+		return
+	}
+	var result struct {
+		AccessToken string `json:"access_token"`
+		Error       string `json:"error"`
+		Interval    int    `json:"interval"`
+	}
+	if json.Unmarshal(response, &result) != nil {
+		http.Error(w, "invalid GitHub token response", http.StatusBadGateway)
+		return
+	}
+	if result.Error == "authorization_pending" || result.Error == "slow_down" {
+		interval := result.Interval
+		if interval < 1 {
+			interval = 5
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(interval))
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "pending"})
+		return
+	}
+	if result.Error != "" || result.AccessToken == "" {
+		http.Error(w, "GitHub login was not completed", http.StatusUnauthorized)
+		return
+	}
+	user, err := s.githubUser(result.AccessToken)
+	if err != nil {
+		http.Error(w, "read GitHub identity", http.StatusBadGateway)
+		return
+	}
+	claims := sessionClaims{
+		Tenant:  fmt.Sprintf("github-%d", user.ID),
+		Login:   user.Login,
+		Expires: time.Now().Add(90 * 24 * time.Hour).Unix(),
+	}
+	token, err := issueSession(s.authSecret, claims)
+	if err != nil {
+		http.Error(w, "create sync session", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"sync_token": token,
+		"login":      user.Login,
+		"expires_at": claims.Expires,
+	})
+}
+
+func (s *server) githubForm(path string, form url.Values) ([]byte, error) {
+	request, err := http.NewRequest(http.MethodPost, strings.TrimRight(s.githubOAuthURL, "/")+path, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("User-Agent", "devin-usage-metrics-sync")
+	response, err := s.httpClient.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1024*1024))
+	if err != nil || response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, errors.New("GitHub OAuth request failed")
+	}
+	return body, nil
+}
+
+func (s *server) githubUser(accessToken string) (struct {
+	ID    int64  `json:"id"`
+	Login string `json:"login"`
+}, error) {
+	var user struct {
+		ID    int64  `json:"id"`
+		Login string `json:"login"`
+	}
+	request, err := http.NewRequest(http.MethodGet, strings.TrimRight(s.githubAPIURL, "/")+"/user", nil)
+	if err != nil {
+		return user, err
+	}
+	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	request.Header.Set("User-Agent", "devin-usage-metrics-sync")
+	response, err := s.httpClient.Do(request)
+	if err != nil {
+		return user, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 1024*1024)).Decode(&user) != nil || user.ID <= 0 || user.Login == "" {
+		return user, errors.New("invalid GitHub user response")
+	}
+	return user, nil
 }
 
 func (s *server) list(w http.ResponseWriter, r *http.Request) {
@@ -366,7 +536,17 @@ func (s *server) dailyGC() {
 	defer ticker.Stop()
 	for range ticker.C {
 		s.mu.Lock()
-		for _, tenant := range s.tokens {
+		entries, err := os.ReadDir(s.root)
+		if err != nil {
+			log.Printf("list storage for gc: %v", err)
+			s.mu.Unlock()
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() || !validTenant(entry.Name()) {
+				continue
+			}
+			tenant := entry.Name()
 			if deleted, err := s.gcTenant(tenant, time.Now()); err != nil {
 				log.Printf("gc tenant=%s: %v", tenant, err)
 			} else if deleted > 0 {

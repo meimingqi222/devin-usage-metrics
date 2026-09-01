@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A native desktop app that reads local sessions from Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, and pi-agent and presents token usage, model distribution, and session details. Switch agents from the left sidebar, in a Chinese or English interface; all data stays on your machine. Multi-device users can sync and aggregate data across machines via iCloud Drive or any shared folder — no central server required.
+A native desktop app that reads local sessions from Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, and pi-agent and presents token usage, model distribution, and session details. Switch agents from the left sidebar in a Chinese or English interface; local data is sent only after you enable GitHub-authenticated sync to a configured self-hosted API.
 
 ## Features
 
@@ -19,13 +19,13 @@ A native desktop app that reads local sessions from Devin, Amp, Claude Code, Cod
   - Resolves `adaptive` routing to the real backing model
   - Click any session for details: median TTFT, turn count, agent messages, time span
 - **Multi-device sync**
-  - Sync usage data across machines via iCloud Drive (macOS) or a user-configured shared folder
+  - Enter one self-hosted sync API address and sign in with GitHub; devices using the same GitHub account share one sync dataset
   - Sync is off by default; toggle it from the top bar ("Sync Off / Sync On"), then it runs fully automatically
-  - Once enabled, the app auto-exports local data and imports other devices' data every 15 minutes in the background. Startup and a manual reload also sync immediately.
+  - Once enabled, the app auto-exports local data and imports other devices' data every hour in the background. Startup and a manual reload also sync immediately.
   - Each device auto-generates a stable device ID. Sync data uses compressed, content-addressed shards with an atomic per-device head, so large histories do not require one ever-growing package.
   - Existing v1 packages are imported automatically during migration. Upgrade every actively syncing client before relying on v2 because older releases cannot read the new format.
   - The sidebar "Devices" section lets you view a single device or aggregate all devices
-  - No central server — sync relies entirely on your existing cloud storage, data never touches a third party
+  - GitHub is used only for identity; sync objects live only in your configured self-hosted service
 - **Data sources**
   - Devin: `~/.local/share/devin/{cli,cli-next}/sessions.db` (platform data directory on Windows)
   - Amp: `~/.local/share/amp/threads/*.json`
@@ -134,7 +134,7 @@ assets/
 - Opens Devin databases read-only and only reads the other agents' JSON/JSONL files
 - Cache file is written via atomic rename to avoid partial files
 - Makes no network requests; everything shown comes from the local machine and the user's configured shared sync folder
-- Multi-device sync never goes through a central server — data packages are written only to your own iCloud Drive or shared folder
+- Multi-device sync data is written only to your configured self-hosted API; GitHub is used solely for account identity
 
 ## License
 

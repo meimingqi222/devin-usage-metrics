@@ -1,12 +1,11 @@
-//! 多设备数据同步：通过本地共享目录或 WebDAV 服务器交换数据包。
+//! 多设备数据同步：通过 GitHub 登录后的自建同步 API 交换数据包。
 //!
 //! 工作方式：
-//! - 用户在设置中开启同步并配置后端（本地目录 / WebDAV / 自建服务）后，后台每 `SYNC_INTERVAL_SECS` 秒自动：
+//! - 用户在设置中填入同步 API 地址并登录 GitHub 后，后台每 `SYNC_INTERVAL_SECS` 秒自动：
 //!   1) 本机数据有变化时才发布内容寻址 block + manifest；内容没变则跳过
 //!   2) 扫描后端中其他设备的数据包并合并进当前数据
 //! - 同步默认关闭，用户可在侧边栏的同步开关处一键开启/关闭。
-//! - 本地后端不发起任何网络请求，依赖用户已有的云盘（iCloud Drive / Dropbox 等）。
-//! - WebDAV 后端通过 HTTP PUT/GET/PROPFIND 与 WebDAV 服务器交互，密码存入系统钥匙串。
+//! - 服务端以 GitHub 用户 ID 隔离数据；同一个 GitHub 账号在不同设备登录后共享同一份同步数据。
 
 use crate::data::{self, LoadedData, SessionRec, TurnRec};
 use sha2::{Digest, Sha256};
@@ -21,8 +20,8 @@ mod v2;
 mod v3;
 
 /// 自动同步间隔（秒）。
-/// v3 使用内容寻址小 block；无变化时上传为零。仍限制为每小时一次，避免第三方
-/// WebDAV / 自建服务被频繁 list/head 请求触发限流。
+/// v3 使用内容寻址小 block；无变化时上传为零。仍限制为每小时一次，避免同步 API
+/// 被频繁 list/head 请求触发限流。
 pub const SYNC_INTERVAL_SECS: u64 = 60 * 60;
 const TRANSIENT_FAILURE_COOLDOWN_SECS: u64 = 30 * 60;
 
@@ -30,77 +29,12 @@ const TRANSIENT_FAILURE_COOLDOWN_SECS: u64 = 30 * 60;
 /// 有界限制，避免异常或恶意服务端耗尽内存。
 const MAX_WEBDAV_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// 同步后端类型。
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub enum SyncBackend {
-    /// 本地共享目录（iCloud / Syncthing / Dropbox 等）
-    #[default]
-    Local,
-    /// WebDAV 服务器
-    WebDav,
-    /// 自建的最小同步 API（Bearer token，数据不经过 GitHub）
-    SelfHosted,
-}
-
-impl SyncBackend {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::WebDav => "webdav",
-            Self::SelfHosted => "self_hosted",
-        }
-    }
-
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "webdav" => Self::WebDav,
-            "self_hosted" => Self::SelfHosted,
-            _ => Self::Local,
-        }
-    }
-}
-
-/// 同步配置：enabled + backend + 各后端的参数，持久化到 sync.json。
-/// WebDAV 密码不存此文件，存入系统钥匙串。
+/// 同步配置：只有开关和服务端 API 地址，持久化到 sync.json。
 #[derive(Debug, Clone, Default)]
 pub struct SyncConfig {
     pub enabled: bool,
-    /// 本地后端：同步目录路径（空串 = 使用默认目录）
-    pub sync_dir: String,
-    /// 同步后端
-    pub backend: SyncBackend,
-    /// WebDAV 后端：服务器 URL（如 https://dav.example.com/path/）
-    pub webdav_url: String,
-    /// WebDAV 后端：用户名
-    pub webdav_username: String,
-    /// 自建服务基础地址，如 `https://sync.example.com`
-    pub sync_server_url: String,
-}
-
-/// 默认同步目录：
-/// - macOS：iCloud Drive 下的 `devin-usage-metrics/`
-/// - 其他平台：`~/.devin-usage-metrics-sync/`（用户需自行用 Syncthing/Dropbox 等同步）
-pub fn default_sync_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        // iCloud Drive 的 Mobile Documents 路径
-        let icloud = dirs::home_dir()
-            .map(|h| h.join("Library/Mobile Documents/com~apple~CloudDocs/devin-usage-metrics"))
-            .unwrap_or_else(|| PathBuf::from("devin-usage-metrics"));
-        if icloud.exists() || icloud.parent().map(|p| p.exists()).unwrap_or(false) {
-            return icloud;
-        }
-        // iCloud 未启用时回退到本地目录
-        dirs::home_dir()
-            .map(|h| h.join(".devin-usage-metrics-sync"))
-            .unwrap_or_else(|| PathBuf::from(".devin-usage-metrics-sync"))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        dirs::home_dir()
-            .map(|h| h.join(".devin-usage-metrics-sync"))
-            .unwrap_or_else(|| PathBuf::from(".devin-usage-metrics-sync"))
-    }
+    /// 自建同步 API 基础地址，例如 `https://sync.example.com`。
+    pub api_url: String,
 }
 
 /// 读取同步配置。文件不存在或解析失败时返回默认值（同步关闭、用默认目录）。
@@ -118,24 +52,19 @@ pub fn read_config() -> SyncConfig {
         #[serde(default)]
         enabled: bool,
         #[serde(default)]
-        sync_dir: String,
-        #[serde(default)]
-        backend: String,
-        #[serde(default)]
-        webdav_url: String,
-        #[serde(default)]
-        webdav_username: String,
+        api_url: String,
+        /// 迁移旧配置时继续使用原自建服务地址，但不再保留其余后端配置。
         #[serde(default)]
         sync_server_url: String,
     }
     match serde_json::from_str::<RawConfig>(&text) {
         Ok(raw) => SyncConfig {
             enabled: raw.enabled,
-            sync_dir: raw.sync_dir,
-            backend: SyncBackend::parse(&raw.backend),
-            webdav_url: raw.webdav_url,
-            webdav_username: raw.webdav_username,
-            sync_server_url: raw.sync_server_url,
+            api_url: if raw.api_url.trim().is_empty() {
+                raw.sync_server_url
+            } else {
+                raw.api_url
+            },
         },
         Err(_) => SyncConfig::default(),
     }
@@ -151,11 +80,7 @@ pub fn save_config(config: &SyncConfig) {
     }
     let payload = serde_json::json!({
         "enabled": config.enabled,
-        "sync_dir": config.sync_dir,
-        "backend": config.backend.as_str(),
-        "webdav_url": config.webdav_url,
-        "webdav_username": config.webdav_username,
-        "sync_server_url": config.sync_server_url,
+        "api_url": config.api_url,
     })
     .to_string();
     let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
@@ -166,35 +91,8 @@ pub fn save_config(config: &SyncConfig) {
     }
 }
 
-fn effective_local_dir(cfg: &SyncConfig) -> PathBuf {
-    if !cfg.sync_dir.is_empty() {
-        let p = PathBuf::from(&cfg.sync_dir);
-        if p.is_absolute() {
-            return p;
-        }
-    }
-    default_sync_dir()
-}
-
-/// 当前生效的同步目录（仅本地后端使用）：配置 > 默认。
-pub fn sync_dir() -> PathBuf {
-    effective_local_dir(&read_config())
-}
-
 pub(crate) fn destination_key(cfg: &SyncConfig) -> String {
-    match cfg.backend {
-        SyncBackend::Local => format!("local:{}", effective_local_dir(cfg).to_string_lossy()),
-        SyncBackend::WebDav => {
-            let mut url = cfg.webdav_url.trim().to_string();
-            if !url.is_empty() && !url.ends_with('/') {
-                url.push('/');
-            }
-            format!("webdav:{url}|{}", cfg.webdav_username)
-        }
-        SyncBackend::SelfHosted => {
-            format!("self_hosted:{}", cfg.sync_server_url.trim_end_matches('/'))
-        }
-    }
+    format!("github:{}", cfg.api_url.trim_end_matches('/'))
 }
 
 /// 同步是否已开启。
@@ -298,62 +196,150 @@ fn content_fingerprint(package: &DevicePackage) -> Result<String, String> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
-// ── 密码管理（系统钥匙串）─────────────────────────────────────────────
+// ── GitHub 同步会话（系统钥匙串）──────────────────────────────────────
 
 const KEYRING_SERVICE: &str = "devin-usage-metrics";
-const KEYRING_USER: &str = "webdav-password";
-const KEYRING_SYNC_SERVER_TOKEN: &str = "sync-server-token";
+const KEYRING_GITHUB_SYNC_SESSION: &str = "github-sync-session";
 
-/// 把 WebDAV 密码存入系统钥匙串。
-pub fn save_webdav_password(password: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+/// 服务端在 GitHub Device Flow 成功后签发的同步会话；GitHub access token 不会写入本机。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GitHubSyncSession {
+    pub sync_token: String,
+    pub login: String,
+    pub expires_at: i64,
+}
+
+pub fn save_github_sync_session(session: &GitHubSyncSession) -> Result<(), String> {
+    let payload = serde_json::to_string(session).map_err(|e| format!("会话序列化失败: {e}"))?;
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_GITHUB_SYNC_SESSION)
         .map_err(|e| format!("钥匙串初始化失败: {e}"))?;
     entry
-        .set_password(password)
-        .map_err(|e| format!("密码存储失败: {e}"))
+        .set_password(&payload)
+        .map_err(|e| format!("GitHub 同步会话存储失败: {e}"))
 }
 
-/// 从系统钥匙串读取 WebDAV 密码。未设置时返回 None。
-pub fn load_webdav_password() -> Option<String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).ok()?;
-    entry.get_password().ok()
+pub fn load_github_sync_session() -> Option<GitHubSyncSession> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_GITHUB_SYNC_SESSION).ok()?;
+    serde_json::from_str(&entry.get_password().ok()?).ok()
 }
 
-/// 删除系统钥匙串中的 WebDAV 密码。
-pub fn delete_webdav_password() {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+pub fn delete_github_sync_session() {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_GITHUB_SYNC_SESSION) {
         let _ = entry.delete_credential();
     }
 }
 
-/// WebDAV 密码是否已设置。
-pub fn has_webdav_password() -> bool {
-    load_webdav_password().is_some()
+pub fn github_sync_session_is_valid() -> bool {
+    load_github_sync_session()
+        .map(|session| session.expires_at > chrono::Utc::now().timestamp())
+        .unwrap_or(false)
 }
 
-/// 自建服务的 Bearer token 同样只保存到系统钥匙串。
-pub fn save_sync_server_token(token: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_SYNC_SERVER_TOKEN)
-        .map_err(|e| format!("钥匙串初始化失败: {e}"))?;
-    entry
-        .set_password(token)
-        .map_err(|e| format!("令牌存储失败: {e}"))
+/// GitHub Device Flow 的一次待完成授权。客户端只展示验证码并轮询自建 API，
+/// 不会接触或保存 GitHub access token。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GitHubDeviceAuthorization {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: u64,
+    pub interval: u64,
 }
 
-pub fn load_sync_server_token() -> Option<String> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_SYNC_SERVER_TOKEN)
-        .ok()?
-        .get_password()
-        .ok()
+fn sync_api_base(api_url: &str) -> Result<String, String> {
+    let base = api_url.trim().trim_end_matches('/');
+    if !(base.starts_with("https://") || base.starts_with("http://")) {
+        return Err("同步 API 地址必须以 http:// 或 https:// 开头".into());
+    }
+    Ok(base.to_string())
 }
 
-pub fn has_sync_server_token() -> bool {
-    load_sync_server_token().is_some()
+fn sync_api_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
 }
 
-pub fn delete_sync_server_token() {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_SYNC_SERVER_TOKEN) {
-        let _ = entry.delete_credential();
+/// 向自建 API 获取 GitHub Device Flow 验证码。
+pub fn begin_github_login(api_url: &str) -> Result<GitHubDeviceAuthorization, String> {
+    let base = sync_api_base(api_url)?;
+    let request = ureq::http::Request::builder()
+        .method("POST")
+        .uri(format!("{base}/v1/auth/github/device"))
+        .body(Vec::new())
+        .map_err(|e| format!("构造 GitHub 登录请求失败: {e}"))?;
+    let response = sync_api_agent()
+        .run(request)
+        .map_err(|e| format!("启动 GitHub 登录失败: {e}"))?;
+    let status = response.status().as_u16();
+    let body = WebDavTransport::read_body(response)?;
+    if status != 200 {
+        return Err(format!("同步 API 启动 GitHub 登录返回 HTTP {status}"));
+    }
+    let mut authorization: GitHubDeviceAuthorization = serde_json::from_slice(&body)
+        .map_err(|e| format!("解析 GitHub 登录响应失败: {e}"))?;
+    if authorization.device_code.is_empty()
+        || authorization.user_code.is_empty()
+        || authorization.verification_uri.is_empty()
+    {
+        return Err("同步 API 返回的 GitHub 登录信息不完整".into());
+    }
+    authorization.interval = authorization.interval.max(1);
+    authorization.expires_in = authorization.expires_in.max(60);
+    Ok(authorization)
+}
+
+/// 轮询自建 API，直到用户在浏览器完成 GitHub 登录或设备验证码过期。
+pub fn wait_for_github_login(
+    api_url: &str,
+    authorization: &GitHubDeviceAuthorization,
+) -> Result<GitHubSyncSession, String> {
+    let base = sync_api_base(api_url)?;
+    let deadline = Instant::now() + Duration::from_secs(authorization.expires_in);
+    let mut interval = authorization.interval.max(1);
+    loop {
+        if Instant::now() >= deadline {
+            return Err("GitHub 登录验证码已过期，请重新登录".into());
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
+            "device_code": authorization.device_code,
+        }))
+        .map_err(|e| format!("构造 GitHub 登录请求失败: {e}"))?;
+        let request = ureq::http::Request::builder()
+            .method("POST")
+            .uri(format!("{base}/v1/auth/github/token"))
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| format!("构造 GitHub 登录请求失败: {e}"))?;
+        let response = sync_api_agent()
+            .run(request)
+            .map_err(|e| format!("等待 GitHub 登录失败: {e}"))?;
+        let status = response.status().as_u16();
+        if status == 202 {
+            if let Some(retry_after) = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                interval = retry_after.max(1);
+            }
+            let _ = WebDavTransport::read_body(response)?;
+            std::thread::sleep(Duration::from_secs(interval));
+            continue;
+        }
+        let response_body = WebDavTransport::read_body(response)?;
+        if status != 200 {
+            return Err(format!("同步 API 完成 GitHub 登录返回 HTTP {status}"));
+        }
+        let session: GitHubSyncSession = serde_json::from_slice(&response_body)
+            .map_err(|e| format!("解析 GitHub 登录结果失败: {e}"))?;
+        if session.sync_token.is_empty() || session.login.is_empty() || session.expires_at <= chrono::Utc::now().timestamp() {
+            return Err("同步 API 返回了无效的登录会话".into());
+        }
+        return Ok(session);
     }
 }
 
@@ -1114,38 +1100,13 @@ fn base64_encode(input: &str) -> String {
 
 /// 根据当前配置构造传输层实例。
 fn build_transport(cfg: &SyncConfig) -> Result<Box<dyn SyncTransport>, String> {
-    match cfg.backend {
-        SyncBackend::Local => {
-            let dir = if cfg.sync_dir.is_empty() {
-                default_sync_dir()
-            } else {
-                PathBuf::from(&cfg.sync_dir)
-            };
-            Ok(Box::new(LocalTransport::new(dir)))
-        }
-        SyncBackend::WebDav => {
-            if cfg.webdav_url.is_empty() {
-                return Err("WebDAV URL 未配置".to_string());
-            }
-            let password = load_webdav_password().ok_or_else(|| "WebDAV 密码未设置".to_string())?;
-            Ok(Box::new(WebDavTransport::new(
-                &cfg.webdav_url,
-                &cfg.webdav_username,
-                &password,
-            )))
-        }
-        SyncBackend::SelfHosted => {
-            if cfg.sync_server_url.trim().is_empty() {
-                return Err("自建同步服务地址未配置".into());
-            }
-            let token =
-                load_sync_server_token().ok_or_else(|| "自建同步服务令牌未设置".to_string())?;
-            Ok(Box::new(SyncServerTransport::new(
-                &cfg.sync_server_url,
-                &token,
-            )))
-        }
+    let base = sync_api_base(&cfg.api_url)?;
+    let session = load_github_sync_session().ok_or_else(|| "请先登录 GitHub".to_string())?;
+    if session.expires_at <= chrono::Utc::now().timestamp() {
+        delete_github_sync_session();
+        return Err("GitHub 同步登录已过期，请重新登录".to_string());
     }
+    Ok(Box::new(SyncServerTransport::new(&base, &session.sync_token)))
 }
 
 /// 用当前配置构造传输层（便捷方法）。
@@ -1586,24 +1547,21 @@ mod tests {
     }
 
     #[test]
-    fn destination_key_distinguishes_backends() {
-        let local = SyncConfig {
-            backend: SyncBackend::Local,
-            sync_dir: "/tmp/a".into(),
+    fn destination_key_uses_normalized_api_address() {
+        let first = SyncConfig {
+            api_url: "https://sync.example.com".into(),
             ..Default::default()
         };
-        let webdav = SyncConfig {
-            backend: SyncBackend::WebDav,
-            webdav_url: "https://dav.example.com/dav".into(),
-            webdav_username: "u".into(),
+        let same_with_slash = SyncConfig {
+            api_url: "https://sync.example.com/".into(),
             ..Default::default()
         };
-        assert_ne!(destination_key(&local), destination_key(&webdav));
-        let webdav_slash = SyncConfig {
-            webdav_url: "https://dav.example.com/dav/".into(),
-            ..webdav.clone()
+        let other = SyncConfig {
+            api_url: "https://other.example.com".into(),
+            ..Default::default()
         };
-        assert_eq!(destination_key(&webdav), destination_key(&webdav_slash));
+        assert_eq!(destination_key(&first), destination_key(&same_with_slash));
+        assert_ne!(destination_key(&first), destination_key(&other));
     }
 
     #[test]

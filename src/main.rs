@@ -151,30 +151,17 @@ struct Root {
     sync_message: Option<String>,
     /// 同步是否已开启（持久化在 sync.json）
     sync_enabled: bool,
-    /// 当前配置的同步目录（空串 = 使用默认目录），持久化在 sync.json
-    sync_dir: String,
-    /// 文件夹选择对话框任务（短暂的，单独持有避免覆盖 load_task）
-    sync_pick_task: Option<Task<()>>,
-    /// 同步后端类型
-    sync_backend: sync::SyncBackend,
-    /// WebDAV 服务器 URL
-    webdav_url: String,
-    /// WebDAV 用户名
-    webdav_username: String,
-    /// 自建同步服务 URL
-    sync_server_url: String,
-    /// WebDAV 密码是否已存入钥匙串
-    webdav_password_set: bool,
-    /// 自建服务令牌是否已在钥匙串中保存
-    sync_server_token_set: bool,
+    /// 自建同步 API 地址；用户只需填写这一项。
+    sync_api_url: String,
+    /// GitHub Device Flow 的进行状态。
+    github_login_busy: bool,
+    github_login_id: u64,
+    github_login_code: Option<String>,
+    github_login_task: Option<Task<()>>,
     /// 同步设置弹窗是否打开
     sync_config_open: bool,
     /// 弹窗输入框（内容在打开时从配置填入，保存时读回）
     modal_url_input: Entity<TextInput>,
-    modal_username_input: Entity<TextInput>,
-    modal_password_input: Entity<TextInput>,
-    modal_dir_input: Entity<TextInput>,
-    modal_device_name_input: Entity<TextInput>,
     /// 弹窗的键盘焦点句柄（Esc 关闭）
     modal_focus: FocusHandle,
     /// 左侧边栏各分区展开状态
@@ -185,6 +172,16 @@ struct Root {
     sync_tick_task: Option<Task<()>>,
     /// 正在进行的一次导出+导入（与 load_task 分开，避免点重新加载打断同步）
     sync_task: Option<Task<()>>,
+}
+
+fn open_external_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("explorer.exe").arg(url).spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    result.map(|_| ()).map_err(|e| format!("无法打开浏览器: {e}"))
 }
 
 impl Root {
@@ -314,20 +311,20 @@ impl Root {
         cx.notify();
     }
 
-    /// 从 Root 当前状态构造完整的 SyncConfig。
     fn build_sync_config(&self) -> sync::SyncConfig {
         sync::SyncConfig {
             enabled: self.sync_enabled,
-            sync_dir: self.sync_dir.clone(),
-            backend: self.sync_backend,
-            webdav_url: self.webdav_url.clone(),
-            webdav_username: self.webdav_username.clone(),
-            sync_server_url: self.sync_server_url.clone(),
+            api_url: self.sync_api_url.clone(),
         }
     }
 
     /// 开启/关闭自动同步。切换后立即持久化，开启时立即执行一次同步并启动定时任务。
     fn toggle_sync(&mut self, cx: &mut Context<Self>) {
+        if !self.sync_enabled && !sync::github_sync_session_is_valid() {
+            self.sync_message = Some("请先在同步设置中登录 GitHub".into());
+            cx.notify();
+            return;
+        }
         self.sync_enabled = !self.sync_enabled;
         sync::save_config(&self.build_sync_config());
 
@@ -351,132 +348,21 @@ impl Root {
         cx.notify();
     }
 
-    /// 打开系统文件夹选择对话框，让用户挑选同步目录。
-    /// 选中后持久化到 sync.json，并在同步已开启时立即用新目录同步一次。
-    fn pick_sync_dir(&mut self, cx: &mut Context<Self>) {
-        let pick = cx.background_executor().spawn(async move {
-            rfd::AsyncFileDialog::new()
-                .set_title("Sync folder")
-                .pick_folder()
-                .await
-                .map(|h| h.path().to_path_buf())
-        });
-        let prev_dir = self.sync_dir.clone();
-        self.sync_pick_task = Some(cx.spawn(async move |this, cx| {
-            let chosen = pick.await;
-            this.update(cx, |this, cx| {
-                let Some(path) = chosen else { return };
-                let dir_str = path.to_string_lossy().to_string();
-                // 没有变化就不重复写盘/同步
-                if dir_str == prev_dir {
-                    return;
-                }
-                this.sync_dir = dir_str.clone();
-                this.modal_dir_input.update(cx, |input, cx| {
-                    input.set_text(dir_str, cx);
-                });
-                sync::save_config(&this.build_sync_config());
-                if this.sync_enabled {
-                    this.start_sync(cx);
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    /// 把同步目录重置为默认（清空 sync_dir，回落到 default_sync_dir）。
-    fn reset_sync_dir(&mut self, cx: &mut Context<Self>) {
-        if self.sync_dir.is_empty() {
-            return;
-        }
-        self.sync_dir = String::new();
-        self.modal_dir_input.update(cx, |input, cx| {
-            input.set_text("", cx);
-        });
-        sync::save_config(&self.build_sync_config());
-        if self.sync_enabled {
-            self.start_sync(cx);
-        }
-        cx.notify();
-    }
-
-    /// 弹窗里切换后端：只改编辑态，点保存才写盘。
-    fn set_sync_backend(&mut self, backend: sync::SyncBackend, cx: &mut Context<Self>) {
-        if self.sync_backend == backend {
-            return;
-        }
-        self.sync_backend = backend;
-        cx.notify();
-    }
-
-    /// 侧边栏切换后端：立即写盘。指纹含目的地，换后端会重新上传。
-    fn commit_sync_backend(&mut self, backend: sync::SyncBackend, cx: &mut Context<Self>) {
-        if self.sync_backend == backend {
-            return;
-        }
-        self.sync_backend = backend;
-        sync::save_config(&self.build_sync_config());
-        if self.sync_enabled {
-            self.start_sync(cx);
-        }
-        cx.notify();
-    }
-
     fn fill_modal_inputs(&mut self, cfg: &sync::SyncConfig, cx: &mut Context<Self>) {
         self.modal_url_input.update(cx, |input, cx| {
-            input.set_placeholder(if cfg.backend == sync::SyncBackend::SelfHosted {
-                "https://sync.example.com"
-            } else {
-                i18n::t(i18n::Key::SyncWebDavUrlPlaceholder)
-            });
-            input.set_text(
-                if cfg.backend == sync::SyncBackend::SelfHosted {
-                    cfg.sync_server_url.clone()
-                } else {
-                    cfg.webdav_url.clone()
-                },
-                cx,
-            );
-        });
-        self.modal_username_input.update(cx, |input, cx| {
-            input.set_placeholder(i18n::t(i18n::Key::SyncWebDavUsernamePlaceholder));
-            input.set_text(cfg.webdav_username.clone(), cx);
-        });
-        self.modal_password_input.update(cx, |input, cx| {
-            input.set_placeholder("password");
-            input.set_text("", cx);
-        });
-        self.modal_dir_input.update(cx, |input, cx| {
-            input.set_placeholder(i18n::t(i18n::Key::SyncDirNotSet));
-            input.set_text(cfg.sync_dir.clone(), cx);
-        });
-        self.modal_device_name_input.update(cx, |input, cx| {
-            input.set_placeholder("留空使用系统设备名");
-            input.set_text(data::custom_device_name().unwrap_or_default(), cx);
+            input.set_placeholder("https://sync.example.com");
+            input.set_text(cfg.api_url.clone(), cx);
         });
     }
 
-    fn read_modal_inputs(&self, cx: &App) -> (String, String, String, String, String) {
-        (
-            self.modal_url_input.read(cx).text(),
-            self.modal_username_input.read(cx).text(),
-            self.modal_password_input.read(cx).text(),
-            self.modal_dir_input.read(cx).text(),
-            self.modal_device_name_input.read(cx).text(),
-        )
+    fn read_modal_api_url(&self, cx: &App) -> String {
+        self.modal_url_input.read(cx).text()
     }
 
     /// 打开同步设置弹窗，从当前配置初始化编辑值。
     fn open_sync_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cfg = sync::read_config();
-        self.sync_backend = cfg.backend;
-        self.sync_dir = cfg.sync_dir.clone();
-        self.webdav_url = cfg.webdav_url.clone();
-        self.webdav_username = cfg.webdav_username.clone();
-        self.sync_server_url = cfg.sync_server_url.clone();
-        self.webdav_password_set = sync::has_webdav_password();
-        self.sync_server_token_set = sync::has_sync_server_token();
+        self.sync_api_url = cfg.api_url.clone();
         self.fill_modal_inputs(&cfg, cx);
         self.sync_config_open = true;
         window.focus(&self.modal_focus);
@@ -486,13 +372,11 @@ impl Root {
     /// 关闭弹窗并丢弃修改（重新加载已保存的配置）。
     fn cancel_sync_config(&mut self, cx: &mut Context<Self>) {
         let cfg = sync::read_config();
-        self.sync_backend = cfg.backend;
-        self.sync_dir = cfg.sync_dir.clone();
-        self.webdav_url = cfg.webdav_url.clone();
-        self.webdav_username = cfg.webdav_username.clone();
-        self.sync_server_url = cfg.sync_server_url.clone();
-        self.webdav_password_set = sync::has_webdav_password();
-        self.sync_server_token_set = sync::has_sync_server_token();
+        self.github_login_id += 1;
+        self.github_login_busy = false;
+        self.github_login_code = None;
+        self.github_login_task = None;
+        self.sync_api_url = cfg.api_url.clone();
         self.fill_modal_inputs(&cfg, cx);
         self.sync_config_open = false;
         cx.notify();
@@ -500,77 +384,115 @@ impl Root {
 
     /// 保存弹窗中的同步设置。
     fn save_sync_config(&mut self, cx: &mut Context<Self>) {
-        let (url, username, password, dir, device_name) = self.read_modal_inputs(cx);
-        if let Err(error) = data::set_device_name(&device_name) {
-            self.sync_message = Some(error);
-            cx.notify();
-            return;
+        let url = self.read_modal_api_url(cx);
+        let url = url.trim().trim_end_matches('/').to_string();
+        let api_changed = self.sync_api_url != url;
+        if api_changed {
+            sync::delete_github_sync_session();
         }
-        if self.sync_backend == sync::SyncBackend::SelfHosted {
-            self.sync_server_url = url;
+        self.sync_api_url = url;
+        if api_changed && self.sync_enabled {
+            self.toggle_sync(cx);
+            self.sync_message = Some("同步 API 已更新，请重新登录 GitHub 后再开启同步".into());
         } else {
-            self.webdav_url = url;
-            self.webdav_username = username;
+            sync::save_config(&self.build_sync_config());
         }
-        self.sync_dir = dir;
-        if !password.is_empty() {
-            let result = if self.sync_backend == sync::SyncBackend::SelfHosted {
-                sync::save_sync_server_token(&password)
-            } else {
-                sync::save_webdav_password(&password)
-            };
-            if let Err(e) = result {
-                self.sync_message = Some(e);
-                cx.notify();
-                return;
-            }
-            if self.sync_backend == sync::SyncBackend::SelfHosted {
-                self.sync_server_token_set = true;
-            } else {
-                self.webdav_password_set = true;
-            }
-        }
-        sync::save_config(&self.build_sync_config());
-        self.modal_password_input.update(cx, |input, cx| {
-            input.set_text("", cx);
-        });
         self.sync_config_open = false;
-        if self.sync_enabled {
+        if self.sync_enabled && !api_changed {
             self.start_sync(cx);
         }
         cx.notify();
     }
 
-    /// 从剪贴板读取 WebDAV 密码，填入弹窗的密码框。
-    fn paste_modal_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let password = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .map(|text| text.trim().to_string())
-            .unwrap_or_default();
-        if !password.is_empty() {
-            self.modal_password_input.update(cx, |input, cx| {
-                input.set_text(password, cx);
-            });
-            self.modal_password_input.read(cx).focus(window);
+    fn start_github_login(&mut self, cx: &mut Context<Self>) {
+        let api_url = self.read_modal_api_url(cx);
+        let api_url = api_url.trim().trim_end_matches('/').to_string();
+        if api_url.is_empty() {
+            self.sync_message = Some("请先填写同步 API 地址".into());
+            cx.notify();
+            return;
         }
-        cx.notify();
+        if self.sync_api_url != api_url {
+            sync::delete_github_sync_session();
+        }
+        self.sync_api_url = api_url.clone();
+        sync::save_config(&self.build_sync_config());
+        self.github_login_id += 1;
+        let login_id = self.github_login_id;
+        self.github_login_busy = true;
+        self.github_login_code = None;
+        self.sync_message = Some("正在请求 GitHub 登录…".into());
+        let begin = cx.background_executor().spawn(async move { sync::begin_github_login(&api_url) });
+        self.github_login_task = Some(cx.spawn(async move |this, cx| {
+            let result = begin.await;
+            this.update(cx, |this, cx| {
+                if this.github_login_id != login_id {
+                    return;
+                }
+                match result {
+                    Ok(authorization) => {
+                        this.github_login_code = Some(authorization.user_code.clone());
+                        this.sync_message = Some(format!("请在浏览器完成 GitHub 登录，验证码：{}", authorization.user_code));
+                        if let Err(error) = open_external_url(&authorization.verification_uri) {
+                            this.sync_message = Some(format!("请手动打开 {}，验证码：{}（{error}）", authorization.verification_uri, authorization.user_code));
+                        }
+                        let wait_api_url = this.sync_api_url.clone();
+                        let wait = cx.background_executor().spawn(async move {
+                            sync::wait_for_github_login(&wait_api_url, &authorization)
+                        });
+                        this.github_login_task = Some(cx.spawn(async move |this, cx| {
+                            let session = wait.await;
+                            this.update(cx, |this, cx| {
+                                if this.github_login_id != login_id {
+                                    return;
+                                }
+                                this.github_login_busy = false;
+                                this.github_login_code = None;
+                                match session {
+                                    Ok(session) => match sync::save_github_sync_session(&session) {
+                                        Ok(()) => {
+                                            this.sync_message = Some(format!("已登录 GitHub：{}", session.login));
+                                            if this.sync_enabled {
+                                                this.start_sync(cx);
+                                            }
+                                        }
+                                        Err(error) => this.sync_message = Some(error),
+                                    },
+                                    Err(error) => this.sync_message = Some(error),
+                                }
+                                cx.notify();
+                            }).ok();
+                        }));
+                    }
+                    Err(error) => {
+                        this.github_login_busy = false;
+                        this.sync_message = Some(error);
+                    }
+                }
+                cx.notify();
+            }).ok();
+        }));
     }
 
-    /// 清除钥匙串中的 WebDAV 密码。
-    fn clear_webdav_password(&mut self, cx: &mut Context<Self>) {
-        sync::delete_webdav_password();
-        self.webdav_password_set = false;
-        self.modal_password_input.update(cx, |input, cx| {
-            input.set_text("", cx);
-        });
-        cx.notify();
-    }
-
-    fn clear_sync_server_token(&mut self, cx: &mut Context<Self>) {
-        sync::delete_sync_server_token();
-        self.sync_server_token_set = false;
-        self.modal_password_input.update(cx, |input, cx| input.set_text("", cx));
+    fn logout_github(&mut self, cx: &mut Context<Self>) {
+        self.github_login_id += 1;
+        self.github_login_busy = false;
+        self.github_login_code = None;
+        self.github_login_task = None;
+        sync::delete_github_sync_session();
+        self.sync_enabled = false;
+        self.sync_id += 1;
+        self.sync_tick_task = None;
+        self.sync_task = None;
+        self.sync_busy = false;
+        self.remote_data = Arc::new(LoadedData::default());
+        self.known_devices = Vec::new();
+        self.sync_last_at.clear();
+        self.sync_message = Some("已退出 GitHub 同步".into());
+        sync::save_config(&self.build_sync_config());
+        self.remerge_all_agents();
+        self.rebuild_buckets();
+        self.rebuild_sessions();
         cx.notify();
     }
 
@@ -1122,75 +1044,9 @@ impl Root {
         );
         let sync_header = section_header(
             SidebarSection::Sync,
-            i18n::t(i18n::Key::SyncDirLabel),
+            "同步",
             self.section_sync_open,
         );
-
-        let sync_backend_btns = div()
-            .flex()
-            .gap_1()
-            .px_2()
-            .pt_1()
-            .child(
-                div()
-                    .id("sync-backend-local")
-                    .flex_1()
-                    .text_center()
-                    .py(px(2.))
-                    .text_xs()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .when(self.sync_backend == sync::SyncBackend::Local, |d| {
-                        d.bg(rgb(PANEL2)).text_color(rgb(TEXT))
-                    })
-                    .when(self.sync_backend != sync::SyncBackend::Local, |d| {
-                        d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
-                    })
-                    .child(i18n::t(i18n::Key::SyncBackendLocal))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.commit_sync_backend(sync::SyncBackend::Local, cx);
-                    })),
-            )
-            .child(
-                div()
-                    .id("sync-backend-webdav")
-                    .flex_1()
-                    .text_center()
-                    .py(px(2.))
-                    .text_xs()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .when(self.sync_backend == sync::SyncBackend::WebDav, |d| {
-                        d.bg(rgb(PANEL2)).text_color(rgb(TEXT))
-                    })
-                    .when(self.sync_backend != sync::SyncBackend::WebDav, |d| {
-                        d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
-                    })
-                    .child(i18n::t(i18n::Key::SyncBackendWebDav))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.commit_sync_backend(sync::SyncBackend::WebDav, cx);
-                    })),
-            )
-            .child(
-                div()
-                    .id("sync-backend-self-hosted")
-                    .flex_1()
-                    .text_center()
-                    .py(px(2.))
-                    .text_xs()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .when(self.sync_backend == sync::SyncBackend::SelfHosted, |d| {
-                        d.bg(rgb(PANEL2)).text_color(rgb(TEXT))
-                    })
-                    .when(self.sync_backend != sync::SyncBackend::SelfHosted, |d| {
-                        d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
-                    })
-                    .child("自建")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.commit_sync_backend(sync::SyncBackend::SelfHosted, cx);
-                    })),
-            );
 
         let sync_config_btn = div()
             .id("sync-config-open")
@@ -1238,7 +1094,6 @@ impl Root {
                         .flex_col()
                         .pl(px(12.))
                         .pr_2()
-                        .child(sync_backend_btns)
                         .child(sync_config_btn),
                 )
             });
@@ -1347,221 +1202,30 @@ impl Root {
             .child(input)
     }
 
-    /// 弹窗中后端切换的小按钮。
-    fn sync_config_backend_btn(
-        &self,
-        backend: sync::SyncBackend,
-        label: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let active = self.sync_backend == backend;
-        div()
-            .id(SharedString::from(format!("modal-backend-{backend:?}")))
-            .flex_1()
-            .text_center()
-            .py(px(2.))
-            .text_xs()
-            .rounded_sm()
-            .cursor_pointer()
-            .when(active, |d| d.bg(rgb(ACCENT)).text_color(rgb(0x0a0a0c)))
-            .when(!active, |d| {
-                d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
-            })
-            .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.set_sync_backend(backend, cx);
-            }))
-    }
-
-    /// 同步设置弹窗（URL/用户名/密码/目录等配置）。
+    /// 同步设置弹窗：只保留 API 地址和 GitHub 登录。
     fn sync_config_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let url_input = self.sync_config_input(self.modal_url_input.clone(), window, cx);
-        let self_hosted_url_input =
-            self.sync_config_input(self.modal_url_input.clone(), window, cx);
-        let username_input = self.sync_config_input(self.modal_username_input.clone(), window, cx);
-        let password_input = self.sync_config_input(self.modal_password_input.clone(), window, cx);
-        let self_hosted_password_input =
-            self.sync_config_input(self.modal_password_input.clone(), window, cx);
-        let local_dir_input = self.sync_config_input(self.modal_dir_input.clone(), window, cx);
-        let device_name_input =
-            self.sync_config_input(self.modal_device_name_input.clone(), window, cx);
-
-        let local_form = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(i18n::t(i18n::Key::SyncDirLabel)),
-            )
-            .child(local_dir_input)
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("modal-pick-dir")
-                            .px_3()
-                            .py_1()
-                            .rounded_sm()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .cursor_pointer()
-                            .hover(|h| h.bg(rgb(PANEL2)))
-                            .child(i18n::t(i18n::Key::SyncDirPick))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.pick_sync_dir(cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("modal-reset-dir")
-                            .px_3()
-                            .py_1()
-                            .rounded_sm()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .cursor_pointer()
-                            .hover(|h| h.bg(rgb(PANEL2)))
-                            .child(i18n::t(i18n::Key::SyncDirReset))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.reset_sync_dir(cx);
-                            })),
-                    ),
-            );
-
-        let webdav_form = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(i18n::t(i18n::Key::SyncWebDavUrl)),
-            )
-            .child(url_input)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(i18n::t(i18n::Key::SyncWebDavUsername)),
-            )
-            .child(username_input)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(i18n::t(i18n::Key::SyncWebDavPassword)),
-            )
-            .child(password_input)
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("modal-paste-password")
-                            .px_3()
-                            .py_1()
-                            .rounded_sm()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .cursor_pointer()
-                            .hover(|h| h.bg(rgb(PANEL2)))
-                            .child(i18n::t(i18n::Key::SyncWebDavPaste))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.paste_modal_password(window, cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("modal-clear-password")
-                            .px_3()
-                            .py_1()
-                            .rounded_sm()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .cursor_pointer()
-                            .hover(|h| h.bg(rgb(PANEL2)))
-                            .child(i18n::t(i18n::Key::SyncWebDavPasswordClear))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.clear_webdav_password(cx);
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(if self.webdav_password_set {
-                        rgb(0x3ddc97)
-                    } else {
-                        rgb(MUTED)
-                    })
-                    .child(if self.webdav_password_set {
-                        i18n::t(i18n::Key::SyncWebDavPasswordSet).to_string()
-                    } else {
-                        i18n::t(i18n::Key::SyncWebDavPasswordNotSet).to_string()
-                    }),
-            );
-
-        let local_btn = self.sync_config_backend_btn(
-            sync::SyncBackend::Local,
-            i18n::t(i18n::Key::SyncBackendLocal),
-            cx,
-        );
-        let webdav_btn = self.sync_config_backend_btn(
-            sync::SyncBackend::WebDav,
-            i18n::t(i18n::Key::SyncBackendWebDav),
-            cx,
-        );
-        let self_hosted_btn =
-            self.sync_config_backend_btn(sync::SyncBackend::SelfHosted, "自建服务", cx);
-        let self_hosted_form = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(div().text_xs().text_color(rgb(MUTED)).child("服务地址"))
-            .child(self_hosted_url_input)
-            .child(div().text_xs().text_color(rgb(MUTED)).child("访问令牌"))
-            .child(self_hosted_password_input)
-            .child(
-                div()
-                    .id("modal-clear-sync-token")
-                    .px_3()
-                    .py_1()
-                    .rounded_sm()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .cursor_pointer()
-                    .hover(|h| h.bg(rgb(PANEL2)))
-                    .child("清除令牌")
-                    .on_click(cx.listener(|this, _, _, cx| this.clear_sync_server_token(cx))),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(if self.sync_server_token_set {
-                        rgb(0x3ddc97)
-                    } else {
-                        rgb(MUTED)
-                    })
-                    .child(if self.sync_server_token_set {
-                        "令牌已设置"
-                    } else {
-                        "令牌未设置"
-                    }),
-            );
-        let device_name_form = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(div().text_xs().text_color(rgb(MUTED)).child("设备名称"))
-            .child(device_name_input)
-            .child(div().text_xs().text_color(rgb(MUTED)).child("可自定义；留空时使用系统名称"));
+        let session = sync::load_github_sync_session();
+        let logged_in = session
+            .as_ref()
+            .filter(|session| session.expires_at > chrono::Utc::now().timestamp());
+        let login_label = if self.github_login_busy {
+            "等待 GitHub 授权…"
+        } else if let Some(session) = logged_in {
+            if session.login.is_empty() { "已登录 GitHub" } else { "重新登录 GitHub" }
+        } else {
+            "登录 GitHub"
+        };
+        let login_status = if self.github_login_busy {
+            self.github_login_code
+                .as_ref()
+                .map(|code| format!("浏览器已打开，请输入验证码：{code}"))
+                .unwrap_or_else(|| "正在准备浏览器登录…".into())
+        } else if let Some(session) = logged_in {
+            format!("已登录 GitHub：{}", session.login)
+        } else {
+            "未登录；同一 GitHub 账号的设备会自动同步".into()
+        };
 
         let card = div()
             .w(px(360.))
@@ -1581,22 +1245,40 @@ impl Root {
                     .text_color(rgb(TEXT))
                     .child(i18n::t(i18n::Key::SyncConfigTitle)),
             )
+            .child(div().text_xs().text_color(rgb(MUTED)).child("同步 API 地址"))
+            .child(url_input)
+            .child(div().text_xs().text_color(rgb(MUTED)).child(login_status))
             .child(
                 div()
-                    .flex()
-                    .gap_2()
-                    .child(local_btn)
-                    .child(webdav_btn)
-                    .child(self_hosted_btn),
+                    .id("modal-github-login")
+                    .px_3()
+                    .py_2()
+                    .rounded_sm()
+                    .text_center()
+                    .text_xs()
+                    .text_color(rgb(0x0a0a0c))
+                    .bg(rgb(ACCENT))
+                    .cursor_pointer()
+                    .hover(|h| h.bg(rgb(0x6ad4ff)))
+                    .child(login_label)
+                    .on_click(cx.listener(|this, _, _, cx| this.start_github_login(cx))),
             )
-            .child(if self.sync_backend == sync::SyncBackend::Local {
-                local_form
-            } else if self.sync_backend == sync::SyncBackend::SelfHosted {
-                self_hosted_form
-            } else {
-                webdav_form
+            .when(logged_in.is_some(), |d| {
+                d.child(
+                    div()
+                        .id("modal-github-logout")
+                        .px_3()
+                        .py_1()
+                        .rounded_sm()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .cursor_pointer()
+                        .hover(|h| h.bg(rgb(PANEL2)))
+                        .child("退出 GitHub")
+                        .on_click(cx.listener(|this, _, _, cx| this.logout_github(cx))),
+                )
             })
-            .child(device_name_form)
+            .child(div().text_xs().text_color(rgb(MUTED)).child("同一 GitHub 账号的设备会合并到同一份同步数据"))
             .child(
                 div()
                     .flex()
@@ -3123,21 +2805,14 @@ fn main() {
                         sync_id: 0,
                         sync_last_at: String::new(),
                         sync_message: None,
-                        sync_enabled: sync_cfg.enabled,
-                        sync_dir: sync_cfg.sync_dir,
-                        sync_pick_task: None,
-                        sync_backend: sync_cfg.backend,
-                        webdav_url: sync_cfg.webdav_url,
-                        webdav_username: sync_cfg.webdav_username,
-                        sync_server_url: sync_cfg.sync_server_url,
-                        webdav_password_set: sync::has_webdav_password(),
-                        sync_server_token_set: sync::has_sync_server_token(),
+                        sync_enabled: sync_cfg.enabled && sync::github_sync_session_is_valid(),
+                        sync_api_url: sync_cfg.api_url,
+                        github_login_busy: false,
+                        github_login_id: 0,
+                        github_login_code: None,
+                        github_login_task: None,
                         sync_config_open: false,
                         modal_url_input: cx.new(|cx| TextInput::new(cx, "", "", false)),
-                        modal_username_input: cx.new(|cx| TextInput::new(cx, "", "", false)),
-                        modal_password_input: cx.new(|cx| TextInput::new(cx, "", "", true)),
-                        modal_dir_input: cx.new(|cx| TextInput::new(cx, "", "", false)),
-                        modal_device_name_input: cx.new(|cx| TextInput::new(cx, "", "", false)),
                         modal_focus: cx.focus_handle(),
                         section_agents_open: true,
                         section_devices_open: true,
