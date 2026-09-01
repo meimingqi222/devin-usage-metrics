@@ -71,7 +71,17 @@ fn log_loaded_part(source: &str, started: Instant, data: &LoadedData) {
 }
 
 #[derive(
-    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
@@ -279,9 +289,41 @@ fn fallback_device_id() -> String {
         .unwrap_or_else(|| "fallback-unknown".into())
 }
 
-/// 本机设备名称（hostname），用于 UI 展示。
+/// 读取用户保存的设备名称；未自定义时返回 None。
+pub fn custom_device_name() -> Option<String> {
+    if let Some(path) = device_id_path() {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            return serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("name")?
+                        .as_str()
+                        .map(|name| name.trim().to_owned())
+                })
+                .filter(|name| !name.is_empty());
+        }
+    }
+    None
+}
+
+/// 本机设备名称：用户自定义优先，未设置时才使用 hostname。
 pub fn device_name() -> String {
-    hostname().unwrap_or_else(|| "This Device".into())
+    custom_device_name().unwrap_or_else(|| hostname().unwrap_or_else(|| "This Device".into()))
+}
+
+/// 保存用户可读的设备名称；空值表示回退到系统 hostname，不影响稳定 device ID。
+pub fn set_device_name(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.chars().count() > 64 || name.chars().any(char::is_control) {
+        return Err("设备名称最长 64 个字符，且不能包含控制字符".into());
+    }
+    let path = device_id_path().ok_or_else(|| "无法定位设备配置目录".to_string())?;
+    let id = device_id();
+    let payload = serde_json::json!({ "id": id, "name": name }).to_string();
+    let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    std::fs::write(&temp, payload).map_err(|error| format!("写入设备名称失败: {error}"))?;
+    std::fs::rename(&temp, path).map_err(|error| format!("保存设备名称失败: {error}"))
 }
 
 fn hostname() -> Option<String> {
@@ -1167,47 +1209,60 @@ fn load_selected_agent(
     }
 }
 
-/// 以当前内存快照为基底，只重新加载指定 Agent 的目标时间窗口。
-/// 新窗口会合并进已有数据，返回已加载页时不需要再次读取源数据。
+/// 强制重新加载指定 Agent 的目标时间窗口。
+///
+/// `previous` 可能已经合并了远端设备数据，因此不能作为本次本机解析的增量
+/// 输入，也不能把目标窗口的旧 turn 留在结果中。否则每次手动刷新都会把远端
+/// 或旧快照残留的 turn 再与新结果叠加，造成用量不断偏大。
 pub fn reload_agent_from(
     previous: Arc<LoadedData>,
     start: i64,
     end: i64,
     agent: AgentKind,
 ) -> LoadedData {
-    let replacement = load_selected_agent(start, end, agent, Some(previous.clone()));
-    let mut data = (*previous).clone();
-    let replacement_keys: HashSet<String> = replacement
-        .sessions
-        .iter()
-        .map(|session| session.key.clone())
-        .collect();
+    // 强制刷新必须直接读取源数据。传入 previous 会复用已合并远端设备的 turn，
+    // 使其被错误视为本机缓存。
+    let replacement = load_selected_agent(start, end, agent, None);
+    let local_id = device_id();
+    let mut data = LoadedData {
+        sessions: previous
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.agent != agent
+                    && (session.device_id.is_empty() || session.device_id == local_id)
+            })
+            .cloned()
+            .collect(),
+        turns: previous
+            .turns
+            .iter()
+            .filter(|turn| {
+                turn.agent != agent && (turn.device_id.is_empty() || turn.device_id == local_id)
+            })
+            .cloned()
+            .collect(),
+        errors: previous
+            .errors
+            .iter()
+            .filter(|error| error.agent != agent)
+            .cloned()
+            .collect(),
+        file_mtimes: previous.file_mtimes.clone(),
+        file_sessions: previous.file_sessions.clone(),
+        ..Default::default()
+    };
     save_agent_cache(agent, &replacement);
-    data.sessions
-        .retain(|session| session.agent != agent || !replacement_keys.contains(&session.key));
-    data.errors.retain(|error| error.agent != agent);
     data.sessions.extend(replacement.sessions);
     data.errors.extend(replacement.errors);
     data.file_mtimes.extend(replacement.file_mtimes);
     data.file_sessions.extend(replacement.file_sessions);
-
-    let mut seen_turns: HashSet<String> = data.turns.iter().map(turn_key).collect();
-    for turn in replacement.turns {
-        if seen_turns.insert(turn_key(&turn)) {
-            data.turns.push(turn);
-        }
-    }
-
-    if data.turns_start == 0 && data.turns_end == 0 {
-        data.turns_start = start;
-        data.turns_end = end;
-    } else {
-        data.turns_start = data.turns_start.min(start);
-        data.turns_end = data.turns_end.max(end);
-    }
+    data.turns.extend(replacement.turns);
+    data.turns_start = start;
+    data.turns_end = end;
     data.turns.sort_by_key(|turn| turn.created_at);
     log_event(format!(
-        "reload_agent_from agent={} merged=true range={}..{} sessions={} turns={}",
+        "reload_agent_from agent={} source_fresh=true range={}..{} sessions={} turns={}",
         agent.label(),
         data.turns_start,
         data.turns_end,

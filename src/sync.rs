@@ -1,8 +1,8 @@
 //! 多设备数据同步：通过本地共享目录或 WebDAV 服务器交换数据包。
 //!
 //! 工作方式：
-//! - 用户在设置中开启同步并配置后端（本地目录 / WebDAV）后，后台每 `SYNC_INTERVAL_SECS` 秒自动：
-//!   1) 本机数据有变化时才把 `device-<id>.json` 覆盖上传；内容没变则跳过
+//! - 用户在设置中开启同步并配置后端（本地目录 / WebDAV / 自建服务）后，后台每 `SYNC_INTERVAL_SECS` 秒自动：
+//!   1) 本机数据有变化时才发布内容寻址 block + manifest；内容没变则跳过
 //!   2) 扫描后端中其他设备的数据包并合并进当前数据
 //! - 同步默认关闭，用户可在侧边栏的同步开关处一键开启/关闭。
 //! - 本地后端不发起任何网络请求，依赖用户已有的云盘（iCloud Drive / Dropbox 等）。
@@ -18,11 +18,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod v2;
+mod v3;
 
 /// 自动同步间隔（秒）。
-/// 每次都是整包覆盖上传，间隔太短会反复传同一份几 MB 的 JSON。
-/// 启动和手动重新加载仍会立即同步一次。
-pub const SYNC_INTERVAL_SECS: u64 = 15 * 60;
+/// v3 使用内容寻址小 block；无变化时上传为零。仍限制为每小时一次，避免第三方
+/// WebDAV / 自建服务被频繁 list/head 请求触发限流。
+pub const SYNC_INTERVAL_SECS: u64 = 60 * 60;
+const TRANSIENT_FAILURE_COOLDOWN_SECS: u64 = 30 * 60;
 
 /// WebDAV 单个响应体上限。同步包可能远大于 ureq 默认的 10 MiB；仍保留
 /// 有界限制，避免异常或恶意服务端耗尽内存。
@@ -36,6 +38,8 @@ pub enum SyncBackend {
     Local,
     /// WebDAV 服务器
     WebDav,
+    /// 自建的最小同步 API（Bearer token，数据不经过 GitHub）
+    SelfHosted,
 }
 
 impl SyncBackend {
@@ -43,12 +47,14 @@ impl SyncBackend {
         match self {
             Self::Local => "local",
             Self::WebDav => "webdav",
+            Self::SelfHosted => "self_hosted",
         }
     }
 
     pub fn parse(s: &str) -> Self {
         match s {
             "webdav" => Self::WebDav,
+            "self_hosted" => Self::SelfHosted,
             _ => Self::Local,
         }
     }
@@ -67,6 +73,8 @@ pub struct SyncConfig {
     pub webdav_url: String,
     /// WebDAV 后端：用户名
     pub webdav_username: String,
+    /// 自建服务基础地址，如 `https://sync.example.com`
+    pub sync_server_url: String,
 }
 
 /// 默认同步目录：
@@ -117,6 +125,8 @@ pub fn read_config() -> SyncConfig {
         webdav_url: String,
         #[serde(default)]
         webdav_username: String,
+        #[serde(default)]
+        sync_server_url: String,
     }
     match serde_json::from_str::<RawConfig>(&text) {
         Ok(raw) => SyncConfig {
@@ -125,6 +135,7 @@ pub fn read_config() -> SyncConfig {
             backend: SyncBackend::parse(&raw.backend),
             webdav_url: raw.webdav_url,
             webdav_username: raw.webdav_username,
+            sync_server_url: raw.sync_server_url,
         },
         Err(_) => SyncConfig::default(),
     }
@@ -144,6 +155,7 @@ pub fn save_config(config: &SyncConfig) {
         "backend": config.backend.as_str(),
         "webdav_url": config.webdav_url,
         "webdav_username": config.webdav_username,
+        "sync_server_url": config.sync_server_url,
     })
     .to_string();
     let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
@@ -179,12 +191,49 @@ pub(crate) fn destination_key(cfg: &SyncConfig) -> String {
             }
             format!("webdav:{url}|{}", cfg.webdav_username)
         }
+        SyncBackend::SelfHosted => {
+            format!("self_hosted:{}", cfg.sync_server_url.trim_end_matches('/'))
+        }
     }
 }
 
 /// 同步是否已开启。
 pub fn is_enabled() -> bool {
     read_config().enabled
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn cooldown_path() -> Option<PathBuf> {
+    let cfg = read_config();
+    let key = sha256_hex(destination_key(&cfg).as_bytes());
+    dirs::config_dir().map(|dir| dir.join(format!("devin-usage-metrics/sync-cooldown-{key}")))
+}
+
+/// 503/502/504 后持久化冷却，防止用户反复点击或重启应用继续打满服务端。
+pub fn record_transient_failure(error: &str) {
+    if !["HTTP 502", "HTTP 503", "HTTP 504"].iter().any(|value| error.contains(value)) {
+        return;
+    }
+    let Some(path) = cooldown_path() else { return };
+    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+    let until = now_secs().saturating_add(TRANSIENT_FAILURE_COOLDOWN_SECS);
+    let _ = atomic_replace(&path, until.to_string().as_bytes());
+}
+
+pub fn cooldown_remaining() -> Option<Duration> {
+    let until = fs::read_to_string(cooldown_path()?).ok()?.trim().parse::<u64>().ok()?;
+    let now = now_secs();
+    if until > now { Some(Duration::from_secs(until - now)) } else { None }
+}
+
+pub fn clear_transient_failure() {
+    if let Some(path) = cooldown_path() { let _ = fs::remove_file(path); }
 }
 
 /// 配置文件路径，与 device.json 同目录。
@@ -253,6 +302,7 @@ fn content_fingerprint(package: &DevicePackage) -> Result<String, String> {
 
 const KEYRING_SERVICE: &str = "devin-usage-metrics";
 const KEYRING_USER: &str = "webdav-password";
+const KEYRING_SYNC_SERVER_TOKEN: &str = "sync-server-token";
 
 /// 把 WebDAV 密码存入系统钥匙串。
 pub fn save_webdav_password(password: &str) -> Result<(), String> {
@@ -279,6 +329,32 @@ pub fn delete_webdav_password() {
 /// WebDAV 密码是否已设置。
 pub fn has_webdav_password() -> bool {
     load_webdav_password().is_some()
+}
+
+/// 自建服务的 Bearer token 同样只保存到系统钥匙串。
+pub fn save_sync_server_token(token: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_SYNC_SERVER_TOKEN)
+        .map_err(|e| format!("钥匙串初始化失败: {e}"))?;
+    entry
+        .set_password(token)
+        .map_err(|e| format!("令牌存储失败: {e}"))
+}
+
+pub fn load_sync_server_token() -> Option<String> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_SYNC_SERVER_TOKEN)
+        .ok()?
+        .get_password()
+        .ok()
+}
+
+pub fn has_sync_server_token() -> bool {
+    load_sync_server_token().is_some()
+}
+
+pub fn delete_sync_server_token() {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_SYNC_SERVER_TOKEN) {
+        let _ = entry.delete_credential();
+    }
 }
 
 // ── 传输层 trait ────────────────────────────────────────────────────────
@@ -476,6 +552,10 @@ impl WebDavTransport {
         format!("{op} 返回 HTTP {status}{hint}")
     }
 
+    fn retryable_status(status: u16) -> bool {
+        matches!(status, 502 | 503 | 504)
+    }
+
     fn run(
         &self,
         method: &str,
@@ -483,25 +563,49 @@ impl WebDavTransport {
         body: &[u8],
         extra: &[(&str, &str)],
     ) -> Result<(u16, Vec<u8>), String> {
-        let http_method = ureq::http::Method::from_bytes(method.as_bytes())
-            .map_err(|e| format!("无效方法 {method}: {e}"))?;
-        let mut builder = ureq::http::Request::builder()
-            .method(http_method)
-            .uri(url)
-            .header("Authorization", self.auth_header());
-        for (key, value) in extra {
-            builder = builder.header(*key, *value);
+        // 坚果云等 WebDAV 服务会偶发 503。这里涉及的 GET/HEAD/PROPFIND/PUT
+        // 均可安全重试；PUT 要么是内容寻址对象，要么带 CAS 条件，重复请求不会
+        // 造成重复记录。退避只在后台同步线程中发生，不阻塞界面线程。
+        const RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
+        for (attempt, delay) in RETRY_DELAYS
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+            .enumerate()
+        {
+            let http_method = ureq::http::Method::from_bytes(method.as_bytes())
+                .map_err(|e| format!("无效方法 {method}: {e}"))?;
+            let mut builder = ureq::http::Request::builder()
+                .method(http_method)
+                .uri(url)
+                .header("Authorization", self.auth_header());
+            for (key, value) in extra {
+                builder = builder.header(*key, *value);
+            }
+            let request = builder
+                .body(body.to_vec())
+                .map_err(|e| format!("构造 {method} 请求失败: {e}"))?;
+            let resp = self
+                .agent
+                .run(request)
+                .map_err(|e| format!("{method} 失败: {e}"))?;
+            let status = resp.status().as_u16();
+            let bytes = Self::read_body(resp)?;
+            if Self::retryable_status(status) {
+                if let Some(delay) = delay {
+                    data::log_event(format!(
+                        "sync WebDAV {method} got HTTP {status}; retry={} delay_secs={}",
+                        attempt + 1,
+                        delay.as_secs()
+                    ));
+                    std::thread::sleep(delay);
+                    continue;
+                }
+            }
+            return Ok((status, bytes));
         }
-        let request = builder
-            .body(body.to_vec())
-            .map_err(|e| format!("构造 {method} 请求失败: {e}"))?;
-        let resp = self
-            .agent
-            .run(request)
-            .map_err(|e| format!("{method} 失败: {e}"))?;
-        let status = resp.status().as_u16();
-        let bytes = Self::read_body(resp)?;
-        Ok((status, bytes))
+        unreachable!("retry loop always returns")
     }
 
     fn list_all_files(&self) -> Result<Vec<String>, String> {
@@ -558,7 +662,10 @@ impl SyncTransport for WebDavTransport {
             .header("Authorization", self.auth_header())
             .body(Vec::new())
             .map_err(|e| format!("构造 GET 请求失败: {e}"))?;
-        let resp = self.agent.run(request).map_err(|e| format!("GET 失败: {e}"))?;
+        let resp = self
+            .agent
+            .run(request)
+            .map_err(|e| format!("GET 失败: {e}"))?;
         if resp.status().as_u16() != 200 {
             return Err(Self::status_err("GET", resp.status().as_u16()));
         }
@@ -666,6 +773,190 @@ impl SyncTransport for WebDavTransport {
 
     fn list_sync_files(&self) -> Result<Vec<String>, String> {
         self.list_all_files()
+    }
+}
+
+/// 自建 Go 服务的对象传输。接口故意与本地/WebDAV 对齐，v3 对象命名保持扁平，
+/// 因而服务端不需要暴露文件系统或 WebDAV。
+struct SyncServerTransport {
+    base_url: String,
+    token: String,
+    agent: ureq::Agent,
+}
+
+impl SyncServerTransport {
+    fn new(url: &str, token: &str) -> Self {
+        Self {
+            base_url: url.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+            agent: ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(120)))
+                .http_status_as_error(false)
+                .redirect_auth_headers(ureq::config::RedirectAuthHeaders::SameHost)
+                .build()
+                .new_agent(),
+        }
+    }
+
+    fn object_url(&self, name: &str) -> String {
+        format!("{}/v1/objects/{name}", self.base_url)
+    }
+
+    fn run(
+        &self,
+        method: &str,
+        url: &str,
+        body: &[u8],
+        extra: &[(&str, &str)],
+    ) -> Result<(u16, Option<String>, Vec<u8>), String> {
+        const RETRIES: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
+        for delay in RETRIES
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
+            let mut request = ureq::http::Request::builder()
+                .method(
+                    ureq::http::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?,
+                )
+                .uri(url)
+                .header("Authorization", format!("Bearer {}", self.token));
+            for (key, value) in extra {
+                request = request.header(*key, *value);
+            }
+            let response = self
+                .agent
+                .run(request.body(body.to_vec()).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("自建同步服务 {method} 失败: {e}"))?;
+            let status = response.status().as_u16();
+            let etag = response
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let payload = WebDavTransport::read_body(response)?;
+            if matches!(status, 502 | 503 | 504) {
+                if let Some(delay) = delay {
+                    data::log_event(format!(
+                        "sync self-hosted {method} got HTTP {status}; retry in {}s",
+                        delay.as_secs()
+                    ));
+                    std::thread::sleep(delay);
+                    continue;
+                }
+            }
+            return Ok((status, etag, payload));
+        }
+        unreachable!()
+    }
+
+    fn error(op: &str, status: u16) -> String {
+        let hint = match status {
+            401 | 403 => "（令牌无效）",
+            413 => "（对象过大）",
+            507 => "（服务端存储配额已满）",
+            _ => "",
+        };
+        format!("自建同步服务 {op} 返回 HTTP {status}{hint}")
+    }
+}
+
+impl SyncTransport for SyncServerTransport {
+    fn put(&self, name: &str, data: &[u8]) -> Result<(), String> {
+        let (status, _, _) = self.run(
+            "PUT",
+            &self.object_url(name),
+            data,
+            &[("Content-Type", "application/octet-stream")],
+        )?;
+        if matches!(status, 200 | 201 | 204) {
+            Ok(())
+        } else {
+            Err(Self::error("PUT", status))
+        }
+    }
+    fn get(&self, name: &str) -> Result<Vec<u8>, String> {
+        let (status, _, body) = self.run("GET", &self.object_url(name), &[], &[])?;
+        if status == 200 {
+            Ok(body)
+        } else {
+            Err(Self::error("GET", status))
+        }
+    }
+    fn get_limited(&self, name: &str, limit: u64) -> Result<Vec<u8>, String> {
+        let value = self.get(name)?;
+        if value.len() as u64 > limit {
+            Err(format!("{name} 超过协议大小上限"))
+        } else {
+            Ok(value)
+        }
+    }
+    fn exists(&self, name: &str) -> Result<bool, String> {
+        let (status, _, _) = self.run("HEAD", &self.object_url(name), &[], &[])?;
+        match status {
+            200..=299 => Ok(true),
+            404 => Ok(false),
+            _ => Err(Self::error("HEAD", status)),
+        }
+    }
+    fn list_device_packages(&self) -> Result<Vec<String>, String> {
+        self.list_sync_files().map(|v| {
+            v.into_iter()
+                .filter(|n| n.starts_with("device-") && n.ends_with(".json"))
+                .collect()
+        })
+    }
+    fn read_head(&self, name: &str) -> Result<HeadRead, String> {
+        let (status, etag, body) = self.run("GET", &self.object_url(name), &[], &[])?;
+        match status {
+            200 => Ok(Some((body, etag))),
+            404 => Ok(None),
+            _ => Err(Self::error("GET", status)),
+        }
+    }
+    fn put_immutable(&self, name: &str, data: &[u8]) -> Result<bool, String> {
+        let (status, _, _) = self.run(
+            "PUT",
+            &self.object_url(name),
+            data,
+            &[
+                ("Content-Type", "application/octet-stream"),
+                ("If-None-Match", "*"),
+            ],
+        )?;
+        match status {
+            200 | 201 | 204 => Ok(true),
+            412 => Ok(false),
+            _ => Err(Self::error("PUT", status)),
+        }
+    }
+    fn cas_head(&self, name: &str, data: &[u8], revision: Option<&str>) -> Result<(), String> {
+        let condition = revision.unwrap_or("*");
+        let header = if revision.is_some() {
+            "If-Match"
+        } else {
+            "If-None-Match"
+        };
+        let (status, _, _) = self.run(
+            "PUT",
+            &self.object_url(name),
+            data,
+            &[("Content-Type", "application/json"), (header, condition)],
+        )?;
+        match status {
+            200 | 201 | 204 => Ok(()),
+            409 | 412 => Err("CAS_CONFLICT".into()),
+            _ => Err(Self::error("PUT", status)),
+        }
+    }
+    fn list_sync_files(&self) -> Result<Vec<String>, String> {
+        let (status, _, body) =
+            self.run("GET", &format!("{}/v1/objects", self.base_url), &[], &[])?;
+        if status != 200 {
+            return Err(Self::error("LIST", status));
+        }
+        serde_json::from_slice(&body).map_err(|e| format!("解析自建同步服务对象列表失败: {e}"))
     }
 }
 
@@ -841,6 +1132,17 @@ fn build_transport(cfg: &SyncConfig) -> Result<Box<dyn SyncTransport>, String> {
                 &cfg.webdav_url,
                 &cfg.webdav_username,
                 &password,
+            )))
+        }
+        SyncBackend::SelfHosted => {
+            if cfg.sync_server_url.trim().is_empty() {
+                return Err("自建同步服务地址未配置".into());
+            }
+            let token =
+                load_sync_server_token().ok_or_else(|| "自建同步服务令牌未设置".to_string())?;
+            Ok(Box::new(SyncServerTransport::new(
+                &cfg.sync_server_url,
+                &token,
             )))
         }
     }
@@ -1128,11 +1430,11 @@ fn import_remote_v1() -> (LoadedData, Vec<RemoteDevice>, Option<String>) {
 }
 
 pub fn export_local(data: LoadedData) -> Result<(), String> {
-    v2::export_local_v2(data)
+    v3::export_local_v3(data)
 }
 
 pub fn import_remote() -> (LoadedData, Vec<RemoteDevice>, Option<String>) {
-    v2::import_remote_v2()
+    v3::import_remote_v3()
 }
 
 /// 同步目录中发现的一个设备。

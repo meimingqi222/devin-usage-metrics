@@ -875,6 +875,14 @@ pub(super) fn export_local_v2(data: LoadedData) -> Result<(), String> {
 }
 
 pub(super) fn import_remote_v2() -> (LoadedData, Vec<RemoteDevice>, Option<String>) {
+    import_remote_v2_excluding(&HashSet::new())
+}
+
+/// 迁移期间按设备双读：已有 v3 head 的设备必须只读 v3，其他设备继续读 v2。
+/// 不能因为任意一台设备升级就丢掉仍停留在 v2 的设备数据。
+pub(super) fn import_remote_v2_excluding(
+    v3_devices: &HashSet<String>,
+) -> (LoadedData, Vec<RemoteDevice>, Option<String>) {
     let started = Instant::now();
     let local_id = data::device_id();
     let mut merged = LoadedData::default();
@@ -897,6 +905,9 @@ pub(super) fn import_remote_v2() -> (LoadedData, Vec<RemoteDevice>, Option<Strin
             .trim_start_matches("v2-head-")
             .trim_end_matches(".json")
             .to_owned();
+        if v3_devices.contains(&id) {
+            continue;
+        }
         v2_devices.insert(id.clone());
         let head_result = transport
             .read_head(name)
@@ -976,7 +987,7 @@ pub(super) fn import_remote_v2() -> (LoadedData, Vec<RemoteDevice>, Option<Strin
         .filter(|n| n.starts_with("device-") && n.ends_with(".json"))
     {
         let id = name.trim_start_matches("device-").trim_end_matches(".json");
-        if v2_devices.contains(id) {
+        if v2_devices.contains(id) || v3_devices.contains(id) {
             continue;
         }
         match transport

@@ -161,8 +161,12 @@ struct Root {
     webdav_url: String,
     /// WebDAV 用户名
     webdav_username: String,
+    /// 自建同步服务 URL
+    sync_server_url: String,
     /// WebDAV 密码是否已存入钥匙串
     webdav_password_set: bool,
+    /// 自建服务令牌是否已在钥匙串中保存
+    sync_server_token_set: bool,
     /// 同步设置弹窗是否打开
     sync_config_open: bool,
     /// 弹窗输入框（内容在打开时从配置填入，保存时读回）
@@ -170,6 +174,7 @@ struct Root {
     modal_username_input: Entity<TextInput>,
     modal_password_input: Entity<TextInput>,
     modal_dir_input: Entity<TextInput>,
+    modal_device_name_input: Entity<TextInput>,
     /// 弹窗的键盘焦点句柄（Esc 关闭）
     modal_focus: FocusHandle,
     /// 左侧边栏各分区展开状态
@@ -244,12 +249,8 @@ impl Root {
                     this.rebuild_sessions();
                     cx.notify();
                 }
-                // 首次本地加载完成后再启动同步，避免冷启动时并发扫描同一数据源；
-                // 手动重新加载后也立即同步。
-                if this.sync_enabled
-                    && !this.sync_busy
-                    && (force || this.sync_last_at.is_empty())
-                {
+                // Reload 只刷新本地 UI，不再隐式触发上传；后续由每小时调度处理。
+                if this.sync_enabled && !this.sync_busy && this.sync_last_at.is_empty() {
                     this.start_sync(cx);
                 }
             })
@@ -321,6 +322,7 @@ impl Root {
             backend: self.sync_backend,
             webdav_url: self.webdav_url.clone(),
             webdav_username: self.webdav_username.clone(),
+            sync_server_url: self.sync_server_url.clone(),
         }
     }
 
@@ -423,8 +425,19 @@ impl Root {
 
     fn fill_modal_inputs(&mut self, cfg: &sync::SyncConfig, cx: &mut Context<Self>) {
         self.modal_url_input.update(cx, |input, cx| {
-            input.set_placeholder(i18n::t(i18n::Key::SyncWebDavUrlPlaceholder));
-            input.set_text(cfg.webdav_url.clone(), cx);
+            input.set_placeholder(if cfg.backend == sync::SyncBackend::SelfHosted {
+                "https://sync.example.com"
+            } else {
+                i18n::t(i18n::Key::SyncWebDavUrlPlaceholder)
+            });
+            input.set_text(
+                if cfg.backend == sync::SyncBackend::SelfHosted {
+                    cfg.sync_server_url.clone()
+                } else {
+                    cfg.webdav_url.clone()
+                },
+                cx,
+            );
         });
         self.modal_username_input.update(cx, |input, cx| {
             input.set_placeholder(i18n::t(i18n::Key::SyncWebDavUsernamePlaceholder));
@@ -438,14 +451,19 @@ impl Root {
             input.set_placeholder(i18n::t(i18n::Key::SyncDirNotSet));
             input.set_text(cfg.sync_dir.clone(), cx);
         });
+        self.modal_device_name_input.update(cx, |input, cx| {
+            input.set_placeholder("留空使用系统设备名");
+            input.set_text(data::custom_device_name().unwrap_or_default(), cx);
+        });
     }
 
-    fn read_modal_inputs(&self, cx: &App) -> (String, String, String, String) {
+    fn read_modal_inputs(&self, cx: &App) -> (String, String, String, String, String) {
         (
             self.modal_url_input.read(cx).text(),
             self.modal_username_input.read(cx).text(),
             self.modal_password_input.read(cx).text(),
             self.modal_dir_input.read(cx).text(),
+            self.modal_device_name_input.read(cx).text(),
         )
     }
 
@@ -456,7 +474,9 @@ impl Root {
         self.sync_dir = cfg.sync_dir.clone();
         self.webdav_url = cfg.webdav_url.clone();
         self.webdav_username = cfg.webdav_username.clone();
+        self.sync_server_url = cfg.sync_server_url.clone();
         self.webdav_password_set = sync::has_webdav_password();
+        self.sync_server_token_set = sync::has_sync_server_token();
         self.fill_modal_inputs(&cfg, cx);
         self.sync_config_open = true;
         window.focus(&self.modal_focus);
@@ -470,7 +490,9 @@ impl Root {
         self.sync_dir = cfg.sync_dir.clone();
         self.webdav_url = cfg.webdav_url.clone();
         self.webdav_username = cfg.webdav_username.clone();
+        self.sync_server_url = cfg.sync_server_url.clone();
         self.webdav_password_set = sync::has_webdav_password();
+        self.sync_server_token_set = sync::has_sync_server_token();
         self.fill_modal_inputs(&cfg, cx);
         self.sync_config_open = false;
         cx.notify();
@@ -478,17 +500,35 @@ impl Root {
 
     /// 保存弹窗中的同步设置。
     fn save_sync_config(&mut self, cx: &mut Context<Self>) {
-        let (url, username, password, dir) = self.read_modal_inputs(cx);
-        self.webdav_url = url;
-        self.webdav_username = username;
+        let (url, username, password, dir, device_name) = self.read_modal_inputs(cx);
+        if let Err(error) = data::set_device_name(&device_name) {
+            self.sync_message = Some(error);
+            cx.notify();
+            return;
+        }
+        if self.sync_backend == sync::SyncBackend::SelfHosted {
+            self.sync_server_url = url;
+        } else {
+            self.webdav_url = url;
+            self.webdav_username = username;
+        }
         self.sync_dir = dir;
         if !password.is_empty() {
-            if let Err(e) = sync::save_webdav_password(&password) {
+            let result = if self.sync_backend == sync::SyncBackend::SelfHosted {
+                sync::save_sync_server_token(&password)
+            } else {
+                sync::save_webdav_password(&password)
+            };
+            if let Err(e) = result {
                 self.sync_message = Some(e);
                 cx.notify();
                 return;
             }
-            self.webdav_password_set = true;
+            if self.sync_backend == sync::SyncBackend::SelfHosted {
+                self.sync_server_token_set = true;
+            } else {
+                self.webdav_password_set = true;
+            }
         }
         sync::save_config(&self.build_sync_config());
         self.modal_password_input.update(cx, |input, cx| {
@@ -527,6 +567,13 @@ impl Root {
         cx.notify();
     }
 
+    fn clear_sync_server_token(&mut self, cx: &mut Context<Self>) {
+        sync::delete_sync_server_token();
+        self.sync_server_token_set = false;
+        self.modal_password_input.update(cx, |input, cx| input.set_text("", cx));
+        cx.notify();
+    }
+
     /// 折叠/展开侧边栏分区。
     fn toggle_section(&mut self, section: SidebarSection, cx: &mut Context<Self>) {
         match section {
@@ -548,9 +595,11 @@ impl Root {
     /// 启动自动同步定时任务：每 SYNC_INTERVAL_SECS 秒自动导出+导入。
     /// 仅在 sync_enabled 为 true 时持续运行；关闭后任务自然停止。
     fn sync_tick(&mut self, cx: &mut Context<Self>) {
-        let timer = cx
-            .background_executor()
-            .timer(Duration::from_secs(sync::SYNC_INTERVAL_SECS));
+        self.sync_tick_after(Duration::from_secs(sync::SYNC_INTERVAL_SECS), cx);
+    }
+
+    fn sync_tick_after(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        let timer = cx.background_executor().timer(delay);
         self.sync_tick_task = Some(cx.spawn(async move |this, cx| {
             timer.await;
             this.update(cx, |this, cx| {
@@ -596,6 +645,12 @@ impl Root {
         if self.sync_busy {
             return;
         }
+        if let Some(remaining) = sync::cooldown_remaining() {
+            self.sync_message = Some(format!("服务暂时限流，将在约 {} 分钟后重试", remaining.as_secs().div_ceil(60)));
+            self.sync_tick_after(remaining, cx);
+            cx.notify();
+            return;
+        }
         self.sync_id += 1;
         let sync_id = self.sync_id;
         self.sync_busy = true;
@@ -624,14 +679,18 @@ impl Root {
                     return;
                 }
                 this.sync_busy = false;
-                this.sync_last_at =
-                    chrono::Local::now().format("%H:%M:%S").to_string();
+                this.sync_last_at = chrono::Local::now().format("%H:%M:%S").to_string();
 
                 this.sync_message = match (export_result.as_ref(), import_error.as_ref()) {
                     (Err(e), _) => Some(e.clone()),
                     (Ok(_), Some(e)) => Some(e.clone()),
                     (Ok(_), None) => None,
                 };
+                if let Some(error) = this.sync_message.as_deref() {
+                    sync::record_transient_failure(error);
+                } else {
+                    sync::clear_transient_failure();
+                }
 
                 // 导入失败时保留上次成功的远程数据，避免设备列表被清空。
                 if import_error.is_none() {
@@ -644,7 +703,11 @@ impl Root {
 
                 // 4. 自动模式下安排下一次定时同步
                 if this.sync_enabled {
-                    this.sync_tick(cx);
+                    if let Some(remaining) = sync::cooldown_remaining() {
+                        this.sync_tick_after(remaining, cx);
+                    } else {
+                        this.sync_tick(cx);
+                    }
                 }
                 cx.notify();
             })
@@ -782,7 +845,10 @@ impl Root {
     }
 
     fn remove_quota_account(&mut self, key: &str, cx: &mut Context<Self>) {
-        if let Some(idx) = key.strip_prefix("devin-").and_then(|s| s.parse::<usize>().ok()) {
+        if let Some(idx) = key
+            .strip_prefix("devin-")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
             quota::remove_devin_account(idx);
         }
         self.start_quota_load(cx);
@@ -989,11 +1055,7 @@ impl Root {
                         } else {
                             gpui::FontWeight::MEDIUM
                         })
-                        .text_color(if selected {
-                            rgb(ACCENT)
-                        } else {
-                            rgb(TEXT)
-                        })
+                        .text_color(if selected { rgb(ACCENT) } else { rgb(TEXT) })
                         .child(truncate(&name, 14)),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1023,11 +1085,7 @@ impl Root {
                     } else {
                         gpui::FontWeight::MEDIUM
                     })
-                    .text_color(if all_selected {
-                        rgb(ACCENT)
-                    } else {
-                        rgb(TEXT)
-                    })
+                    .text_color(if all_selected { rgb(ACCENT) } else { rgb(TEXT) })
                     .child(i18n::t(i18n::Key::AllDevices)),
             )
             .on_click(cx.listener(|this, _, _, cx| {
@@ -1052,9 +1110,21 @@ impl Root {
                 }))
         };
 
-        let agents_header = section_header(SidebarSection::Agents, i18n::t(i18n::Key::AgentsSection), self.section_agents_open);
-        let devices_header = section_header(SidebarSection::Devices, i18n::t(i18n::Key::DevicesSection), self.section_devices_open);
-        let sync_header = section_header(SidebarSection::Sync, i18n::t(i18n::Key::SyncDirLabel), self.section_sync_open);
+        let agents_header = section_header(
+            SidebarSection::Agents,
+            i18n::t(i18n::Key::AgentsSection),
+            self.section_agents_open,
+        );
+        let devices_header = section_header(
+            SidebarSection::Devices,
+            i18n::t(i18n::Key::DevicesSection),
+            self.section_devices_open,
+        );
+        let sync_header = section_header(
+            SidebarSection::Sync,
+            i18n::t(i18n::Key::SyncDirLabel),
+            self.section_sync_open,
+        );
 
         let sync_backend_btns = div()
             .flex()
@@ -1100,6 +1170,26 @@ impl Root {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.commit_sync_backend(sync::SyncBackend::WebDav, cx);
                     })),
+            )
+            .child(
+                div()
+                    .id("sync-backend-self-hosted")
+                    .flex_1()
+                    .text_center()
+                    .py(px(2.))
+                    .text_xs()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(self.sync_backend == sync::SyncBackend::SelfHosted, |d| {
+                        d.bg(rgb(PANEL2)).text_color(rgb(TEXT))
+                    })
+                    .when(self.sync_backend != sync::SyncBackend::SelfHosted, |d| {
+                        d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
+                    })
+                    .child("自建")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.commit_sync_backend(sync::SyncBackend::SelfHosted, cx);
+                    })),
             );
 
         let sync_config_btn = div()
@@ -1126,14 +1216,7 @@ impl Root {
             .flex_col()
             .child(agents_header)
             .when(self.section_agents_open, |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .pl(px(12.))
-                        .pr_2()
-                        .children(items),
-                )
+                d.child(div().flex().flex_col().pl(px(12.)).pr_2().children(items))
             })
             .child(devices_header)
             .when(self.section_devices_open, |d| {
@@ -1189,13 +1272,7 @@ impl Root {
                     .cursor_pointer()
                     .text_color(sync_color)
                     .hover(|h| h.bg(rgb(PANEL2)))
-                    .child(
-                        div()
-                            .w(px(7.))
-                            .h(px(7.))
-                            .rounded_full()
-                            .bg(sync_color),
-                    )
+                    .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(sync_color))
                     .child(self.sync_toggle_label())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_sync(cx);
@@ -1257,7 +1334,9 @@ impl Root {
             .when(focused, |d| {
                 d.bg(rgb(PANEL2)).border_1().border_color(rgb(ACCENT))
             })
-            .when(!focused, |d| d.bg(rgb(0x101014)).hover(|h| h.bg(rgb(PANEL2))))
+            .when(!focused, |d| {
+                d.bg(rgb(0x101014)).hover(|h| h.bg(rgb(PANEL2)))
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |_, _, window, cx| {
@@ -1297,11 +1376,15 @@ impl Root {
     /// 同步设置弹窗（URL/用户名/密码/目录等配置）。
     fn sync_config_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let url_input = self.sync_config_input(self.modal_url_input.clone(), window, cx);
-        let username_input =
-            self.sync_config_input(self.modal_username_input.clone(), window, cx);
-        let password_input =
+        let self_hosted_url_input =
+            self.sync_config_input(self.modal_url_input.clone(), window, cx);
+        let username_input = self.sync_config_input(self.modal_username_input.clone(), window, cx);
+        let password_input = self.sync_config_input(self.modal_password_input.clone(), window, cx);
+        let self_hosted_password_input =
             self.sync_config_input(self.modal_password_input.clone(), window, cx);
         let local_dir_input = self.sync_config_input(self.modal_dir_input.clone(), window, cx);
+        let device_name_input =
+            self.sync_config_input(self.modal_device_name_input.clone(), window, cx);
 
         let local_form = div()
             .flex()
@@ -1435,6 +1518,50 @@ impl Root {
             i18n::t(i18n::Key::SyncBackendWebDav),
             cx,
         );
+        let self_hosted_btn =
+            self.sync_config_backend_btn(sync::SyncBackend::SelfHosted, "自建服务", cx);
+        let self_hosted_form = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().text_xs().text_color(rgb(MUTED)).child("服务地址"))
+            .child(self_hosted_url_input)
+            .child(div().text_xs().text_color(rgb(MUTED)).child("访问令牌"))
+            .child(self_hosted_password_input)
+            .child(
+                div()
+                    .id("modal-clear-sync-token")
+                    .px_3()
+                    .py_1()
+                    .rounded_sm()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .cursor_pointer()
+                    .hover(|h| h.bg(rgb(PANEL2)))
+                    .child("清除令牌")
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_sync_server_token(cx))),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(if self.sync_server_token_set {
+                        rgb(0x3ddc97)
+                    } else {
+                        rgb(MUTED)
+                    })
+                    .child(if self.sync_server_token_set {
+                        "令牌已设置"
+                    } else {
+                        "令牌未设置"
+                    }),
+            );
+        let device_name_form = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().text_xs().text_color(rgb(MUTED)).child("设备名称"))
+            .child(device_name_input)
+            .child(div().text_xs().text_color(rgb(MUTED)).child("可自定义；留空时使用系统名称"));
 
         let card = div()
             .w(px(360.))
@@ -1459,13 +1586,17 @@ impl Root {
                     .flex()
                     .gap_2()
                     .child(local_btn)
-                    .child(webdav_btn),
+                    .child(webdav_btn)
+                    .child(self_hosted_btn),
             )
             .child(if self.sync_backend == sync::SyncBackend::Local {
                 local_form
+            } else if self.sync_backend == sync::SyncBackend::SelfHosted {
+                self_hosted_form
             } else {
                 webdav_form
             })
+            .child(device_name_form)
             .child(
                 div()
                     .flex()
@@ -1720,9 +1851,7 @@ impl Root {
                                 } else {
                                     i18n::t(i18n::Key::QuotaRefresh)
                                 })
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation()
-                                })
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if !this.quota_loading {
                                         this.start_quota_load(cx);
@@ -1747,9 +1876,7 @@ impl Root {
                                 } else {
                                     i18n::t(i18n::Key::QuotaAddDevin)
                                 })
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation()
-                                })
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.add_devin_from_clipboard(cx);
                                 })),
@@ -1833,28 +1960,29 @@ impl Root {
     fn windows_caption_buttons(&self, window: &mut Window) -> impl IntoElement {
         // Win11 为 Segoe Fluent Icons；若需支持 Win10 改为 "Segoe MDL2 Assets"
         const ICON_FONT: &str = "Segoe Fluent Icons";
-        let caption_button = |id: &'static str, icon: &str, area: WindowControlArea, danger: bool| {
-            div()
-                .id(id)
-                .occlude()
-                .window_control_area(area)
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(46.))
-                .h_full()
-                .text_size(px(10.))
-                .font_family(ICON_FONT)
-                .text_color(rgb(MUTED))
-                .hover(|s| {
-                    if danger {
-                        s.bg(rgb(0xe81123)).text_color(rgb(0xffffff))
-                    } else {
-                        s.bg(rgb(PANEL2)).text_color(rgb(TEXT))
-                    }
-                })
-                .child(icon.to_string())
-        };
+        let caption_button =
+            |id: &'static str, icon: &str, area: WindowControlArea, danger: bool| {
+                div()
+                    .id(id)
+                    .occlude()
+                    .window_control_area(area)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(46.))
+                    .h_full()
+                    .text_size(px(10.))
+                    .font_family(ICON_FONT)
+                    .text_color(rgb(MUTED))
+                    .hover(|s| {
+                        if danger {
+                            s.bg(rgb(0xe81123)).text_color(rgb(0xffffff))
+                        } else {
+                            s.bg(rgb(PANEL2)).text_color(rgb(TEXT))
+                        }
+                    })
+                    .child(icon.to_string())
+            };
         div()
             .flex()
             .h_full()
@@ -2523,12 +2651,7 @@ impl Root {
             .gap_3();
 
         if let Some(msg) = &self.quota_message {
-            body = body.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0xf87171))
-                    .child(msg.clone()),
-            );
+            body = body.child(div().text_xs().text_color(rgb(0xf87171)).child(msg.clone()));
         }
 
         if self.quota_loading && self.quota_cards.is_empty() {
@@ -2637,16 +2760,18 @@ impl Root {
             }
             Ok(result) => {
                 if let Some(plan) = &result.plan {
-                    d = d.child(div().flex().child(
-                        div()
-                            .px_2()
-                            .py(px(1.))
-                            .rounded_sm()
-                            .bg(rgb(PANEL2))
-                            .text_xs()
-                            .text_color(rgb(ACCENT))
-                            .child(plan.clone()),
-                    ));
+                    d = d.child(
+                        div().flex().child(
+                            div()
+                                .px_2()
+                                .py(px(1.))
+                                .rounded_sm()
+                                .bg(rgb(PANEL2))
+                                .text_xs()
+                                .text_color(rgb(ACCENT))
+                                .child(plan.clone()),
+                        ),
+                    );
                 }
                 for w in &result.windows {
                     let color = pct_color(w.used_percent);
@@ -3004,12 +3129,15 @@ fn main() {
                         sync_backend: sync_cfg.backend,
                         webdav_url: sync_cfg.webdav_url,
                         webdav_username: sync_cfg.webdav_username,
+                        sync_server_url: sync_cfg.sync_server_url,
                         webdav_password_set: sync::has_webdav_password(),
+                        sync_server_token_set: sync::has_sync_server_token(),
                         sync_config_open: false,
                         modal_url_input: cx.new(|cx| TextInput::new(cx, "", "", false)),
                         modal_username_input: cx.new(|cx| TextInput::new(cx, "", "", false)),
                         modal_password_input: cx.new(|cx| TextInput::new(cx, "", "", true)),
                         modal_dir_input: cx.new(|cx| TextInput::new(cx, "", "", false)),
+                        modal_device_name_input: cx.new(|cx| TextInput::new(cx, "", "", false)),
                         modal_focus: cx.focus_handle(),
                         section_agents_open: true,
                         section_devices_open: true,
