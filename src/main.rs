@@ -181,7 +181,9 @@ fn open_external_url(url: &str) -> Result<(), String> {
     let result = std::process::Command::new("open").arg(url).spawn();
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     let result = std::process::Command::new("xdg-open").arg(url).spawn();
-    result.map(|_| ()).map_err(|e| format!("无法打开浏览器: {e}"))
+    result
+        .map(|_| ())
+        .map_err(|e| format!("无法打开浏览器: {e}"))
 }
 
 impl Root {
@@ -422,7 +424,9 @@ impl Root {
         self.github_login_busy = true;
         self.github_login_code = None;
         self.sync_message = Some("正在请求 GitHub 登录…".into());
-        let begin = cx.background_executor().spawn(async move { sync::begin_github_login(&api_url) });
+        let begin = cx
+            .background_executor()
+            .spawn(async move { sync::begin_github_login(&api_url) });
         self.github_login_task = Some(cx.spawn(async move |this, cx| {
             let result = begin.await;
             this.update(cx, |this, cx| {
@@ -432,9 +436,15 @@ impl Root {
                 match result {
                     Ok(authorization) => {
                         this.github_login_code = Some(authorization.user_code.clone());
-                        this.sync_message = Some(format!("请在浏览器完成 GitHub 登录，验证码：{}", authorization.user_code));
+                        this.sync_message = Some(format!(
+                            "请在浏览器完成 GitHub 登录，验证码：{}",
+                            authorization.user_code
+                        ));
                         if let Err(error) = open_external_url(&authorization.verification_uri) {
-                            this.sync_message = Some(format!("请手动打开 {}，验证码：{}（{error}）", authorization.verification_uri, authorization.user_code));
+                            this.sync_message = Some(format!(
+                                "请手动打开 {}，验证码：{}（{error}）",
+                                authorization.verification_uri, authorization.user_code
+                            ));
                         }
                         let wait_api_url = this.sync_api_url.clone();
                         let wait = cx.background_executor().spawn(async move {
@@ -451,7 +461,8 @@ impl Root {
                                 match session {
                                     Ok(session) => match sync::save_github_sync_session(&session) {
                                         Ok(()) => {
-                                            this.sync_message = Some(format!("已登录 GitHub：{}", session.login));
+                                            this.sync_message =
+                                                Some(format!("已登录 GitHub：{}", session.login));
                                             if this.sync_enabled {
                                                 this.start_sync(cx);
                                             }
@@ -461,7 +472,8 @@ impl Root {
                                     Err(error) => this.sync_message = Some(error),
                                 }
                                 cx.notify();
-                            }).ok();
+                            })
+                            .ok();
                         }));
                     }
                     Err(error) => {
@@ -470,7 +482,8 @@ impl Root {
                     }
                 }
                 cx.notify();
-            }).ok();
+            })
+            .ok();
         }));
     }
 
@@ -568,7 +581,10 @@ impl Root {
             return;
         }
         if let Some(remaining) = sync::cooldown_remaining() {
-            self.sync_message = Some(format!("服务暂时限流，将在约 {} 分钟后重试", remaining.as_secs().div_ceil(60)));
+            self.sync_message = Some(format!(
+                "服务暂时限流，将在约 {} 分钟后重试",
+                remaining.as_secs().div_ceil(60)
+            ));
             self.sync_tick_after(remaining, cx);
             cx.notify();
             return;
@@ -1042,11 +1058,7 @@ impl Root {
             i18n::t(i18n::Key::DevicesSection),
             self.section_devices_open,
         );
-        let sync_header = section_header(
-            SidebarSection::Sync,
-            "同步",
-            self.section_sync_open,
-        );
+        let sync_header = section_header(SidebarSection::Sync, "同步", self.section_sync_open);
 
         let sync_config_btn = div()
             .id("sync-config-open")
@@ -1212,7 +1224,11 @@ impl Root {
         let login_label = if self.github_login_busy {
             "等待 GitHub 授权…"
         } else if let Some(session) = logged_in {
-            if session.login.is_empty() { "已登录 GitHub" } else { "重新登录 GitHub" }
+            if session.login.is_empty() {
+                "已登录 GitHub"
+            } else {
+                "重新登录 GitHub"
+            }
         } else {
             "登录 GitHub"
         };
@@ -1245,7 +1261,12 @@ impl Root {
                     .text_color(rgb(TEXT))
                     .child(i18n::t(i18n::Key::SyncConfigTitle)),
             )
-            .child(div().text_xs().text_color(rgb(MUTED)).child("同步 API 地址"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("同步 API 地址"),
+            )
             .child(url_input)
             .child(div().text_xs().text_color(rgb(MUTED)).child(login_status))
             .child(
@@ -1278,7 +1299,12 @@ impl Root {
                         .on_click(cx.listener(|this, _, _, cx| this.logout_github(cx))),
                 )
             })
-            .child(div().text_xs().text_color(rgb(MUTED)).child("同一 GitHub 账号的设备会合并到同一份同步数据"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("同一 GitHub 账号的设备会合并到同一份同步数据"),
+            )
             .child(
                 div()
                     .flex()

@@ -425,7 +425,7 @@ fn parse_amp_value(
                     ttft_ms: 0.0,
                     total_time_ms: 0.0,
                     recorded_cost: None,
-                ..Default::default()
+                    ..Default::default()
                 });
             }
         }
@@ -666,21 +666,8 @@ fn load_amp_thread_export(id: &str, updated: i64) -> Option<Value> {
     let cache_dir = amp_cache_dir();
     let cache_path = cache_dir.join(format!("{id}.json"));
 
-    // 检查缓存文件是否存在且足够新
-    if let Ok(metadata) = std::fs::metadata(&cache_path) {
-        if let Ok(mtime) = metadata.modified() {
-            if let Ok(secs) = mtime.duration_since(UNIX_EPOCH) {
-                let cached_mtime = secs.as_secs() as i64;
-                if cached_mtime >= updated {
-                    if let Ok(file) = File::open(&cache_path) {
-                        if let Ok(value) = serde_json::from_reader::<_, Value>(BufReader::new(file))
-                        {
-                            return Some(value);
-                        }
-                    }
-                }
-            }
-        }
+    if let Some(value) = load_amp_thread_export_cache(&cache_path, updated) {
+        return Some(value);
     }
 
     // 缓存未命中或已过期，从 CLI 导出
@@ -696,6 +683,26 @@ fn load_amp_thread_export(id: &str, updated: i64) -> Option<Value> {
     }
 
     Some(value)
+}
+
+fn load_amp_thread_export_cache(cache_path: &Path, updated: i64) -> Option<Value> {
+    // 检查缓存文件是否存在且足够新
+    if let Ok(metadata) = std::fs::metadata(cache_path) {
+        if let Ok(mtime) = metadata.modified() {
+            if let Ok(secs) = mtime.duration_since(UNIX_EPOCH) {
+                let cached_mtime = secs.as_secs() as i64;
+                if cached_mtime >= updated {
+                    if let Ok(file) = File::open(cache_path) {
+                        if let Ok(value) = serde_json::from_reader::<_, Value>(BufReader::new(file))
+                        {
+                            return Some(value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn load_amp_remote(start: i64, end: i64) -> (Vec<SessionRec>, Vec<TurnRec>, Vec<String>) {
@@ -996,7 +1003,7 @@ fn parse_claude_file(
                     ttft_ms: 0.0,
                     total_time_ms: 0.0,
                     recorded_cost: None,
-                ..Default::default()
+                    ..Default::default()
                 };
                 if message_id.is_empty() {
                     anonymous_turns.push((id, turn));
@@ -1424,7 +1431,7 @@ pub(crate) fn load_codex(start: i64, end: i64, previous: Option<&LoadedData>) ->
                 ttft_ms: 0.0,
                 total_time_ms: 0.0,
                 recorded_cost: None,
-            ..Default::default()
+                ..Default::default()
             });
         }
     }
@@ -1786,7 +1793,7 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> AgParse {
                             ttft_ms: 0.0,
                             total_time_ms: 0.0,
                             recorded_cost: None,
-                        ..Default::default()
+                            ..Default::default()
                         });
                     }
                 } else if let Some(prompt) = pb_varint_field(&row, 11) {
@@ -1809,7 +1816,7 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> AgParse {
                             ttft_ms: 0.0,
                             total_time_ms: 0.0,
                             recorded_cost: None,
-                        ..Default::default()
+                            ..Default::default()
                         });
                     }
                 }
@@ -2096,7 +2103,7 @@ fn parse_grok_session(
                     ttft_ms: 0.0,
                     total_time_ms: duration_ms,
                     recorded_cost,
-                ..Default::default()
+                    ..Default::default()
                 });
             }
         }
@@ -2673,7 +2680,7 @@ pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
                         ttft_ms: 0.0,
                         total_time_ms: duration_ms,
                         recorded_cost: None,
-                    ..Default::default()
+                        ..Default::default()
                     });
                 }
             }
@@ -2838,12 +2845,13 @@ fn timestamp_ms_to_sec(ts: Option<i64>) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        amp_cache_dir, amp_list_cache_path, content_text, load_amp_thread_export, parse_amp_value,
-        parse_claude_file, parse_pi_file, timestamp, AmpListCache, AmpListEntry,
+        amp_cache_dir, amp_list_cache_path, content_text, load_amp_thread_export_cache,
+        parse_amp_value, parse_claude_file, parse_pi_file, timestamp, AmpListCache, AmpListEntry,
     };
     use serde_json::json;
     use std::fs::File;
     use std::io::{BufWriter, Write};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_iso_and_millisecond_timestamps() {
@@ -2985,12 +2993,18 @@ mod tests {
     /// 验证线程导出缓存：写入后能从本地文件读回，不需要 CLI 调用。
     #[test]
     fn amp_thread_export_cache_roundtrip() {
-        let dir = amp_cache_dir();
+        let dir = std::env::temp_dir().join(format!(
+            "devin-usage-metrics-amp-cache-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let test_id = format!("test-export-roundtrip-{}", std::process::id());
         let cache_path = dir.join(format!("{test_id}.json"));
 
-        // 清理可能存在的残留文件
-        let _ = std::fs::remove_file(&cache_path);
+        std::fs::create_dir_all(&dir).unwrap();
 
         let value = json!({
             "id": test_id,
@@ -3010,14 +3024,11 @@ mod tests {
         });
 
         // 写入缓存文件
-        if let Some(parent) = cache_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let file = File::create(&cache_path).unwrap();
         serde_json::to_writer(BufWriter::new(file), &value).unwrap();
 
         // updated=0 表示线程从未更新，缓存 mtime 一定 >= 0，应命中缓存
-        let loaded = load_amp_thread_export(&test_id, 0);
+        let loaded = load_amp_thread_export_cache(&cache_path, 0);
         assert!(loaded.is_some());
         let loaded_val = loaded.unwrap();
         assert_eq!(
@@ -3026,7 +3037,7 @@ mod tests {
         );
 
         // 清理
-        let _ = std::fs::remove_file(&cache_path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 验证线程列表缓存文件能正确序列化/反序列化。

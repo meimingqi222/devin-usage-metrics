@@ -115,23 +115,38 @@ fn cooldown_path() -> Option<PathBuf> {
 
 /// 503/502/504 后持久化冷却，防止用户反复点击或重启应用继续打满服务端。
 pub fn record_transient_failure(error: &str) {
-    if !["HTTP 502", "HTTP 503", "HTTP 504"].iter().any(|value| error.contains(value)) {
+    if !["HTTP 502", "HTTP 503", "HTTP 504"]
+        .iter()
+        .any(|value| error.contains(value))
+    {
         return;
     }
     let Some(path) = cooldown_path() else { return };
-    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     let until = now_secs().saturating_add(TRANSIENT_FAILURE_COOLDOWN_SECS);
     let _ = atomic_replace(&path, until.to_string().as_bytes());
 }
 
 pub fn cooldown_remaining() -> Option<Duration> {
-    let until = fs::read_to_string(cooldown_path()?).ok()?.trim().parse::<u64>().ok()?;
+    let until = fs::read_to_string(cooldown_path()?)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
     let now = now_secs();
-    if until > now { Some(Duration::from_secs(until - now)) } else { None }
+    if until > now {
+        Some(Duration::from_secs(until - now))
+    } else {
+        None
+    }
 }
 
 pub fn clear_transient_failure() {
-    if let Some(path) = cooldown_path() { let _ = fs::remove_file(path); }
+    if let Some(path) = cooldown_path() {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// 配置文件路径，与 device.json 同目录。
@@ -278,8 +293,8 @@ pub fn begin_github_login(api_url: &str) -> Result<GitHubDeviceAuthorization, St
     if status != 200 {
         return Err(format!("同步 API 启动 GitHub 登录返回 HTTP {status}"));
     }
-    let mut authorization: GitHubDeviceAuthorization = serde_json::from_slice(&body)
-        .map_err(|e| format!("解析 GitHub 登录响应失败: {e}"))?;
+    let mut authorization: GitHubDeviceAuthorization =
+        serde_json::from_slice(&body).map_err(|e| format!("解析 GitHub 登录响应失败: {e}"))?;
     if authorization.device_code.is_empty()
         || authorization.user_code.is_empty()
         || authorization.verification_uri.is_empty()
@@ -336,7 +351,10 @@ pub fn wait_for_github_login(
         }
         let session: GitHubSyncSession = serde_json::from_slice(&response_body)
             .map_err(|e| format!("解析 GitHub 登录结果失败: {e}"))?;
-        if session.sync_token.is_empty() || session.login.is_empty() || session.expires_at <= chrono::Utc::now().timestamp() {
+        if session.sync_token.is_empty()
+            || session.login.is_empty()
+            || session.expires_at <= chrono::Utc::now().timestamp()
+        {
             return Err("同步 API 返回了无效的登录会话".into());
         }
         return Ok(session);
@@ -539,7 +557,7 @@ impl WebDavTransport {
     }
 
     fn retryable_status(status: u16) -> bool {
-        matches!(status, 502 | 503 | 504)
+        matches!(status, 502..=504)
     }
 
     fn run(
@@ -822,7 +840,7 @@ impl SyncServerTransport {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_owned);
             let payload = WebDavTransport::read_body(response)?;
-            if matches!(status, 502 | 503 | 504) {
+            if matches!(status, 502..=504) {
                 if let Some(delay) = delay {
                     data::log_event(format!(
                         "sync self-hosted {method} got HTTP {status}; retry in {}s",
@@ -1106,7 +1124,10 @@ fn build_transport(cfg: &SyncConfig) -> Result<Box<dyn SyncTransport>, String> {
         delete_github_sync_session();
         return Err("GitHub 同步登录已过期，请重新登录".to_string());
     }
-    Ok(Box::new(SyncServerTransport::new(&base, &session.sync_token)))
+    Ok(Box::new(SyncServerTransport::new(
+        &base,
+        &session.sync_token,
+    )))
 }
 
 /// 用当前配置构造传输层（便捷方法）。

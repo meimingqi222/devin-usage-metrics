@@ -8,10 +8,10 @@ use std::ops::Range;
 
 use gpui::{
     actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size, App, Bounds,
-    ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString, Style,
-    TextRun, UTF16Selection, UnderlineStyle, Window,
+    ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
+    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 
 actions!(
@@ -606,12 +606,16 @@ impl Element for TextElement {
                     Bounds::from_corners(
                         point(
                             bounds.left()
-                                + line.x_for_index(input.content_index_to_display(selected_range.start)),
+                                + line.x_for_index(
+                                    input.content_index_to_display(selected_range.start),
+                                ),
                             bounds.top(),
                         ),
                         point(
                             bounds.left()
-                                + line.x_for_index(input.content_index_to_display(selected_range.end)),
+                                + line.x_for_index(
+                                    input.content_index_to_display(selected_range.end),
+                                ),
                             bounds.bottom(),
                         ),
                     ),
@@ -687,9 +691,7 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .child(TextElement {
-                input: cx.entity(),
-            })
+            .child(TextElement { input: cx.entity() })
     }
 }
 

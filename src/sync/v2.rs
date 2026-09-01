@@ -528,7 +528,9 @@ fn read_last_audit() -> Option<(String, i64)> {
 }
 
 fn write_last_audit(generation: &str, at: i64) {
-    let Some(path) = audit_state_path() else { return };
+    let Some(path) = audit_state_path() else {
+        return;
+    };
     // import 路径不持 writer lock,多进程并发审计时裸 fs::write 可能撕裂状态文件;
     // 用原子替换避免,读取侧 read_last_audit 解析失败也只会多跑一次审计。
     let _ = atomic_replace(&path, format!("{generation}\n{at}\n").as_bytes());
@@ -571,9 +573,7 @@ fn audit_local_device_with(
         // at > now_ts:状态时间在未来(时钟回拨或状态文件异常),视为无效立即重跑,
         // 否则会一直跳过到系统时间追上它。
         Some((g, at)) => {
-            g != generation_hash
-                || at > now_ts
-                || now_ts.saturating_sub(at) >= AUDIT_INTERVAL_SECS
+            g != generation_hash || at > now_ts || now_ts.saturating_sub(at) >= AUDIT_INTERVAL_SECS
         }
         None => true,
     };
@@ -701,8 +701,7 @@ fn ensure_strong_revision(revision: Option<&str>) -> Result<(), String> {
     match revision {
         Some(etag) if !etag.trim_start().starts_with("W/") => Ok(()),
         _ => Err(
-            "WebDAV 服务端已有 head，但未提供可用于 If-Match 的强 ETag，不支持安全并发发布"
-                .into(),
+            "WebDAV 服务端已有 head，但未提供可用于 If-Match 的强 ETag，不支持安全并发发布".into(),
         ),
     }
 }
@@ -812,10 +811,7 @@ pub(super) fn export_local_v2(data: LoadedData) -> Result<(), String> {
                 }
                 reused += 1
             }
-            atomic_replace(
-                &cache_dir().join(format!("{}.zst", reference.hash)),
-                bytes,
-            )?;
+            atomic_replace(&cache_dir().join(format!("{}.zst", reference.hash)), bytes)?;
         }
         let generation = Generation {
             protocol: PROTOCOL,
@@ -1232,10 +1228,7 @@ mod tests {
     }
 
     /// 构造一个真实发布到 transport 的设备,返回 (generation, head)。
-    fn publish_device(
-        transport: &LocalTransport,
-        device_id: &str,
-    ) -> (Generation, Head) {
+    fn publish_device(transport: &LocalTransport, device_id: &str) -> (Generation, Head) {
         let pkg = DevicePackage {
             schema_version: 1,
             device_id: device_id.into(),
@@ -1365,7 +1358,10 @@ mod tests {
         state.borrow_mut().as_mut().unwrap().1 = now() - AUDIT_INTERVAL_SECS - 1;
         let result = audit();
         assert!(result.is_err(), "远端损坏且本地无副本必须报错");
-        assert!(result.unwrap_err().contains("无可用副本"), "报错应指明无法修复");
+        assert!(
+            result.unwrap_err().contains("无可用副本"),
+            "报错应指明无法修复"
+        );
 
         fs::remove_dir_all(dir).unwrap();
         let _ = fs::remove_dir_all(cache_dir);
@@ -1420,7 +1416,8 @@ mod tests {
 
         // 状态键匹配但时间戳在未来(时钟回拨/状态文件异常):必须立即重跑,
         // 否则审计会一直跳过到系统时间追上它。
-        let state = std::cell::RefCell::new(Some((head.generation.clone(), now() + 365 * 24 * 3600)));
+        let state =
+            std::cell::RefCell::new(Some((head.generation.clone(), now() + 365 * 24 * 3600)));
         let read_state = || state.borrow().clone();
         let write_state = |g: &str, at: i64| {
             *state.borrow_mut() = Some((g.to_owned(), at));

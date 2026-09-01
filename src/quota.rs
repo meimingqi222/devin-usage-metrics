@@ -66,10 +66,19 @@ pub struct QuotaResult {
 }
 
 pub enum AccountKind {
-    ClaudeLocal { path: PathBuf },
-    CodexLocal { path: PathBuf },
-    GrokLocal { path: PathBuf },
-    Devin { cookie: String, org_id: Option<String> },
+    ClaudeLocal {
+        path: PathBuf,
+    },
+    CodexLocal {
+        path: PathBuf,
+    },
+    GrokLocal {
+        path: PathBuf,
+    },
+    Devin {
+        cookie: String,
+        org_id: Option<String>,
+    },
 }
 
 pub struct Account {
@@ -201,7 +210,11 @@ pub fn discover_accounts() -> Vec<Account> {
         out.push(Account {
             key: format!("devin-{i}"),
             provider: Provider::Devin,
-            label: if d.label.is_empty() { "Devin".into() } else { d.label },
+            label: if d.label.is_empty() {
+                "Devin".into()
+            } else {
+                d.label
+            },
             kind: AccountKind::Devin {
                 cookie: d.cookie,
                 org_id: d.org_id,
@@ -228,9 +241,7 @@ fn read_claude_email(path: &Path) -> Option<String> {
 
 fn read_codex_email(path: &Path) -> Option<String> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    v.get("email")
-        .and_then(Value::as_str)
-        .map(str::to_string)
+    v.get("email").and_then(Value::as_str).map(str::to_string)
 }
 
 fn read_grok_email(path: &Path) -> Option<String> {
@@ -269,7 +280,12 @@ fn get_json(agent: &ureq::Agent, url: &str, headers: &[(&str, &str)]) -> Result<
     read_json(resp)
 }
 
-fn post_form(agent: &ureq::Agent, url: &str, form: &str, headers: &[(&str, &str)]) -> Result<Value, String> {
+fn post_form(
+    agent: &ureq::Agent,
+    url: &str,
+    form: &str,
+    headers: &[(&str, &str)],
+) -> Result<Value, String> {
     let mut req = agent
         .post(url)
         .header("content-type", "application/x-www-form-urlencoded")
@@ -281,7 +297,12 @@ fn post_form(agent: &ureq::Agent, url: &str, form: &str, headers: &[(&str, &str)
     read_json(resp)
 }
 
-fn post_json(agent: &ureq::Agent, url: &str, payload: Value, headers: &[(&str, &str)]) -> Result<Value, String> {
+fn post_json(
+    agent: &ureq::Agent,
+    url: &str,
+    payload: Value,
+    headers: &[(&str, &str)],
+) -> Result<Value, String> {
     let mut req = agent.post(url).header("accept", "application/json");
     for &(k, v) in headers {
         req = req.header(k, v);
@@ -342,7 +363,8 @@ pub fn fetch_account(account: &Account) -> Result<QuotaResult, String> {
 // ---------------------------------------------------------------------------
 
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const CLAUDE_SCOPES: &str = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+const CLAUDE_SCOPES: &str =
+    "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 struct ClaudeCred {
     access_token: String,
@@ -354,8 +376,9 @@ struct ClaudeCred {
 fn read_claude_cred(path: &Path) -> Result<ClaudeCred, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let oauth = json_field(&v, &["claudeAiOauth"])
-        .ok_or_else(|| "credentials.json missing claudeAiOauth (macOS Keychain not supported yet)".to_string())?;
+    let oauth = json_field(&v, &["claudeAiOauth"]).ok_or_else(|| {
+        "credentials.json missing claudeAiOauth (macOS Keychain not supported yet)".to_string()
+    })?;
     let access_token = json_field(oauth, &["accessToken"])
         .and_then(Value::as_str)
         .ok_or_else(|| "missing accessToken".to_string())?
@@ -373,18 +396,30 @@ fn read_claude_cred(path: &Path) -> Result<ClaudeCred, String> {
 }
 
 fn write_back_claude(path: &Path, cred: &ClaudeCred) {
-    let Ok(text) = std::fs::read_to_string(path) else { return };
-    let Ok(mut v) = serde_json::from_str::<Value>(&text) else { return };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
     if let Some(oauth) = v.pointer_mut("/claudeAiOauth") {
         if let Some(obj) = oauth.as_object_mut() {
-            obj.insert("accessToken".into(), Value::String(cred.access_token.clone()));
-            obj.insert("refreshToken".into(), Value::String(cred.refresh_token.clone()));
+            obj.insert(
+                "accessToken".into(),
+                Value::String(cred.access_token.clone()),
+            );
+            obj.insert(
+                "refreshToken".into(),
+                Value::String(cred.refresh_token.clone()),
+            );
             if let Some(ts) = cred.expires_at {
                 obj.insert("expiresAt".into(), Value::from(ts * 1000));
             }
         }
     }
-    let Ok(out) = serde_json::to_string_pretty(&v) else { return };
+    let Ok(out) = serde_json::to_string_pretty(&v) else {
+        return;
+    };
     atomic_write(path, out.as_bytes());
 }
 
@@ -421,7 +456,10 @@ fn fetch_claude(path: &Path) -> Result<QuotaResult, String> {
         [
             ("authorization", format!("Bearer {token}")),
             ("anthropic-beta", "oauth-2025-04-20".to_string()),
-            ("user-agent", "claude-cli/1.0.90 (external, cli)".to_string()),
+            (
+                "user-agent",
+                "claude-cli/1.0.90 (external, cli)".to_string(),
+            ),
         ]
     };
 
@@ -502,7 +540,9 @@ pub fn parse_claude_usage(usage: &Value, plan: Option<String>) -> QuotaResult {
     }
 
     let extra = json_field(usage, &["extra_usage"]).and_then(|e| {
-        let enabled = json_field(e, &["is_enabled"]).and_then(Value::as_bool).unwrap_or(false);
+        let enabled = json_field(e, &["is_enabled"])
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if !enabled {
             return None;
         }
@@ -527,7 +567,8 @@ pub fn parse_claude_usage(usage: &Value, plan: Option<String>) -> QuotaResult {
 // ---------------------------------------------------------------------------
 
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const CODEX_UA: &str = "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)";
+const CODEX_UA: &str =
+    "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)";
 
 struct CodexCred {
     access_token: String,
@@ -549,7 +590,10 @@ fn read_codex_cred(path: &Path) -> Result<CodexCred, String> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let id_token = v.get("id_token").and_then(Value::as_str).map(str::to_string);
+    let id_token = v
+        .get("id_token")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let expires_at = v.get("expired").and_then(parse_when);
     Ok(CodexCred {
         access_token: access,
@@ -560,11 +604,21 @@ fn read_codex_cred(path: &Path) -> Result<CodexCred, String> {
 }
 
 fn write_back_codex(path: &Path, cred: &CodexCred) {
-    let Ok(text) = std::fs::read_to_string(path) else { return };
-    let Ok(mut v) = serde_json::from_str::<Value>(&text) else { return };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
     if let Some(obj) = v.as_object_mut() {
-        obj.insert("access_token".into(), Value::String(cred.access_token.clone()));
-        obj.insert("refresh_token".into(), Value::String(cred.refresh_token.clone()));
+        obj.insert(
+            "access_token".into(),
+            Value::String(cred.access_token.clone()),
+        );
+        obj.insert(
+            "refresh_token".into(),
+            Value::String(cred.refresh_token.clone()),
+        );
         if let Some(id) = &cred.id_token {
             obj.insert("id_token".into(), Value::String(id.clone()));
         }
@@ -581,7 +635,9 @@ fn write_back_codex(path: &Path, cred: &CodexCred) {
             );
         }
     }
-    let Ok(out) = serde_json::to_string_pretty(&v) else { return };
+    let Ok(out) = serde_json::to_string_pretty(&v) else {
+        return;
+    };
     atomic_write(path, out.as_bytes());
 }
 
@@ -618,7 +674,11 @@ fn fetch_codex(path: &Path) -> Result<QuotaResult, String> {
             ("authorization", &*format!("Bearer {}", cred.access_token)),
             ("user-agent", CODEX_UA),
         ];
-        usage = get_json(&agent, "https://chatgpt.com/backend-api/wham/usage", &headers);
+        usage = get_json(
+            &agent,
+            "https://chatgpt.com/backend-api/wham/usage",
+            &headers,
+        );
         match &usage {
             Err(e) if e == "HTTP 401" && !refreshed && !cred.refresh_token.is_empty() => {
                 refresh_codex(&mut cred)?;
@@ -630,7 +690,10 @@ fn fetch_codex(path: &Path) -> Result<QuotaResult, String> {
         }
     }
     let usage = usage?;
-    let plan = usage.get("plan_type").and_then(Value::as_str).map(str::to_string);
+    let plan = usage
+        .get("plan_type")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Ok(parse_codex_usage(&usage, plan))
 }
 
@@ -644,7 +707,10 @@ pub fn parse_codex_usage(usage: &Value, plan: Option<String>) -> QuotaResult {
             }
         }
     }
-    if let Some(additional) = usage.get("additional_rate_limits").and_then(Value::as_array) {
+    if let Some(additional) = usage
+        .get("additional_rate_limits")
+        .and_then(Value::as_array)
+    {
         for item in additional {
             let name = item
                 .get("limit_name")
@@ -675,13 +741,10 @@ fn codex_window(v: Option<&Value>) -> Option<QuotaWindow> {
         Some(s) if (2400000.0..2800000.0).contains(&s) => WindowLabel::Monthly,
         _ => WindowLabel::Weekly,
     };
-    let resets_at = v
-        .get("reset_at")
-        .and_then(parse_when)
-        .or_else(|| {
-            let after = v.get("reset_after_seconds").and_then(Value::as_f64)?;
-            Some(now_sec() + after as i64)
-        });
+    let resets_at = v.get("reset_at").and_then(parse_when).or_else(|| {
+        let after = v.get("reset_after_seconds").and_then(Value::as_f64)?;
+        Some(now_sec() + after as i64)
+    });
     Some(QuotaWindow {
         label,
         used_percent: pct,
@@ -697,7 +760,10 @@ const GROK_HEADERS_BASE: &[(&str, &str)] = &[
     ("x-xai-token-auth", "xai-grok-cli"),
     ("x-grok-client-version", "0.2.91"),
     ("accept", "*/*"),
-    ("user-agent", "grok-pager/0.2.91 grok-shell/0.2.91 (windows; x86_64)"),
+    (
+        "user-agent",
+        "grok-pager/0.2.91 grok-shell/0.2.91 (windows; x86_64)",
+    ),
 ];
 
 struct GrokCred {
@@ -714,7 +780,9 @@ struct GrokCred {
 fn read_grok_cred(path: &Path) -> Result<GrokCred, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let obj = v.as_object().ok_or_else(|| "invalid auth.json".to_string())?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "invalid auth.json".to_string())?;
     let (entry_key, entry) = obj
         .iter()
         .find(|(_, val)| val.is_object() && val.get("refresh_token").is_some())
@@ -752,8 +820,12 @@ fn read_grok_cred(path: &Path) -> Result<GrokCred, String> {
 }
 
 fn write_back_grok(path: &Path, cred: &GrokCred) {
-    let Ok(text) = std::fs::read_to_string(path) else { return };
-    let Ok(mut v) = serde_json::from_str::<Value>(&text) else { return };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
     if let Some(entry) = v.get_mut(&cred.entry_key).and_then(Value::as_object_mut) {
         // 保持与读取时一致的时间单位（原值 > 1e12 视为毫秒）
         let unit_ms = entry
@@ -761,13 +833,18 @@ fn write_back_grok(path: &Path, cred: &GrokCred) {
             .and_then(Value::as_f64)
             .is_some_and(|n| n > 1e12);
         entry.insert("key".into(), Value::String(cred.access_token.clone()));
-        entry.insert("refresh_token".into(), Value::String(cred.refresh_token.clone()));
+        entry.insert(
+            "refresh_token".into(),
+            Value::String(cred.refresh_token.clone()),
+        );
         if let Some(ts) = cred.expires_at {
             let stored = if unit_ms { ts * 1000 } else { ts };
             entry.insert("expires_at".into(), Value::from(stored));
         }
     }
-    let Ok(out) = serde_json::to_string_pretty(&v) else { return };
+    let Ok(out) = serde_json::to_string_pretty(&v) else {
+        return;
+    };
     atomic_write(path, out.as_bytes());
 }
 
@@ -780,7 +857,11 @@ fn refresh_grok(cred: &mut GrokCred) -> Result<(), String> {
         &[],
     )
     .ok()
-    .and_then(|d| d.get("token_endpoint").and_then(Value::as_str).map(str::to_string))
+    .and_then(|d| {
+        d.get("token_endpoint")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
     .filter(|u| u.starts_with("https://") && u.contains("x.ai"))
     .unwrap_or_else(|| format!("{}/oauth2/token", cred.issuer));
 
@@ -832,7 +913,12 @@ fn fetch_grok(path: &Path) -> Result<QuotaResult, String> {
     let bearer = format!("Bearer {}", cred.access_token);
     let mut headers: Vec<(&str, &str)> = vec![("authorization", &bearer)];
     headers.extend_from_slice(GROK_HEADERS_BASE);
-    let monthly = get_json(&agent, "https://cli-chat-proxy.grok.com/v1/billing", &headers).ok();
+    let monthly = get_json(
+        &agent,
+        "https://cli-chat-proxy.grok.com/v1/billing",
+        &headers,
+    )
+    .ok();
 
     Ok(parse_grok_billing(&weekly, monthly.as_ref()))
 }
@@ -846,7 +932,8 @@ pub fn parse_grok_billing(weekly: &Value, monthly: Option<&Value>) -> QuotaResul
         let pct = json_field(cfg, &["creditUsagePercent"])
             .or_else(|| json_field(cfg, &["credit_usage_percent"]))
             .and_then(Value::as_f64);
-        let period = json_field(cfg, &["currentPeriod"]).or_else(|| json_field(cfg, &["current_period"]));
+        let period =
+            json_field(cfg, &["currentPeriod"]).or_else(|| json_field(cfg, &["current_period"]));
         let raw_type = period
             .and_then(|p| p.get("type"))
             .and_then(Value::as_str)
@@ -929,7 +1016,11 @@ fn fetch_devin(cookie: &str, org_id: Option<&str>) -> Result<QuotaResult, String
         &headers,
     )
     .ok()
-    .and_then(|s| s.get("plan_slug").and_then(Value::as_str).map(str::to_string));
+    .and_then(|s| {
+        s.get("plan_slug")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
 
     Ok(parse_devin_quota(&quota, plan))
 }
@@ -970,7 +1061,10 @@ pub fn parse_devin_quota(quota: &Value, plan: Option<String>) -> QuotaResult {
         .get("hide_daily_quota")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if let (Some(pct), false) = (quota.get("daily_percentage").and_then(Value::as_f64), hide_daily) {
+    if let (Some(pct), false) = (
+        quota.get("daily_percentage").and_then(Value::as_f64),
+        hide_daily,
+    ) {
         windows.push(QuotaWindow {
             label: WindowLabel::Daily,
             used_percent: pct,
@@ -1186,19 +1280,14 @@ mod tests {
             Some(1788134400)
         );
         assert_eq!(parse_when(&Value::from(1788163200i64)), Some(1788163200));
-        assert_eq!(
-            parse_when(&Value::from(1788163200000i64)),
-            Some(1788163200)
-        );
+        assert_eq!(parse_when(&Value::from(1788163200000i64)), Some(1788163200));
         assert_eq!(parse_when(&Value::Null), None);
     }
 
     #[test]
     fn find_org_id_recurses() {
-        let v: Value = serde_json::from_str(
-            r#"{"orgs": [{"name": "x", "org_id": "org-abc123"}]}"#,
-        )
-        .unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"orgs": [{"name": "x", "org_id": "org-abc123"}]}"#).unwrap();
         assert_eq!(find_org_id(&v).as_deref(), Some("org-abc123"));
     }
 
