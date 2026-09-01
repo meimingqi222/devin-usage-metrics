@@ -7,6 +7,7 @@
 use super::*;
 use crate::data::AgentKind;
 use fs2::FileExt;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -20,6 +21,13 @@ const MAX_BLOCK_RAW_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_BLOCKS: usize = 16_384;
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const RETAIN_DAYS: i64 = 366;
+const LOCAL_MANIFEST_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
+/// 首次同步会产生数百个不可变小对象。并发上传可重叠网络往返；head 仍在全部
+/// 对象成功写入后才通过 CAS 发布，因此其他设备不会观察到半成品。
+const UPLOAD_CONCURRENCY: usize = 8;
+
+type EncodedBlock = (BlockRef, Vec<u8>);
+type EncodedSession = (SessionRef, Vec<u8>);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Head {
@@ -47,12 +55,20 @@ struct Manifest {
     session_count: usize,
     turn_count: usize,
     source_hash: String,
+    /// 本机 Agent 缓存的组合内容指纹。命中时所有原始记录均已由缓存哈希验证，
+    /// 可跳过 block 分组和编码；旧 manifest 无此字段时正常回退。
+    #[serde(default)]
+    source_input_hash: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BlockRef {
     file: String,
     hash: String,
+    /// 分组后的原始记录哈希。它与压缩对象哈希不同，用于在后续同步中跳过对
+    /// 未变化历史日期的重复 zstd 压缩；旧 manifest 没有该字段时安全降级。
+    #[serde(default)]
+    content_hash: String,
     agent: AgentKind,
     utc_day: String,
     part: u16,
@@ -65,6 +81,9 @@ struct BlockRef {
 struct SessionRef {
     file: String,
     hash: String,
+    /// 参见 BlockRef::content_hash。
+    #[serde(default)]
+    content_hash: String,
     #[serde(default)]
     utc_day: String,
     compressed_size: u64,
@@ -99,6 +118,7 @@ fn day(timestamp: i64) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+#[cfg(test)]
 fn day_start(timestamp: i64) -> i64 {
     timestamp.div_euclid(86_400) * 86_400
 }
@@ -120,6 +140,29 @@ fn stable_session_id(session: &SessionRec) -> String {
         )
         .as_bytes(),
     )
+}
+
+fn sort_turns_stably(turns: &mut [TurnRec]) {
+    // 大多数记录靠轻量字段即可确定顺序。旧实现为每个 turn 都序列化并 SHA-256，
+    // 近十万条历史记录在“无变化同步”里也会花几十秒。只在这些字段完全相同
+    // （极少见）时使用完整稳定 ID 作为最后的确定性 tie-breaker。
+    turns.sort_by(|left, right| {
+        (
+            left.created_at,
+            &left.device_id,
+            left.agent,
+            &left.session_key,
+            &left.model,
+        )
+            .cmp(&(
+                right.created_at,
+                &right.device_id,
+                right.agent,
+                &right.session_key,
+                &right.model,
+            ))
+            .then_with(|| stable_turn_id(left).cmp(&stable_turn_id(right)))
+    });
 }
 
 fn encode_turns(turns: &[TurnRec]) -> Result<(Vec<u8>, u64), String> {
@@ -189,7 +232,55 @@ fn split_sessions(
     split_sessions(sessions[middle..].to_vec(), output)
 }
 
-fn make_blocks(turns: Vec<TurnRec>) -> Result<Vec<(BlockRef, Vec<u8>)>, String> {
+fn reusable_blocks(
+    references: &[BlockRef],
+    agent: AgentKind,
+    utc_day: &str,
+    content_hash: &str,
+    turn_count: usize,
+) -> Option<Vec<BlockRef>> {
+    let mut values: Vec<_> = references
+        .iter()
+        .filter(|reference| {
+            reference.agent == agent
+                && reference.utc_day == utc_day
+                && reference.content_hash == content_hash
+        })
+        .cloned()
+        .collect();
+    values.sort_by_key(|reference| reference.part);
+    (values
+        .iter()
+        .map(|reference| reference.turn_count)
+        .sum::<usize>()
+        == turn_count
+        && values
+            .iter()
+            .enumerate()
+            .all(|(part, reference)| reference.part as usize == part))
+    .then_some(values)
+}
+
+fn reusable_sessions(
+    references: &[SessionRef],
+    utc_day: &str,
+    content_hash: &str,
+    session_count: usize,
+) -> Option<Vec<SessionRef>> {
+    let values: Vec<_> = references
+        .iter()
+        .filter(|reference| reference.utc_day == utc_day && reference.content_hash == content_hash)
+        .cloned()
+        .collect();
+    (values
+        .iter()
+        .map(|reference| reference.session_count)
+        .sum::<usize>()
+        == session_count)
+        .then_some(values)
+}
+
+fn make_blocks(turns: Vec<TurnRec>, previous: &[BlockRef]) -> Result<Vec<EncodedBlock>, String> {
     let mut grouped: BTreeMap<(AgentKind, String), Vec<TurnRec>> = BTreeMap::new();
     for turn in turns {
         grouped
@@ -197,33 +288,58 @@ fn make_blocks(turns: Vec<TurnRec>) -> Result<Vec<(BlockRef, Vec<u8>)>, String> 
             .or_default()
             .push(turn);
     }
-    let mut output = Vec::new();
-    for ((agent, utc_day), mut values) in grouped {
-        values.sort_by_key(stable_turn_id);
-        let mut pieces = Vec::new();
-        split_turns(values, &mut pieces)?;
-        for (part, (turns, bytes, raw)) in pieces.into_iter().enumerate() {
-            let hash = sha256_hex(&bytes);
-            output.push((
-                BlockRef {
-                    file: format!("v3-block-{hash}.zst"),
-                    hash,
-                    agent,
-                    utc_day: utc_day.clone(),
-                    part: part as u16,
-                    compressed_size: bytes.len() as u64,
-                    uncompressed_size: raw,
-                    turn_count: turns.len(),
-                },
-                bytes,
-            ));
-        }
-    }
+    let grouped_output: Result<Vec<Vec<EncodedBlock>>, String> = grouped
+        .into_par_iter()
+        .map(|((agent, utc_day), mut values)| {
+            sort_turns_stably(&mut values);
+            let content_hash = sha256_hex(
+                &serde_json::to_vec(&values)
+                    .map_err(|e| format!("序列化 v3 turn block 指纹失败: {e}"))?,
+            );
+            if let Some(references) =
+                reusable_blocks(previous, agent, &utc_day, &content_hash, values.len())
+            {
+                // 引用旧不可变对象即可；它们已被当前 manifest 持有，上传阶段会跳过
+                // 空 payload。这样历史日期不用每轮都做 zstd 压缩。
+                return Ok(references
+                    .into_iter()
+                    .map(|reference| (reference, Vec::new()))
+                    .collect());
+            }
+            let mut pieces = Vec::new();
+            split_turns(values, &mut pieces)?;
+            Ok(pieces
+                .into_iter()
+                .enumerate()
+                .map(|(part, (turns, bytes, raw))| {
+                    let hash = sha256_hex(&bytes);
+                    (
+                        BlockRef {
+                            file: format!("v3-block-{hash}.zst"),
+                            hash,
+                            content_hash: content_hash.clone(),
+                            agent,
+                            utc_day: utc_day.clone(),
+                            part: part as u16,
+                            compressed_size: bytes.len() as u64,
+                            uncompressed_size: raw,
+                            turn_count: turns.len(),
+                        },
+                        bytes,
+                    )
+                })
+                .collect())
+        })
+        .collect();
+    let mut output: Vec<_> = grouped_output?.into_iter().flatten().collect();
     output.sort_by(|a, b| a.0.file.cmp(&b.0.file));
     Ok(output)
 }
 
-fn make_session_snapshots(sessions: Vec<SessionRec>) -> Result<Vec<(SessionRef, Vec<u8>)>, String> {
+fn make_session_snapshots(
+    sessions: Vec<SessionRec>,
+    previous: &[SessionRef],
+) -> Result<Vec<EncodedSession>, String> {
     // Session 元数据通常很小；按 agent/day 分段，保持每个快照可独立复用。
     let mut grouped: BTreeMap<(AgentKind, String), Vec<SessionRec>> = BTreeMap::new();
     for session in sessions {
@@ -237,26 +353,45 @@ fn make_session_snapshots(sessions: Vec<SessionRec>) -> Result<Vec<(SessionRef, 
             .or_default()
             .push(session);
     }
-    let mut output = Vec::new();
-    for ((_, utc_day), mut values) in grouped {
-        values.sort_by_key(stable_session_id);
-        let mut pieces = Vec::new();
-        split_sessions(values, &mut pieces)?;
-        for (sessions, bytes, raw) in pieces {
-            let hash = sha256_hex(&bytes);
-            output.push((
-                SessionRef {
-                    file: format!("v3-session-{hash}.zst"),
-                    hash,
-                    utc_day: utc_day.clone(),
-                    compressed_size: bytes.len() as u64,
-                    uncompressed_size: raw,
-                    session_count: sessions.len(),
-                },
-                bytes,
-            ));
-        }
-    }
+    let grouped_output: Result<Vec<Vec<EncodedSession>>, String> = grouped
+        .into_par_iter()
+        .map(|((_, utc_day), mut values)| {
+            values.sort_by_key(stable_session_id);
+            let content_hash = sha256_hex(
+                &serde_json::to_vec(&values)
+                    .map_err(|e| format!("序列化 v3 session snapshot 指纹失败: {e}"))?,
+            );
+            if let Some(references) =
+                reusable_sessions(previous, &utc_day, &content_hash, values.len())
+            {
+                return Ok(references
+                    .into_iter()
+                    .map(|reference| (reference, Vec::new()))
+                    .collect());
+            }
+            let mut pieces = Vec::new();
+            split_sessions(values, &mut pieces)?;
+            Ok(pieces
+                .into_iter()
+                .map(|(sessions, bytes, raw)| {
+                    let hash = sha256_hex(&bytes);
+                    (
+                        SessionRef {
+                            file: format!("v3-session-{hash}.zst"),
+                            hash,
+                            content_hash: content_hash.clone(),
+                            utc_day: utc_day.clone(),
+                            compressed_size: bytes.len() as u64,
+                            uncompressed_size: raw,
+                            session_count: sessions.len(),
+                        },
+                        bytes,
+                    )
+                })
+                .collect())
+        })
+        .collect();
+    let mut output: Vec<_> = grouped_output?.into_iter().flatten().collect();
     output.sort_by(|a, b| a.0.file.cmp(&b.0.file));
     Ok(output)
 }
@@ -285,6 +420,55 @@ fn cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("devin-usage-metrics/sync-v3-objects")
+}
+
+fn local_manifest_cache_path(device_id: &str) -> PathBuf {
+    let key = sha256_hex(format!("{}\0{}", destination_key(&read_config()), device_id).as_bytes());
+    cache_dir().join(format!("local-manifest-{key}.json"))
+}
+
+fn cache_local_manifest(manifest: &Manifest) -> Result<(), String> {
+    fs::create_dir_all(cache_dir()).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(manifest).map_err(|error| error.to_string())?;
+    atomic_replace(&local_manifest_cache_path(&manifest.device_id), &bytes)
+}
+
+fn read_cached_local_manifest(device_id: &str) -> Option<Manifest> {
+    let path = local_manifest_cache_path(device_id);
+    let modified = fs::metadata(&path).ok()?.modified().ok()?;
+    if SystemTime::now().duration_since(modified).ok()? > LOCAL_MANIFEST_CACHE_MAX_AGE {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    cached_manifest_from_bytes(device_id, &bytes)
+}
+
+fn cached_manifest_from_bytes(device_id: &str, bytes: &[u8]) -> Option<Manifest> {
+    let manifest = serde_json::from_slice::<Manifest>(bytes).ok()?;
+    (manifest.protocol == PROTOCOL
+        && manifest.data_schema == DATA_SCHEMA
+        && manifest.device_id == device_id
+        && valid_hash(&manifest.source_hash))
+    .then_some(manifest)
+}
+
+fn cached_manifest_matches_head(bytes: &[u8], manifest_hash: &str) -> bool {
+    sha256_hex(bytes) == manifest_hash
+}
+
+/// 仅当缓存字节正好就是 head 指向的不可变 manifest 时才用于导出。
+/// 这样能省掉一次 manifest GET，同时不会因过期缓存漏传新数据。
+fn read_cached_local_manifest_matching(device_id: &str, manifest_hash: &str) -> Option<Manifest> {
+    let path = local_manifest_cache_path(device_id);
+    let modified = fs::metadata(&path).ok()?.modified().ok()?;
+    if SystemTime::now().duration_since(modified).ok()? > LOCAL_MANIFEST_CACHE_MAX_AGE {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    if !cached_manifest_matches_head(&bytes, manifest_hash) {
+        return None;
+    }
+    cached_manifest_from_bytes(device_id, &bytes)
 }
 
 fn read_object(
@@ -349,6 +533,21 @@ fn read_manifest(transport: &dyn SyncTransport, hash: &str) -> Result<Manifest, 
         }
     }
     Ok(manifest)
+}
+
+fn manifest_has_content_hashes(manifest: &Manifest) -> bool {
+    manifest
+        .blocks
+        .iter()
+        .all(|reference| !reference.content_hash.is_empty())
+        && manifest
+            .sessions
+            .iter()
+            .all(|reference| !reference.content_hash.is_empty())
+}
+
+fn manifest_matches_source_input(manifest: &Manifest, source_input_hash: &str) -> bool {
+    !source_input_hash.is_empty() && manifest.source_input_hash == source_input_hash
 }
 
 /// 每天只抽检一个可轮换 block（session snapshot 也算），避免 generation 更新时
@@ -447,19 +646,27 @@ fn local_package(mut data: LoadedData, id: &str) -> DevicePackage {
     }
 }
 
-fn source_hash(package: &DevicePackage) -> String {
-    let mut sessions = package.sessions.clone();
-    let mut turns = package.turns.clone();
-    sessions.sort_by_key(stable_session_id);
-    turns.sort_by_key(stable_turn_id);
+fn source_hash(
+    package: &DevicePackage,
+    blocks: &[EncodedBlock],
+    sessions: &[EncodedSession],
+) -> String {
+    // block/session 的 content_hash 已覆盖完整原始记录；这里只需哈希轻量引用，
+    // 不能再为 no-op 克隆、排序、序列化整个 DevicePackage。
     sha256_hex(
         &serde_json::to_vec(&(
             &package.device_id,
             &package.device_name,
             package.turns_start,
             package.turns_end,
-            sessions,
-            turns,
+            blocks
+                .iter()
+                .map(|(reference, _)| reference)
+                .collect::<Vec<_>>(),
+            sessions
+                .iter()
+                .map(|(reference, _)| reference)
+                .collect::<Vec<_>>(),
         ))
         .expect("canonical v3 source hash"),
     )
@@ -484,6 +691,25 @@ fn writer_lock() -> Result<File, String> {
     Ok(file)
 }
 
+fn upload_immutable_parallel<T: Send>(
+    objects: &[(&str, &[u8])],
+    upload: impl Fn(&str, &[u8]) -> Result<T, String> + Send + Sync,
+) -> Result<Vec<T>, String> {
+    if objects.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(UPLOAD_CONCURRENCY.min(objects.len()))
+        .build()
+        .map_err(|error| format!("创建同步上传线程池失败: {error}"))?;
+    pool.install(|| {
+        objects
+            .par_iter()
+            .map(|(name, bytes)| upload(name, bytes))
+            .collect()
+    })
+}
+
 fn strong_revision(revision: Option<&str>) -> Result<(), String> {
     match revision {
         Some(value) if !value.trim_start().starts_with("W/") => Ok(()),
@@ -492,12 +718,19 @@ fn strong_revision(revision: Option<&str>) -> Result<(), String> {
 }
 
 pub(super) fn export_local_v3(data: LoadedData) -> Result<(), String> {
+    let transport = current_transport()?;
+    export_local_v3_with_transport(data, transport.as_ref())
+}
+
+pub(super) fn export_local_v3_with_transport(
+    data: LoadedData,
+    transport: &dyn SyncTransport,
+) -> Result<(), String> {
     let started = Instant::now();
     let id = data::device_id();
     let _lock = writer_lock()?;
-    let transport = current_transport()?;
+    let source_input_hash = data.sync_content_hash.clone();
     let package = local_package(data, &id);
-    let hash = source_hash(&package);
     let head_name = format!("v3-head-{id}.json");
 
     for retry in 0..3 {
@@ -514,31 +747,72 @@ pub(super) fn export_local_v3(data: LoadedData) -> Result<(), String> {
             }
             None => (None, None),
         };
-        let old_manifest = if let Some(head) = &old_head {
-            match read_manifest(transport.as_ref(), &head.manifest) {
-                Ok(manifest) => {
-                    if manifest.source_hash == hash {
-                        data::log_event(format!("sync v3 export no-op blocks=0 uploaded_bytes=0 sessions={} turns={} elapsed_ms={}", package.sessions.len(), package.turns.len(), started.elapsed().as_millis()));
-                        return Ok(());
+        let (old_manifest, manifest_cache_hit) = if let Some(head) = &old_head {
+            if let Some(manifest) = read_cached_local_manifest_matching(&id, &head.manifest) {
+                (Some(manifest), true)
+            } else {
+                match read_manifest(transport, &head.manifest) {
+                    Ok(manifest) => (Some(manifest), false),
+                    Err(error) => {
+                        data::log_event(format!(
+                            "sync v3 current manifest unreadable; publishing a repair: {error}"
+                        ));
+                        (None, false)
                     }
-                    Some(manifest)
-                }
-                Err(error) => {
-                    data::log_event(format!(
-                        "sync v3 current manifest unreadable; publishing a repair: {error}"
-                    ));
-                    None
                 }
             }
         } else {
-            None
+            (None, false)
         };
         if old_head.is_none() && package.sessions.is_empty() && package.turns.is_empty() {
             data::log_event("sync v3 export skipped empty initial manifest");
             return Ok(());
         }
-        let blocks = make_blocks(package.turns.clone())?;
-        let sessions = make_session_snapshots(package.sessions.clone())?;
+        if old_manifest.as_ref().is_some_and(|manifest| {
+            manifest_matches_source_input(manifest, &source_input_hash)
+                && manifest_has_content_hashes(manifest)
+        }) {
+            if let Some(manifest) = old_manifest.as_ref() {
+                if let Err(error) = cache_local_manifest(manifest) {
+                    data::log_event(format!(
+                        "sync v3 local manifest cache write failed: {error}"
+                    ));
+                }
+            }
+            data::log_event(format!("sync v3 export no-op blocks=0 uploaded_bytes=0 manifest_cache_hit={manifest_cache_hit} input_cache_hit=true blocks_ms=0 sessions_ms=0 source_hash_ms=0 encode_ms=0 sessions={} turns={} elapsed_ms={}", package.sessions.len(), package.turns.len(), started.elapsed().as_millis()));
+            return Ok(());
+        }
+        let encode_started = Instant::now();
+        let previous_blocks = old_manifest
+            .as_ref()
+            .map(|manifest| manifest.blocks.as_slice())
+            .unwrap_or_default();
+        let previous_sessions = old_manifest
+            .as_ref()
+            .map(|manifest| manifest.sessions.as_slice())
+            .unwrap_or_default();
+        let blocks = make_blocks(package.turns.clone(), previous_blocks)?;
+        let blocks_elapsed = encode_started.elapsed();
+        let sessions_started = Instant::now();
+        let sessions = make_session_snapshots(package.sessions.clone(), previous_sessions)?;
+        let sessions_elapsed = sessions_started.elapsed();
+        let source_hash_started = Instant::now();
+        let hash = source_hash(&package, &blocks, &sessions);
+        let source_hash_elapsed = source_hash_started.elapsed();
+        let encode_elapsed = encode_started.elapsed();
+        if old_manifest.as_ref().is_some_and(|manifest| {
+            manifest.source_hash == hash && manifest_has_content_hashes(manifest)
+        }) {
+            if let Some(manifest) = old_manifest.as_ref() {
+                if let Err(error) = cache_local_manifest(manifest) {
+                    data::log_event(format!(
+                        "sync v3 local manifest cache write failed: {error}"
+                    ));
+                }
+            }
+            data::log_event(format!("sync v3 export no-op blocks=0 uploaded_bytes=0 manifest_cache_hit={manifest_cache_hit} blocks_ms={} sessions_ms={} source_hash_ms={} encode_ms={} sessions={} turns={} elapsed_ms={}", blocks_elapsed.as_millis(), sessions_elapsed.as_millis(), source_hash_elapsed.as_millis(), encode_elapsed.as_millis(), package.sessions.len(), package.turns.len(), started.elapsed().as_millis()));
+            return Ok(());
+        }
         let old_objects: HashSet<&str> = old_manifest
             .as_ref()
             .into_iter()
@@ -550,25 +824,38 @@ pub(super) fn export_local_v3(data: LoadedData) -> Result<(), String> {
                     .chain(manifest.sessions.iter().map(|value| value.file.as_str()))
             })
             .collect();
-        let mut uploaded = 0usize;
-        let mut reused = 0usize;
-        let mut bytes = 0usize;
-        for (reference, object) in blocks
+        let objects: Vec<(&str, &[u8])> = blocks
             .iter()
-            .map(|(r, b)| (&r.file, b))
-            .chain(sessions.iter().map(|(r, b)| (&r.file, b)))
-        {
-            if old_objects.contains(reference.as_str()) {
-                // 当前 head 已引用这些不可变对象；本次只上传相对旧 manifest 的
-                // 新 hash，避免一条新 turn 触发全年 block 的 412 请求风暴。
-                reused += 1;
-            } else if transport.put_immutable(reference, object)? {
-                uploaded += 1;
-                bytes += object.len();
-            } else {
-                reused += 1;
-            }
-        }
+            .map(|(r, b)| (r.file.as_str(), b.as_slice()))
+            .chain(
+                sessions
+                    .iter()
+                    .map(|(r, b)| (r.file.as_str(), b.as_slice())),
+            )
+            .collect();
+        // 当前 head 已引用的不可变对象不再请求服务端；其余对象并发上传。即使
+        // 并发任务中部分成功后另一个失败，也不会发布 head，下一轮可安全重试。
+        let pending: Vec<_> = objects
+            .iter()
+            .copied()
+            .filter(|(name, _)| !old_objects.contains(*name))
+            .collect();
+        let upload_started = Instant::now();
+        let upload_results = upload_immutable_parallel(&pending, |name, object| {
+            transport
+                .put_immutable(name, object)
+                .map(|created| (created, object.len()))
+        })?;
+        let upload_elapsed = upload_started.elapsed();
+        let uploaded = upload_results
+            .iter()
+            .filter(|(created, _)| *created)
+            .count();
+        let bytes: usize = upload_results
+            .iter()
+            .filter_map(|(created, bytes)| created.then_some(*bytes))
+            .sum();
+        let reused = objects.len() - uploaded;
         let manifest = Manifest {
             protocol: PROTOCOL,
             data_schema: DATA_SCHEMA,
@@ -584,6 +871,7 @@ pub(super) fn export_local_v3(data: LoadedData) -> Result<(), String> {
             session_count: package.sessions.len(),
             turn_count: package.turns.len(),
             source_hash: hash.clone(),
+            source_input_hash: source_input_hash.clone(),
         };
         let manifest_bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
         let manifest_hash = sha256_hex(&manifest_bytes);
@@ -603,7 +891,12 @@ pub(super) fn export_local_v3(data: LoadedData) -> Result<(), String> {
             revision.as_deref(),
         ) {
             Ok(()) => {
-                data::log_event(format!("sync v3 export ok blocks={} uploaded={} reused={} uploaded_bytes={} sessions={} turns={} elapsed_ms={}", manifest.blocks.len() + manifest.sessions.len(), uploaded, reused, bytes, package.sessions.len(), package.turns.len(), started.elapsed().as_millis()));
+                if let Err(error) = cache_local_manifest(&manifest) {
+                    data::log_event(format!(
+                        "sync v3 local manifest cache write failed: {error}"
+                    ));
+                }
+                data::log_event(format!("sync v3 export ok blocks={} uploaded={} reused={} uploaded_bytes={} upload_parallelism={} manifest_cache_hit={manifest_cache_hit} blocks_ms={} sessions_ms={} source_hash_ms={} encode_ms={} immutable_upload_ms={} sessions={} turns={} elapsed_ms={}", manifest.blocks.len() + manifest.sessions.len(), uploaded, reused, bytes, UPLOAD_CONCURRENCY.min(pending.len().max(1)), blocks_elapsed.as_millis(), sessions_elapsed.as_millis(), source_hash_elapsed.as_millis(), encode_elapsed.as_millis(), upload_elapsed.as_millis(), package.sessions.len(), package.turns.len(), started.elapsed().as_millis()));
                 return Ok(());
             }
             Err(error) if error == "CAS_CONFLICT" && retry < 2 => continue,
@@ -693,24 +986,31 @@ fn load_remote(
 }
 
 pub(super) fn import_remote_v3() -> (LoadedData, Vec<RemoteDevice>, Option<String>) {
-    let started = Instant::now();
-    let local_id = data::device_id();
     let transport = match current_transport() {
         Ok(value) => value,
         Err(error) => return (LoadedData::default(), Vec::new(), Some(error)),
     };
+    import_remote_v3_with_transport(transport.as_ref())
+}
+
+pub(super) fn import_remote_v3_with_transport(
+    transport: &dyn SyncTransport,
+) -> (LoadedData, Vec<RemoteDevice>, Option<String>) {
+    let started = Instant::now();
+    let local_id = data::device_id();
     let names = match transport.list_sync_files() {
         Ok(value) => value,
         Err(error) => return (LoadedData::default(), Vec::new(), Some(error)),
     };
     let heads: Vec<_> = names
-        .into_iter()
+        .iter()
         .filter(|name| name.starts_with("v3-head-") && name.ends_with(".json"))
+        .cloned()
         .collect();
     // 双读迁移：按设备选协议。任何一台设备升级都不能让其他 v2 设备的
     // 数据从 UI 消失。
     if heads.is_empty() {
-        return v2::import_remote_v2();
+        return v2::import_remote_v2_with_files(transport, &names);
     }
     let mut merged = LoadedData::default();
     let mut devices = Vec::new();
@@ -723,6 +1023,26 @@ pub(super) fn import_remote_v3() -> (LoadedData, Vec<RemoteDevice>, Option<Strin
             .trim_start_matches("v3-head-")
             .trim_end_matches(".json")
             .to_string();
+        // start_sync 总是在导出成功/无变化检查后才进入导入；本机 manifest 已由
+        // 导出阶段验证并缓存。复用它能省掉本机 head + manifest 两次串行请求，
+        // 每日对象审计仍会照常执行。
+        if id == local_id {
+            if let Some(manifest) = read_cached_local_manifest(&id) {
+                devices.push(RemoteDevice {
+                    device_id: manifest.device_id.clone(),
+                    device_name: manifest.device_name.clone(),
+                    exported_at: manifest.created_at,
+                    session_count: manifest.session_count,
+                    is_local: true,
+                });
+                v3_devices.insert(id.clone());
+                if let Err(error) = audit_local_device(transport, &manifest) {
+                    data::log_event(format!("sync v3 daily audit device={id} failed: {error}"));
+                    first_error.get_or_insert_with(|| format!("本机 v3 每日审计失败: {error}"));
+                }
+                continue;
+            }
+        }
         let result = transport
             .read_head(&name)
             .and_then(|value| value.ok_or_else(|| "v3 head 已消失".into()))
@@ -733,7 +1053,7 @@ pub(super) fn import_remote_v3() -> (LoadedData, Vec<RemoteDevice>, Option<Strin
                 {
                     return Err("v3 head 无效".into());
                 }
-                let manifest = read_manifest(transport.as_ref(), &head.manifest)?;
+                let manifest = read_manifest(transport, &head.manifest)?;
                 if manifest.device_id != id {
                     return Err("v3 head 与 manifest 设备不一致".into());
                 }
@@ -749,7 +1069,7 @@ pub(super) fn import_remote_v3() -> (LoadedData, Vec<RemoteDevice>, Option<Strin
                     is_local: manifest.device_id == local_id,
                 });
                 if manifest.device_id != local_id {
-                    match load_remote(transport.as_ref(), &manifest) {
+                    match load_remote(transport, &manifest) {
                         Ok(package) => {
                             v3_devices.insert(manifest.device_id.clone());
                             merged.sessions.extend(package.sessions);
@@ -768,7 +1088,7 @@ pub(super) fn import_remote_v3() -> (LoadedData, Vec<RemoteDevice>, Option<Strin
                     }
                 } else {
                     v3_devices.insert(manifest.device_id.clone());
-                    if let Err(error) = audit_local_device(transport.as_ref(), &manifest) {
+                    if let Err(error) = audit_local_device(transport, &manifest) {
                         data::log_event(format!("sync v3 daily audit device={id} failed: {error}"));
                         if first_error.is_none() {
                             first_error = Some(format!("本机 v3 每日审计失败: {error}"));
@@ -782,7 +1102,16 @@ pub(super) fn import_remote_v3() -> (LoadedData, Vec<RemoteDevice>, Option<Strin
             Err(_) => {}
         }
     }
-    let (legacy, legacy_devices, legacy_error) = v2::import_remote_v2_excluding(&v3_devices);
+    // 完成 v3 迁移后通常不会再有旧对象；这种情况下跳过整个 v2 兼容导入。
+    // 若仍存在旧 head/package，则复用本轮已取得的目录清单，避免第二个 LIST。
+    let has_legacy = names.iter().any(|name| {
+        (name.starts_with("v2-head-") || name.starts_with("device-")) && name.ends_with(".json")
+    });
+    let (legacy, legacy_devices, legacy_error) = if has_legacy {
+        v2::import_remote_v2_excluding_with_files(transport, &names, &v3_devices)
+    } else {
+        (LoadedData::default(), Vec::new(), None)
+    };
     merged.sessions.extend(legacy.sessions);
     merged.turns.extend(legacy.turns);
     if legacy.turns_start != 0 {
@@ -816,6 +1145,9 @@ pub(super) fn import_remote_v3() -> (LoadedData, Vec<RemoteDevice>, Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     fn turn(day: i64, input: f64) -> TurnRec {
         TurnRec {
@@ -832,12 +1164,11 @@ mod tests {
     fn historical_day_block_is_stable_when_today_changes() {
         let yesterday = day_start(now() - 86_400);
         let today = day_start(now());
-        let first = make_blocks(vec![turn(yesterday, 1.0), turn(today, 2.0)]).unwrap();
-        let second = make_blocks(vec![
-            turn(yesterday, 1.0),
-            turn(today, 2.0),
-            turn(today, 3.0),
-        ])
+        let first = make_blocks(vec![turn(yesterday, 1.0), turn(today, 2.0)], &[]).unwrap();
+        let second = make_blocks(
+            vec![turn(yesterday, 1.0), turn(today, 2.0), turn(today, 3.0)],
+            &[],
+        )
         .unwrap();
         let old = first
             .iter()
@@ -857,6 +1188,113 @@ mod tests {
     }
 
     #[test]
+    fn cached_manifest_bytes_must_match_head_hash() {
+        let manifest = Manifest {
+            protocol: PROTOCOL,
+            data_schema: DATA_SCHEMA,
+            device_id: "device-a".into(),
+            device_name: "host".into(),
+            created_at: 1,
+            parent: None,
+            retained_since: 0,
+            turns_start: 0,
+            turns_end: 1,
+            blocks: Vec::new(),
+            sessions: Vec::new(),
+            session_count: 0,
+            turn_count: 0,
+            source_hash: "a".repeat(64),
+            source_input_hash: String::new(),
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let head_hash = sha256_hex(&bytes);
+        assert!(cached_manifest_from_bytes("device-a", &bytes).is_some());
+        assert!(cached_manifest_matches_head(&bytes, &head_hash));
+        assert!(!cached_manifest_matches_head(&bytes, &"b".repeat(64)));
+    }
+
+    #[test]
+    fn source_input_hash_requires_an_exact_nonempty_match() {
+        let manifest = Manifest {
+            protocol: PROTOCOL,
+            data_schema: DATA_SCHEMA,
+            device_id: "device-a".into(),
+            device_name: "host".into(),
+            created_at: 1,
+            parent: None,
+            retained_since: 0,
+            turns_start: 0,
+            turns_end: 1,
+            blocks: Vec::new(),
+            sessions: Vec::new(),
+            session_count: 0,
+            turn_count: 0,
+            source_hash: "a".repeat(64),
+            source_input_hash: "b".repeat(64),
+        };
+        assert!(manifest_matches_source_input(&manifest, &"b".repeat(64)));
+        assert!(!manifest_matches_source_input(&manifest, ""));
+        assert!(!manifest_matches_source_input(&manifest, &"c".repeat(64)));
+    }
+
+    #[test]
+    fn unchanged_blocks_reuse_previous_compressed_objects() {
+        let today = day_start(now());
+        let values = vec![turn(today, 1.0), turn(today, 2.0)];
+        let first = make_blocks(values.clone(), &[]).unwrap();
+        let previous: Vec<_> = first
+            .iter()
+            .map(|(reference, _)| reference.clone())
+            .collect();
+
+        let reused = make_blocks(values, &previous).unwrap();
+
+        assert_eq!(
+            reused
+                .iter()
+                .map(|(reference, _)| &reference.file)
+                .collect::<Vec<_>>(),
+            previous
+                .iter()
+                .map(|reference| &reference.file)
+                .collect::<Vec<_>>()
+        );
+        assert!(reused.iter().all(|(_, bytes)| bytes.is_empty()));
+    }
+
+    #[test]
+    fn unchanged_sessions_reuse_previous_compressed_objects() {
+        let today = day_start(now());
+        let sessions = vec![SessionRec {
+            agent: AgentKind::Devin,
+            key: "session".into(),
+            created_at: today,
+            last_activity_at: today,
+            device_id: "device".into(),
+            ..Default::default()
+        }];
+        let first = make_session_snapshots(sessions.clone(), &[]).unwrap();
+        let previous: Vec<_> = first
+            .iter()
+            .map(|(reference, _)| reference.clone())
+            .collect();
+
+        let reused = make_session_snapshots(sessions, &previous).unwrap();
+
+        assert_eq!(
+            reused
+                .iter()
+                .map(|(reference, _)| &reference.file)
+                .collect::<Vec<_>>(),
+            previous
+                .iter()
+                .map(|reference| &reference.file)
+                .collect::<Vec<_>>()
+        );
+        assert!(reused.iter().all(|(_, bytes)| bytes.is_empty()));
+    }
+
+    #[test]
     fn blocks_are_bounded_and_parseable() {
         let today = day_start(now());
         let values = (0..200)
@@ -869,7 +1307,7 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let blocks = make_blocks(values).unwrap();
+        let blocks = make_blocks(values, &[]).unwrap();
         assert!(blocks
             .iter()
             .all(|(reference, _)| reference.compressed_size <= MAX_BLOCK_BYTES as u64));
@@ -912,7 +1350,7 @@ mod tests {
                 }
             })
             .collect();
-        let snapshots = make_session_snapshots(sessions).unwrap();
+        let snapshots = make_session_snapshots(sessions, &[]).unwrap();
         assert!(snapshots.len() > 1);
         for (reference, bytes) in snapshots {
             assert!(reference.compressed_size <= MAX_BLOCK_BYTES as u64);
@@ -926,5 +1364,28 @@ mod tests {
             .unwrap();
             assert_eq!(decoded.sessions.len(), reference.session_count);
         }
+    }
+
+    #[test]
+    fn immutable_uploads_use_bounded_parallelism() {
+        let payloads = vec![vec![42u8; 64]; UPLOAD_CONCURRENCY * 2];
+        let objects: Vec<_> = payloads
+            .iter()
+            .map(|payload| ("v3-block-test.zst", payload.as_slice()))
+            .collect();
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+
+        let result = upload_immutable_parallel(&objects, |_, _| {
+            let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now_active, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(20));
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok::<_, String>(())
+        });
+
+        assert_eq!(result.unwrap().len(), objects.len());
+        assert!(peak.load(Ordering::SeqCst) > 1);
+        assert!(peak.load(Ordering::SeqCst) <= UPLOAD_CONCURRENCY);
     }
 }

@@ -1,9 +1,10 @@
 use super::*;
 use crate::data::AgentKind;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::HashSet;
+use std::fs::{self};
 use std::io::{Cursor, Read};
 
 const PROTOCOL: u32 = 2;
@@ -175,6 +176,7 @@ pub(super) fn stable_turn_id(t: &TurnRec) -> String {
     sha256_hex(&bytes)
 }
 
+#[cfg(test)]
 fn records(pkg: &DevicePackage) -> Vec<Record> {
     let mut out = Vec::with_capacity(pkg.sessions.len() + pkg.turns.len());
     out.extend(pkg.sessions.iter().cloned().map(|value| Record::Session {
@@ -208,6 +210,7 @@ fn package_from_records(g: &Generation, records: Vec<Record>) -> DevicePackage {
     pkg
 }
 
+#[cfg(test)]
 fn encode(records: Vec<Record>) -> Result<(Vec<u8>, u64), String> {
     let json = serde_json::to_vec(&Chunk {
         protocol: PROTOCOL,
@@ -220,6 +223,7 @@ fn encode(records: Vec<Record>) -> Result<(Vec<u8>, u64), String> {
     Ok((compressed, json.len() as u64))
 }
 
+#[cfg(test)]
 fn split_group(
     records: Vec<Record>,
     prefix: String,
@@ -253,6 +257,7 @@ fn split_group(
     Ok(())
 }
 
+#[cfg(test)]
 fn make_shards(records: Vec<Record>) -> Result<Vec<(ShardRef, Vec<u8>)>, String> {
     let mut groups: BTreeMap<(String, String), Vec<Record>> = BTreeMap::new();
     for record in records {
@@ -400,7 +405,9 @@ fn read_shard(
 
 struct LoadedDevice {
     package: DevicePackage,
+    #[cfg(test)]
     fell_back: bool,
+    #[cfg(test)]
     generation: String,
 }
 
@@ -433,7 +440,9 @@ fn load_device(
     match attempt(&head.generation) {
         Ok(package) => Ok(LoadedDevice {
             package,
+            #[cfg(test)]
             fell_back: false,
+            #[cfg(test)]
             generation: head.generation.clone(),
         }),
         Err(primary) => {
@@ -445,7 +454,9 @@ fn load_device(
                 attempt(previous)
                     .map(|package| LoadedDevice {
                         package,
+                        #[cfg(test)]
                         fell_back: true,
+                        #[cfg(test)]
                         generation: previous.clone(),
                     })
                     .map_err(|fallback| {
@@ -490,6 +501,7 @@ fn read_device_generation(
 /// Ok(true)=全部在, Ok(false)=至少一个缺失, Err=传输层错误。
 /// 用一次 list_sync_files(WebDAV 下是单次 PROPFIND)建立文件名集合,
 /// 避免对每个 shard 串行发 HEAD——分片多时慢 WebDAV 会累积成分钟级延迟。
+#[cfg(test)]
 fn remote_shards_present(t: &dyn SyncTransport, generation: &Generation) -> Result<bool, String> {
     let files: HashSet<String> = t.list_sync_files()?.into_iter().collect();
     for shard in &generation.shards {
@@ -635,6 +647,7 @@ fn audit_local_device_with(
     Ok(())
 }
 
+#[cfg(test)]
 fn local_package(mut data: LoadedData, id: &str) -> DevicePackage {
     data.sessions
         .retain(|s| s.device_id.is_empty() || s.device_id == id);
@@ -662,6 +675,7 @@ fn local_package(mut data: LoadedData, id: &str) -> DevicePackage {
     }
 }
 
+#[cfg(test)]
 fn content_hash(pkg: &DevicePackage, values: &mut [Record]) -> String {
     values.sort_by(|a, b| a.id().cmp(b.id()));
     sha256_hex(
@@ -676,27 +690,28 @@ fn content_hash(pkg: &DevicePackage, values: &mut [Record]) -> String {
     )
 }
 
-fn writer_lock() -> Result<File, String> {
+#[cfg(test)]
+fn writer_lock() -> Result<std::fs::File, String> {
     let path = dirs::config_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("devin-usage-metrics/sync-v2-writer.lock");
     if let Some(p) = path.parent() {
         fs::create_dir_all(p).map_err(|e| e.to_string())?;
     }
-    let file = OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(path)
         .map_err(|e| e.to_string())?;
-    file.lock_exclusive()
-        .map_err(|e| format!("获取同步 writer lock 失败: {e}"))?;
+    fs2::FileExt::lock_exclusive(&file).map_err(|e| format!("获取同步 writer lock 失败: {e}"))?;
     Ok(file)
 }
 
 /// 校验 CAS 所需的强 ETag。已有 head 时:无 ETag 或 weak ETag(W/ 前缀,RFC 7232
 /// 强比较永不匹配)都拒绝,不降级为不安全并发发布。
+#[cfg(test)]
 fn ensure_strong_revision(revision: Option<&str>) -> Result<(), String> {
     match revision {
         Some(etag) if !etag.trim_start().starts_with("W/") => Ok(()),
@@ -706,6 +721,8 @@ fn ensure_strong_revision(revision: Option<&str>) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn export_local_v2(data: LoadedData) -> Result<(), String> {
     let started = Instant::now();
     let id = data::device_id();
@@ -870,13 +887,17 @@ pub(super) fn export_local_v2(data: LoadedData) -> Result<(), String> {
     Err("head CAS 重试耗尽".into())
 }
 
-pub(super) fn import_remote_v2() -> (LoadedData, Vec<RemoteDevice>, Option<String>) {
-    import_remote_v2_excluding(&HashSet::new())
+pub(super) fn import_remote_v2_with_files(
+    transport: &dyn SyncTransport,
+    files: &[String],
+) -> (LoadedData, Vec<RemoteDevice>, Option<String>) {
+    import_remote_v2_excluding_with_files(transport, files, &HashSet::new())
 }
 
-/// 迁移期间按设备双读：已有 v3 head 的设备必须只读 v3，其他设备继续读 v2。
-/// 不能因为任意一台设备升级就丢掉仍停留在 v2 的设备数据。
-pub(super) fn import_remote_v2_excluding(
+/// 使用调用方已取得的目录清单导入旧协议，避免 v3 迁移路径重复 LIST/PROPFIND。
+pub(super) fn import_remote_v2_excluding_with_files(
+    transport: &dyn SyncTransport,
+    files: &[String],
     v3_devices: &HashSet<String>,
 ) -> (LoadedData, Vec<RemoteDevice>, Option<String>) {
     let started = Instant::now();
@@ -884,14 +905,6 @@ pub(super) fn import_remote_v2_excluding(
     let mut merged = LoadedData::default();
     let mut devices = Vec::new();
     let mut first_error = None;
-    let transport = match current_transport() {
-        Ok(v) => v,
-        Err(e) => return (merged, devices, Some(e)),
-    };
-    let files = match transport.list_sync_files() {
-        Ok(v) => v,
-        Err(e) => return (merged, devices, Some(e)),
-    };
     let mut v2_devices = HashSet::new();
     for name in files
         .iter()
@@ -923,10 +936,10 @@ pub(super) fn import_remote_v2_excluding(
             });
         let result = head_result.and_then(|head| {
             if id == local_id {
-                read_device_generation(transport.as_ref(), &head)
+                read_device_generation(transport, &head)
                     .map(|(generation, hash, _)| ImportedDevice::Local(generation, hash))
             } else {
-                load_device(transport.as_ref(), &head, &cache_dir())
+                load_device(transport, &head, &cache_dir())
                     .map(|loaded| ImportedDevice::Remote(loaded.package))
             }
         });
@@ -934,12 +947,9 @@ pub(super) fn import_remote_v2_excluding(
             Ok(ImportedDevice::Local(generation, generation_hash)) => {
                 // 本机设备只读 manifest 拿元数据;周期性深度审计校验远端 shard 完整性,
                 // 失败不阻断设备列表,但记入 first_error 让 UI 保留旧快照。
-                if let Err(e) = audit_local_device(
-                    transport.as_ref(),
-                    &generation,
-                    &generation_hash,
-                    &cache_dir(),
-                ) {
+                if let Err(e) =
+                    audit_local_device(transport, &generation, &generation_hash, &cache_dir())
+                {
                     data::log_event(format!("sync v2 audit device={id} failed: {e}"));
                     if first_error.is_none() {
                         first_error = Some(format!("本机 generation 远端审计失败: {e}"));

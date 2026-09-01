@@ -14,13 +14,15 @@ use data::{AgentKind, LoadedData};
 use devin_usage_metrics::{agg, cli, data, i18n, pricing, quota, sync};
 use gpui::{
     actions, div, point, prelude::*, px, relative, rgb, size, Animation, AnimationExt as _, App,
-    Application, Bounds, Context, Entity, FocusHandle, KeyBinding, KeyDownEvent, MouseButton,
-    Render, SharedString, Task, TitlebarOptions, Window, WindowBounds, WindowControlArea,
-    WindowOptions,
+    Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyBinding, KeyDownEvent,
+    MouseButton, Render, SharedString, Task, TitlebarOptions, Window, WindowBounds,
+    WindowControlArea, WindowOptions,
 };
+use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use text_input::TextInput;
 
 actions!(main, [Quit]);
@@ -36,6 +38,9 @@ const C_IN: u32 = 0x4cc2ff;
 const C_OUT: u32 = 0x3ddc97;
 const C_CACHED: u32 = 0x8b7cf6;
 const C_COST: u32 = 0xfbbf24;
+/// 同步采集涵盖 CLI、SQLite 与大量 JSONL 文件。限制外层并行度以重叠 I/O，
+/// 同时让各数据源内部的 Rayon 任务共享同一个池，避免过度抢占磁盘和 CPU。
+const SYNC_COLLECTION_CONCURRENCY: usize = 4;
 
 const MODEL_COLORS: [u32; 10] = [
     0xf472b6, 0xfbbf24, 0x60a5fa, 0x34d399, 0xa78bfa, 0xfb923c, 0xf87171, 0x4ade80, 0x22d3ee,
@@ -157,6 +162,7 @@ struct Root {
     github_login_busy: bool,
     github_login_id: u64,
     github_login_code: Option<String>,
+    github_login_code_copied: bool,
     github_login_task: Option<Task<()>>,
     /// 同步设置弹窗是否打开
     sync_config_open: bool,
@@ -377,6 +383,7 @@ impl Root {
         self.github_login_id += 1;
         self.github_login_busy = false;
         self.github_login_code = None;
+        self.github_login_code_copied = false;
         self.github_login_task = None;
         self.sync_api_url = cfg.api_url.clone();
         self.fill_modal_inputs(&cfg, cx);
@@ -423,6 +430,7 @@ impl Root {
         let login_id = self.github_login_id;
         self.github_login_busy = true;
         self.github_login_code = None;
+        self.github_login_code_copied = false;
         self.sync_message = Some("正在请求 GitHub 登录…".into());
         let begin = cx
             .background_executor()
@@ -436,6 +444,7 @@ impl Root {
                 match result {
                     Ok(authorization) => {
                         this.github_login_code = Some(authorization.user_code.clone());
+                        this.github_login_code_copied = false;
                         this.sync_message = Some(format!(
                             "请在浏览器完成 GitHub 登录，验证码：{}",
                             authorization.user_code
@@ -458,6 +467,7 @@ impl Root {
                                 }
                                 this.github_login_busy = false;
                                 this.github_login_code = None;
+                                this.github_login_code_copied = false;
                                 match session {
                                     Ok(session) => match sync::save_github_sync_session(&session) {
                                         Ok(()) => {
@@ -485,12 +495,24 @@ impl Root {
             })
             .ok();
         }));
+        // 后台请求可能要等待网络超时；立即刷新弹窗，让用户知道点击已生效。
+        cx.notify();
+    }
+
+    fn copy_github_login_code(&mut self, cx: &mut Context<Self>) {
+        let Some(code) = self.github_login_code.clone() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(code));
+        self.github_login_code_copied = true;
+        cx.notify();
     }
 
     fn logout_github(&mut self, cx: &mut Context<Self>) {
         self.github_login_id += 1;
         self.github_login_busy = false;
         self.github_login_code = None;
+        self.github_login_code_copied = false;
         self.github_login_task = None;
         sync::delete_github_sync_session();
         self.sync_enabled = false;
@@ -598,19 +620,14 @@ impl Root {
         // 导出本机已安装的全部 agent，时间窗口固定为最近 12 个月，
         // 与界面上的日/周/月选择无关，避免窄窗口覆盖掉远端更早的数据。
         let (start, end) = window_for(PeriodKind::Month, 0);
-        let export_task = cx.background_executor().spawn(async move {
+        let sync_task = cx.background_executor().spawn(async move {
             let export_data = collect_local_export(start, end);
-            sync::export_local(export_data)
+            sync::sync_cycle(export_data)
         });
 
         self.sync_task = Some(cx.spawn(async move |this, cx| {
-            // 1. 导出
-            let export_result = export_task.await;
-            // 2. 导入（无论导出是否成功都尝试导入，以便读取其他设备数据）
-            let (remote, devices, import_error) = cx
-                .background_executor()
-                .spawn(async move { sync::import_remote() })
-                .await;
+            // 导出和导入共用一个 HTTP 连接池；导出失败时仍会继续导入。
+            let (export_result, (remote, devices, import_error)) = sync_task.await;
 
             this.update(cx, |this, cx| {
                 if this.sync_id != sync_id {
@@ -1235,7 +1252,13 @@ impl Root {
         let login_status = if self.github_login_busy {
             self.github_login_code
                 .as_ref()
-                .map(|code| format!("浏览器已打开，请输入验证码：{code}"))
+                .map(|code| {
+                    if self.github_login_code_copied {
+                        format!("验证码 {code} 已复制，请到浏览器粘贴")
+                    } else {
+                        format!("浏览器已打开，请输入验证码：{code}")
+                    }
+                })
                 .unwrap_or_else(|| "正在准备浏览器登录…".into())
         } else if let Some(session) = logged_in {
             format!("已登录 GitHub：{}", session.login)
@@ -1279,10 +1302,41 @@ impl Root {
                     .text_xs()
                     .text_color(rgb(0x0a0a0c))
                     .bg(rgb(ACCENT))
-                    .cursor_pointer()
-                    .hover(|h| h.bg(rgb(0x6ad4ff)))
-                    .child(login_label)
-                    .on_click(cx.listener(|this, _, _, cx| this.start_github_login(cx))),
+                    .when(!self.github_login_busy, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(|h| h.bg(rgb(0x6ad4ff)))
+                            .on_click(cx.listener(|this, _, _, cx| this.start_github_login(cx)))
+                    })
+                    .child(login_label),
+            )
+            .when(
+                self.github_login_busy && self.github_login_code.is_some(),
+                |card| {
+                    card.child(
+                        div()
+                            .id("modal-github-copy-code")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .text_center()
+                            .text_xs()
+                            .text_color(rgb(TEXT))
+                            .bg(rgb(PANEL2))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .cursor_pointer()
+                            .hover(|h| h.bg(rgb(0x30303b)))
+                            .child(if self.github_login_code_copied {
+                                "验证码已复制"
+                            } else {
+                                "复制验证码"
+                            })
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.copy_github_login_code(cx)),
+                            ),
+                    )
+                },
             )
             .when(logged_in.is_some(), |d| {
                 d.child(
@@ -2595,16 +2649,20 @@ fn window_label_text(label: &quota::WindowLabel) -> String {
 /// 为本机同步包收集数据。每个 Agent 都通过带新鲜度检查的加载入口读取，
 /// 避免长期运行时反复导出启动时的内存快照。
 fn collect_local_export(start: i64, end: i64) -> LoadedData {
+    let started = Instant::now();
     let local_id = data::device_id();
     let mut combined = LoadedData {
         turns_start: start,
         turns_end: end,
         ..Default::default()
     };
-    for kind in AgentKind::ALL {
-        if !kind.is_installed() {
-            continue;
-        }
+    let agents: Vec<_> = AgentKind::ALL
+        .into_iter()
+        .filter(|kind| kind.is_installed())
+        .collect();
+    let agent_count = agents.len();
+    let parallelism = SYNC_COLLECTION_CONCURRENCY.min(agents.len().max(1));
+    let load_agent = |kind: AgentKind| {
         let mut agent_data = data::load_agent_for_sync(kind, start, end);
         agent_data
             .sessions
@@ -2612,9 +2670,53 @@ fn collect_local_export(start: i64, end: i64) -> LoadedData {
         agent_data
             .turns
             .retain(|t| t.device_id.is_empty() || t.device_id == local_id);
+        agent_data
+    };
+    let loaded: Vec<_> = rayon::ThreadPoolBuilder::new()
+        .num_threads(parallelism)
+        .build()
+        .map(|pool| {
+            pool.install(|| {
+                agents
+                    .par_iter()
+                    .copied()
+                    .map(|kind| (kind, load_agent(kind)))
+                    .collect()
+            })
+        })
+        // 线程池无法创建时仍保证同步可用，只回退为原有串行行为。
+        .unwrap_or_else(|_| {
+            agents
+                .iter()
+                .copied()
+                .map(|kind| (kind, load_agent(kind)))
+                .collect()
+        });
+    let fingerprints: Option<Vec<_>> = loaded
+        .iter()
+        .map(|(kind, data)| {
+            (!data.sync_content_hash.is_empty()).then_some((*kind, data.sync_content_hash.clone()))
+        })
+        .collect();
+    for (_, mut agent_data) in loaded {
         combined.sessions.append(&mut agent_data.sessions);
         combined.turns.append(&mut agent_data.turns);
     }
+    if let Some(fingerprints) = fingerprints {
+        if let Ok(bytes) =
+            serde_json::to_vec(&(local_id, data::device_name(), start, end, fingerprints))
+        {
+            combined.sync_content_hash = format!("{:x}", Sha256::digest(bytes));
+        }
+    }
+    data::log_event(format!(
+        "sync local collection agents={} parallelism={} sessions={} turns={} elapsed_ms={}",
+        agent_count,
+        parallelism,
+        combined.sessions.len(),
+        combined.turns.len(),
+        started.elapsed().as_millis()
+    ));
     combined
 }
 
@@ -2836,6 +2938,7 @@ fn main() {
                         github_login_busy: false,
                         github_login_id: 0,
                         github_login_code: None,
+                        github_login_code_copied: false,
                         github_login_task: None,
                         sync_config_open: false,
                         modal_url_input: cx.new(|cx| TextInput::new(cx, "", "", false)),

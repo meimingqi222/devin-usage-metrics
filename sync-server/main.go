@@ -210,7 +210,8 @@ func (s *server) githubDevice(w http.ResponseWriter, _ *http.Request) {
 		"scope":     {"read:user"},
 	})
 	if err != nil {
-		http.Error(w, "start GitHub login", http.StatusBadGateway)
+		log.Printf("start GitHub login: %v", err)
+		http.Error(w, "start GitHub login: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	var device githubDeviceCode
@@ -238,7 +239,8 @@ func (s *server) githubToken(w http.ResponseWriter, r *http.Request) {
 		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
 	})
 	if err != nil {
-		http.Error(w, "complete GitHub login", http.StatusBadGateway)
+		log.Printf("complete GitHub login: %v", err)
+		http.Error(w, "complete GitHub login: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	var result struct {
@@ -299,8 +301,11 @@ func (s *server) githubForm(path string, form url.Values) ([]byte, error) {
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 1024*1024))
-	if err != nil || response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, errors.New("GitHub OAuth request failed")
+	if err != nil {
+		return nil, fmt.Errorf("read GitHub OAuth response: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("GitHub OAuth returned HTTP %d", response.StatusCode)
 	}
 	return body, nil
 }

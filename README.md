@@ -2,12 +2,12 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A native desktop app that reads local sessions from Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, and pi-agent and presents token usage, model distribution, and session details. Switch agents from the left sidebar in a Chinese or English interface; local data is sent only after you enable GitHub-authenticated sync to a configured self-hosted API.
+A native desktop app that reads local sessions from Devin, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, and pi-agent and presents token usage, model distribution, and session details. Switch agents from the left sidebar in a Chinese or English interface; local data is sent only after you enable GitHub-authenticated sync to a configured self-hosted API.
 
 ## Features
 
 - **Usage view**
-  - Left sidebar with every supported agent (Devin, Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, pi-agent) and its session count
+  - Left sidebar with every supported agent (Devin, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, pi-agent) and its session count
   - Chinese and English interface, defaulting to the system language; switch from the top bar and the choice is remembered
   - Aggregate token usage by day (15 days) / week (12 weeks) / month (12 months)
   - Stat cards for Total Tokens, Input (new), Output, Cached read, and Turns/Sessions
@@ -28,7 +28,6 @@ A native desktop app that reads local sessions from Devin, Amp, Claude Code, Cod
   - GitHub is used only for identity; sync objects live only in your configured self-hosted service
 - **Data sources**
   - Devin: `~/.local/share/devin/{cli,cli-next}/sessions.db` (platform data directory on Windows)
-  - Amp: `~/.local/share/amp/threads/*.json`
   - Claude Code: `~/.claude/projects/**/*.jsonl` (subagent usage is merged into its parent session)
   - Codex: `~/.codex/{sessions,archived_sessions}/**/*.jsonl` or `$CODEX_HOME`
   - Antigravity: `~/.gemini/antigravity/conversations/*.db` (protobuf-encoded SQLite)
@@ -94,7 +93,7 @@ cargo build --release
 cargo test
 ```
 
-The CLI defaults to the last 30 days of Claude Code usage. It supports `all`, `devin`, `amp`, `claude`, `codex`, `antigravity`, `grok`, `zcode`, `opencode`, and `pi`. Use `--by-agent` to include per-agent rows under the `all` totals. Run `cargo run -- --cli --help` for all options.
+The CLI defaults to the last 30 days of Claude Code usage. It supports `all`, `devin`, `claude`, `codex`, `antigravity`, `grok`, `zcode`, `opencode`, and `pi`. Use `--by-agent` to include per-agent rows under the `all` totals. Run `cargo run -- --cli --help` for all options.
 
 ## Bundle as .app
 
@@ -114,7 +113,7 @@ src/
 ├── main.rs    # GPUI app entry, UI rendering, usage/sessions/quota views, multi-device sync UI
 ├── lib.rs     # Module exports
 ├── data.rs    # Shared records, Devin SQLite reads, on-disk cache, device identity
-├── local_sources.rs # Amp, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, and pi-agent importers
+├── local_sources.rs # Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, and pi-agent importers
 ├── sync.rs    # Multi-device sync orchestration, storage transports, and v1 migration
 ├── sync/v2.rs # Content-addressed, compressed and integrity-checked sync protocol
 ├── pricing.rs # Model pricing table and cost calculation

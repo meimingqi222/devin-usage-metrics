@@ -34,7 +34,7 @@ identifier = "com.devin.usage-metrics"
 icon = ["assets/icon.icns", "assets/icon.ico"]
 category = "Developer Tool"
 short_description = "Local coding-agent usage analytics dashboard"
-long_description = "A native desktop app for tracking Devin, Amp, Claude Code, Codex, and Antigravity usage and sessions."
+long_description = "A native desktop app for tracking Devin, Claude Code, Codex, and Antigravity usage and sessions."
 
 [profile.dev]
 debug = 1

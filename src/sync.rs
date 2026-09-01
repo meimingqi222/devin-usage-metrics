@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::hash::Hasher;
-use std::io::{BufWriter, Write};
+#[cfg(test)]
+use std::io::BufWriter;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -277,6 +279,19 @@ fn sync_api_agent() -> ureq::Agent {
         .new_agent()
 }
 
+fn sync_api_error(status: u16, body: &[u8], action: &str) -> String {
+    let detail = String::from_utf8_lossy(body)
+        .trim()
+        .chars()
+        .take(300)
+        .collect::<String>();
+    if detail.is_empty() {
+        format!("同步 API {action}返回 HTTP {status}")
+    } else {
+        format!("同步 API {action}返回 HTTP {status}: {detail}")
+    }
+}
+
 /// 向自建 API 获取 GitHub Device Flow 验证码。
 pub fn begin_github_login(api_url: &str) -> Result<GitHubDeviceAuthorization, String> {
     let base = sync_api_base(api_url)?;
@@ -291,7 +306,7 @@ pub fn begin_github_login(api_url: &str) -> Result<GitHubDeviceAuthorization, St
     let status = response.status().as_u16();
     let body = WebDavTransport::read_body(response)?;
     if status != 200 {
-        return Err(format!("同步 API 启动 GitHub 登录返回 HTTP {status}"));
+        return Err(sync_api_error(status, &body, "启动 GitHub 登录"));
     }
     let mut authorization: GitHubDeviceAuthorization =
         serde_json::from_slice(&body).map_err(|e| format!("解析 GitHub 登录响应失败: {e}"))?;
@@ -347,7 +362,7 @@ pub fn wait_for_github_login(
         }
         let response_body = WebDavTransport::read_body(response)?;
         if status != 200 {
-            return Err(format!("同步 API 完成 GitHub 登录返回 HTTP {status}"));
+            return Err(sync_api_error(status, &response_body, "完成 GitHub 登录"));
         }
         let session: GitHubSyncSession = serde_json::from_slice(&response_body)
             .map_err(|e| format!("解析 GitHub 登录结果失败: {e}"))?;
@@ -384,17 +399,20 @@ pub trait SyncTransport: Sync {
     fn list_sync_files(&self) -> Result<Vec<String>, String>;
 }
 
-/// 本地文件系统传输层。
+/// 本地文件系统传输层，仅保留给协议回归测试。
+#[cfg(test)]
 struct LocalTransport {
     dir: PathBuf,
 }
 
+#[cfg(test)]
 impl LocalTransport {
     fn new(dir: PathBuf) -> Self {
         Self { dir }
     }
 }
 
+#[cfg(test)]
 impl SyncTransport for LocalTransport {
     fn put(&self, name: &str, data: &[u8]) -> Result<(), String> {
         fs::create_dir_all(&self.dir).map_err(|e| format!("创建同步目录失败: {e}"))?;
@@ -496,28 +514,6 @@ struct WebDavTransport {
 }
 
 impl WebDavTransport {
-    fn new(url: &str, username: &str, password: &str) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(120)))
-            // PROPFIND/MKCOL 不是 HTTP/1.1 标准方法，ureq 默认会直接拒绝
-            .allow_non_standard_methods(true)
-            .http_status_as_error(false)
-            .redirect_auth_headers(ureq::config::RedirectAuthHeaders::SameHost)
-            .build()
-            .new_agent();
-        let base_url = if url.ends_with('/') {
-            url.to_string()
-        } else {
-            format!("{url}/")
-        };
-        Self {
-            base_url,
-            username: username.to_string(),
-            password: password.to_string(),
-            agent,
-        }
-    }
-
     fn auth_header(&self) -> String {
         let encoded = base64_encode(&format!("{}:{}", self.username, self.password));
         format!("Basic {encoded}")
@@ -1018,6 +1014,7 @@ fn atomic_replace(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
     fs::rename(&temp, path).map_err(|e| format!("原子替换失败: {e}"))
 }
 
+#[cfg(test)]
 fn list_local_sync_files(dir: &std::path::Path) -> Result<Vec<String>, String> {
     let entries = match fs::read_dir(dir) {
         Ok(v) => v,
@@ -1417,6 +1414,26 @@ pub fn export_local(data: LoadedData) -> Result<(), String> {
 
 pub fn import_remote() -> (LoadedData, Vec<RemoteDevice>, Option<String>) {
     v3::import_remote_v3()
+}
+
+pub type RemoteImport = (LoadedData, Vec<RemoteDevice>, Option<String>);
+pub type SyncCycleResult = (Result<(), String>, RemoteImport);
+
+/// 在同一个传输实例上完成一轮导出与导入，让 HTTP 连接池复用 TLS 连接。
+/// 导出失败时仍继续导入，保持原有“尽量拉取其他设备”的恢复语义。
+pub fn sync_cycle(data: LoadedData) -> SyncCycleResult {
+    let transport = match current_transport() {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                Err(error.clone()),
+                (LoadedData::default(), Vec::new(), Some(error)),
+            )
+        }
+    };
+    let export = v3::export_local_v3_with_transport(data, transport.as_ref());
+    let imported = v3::import_remote_v3_with_transport(transport.as_ref());
+    (export, imported)
 }
 
 /// 同步目录中发现的一个设备。

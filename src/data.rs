@@ -2,6 +2,7 @@ use crate::i18n;
 use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
@@ -12,7 +13,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::local_sources;
 
 const CACHE_TTL_SECS: i64 = 300; // 5 minutes cache TTL
-const CACHE_SCHEMA_VERSION: u32 = 6;
+const CACHE_SCHEMA_VERSION: u32 = 7;
 
 fn cache_path() -> PathBuf {
     #[cfg(target_os = "windows")]
@@ -47,7 +48,7 @@ fn log_path() -> PathBuf {
     cache_path().with_file_name("load.log")
 }
 
-pub(crate) fn log_event(message: impl AsRef<str>) {
+pub fn log_event(message: impl AsRef<str>) {
     let path = log_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -98,9 +99,12 @@ pub enum AgentKind {
 }
 
 impl AgentKind {
-    pub const ALL: [Self; 9] = [
+    /// Product-visible agents. Amp is intentionally omitted because its CLI
+    /// exports every thread from the remote service and makes routine loads
+    /// and sync collection unacceptably slow. Keep `AgentKind::Amp` itself so
+    /// existing caches and synchronized historical records still deserialize.
+    pub const ALL: [Self; 8] = [
         Self::Devin,
-        Self::Amp,
         Self::Claude,
         Self::Codex,
         Self::Antigravity,
@@ -182,6 +186,10 @@ struct CacheFile {
     file_mtimes: HashMap<String, i64>,
     #[serde(default)]
     file_sessions: HashMap<String, String>,
+    /// 会话和 turn 的内容指纹。同步导出可据此复用已发布的 v3 清单，避免每轮
+    /// 再次对全部历史 turn 分组、排序和序列化。
+    #[serde(default)]
+    sync_content_hash: String,
 }
 
 #[derive(serde::Serialize)]
@@ -195,6 +203,7 @@ struct CacheFileRef<'a> {
     errors: &'a [DataError],
     file_mtimes: &'a HashMap<String, i64>,
     file_sessions: &'a HashMap<String, String>,
+    sync_content_hash: &'a str,
 }
 
 fn now_timestamp() -> Option<i64> {
@@ -434,7 +443,20 @@ fn load_agent_cache(
         errors: cached.errors,
         file_mtimes: cached.file_mtimes,
         file_sessions: cached.file_sessions,
+        sync_content_hash: cached.sync_content_hash,
     })
+}
+
+fn sync_content_hash(data: &LoadedData) -> String {
+    // 仅在 Agent 缓存首次建立或本机数据真的变化时计算。哈希输入覆盖 export 会
+    // 用到的全部原始记录；随后 v3 可安全地直接复用同一份 manifest。
+    let bytes = serde_json::to_vec(&(&data.sessions, &data.turns))
+        .expect("sync cache content is serializable");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn same_sync_content(left: &LoadedData, right: &LoadedData) -> bool {
+    left.sessions == right.sessions && left.turns == right.turns
 }
 
 pub fn save_agent_cache(agent: AgentKind, data: &LoadedData) {
@@ -455,6 +477,7 @@ pub fn save_agent_cache(agent: AgentKind, data: &LoadedData) {
         errors: &data.errors,
         file_mtimes: &data.file_mtimes,
         file_sessions: &data.file_sessions,
+        sync_content_hash: &data.sync_content_hash,
     };
     let temp_path = path.with_extension(format!("json.tmp-{}", std::process::id()));
     if let Ok(file) = File::create(&temp_path) {
@@ -478,7 +501,15 @@ pub fn load_agent(agent: AgentKind, start: i64, end: i64) -> LoadedData {
         data
     } else {
         let previous = load_agent_cache(agent, start, end, false).map(Arc::new);
-        let data = load_selected_agent(start, end, agent, previous);
+        let mut data = load_selected_agent(start, end, agent, previous.clone());
+        if let Some(previous) = previous.as_deref() {
+            if !previous.sync_content_hash.is_empty() && same_sync_content(previous, &data) {
+                data.sync_content_hash = previous.sync_content_hash.clone();
+            }
+        }
+        if data.sync_content_hash.is_empty() {
+            data.sync_content_hash = sync_content_hash(&data);
+        }
         save_agent_cache(agent, &data);
         log_event(format!(
             "load_agent agent={} cache_miss fresh_loaded sessions={} turns={}",
@@ -522,6 +553,7 @@ fn load_cache(start: i64, end: i64) -> Option<LoadedData> {
         errors: cached.errors,
         file_mtimes: cached.file_mtimes,
         file_sessions: cached.file_sessions,
+        sync_content_hash: cached.sync_content_hash,
     })
 }
 
@@ -547,6 +579,7 @@ fn save_to_cache(data: &LoadedData) {
         errors: &data.errors,
         file_mtimes: &data.file_mtimes,
         file_sessions: &data.file_sessions,
+        sync_content_hash: &data.sync_content_hash,
     };
     let temp_path = path.with_extension(format!("json.tmp-{}", std::process::id()));
     if let Ok(file) = File::create(&temp_path) {
@@ -585,7 +618,7 @@ struct DevinMetrics {
     total_time_ms: Option<f64>,
 }
 
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionRec {
     pub agent: AgentKind,
     pub key: String, // "<source>/<id>"
@@ -639,7 +672,7 @@ impl SessionRec {
     }
 }
 
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TurnRec {
     pub agent: AgentKind,
     pub session_key: String,
@@ -688,6 +721,9 @@ pub struct LoadedData {
     /// 增量 reload 时据此把未变化文件映射回可复用的会话。
     #[serde(default)]
     pub file_sessions: HashMap<String, String>,
+    /// Agent 缓存的组合内容指纹；仅用于 v3 同步的 no-op 快速路径。
+    #[serde(default)]
+    pub sync_content_hash: String,
 }
 
 pub fn devin_db_paths() -> Vec<(String, PathBuf)> {
@@ -1080,12 +1116,6 @@ fn load_uncached(start: i64, end: i64, previous: Option<Arc<LoadedData>>) -> Loa
                 parts.lock().unwrap().push(data);
             });
         }
-        scope.spawn(|_| {
-            let started = Instant::now();
-            let data = local_sources::load_amp(start, end, previous.as_deref());
-            log_loaded_part("Amp", started, &data);
-            parts.lock().unwrap().push(data);
-        });
         scope.spawn(|_| {
             let started = Instant::now();
             let data = local_sources::load_claude(start, end, previous.as_deref());

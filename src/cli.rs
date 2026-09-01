@@ -216,7 +216,6 @@ fn parse_agent(value: &str) -> Result<Option<AgentKind>, String> {
     match value.to_ascii_lowercase().replace('_', "-").as_str() {
         "all" => Ok(None),
         "devin" => Ok(Some(AgentKind::Devin)),
-        "amp" => Ok(Some(AgentKind::Amp)),
         "claude" | "claude-code" => Ok(Some(AgentKind::Claude)),
         "codex" => Ok(Some(AgentKind::Codex)),
         "antigravity" => Ok(Some(AgentKind::Antigravity)),
@@ -570,6 +569,7 @@ mod tests {
         assert_eq!(parse_agent("open_code").unwrap(), Some(AgentKind::OpenCode));
         assert_eq!(parse_agent("pi-agent").unwrap(), Some(AgentKind::Pi));
         assert_eq!(parse_agent("all").unwrap(), None);
+        assert!(parse_agent("amp").is_err());
     }
 
     #[test]
