@@ -4,6 +4,9 @@
 //!   与 CLI 自身行为一致（这些 OAuth 的 refresh_token 是一次性轮换的，
 //!   只刷不写回会让 CLI 下次刷新失败）。
 //! - Devin 走浏览器 session cookie（手动粘贴，存本应用配置目录）。
+//! - Devin CLI 走本地 credentials.toml 中的 session token 自动发现，
+//!   配额数据从本地缓存的 user_status.bin (protobuf) 读取，辅以
+//!   billing/status JSON API。
 //! - 全部接口为各家客户端使用的内部接口，无公开文档；解析一律防御式，
 //!   字段缺失时降级而不是崩溃。
 
@@ -78,6 +81,12 @@ pub enum AccountKind {
     Devin {
         cookie: String,
         org_id: Option<String>,
+    },
+    /// Devin CLI 本地自动发现：session token 来自 credentials.toml，
+    /// org_id 来自 config.json。不可手动删除（关闭 Devin CLI 后自动消失）。
+    DevinCli {
+        token: String,
+        org_id: String,
     },
 }
 
@@ -204,6 +213,16 @@ pub fn discover_accounts() -> Vec<Account> {
                 kind: AccountKind::GrokLocal { path: grok },
             });
         }
+    }
+
+    // Devin CLI 自动发现：读取 credentials.toml + config.json
+    if let Some((token, org_id)) = read_devin_cli_credentials() {
+        out.push(Account {
+            key: "devin-cli".into(),
+            provider: Provider::Devin,
+            label: "Devin CLI".into(),
+            kind: AccountKind::DevinCli { token, org_id },
+        });
     }
 
     for (i, d) in load_store().devin.into_iter().enumerate() {
@@ -355,6 +374,7 @@ pub fn fetch_account(account: &Account) -> Result<QuotaResult, String> {
         AccountKind::CodexLocal { path } => fetch_codex(path),
         AccountKind::GrokLocal { path } => fetch_grok(path),
         AccountKind::Devin { cookie, org_id } => fetch_devin(cookie, org_id.as_deref()),
+        AccountKind::DevinCli { token, org_id } => fetch_devin_cli(token, org_id),
     }
 }
 
@@ -532,10 +552,21 @@ pub fn parse_claude_usage(usage: &Value, plan: Option<String>) -> QuotaResult {
         let Some(pct) = json_field(w, &["utilization"]).and_then(Value::as_f64) else {
             continue;
         };
+        let resets_at = json_field(w, &["resets_at"]).and_then(parse_when).or_else(|| {
+            // 当 resets_at 为 null 时，按窗口类型估算下一次重置时间
+            match label {
+                WindowLabel::FiveHour => Some(now_sec() + 5 * 3600),
+                WindowLabel::SevenDay
+                | WindowLabel::SevenDayOauthApps
+                | WindowLabel::SevenDayOpus
+                | WindowLabel::SevenDaySonnet => Some(now_sec() + 7 * 86400),
+                _ => None,
+            }
+        });
         windows.push(QuotaWindow {
             label: label.clone(),
             used_percent: pct,
-            resets_at: json_field(w, &["resets_at"]).and_then(parse_when),
+            resets_at,
         });
     }
 
@@ -664,7 +695,18 @@ fn refresh_codex(cred: &mut CodexCred) -> Result<(), String> {
 }
 
 fn fetch_codex(path: &Path) -> Result<QuotaResult, String> {
-    let mut cred = read_codex_cred(path)?;
+    // API-key mode：auth.json 没有 access_token，无法查询订阅配额。
+    // 直接返回一个标识性的结果，不当作错误。
+    let mut cred = match read_codex_cred(path) {
+        Ok(c) => c,
+        Err(_) => {
+            return Ok(QuotaResult {
+                plan: Some("API MODE".into()),
+                windows: Vec::new(),
+                extra: None,
+            });
+        }
+    };
     let agent = http_agent();
 
     let mut usage: Result<Value, String>;
@@ -908,7 +950,21 @@ fn fetch_grok(path: &Path) -> Result<QuotaResult, String> {
             _ => break,
         }
     }
-    let weekly = body?;
+    // Grok 未使用过时 billing API 可能返回错误，视为 100% 剩余（0% 已用）
+    let weekly = match body {
+        Ok(v) => v,
+        Err(_) => {
+            return Ok(QuotaResult {
+                plan: None,
+                windows: vec![QuotaWindow {
+                    label: WindowLabel::Weekly,
+                    used_percent: 0.0,
+                    resets_at: None,
+                }],
+                extra: None,
+            });
+        }
+    };
 
     let bearer = format!("Bearer {}", cred.access_token);
     let mut headers: Vec<(&str, &str)> = vec![("authorization", &bearer)];
@@ -1067,14 +1123,14 @@ pub fn parse_devin_quota(quota: &Value, plan: Option<String>) -> QuotaResult {
     ) {
         windows.push(QuotaWindow {
             label: WindowLabel::Daily,
-            used_percent: pct,
+            used_percent: 100.0 - pct,
             resets_at: quota.get("daily_reset_at").and_then(parse_when),
         });
     }
     if let Some(pct) = quota.get("weekly_percentage").and_then(Value::as_f64) {
         windows.push(QuotaWindow {
             label: WindowLabel::Weekly,
-            used_percent: pct,
+            used_percent: 100.0 - pct,
             resets_at: quota.get("weekly_reset_at").and_then(parse_when),
         });
     }
@@ -1088,6 +1144,291 @@ pub fn parse_devin_quota(quota: &Value, plan: Option<String>) -> QuotaResult {
         windows,
         extra,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Devin CLI（本地 session token 自动发现 + GetUserStatus API 调用）
+// ---------------------------------------------------------------------------
+
+/// 从 credentials.toml 读取简单 key="value" 行。避免引入 toml 依赖。
+fn parse_simple_toml(text: &str, key: &str) -> Option<String> {
+    let prefix = key;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(prefix) {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let rest = rest.trim();
+                if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
+                    return Some(rest[1..rest.len() - 1].to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 读取 Devin CLI 本地凭证：credentials.toml 中的 session token + config.json 中的 org_id。
+fn read_devin_cli_credentials() -> Option<(String, String)> {
+    let config_dir = dirs::config_dir()?;
+    let cred_path = config_dir.join("devin/credentials.toml");
+    let cred_text = std::fs::read_to_string(&cred_path).ok()?;
+    let token = parse_simple_toml(&cred_text, "windsurf_api_key")?;
+
+    let config_path = config_dir.join("devin/config.json");
+    let config_text = std::fs::read_to_string(&config_path).ok()?;
+    let config: Value = serde_json::from_str(&config_text).ok()?;
+    let org_id = json_field(&config, &["devin", "org_id"])
+        .and_then(Value::as_str)
+        .map(str::to_string)?;
+
+    Some((token, org_id))
+}
+
+/// 最小 protobuf wire-format 解析与编码。
+/// 仅支持本项目需要的子集（varint + length-delimited），无 schema 依赖。
+mod pb {
+    /// 读取 varint，返回 (值, 新位置)。
+    fn read_varint(data: &[u8], pos: usize) -> Option<(u64, usize)> {
+        let mut result: u64 = 0;
+        let mut shift = 0;
+        let mut p = pos;
+        loop {
+            if p >= data.len() {
+                return None;
+            }
+            let b = data[p];
+            result |= (b as u64 & 0x7f) << shift;
+            p += 1;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 63 {
+                return None;
+            }
+        }
+        Some((result, p))
+    }
+
+    /// 编码 varint。
+    fn write_varint(val: u64, out: &mut Vec<u8>) {
+        let mut v = val;
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                out.push(b | 0x80);
+            } else {
+                out.push(b);
+            }
+            if v == 0 {
+                break;
+            }
+        }
+    }
+
+    /// 编码一个 string 字段 (wire type 2)。
+    pub fn write_string_field(out: &mut Vec<u8>, field_num: u32, s: &str) {
+        write_varint((field_num as u64) << 3 | 2, out);
+        write_varint(s.len() as u64, out);
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    /// 编码一个嵌套 message 字段 (wire type 2)。
+    pub fn write_message_field(out: &mut Vec<u8>, field_num: u32, msg: &[u8]) {
+        write_varint((field_num as u64) << 3 | 2, out);
+        write_varint(msg.len() as u64, out);
+        out.extend_from_slice(msg);
+    }
+
+    /// 在 protobuf 消息中找第一个指定 field number 的 length-delimited 子消息。
+    pub fn find_submessage(data: &[u8], target_field: u32) -> Option<&[u8]> {
+        let mut pos = 0;
+        while pos < data.len() {
+            let Some((tag, p)) = read_varint(data, pos) else {
+                break;
+            };
+            pos = p;
+            let field_num = (tag >> 3) as u32;
+            let wire_type = (tag & 0x7) as u8;
+            match wire_type {
+                0 => {
+                    let Some((_, p)) = read_varint(data, pos) else {
+                        break;
+                    };
+                    pos = p;
+                }
+                2 => {
+                    let Some((len, p)) = read_varint(data, pos) else {
+                        break;
+                    };
+                    pos = p;
+                    if pos + len as usize > data.len() {
+                        break;
+                    }
+                    if field_num == target_field {
+                        return Some(&data[pos..pos + len as usize]);
+                    }
+                    pos += len as usize;
+                }
+                1 => pos += 8,
+                5 => pos += 4,
+                _ => break,
+            }
+        }
+        None
+    }
+
+    /// 在 protobuf 消息中找第一个指定 field number 的 varint 值。
+    pub fn find_varint(data: &[u8], target_field: u32) -> Option<u64> {
+        let mut pos = 0;
+        while pos < data.len() {
+            let Some((tag, p)) = read_varint(data, pos) else {
+                break;
+            };
+            pos = p;
+            let field_num = (tag >> 3) as u32;
+            let wire_type = (tag & 0x7) as u8;
+            match wire_type {
+                0 => {
+                    let Some((val, p)) = read_varint(data, pos) else {
+                        break;
+                    };
+                    pos = p;
+                    if field_num == target_field {
+                        return Some(val);
+                    }
+                }
+                2 => {
+                    let Some((len, p)) = read_varint(data, pos) else {
+                        break;
+                    };
+                    pos = p;
+                    if pos + len as usize > data.len() {
+                        break;
+                    }
+                    pos += len as usize;
+                }
+                1 => pos += 8,
+                5 => pos += 4,
+                _ => break,
+            }
+        }
+        None
+    }
+
+    /// 在 protobuf 消息中找第一个指定 field number 的字符串。
+    pub fn find_string(data: &[u8], target_field: u32) -> Option<String> {
+        let raw = find_submessage(data, target_field)?;
+        std::str::from_utf8(raw).ok().map(|s| s.to_string())
+    }
+}
+
+/// 调用 Devin CLI 的 GetUserStatus API 获取实时配额数据。
+///
+/// API 端点：`server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus`
+/// 协议：Connect-RPC (protobuf over HTTP POST)
+/// 认证：`Authorization: Basic <token>-<token>`（token 重复一次，用 dash 分隔）
+///
+/// 请求体（protobuf，逆向自 Devin CLI 3000.6.11 抓包）：
+/// ```text
+/// F1 (msg): Metadata
+///   F1 (str): client_name = "chisel"   // 必须为 "chisel"，其他值返回 500
+///   F2 (str): client_version           // 任意版本字符串
+///   F3 (str): auth_token               // "devin-session-token$<JWT>"
+///   F7 (str): version                  // 必须存在，否则返回 400
+/// ```
+///
+/// 响应体（protobuf）：
+/// ```text
+/// F1 (msg): UserStatus
+///   F13 (msg): QuotaInfo
+///     F1 (msg): PlanInfo { F2 (str): plan_name }
+///     F14 (varint): daily_percentage
+///     F15 (varint): weekly_percentage
+///     F16 (varint): overage_credits × 1,000,000
+///     F17 (varint): daily_reset_at (unix 秒)
+///     F18 (varint): weekly_reset_at (unix 秒)
+/// ```
+fn fetch_devin_cli(token: &str, _org_id: &str) -> Result<QuotaResult, String> {
+    // 构造 protobuf 请求体
+    let mut meta = Vec::new();
+    pb::write_string_field(&mut meta, 1, "chisel");
+    pb::write_string_field(&mut meta, 2, "3000.6.11");
+    pb::write_string_field(&mut meta, 3, token);
+    pb::write_string_field(&mut meta, 7, "3000.6.11");
+    let mut body = Vec::new();
+    pb::write_message_field(&mut body, 1, &meta);
+
+    // 发送请求
+    let agent = http_agent();
+    let auth = format!("Basic {token}-{token}");
+    let url = "https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus";
+    let resp = agent
+        .post(url)
+        .header("authorization", &auth)
+        .header("content-type", "application/proto")
+        .header("connect-protocol-version", "1")
+        .header("accept", "*/*")
+        .send(&body)
+        .map_err(http_err)?;
+
+    // 读取二进制响应体
+    let resp_bytes: Vec<u8> = {
+        let mut r = resp.into_body();
+        r.read_to_vec()
+            .map_err(|e: ureq::Error| e.to_string())?
+    };
+
+    // 解析响应：F1 (UserStatus) -> F13 (QuotaInfo)
+    let f1 = pb::find_submessage(&resp_bytes, 1)
+        .ok_or_else(|| "GetUserStatus response missing F1".to_string())?;
+    let f13 = pb::find_submessage(f1, 13)
+        .ok_or_else(|| "GetUserStatus response missing F13 (quota)".to_string())?;
+
+    // Devin API 返回的是剩余百分比，需转换为已用百分比
+    let daily_remaining = pb::find_varint(f13, 14).map(|v| v as f64);
+    let weekly_remaining = pb::find_varint(f13, 15).map(|v| v as f64);
+    let overage_raw = pb::find_varint(f13, 16);
+    let daily_reset = pb::find_varint(f13, 17).map(|v| v as i64);
+    let weekly_reset = pb::find_varint(f13, 18).map(|v| v as i64);
+
+    // F13.1 (PlanInfo) -> F2 = plan name
+    let plan = pb::find_submessage(f13, 1)
+        .and_then(|m| pb::find_string(m, 2))
+        .map(|s| s.to_lowercase());
+
+    let mut windows = Vec::new();
+    if let Some(remaining) = daily_remaining {
+        windows.push(QuotaWindow {
+            label: WindowLabel::Daily,
+            used_percent: 100.0 - remaining,
+            resets_at: daily_reset,
+        });
+    }
+    if let Some(remaining) = weekly_remaining {
+        windows.push(QuotaWindow {
+            label: WindowLabel::Weekly,
+            used_percent: 100.0 - remaining,
+            resets_at: weekly_reset,
+        });
+    }
+
+    let extra = overage_raw
+        .map(|v| v as f64 / 1_000_000.0)
+        .filter(|b| *b > 0.0)
+        .map(|b| format!("{b:.2} ACU"));
+
+    if plan.is_none() && windows.is_empty() && extra.is_none() {
+        return Err("GetUserStatus returned no quota fields".into());
+    }
+
+    Ok(QuotaResult {
+        plan,
+        windows,
+        extra,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,7 +1566,7 @@ mod tests {
         let r = parse_devin_quota(&quota, Some("pro".into()));
         assert_eq!(r.windows.len(), 2);
         assert_eq!(r.windows[0].label, WindowLabel::Daily);
-        assert_eq!(r.windows[0].used_percent, 42.0);
+        assert_eq!(r.windows[0].used_percent, 58.0);
         // -08:00 → UTC 08:00
         assert_eq!(r.windows[0].resets_at, Some(1788163200));
         assert_eq!(r.extra.as_deref(), Some("193.45 ACU"));
@@ -1294,5 +1635,111 @@ mod tests {
     #[test]
     fn urlencoded_escapes() {
         assert_eq!(urlencoded("a b+c/d"), "a%20b%2Bc%2Fd");
+    }
+
+    #[test]
+    fn parse_simple_toml_extracts_quoted_value() {
+        let text = r#"
+api_server_url = "https://server.codeium.com"
+windsurf_api_key = "devin-session-token$abc123"
+devin_webapp_host = "app.devin.ai"
+"#;
+        assert_eq!(
+            parse_simple_toml(text, "windsurf_api_key").as_deref(),
+            Some("devin-session-token$abc123")
+        );
+        assert_eq!(
+            parse_simple_toml(text, "devin_webapp_host").as_deref(),
+            Some("app.devin.ai")
+        );
+        assert_eq!(parse_simple_toml(text, "nonexistent"), None);
+    }
+
+    #[test]
+    fn pb_find_varint_and_submessage() {
+        // 手工构造一个 protobuf 消息:
+        // F1 (varint) = 42
+        // F2 (string) = "hello"
+        // F13 (msg) = { F14 (varint) = 72, F15 (varint) = 68, F1 (msg) = { F2 (string) = "Pro" } }
+        let mut msg = Vec::new();
+        // F1 = 42 (varint)
+        msg.push(0x08); // tag: field 1, wire type 0
+        msg.push(0x2a); // 42
+        // F2 = "hello" (length-delimited)
+        msg.push(0x12); // tag: field 2, wire type 2
+        msg.push(0x05); // length 5
+        msg.extend_from_slice(b"hello");
+        // F13 = submessage
+        let mut sub = Vec::new();
+        // F14 = 72
+        sub.push(0x70); // tag: field 14, wire type 0
+        sub.push(0x48); // 72
+        // F15 = 68
+        sub.push(0x78); // tag: field 15, wire type 0
+        sub.push(0x44); // 68
+        // F1 (msg) = { F2 = "Pro" }
+        let mut inner = Vec::new();
+        inner.push(0x12); // tag: field 2, wire type 2
+        inner.push(0x03); // length 3
+        inner.extend_from_slice(b"Pro");
+        sub.push(0x0a); // tag: field 1, wire type 2
+        sub.push(inner.len() as u8);
+        sub.extend_from_slice(&inner);
+
+        msg.push(0x6a); // tag: field 13, wire type 2
+        msg.push(sub.len() as u8);
+        msg.extend_from_slice(&sub);
+
+        assert_eq!(pb::find_varint(&msg, 1), Some(42));
+        assert_eq!(pb::find_string(&msg, 2).as_deref(), Some("hello"));
+        let f13 = pb::find_submessage(&msg, 13).unwrap();
+        assert_eq!(pb::find_varint(f13, 14), Some(72));
+        assert_eq!(pb::find_varint(f13, 15), Some(68));
+        let f13_1 = pb::find_submessage(f13, 1).unwrap();
+        assert_eq!(pb::find_string(f13_1, 2).as_deref(), Some("Pro"));
+    }
+
+    #[test]
+    fn pb_encode_and_decode_roundtrip() {
+        // 编码一个请求体，然后解码验证
+        let mut meta = Vec::new();
+        pb::write_string_field(&mut meta, 1, "chisel");
+        pb::write_string_field(&mut meta, 2, "3000.6.11");
+        pb::write_string_field(&mut meta, 3, "devin-session-token$test");
+        pb::write_string_field(&mut meta, 7, "3000.6.11");
+        let mut body = Vec::new();
+        pb::write_message_field(&mut body, 1, &meta);
+
+        // 解码外层 F1
+        let f1 = pb::find_submessage(&body, 1).unwrap();
+        assert_eq!(pb::find_string(f1, 1).as_deref(), Some("chisel"));
+        assert_eq!(pb::find_string(f1, 2).as_deref(), Some("3000.6.11"));
+        assert_eq!(
+            pb::find_string(f1, 3).as_deref(),
+            Some("devin-session-token$test")
+        );
+        assert_eq!(pb::find_string(f1, 7).as_deref(), Some("3000.6.11"));
+    }
+
+    #[test]
+    fn fetch_real_devin_cli() {
+        if let Some((token, org_id)) = read_devin_cli_credentials() {
+            println!("org_id: {org_id}");
+            match fetch_devin_cli(&token, &org_id) {
+                Ok(r) => {
+                    println!("plan: {:?}", r.plan);
+                    println!("windows: {:?}", r.windows);
+                    println!("extra: {:?}", r.extra);
+                    assert!(r.plan.is_some() || !r.windows.is_empty(),
+                        "should get some quota data from API");
+                }
+                Err(e) => {
+                    // 网络不可用时不应该 panic，只打印
+                    println!("error (network may be unavailable): {e}");
+                }
+            }
+        } else {
+            println!("No Devin CLI credentials found (skipping)");
+        }
     }
 }

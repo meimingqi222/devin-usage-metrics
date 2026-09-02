@@ -136,7 +136,6 @@ struct Root {
     quota_load_id: u64,
     quota_task: Option<Task<()>>,
     quota_tick_task: Option<Task<()>>,
-    quota_adding: bool,
     quota_updated_at: String,
     quota_message: Option<String>,
     // 多设备同步
@@ -751,48 +750,6 @@ impl Root {
                 if this.tab == Tab::Quota && !this.quota_cards.is_empty() {
                     cx.notify();
                     this.quota_tick(cx);
-                }
-            })
-            .ok();
-        }));
-    }
-
-    /// 从剪贴板读取 Devin Cookie，验证后保存并重新查询。
-    fn add_devin_from_clipboard(&mut self, cx: &mut Context<Self>) {
-        if self.quota_adding {
-            return;
-        }
-        let cookie = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .map(|text| text.trim().to_string())
-            .unwrap_or_default();
-        if cookie.is_empty() {
-            self.quota_message = Some(i18n::t(i18n::Key::QuotaErrClipboard).into());
-            cx.notify();
-            return;
-        }
-        self.quota_adding = true;
-        self.quota_message = None;
-        cx.notify();
-        self.quota_task = Some(cx.spawn(async move |this, cx| {
-            let cookie_for_check = cookie.clone();
-            let validate = cx
-                .background_executor()
-                .spawn(async move { quota::validate_devin_cookie(&cookie_for_check) });
-            let res = validate.await;
-            this.update(cx, |this, cx| {
-                this.quota_adding = false;
-                match res {
-                    Ok((label, org)) => {
-                        quota::save_devin_account(&label, &cookie, Some(&org));
-                        this.start_quota_load(cx);
-                    }
-                    Err(e) => {
-                        this.quota_message =
-                            Some(i18n::tf(i18n::Key::QuotaErrCookieInvalid, &[&e]));
-                        cx.notify();
-                    }
                 }
             })
             .ok();
@@ -1619,29 +1576,6 @@ impl Root {
                                         this.start_quota_load(cx);
                                     }
                                 })),
-                        )
-                        .child(
-                            div()
-                                .id("quota-add-devin")
-                                .px_2()
-                                .py(px(2.))
-                                .rounded_sm()
-                                .text_xs()
-                                .when(!self.quota_adding, |b| {
-                                    b.cursor_pointer()
-                                        .text_color(rgb(MUTED))
-                                        .hover(|h| h.bg(rgb(PANEL2)))
-                                })
-                                .when(self.quota_adding, |b| b.text_color(rgba(MUTED, 0.55)))
-                                .child(if self.quota_adding {
-                                    i18n::t(i18n::Key::QuotaValidatingCookie)
-                                } else {
-                                    i18n::t(i18n::Key::QuotaAddDevin)
-                                })
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.add_devin_from_clipboard(cx);
-                                })),
                         ),
                 )
             })
@@ -2452,7 +2386,7 @@ impl Root {
     }
 
     fn quota_card(&self, card: &QuotaCard, cx: &mut Context<Self>) -> gpui::Div {
-        let removable = card.key.starts_with("devin-");
+        let removable = card.key.starts_with("devin-") && card.key != "devin-cli";
         let key = card.key.clone();
         let mut header = div()
             .flex()
@@ -2522,6 +2456,11 @@ impl Root {
             }
             Ok(result) => {
                 if let Some(plan) = &result.plan {
+                    let plan_color = if plan == "API MODE" {
+                        0x34d399
+                    } else {
+                        ACCENT
+                    };
                     d = d.child(
                         div().flex().child(
                             div()
@@ -2530,7 +2469,7 @@ impl Root {
                                 .rounded_sm()
                                 .bg(rgb(PANEL2))
                                 .text_xs()
-                                .text_color(rgb(ACCENT))
+                                .text_color(rgb(plan_color))
                                 .child(plan.clone()),
                         ),
                     );
@@ -2590,7 +2529,7 @@ impl Root {
                     }
                     d = d.child(win);
                 }
-                if result.windows.is_empty() {
+                if result.windows.is_empty() && result.plan.as_deref() != Some("API MODE") {
                     d = d.child(
                         div()
                             .text_xs()
@@ -2621,11 +2560,12 @@ fn provider_color(provider: quota::Provider) -> u32 {
     }
 }
 
-/// 进度条阈值配色：<50% 绿、<80% 黄、否则红。
-fn pct_color(pct: f64) -> u32 {
-    if pct < 50.0 {
+/// 进度条阈值配色（按剩余用量）：剩余≥66% 绿、33~66% 黄、<33% 红。
+fn pct_color(used_percent: f64) -> u32 {
+    let remaining = 100.0 - used_percent;
+    if remaining >= 66.0 {
         0x34d399
-    } else if pct < 80.0 {
+    } else if remaining >= 33.0 {
         0xfbbf24
     } else {
         0xf87171
@@ -2923,7 +2863,6 @@ fn main() {
                         quota_load_id: 0,
                         quota_task: None,
                         quota_tick_task: None,
-                        quota_adding: false,
                         quota_updated_at: String::new(),
                         quota_message: None,
                         device_filter: Some(local_id),
