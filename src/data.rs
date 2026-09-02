@@ -13,7 +13,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::local_sources;
 
 const CACHE_TTL_SECS: i64 = 300; // 5 minutes cache TTL
-const CACHE_SCHEMA_VERSION: u32 = 7;
+const CACHE_SCHEMA_VERSION: u32 = 8;
 
 fn cache_path() -> PathBuf {
     #[cfg(target_os = "windows")]
@@ -704,6 +704,11 @@ pub struct TurnRec {
     /// 该轮来源设备的人类可读名称（hostname）
     #[serde(default)]
     pub device_name: String,
+    /// 用于跨文件去重的稳定 key（目前仅 Claude Code 使用，取 message.id/
+    /// requestId）。`/resume` 续接会话时 Claude Code 会把历史 message 原样
+    /// 复制进新文件，必须靠这个 key 才能跨会话文件识别出同一次真实调用。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dedup_key: String,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]

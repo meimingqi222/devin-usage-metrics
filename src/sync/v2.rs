@@ -137,6 +137,8 @@ fn session_id(s: &SessionRec) -> String {
     )
 }
 pub(super) fn stable_turn_id(t: &TurnRec) -> String {
+    // 字段是显式列举的：`TurnRec::dedup_key` 被有意排除在外——它是本机解析期
+    // 的跨文件去重 key，把它算进同步身份会让所有已上传的 turn 换 id。
     #[derive(Serialize)]
     struct Canon<'a> {
         version: u8,

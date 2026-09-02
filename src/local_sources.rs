@@ -16,6 +16,10 @@ use std::os::windows::process::CommandExt;
 
 const MAX_SESSION_FILES: usize = 1500;
 
+/// Claude Code 会话 key 的前缀。构造和拆解必须用同一个常量：拆解侧一旦和
+/// 构造侧对不上，会话汇总会静默归零而不是报错。
+const CLAUDE_SESSION_PREFIX: &str = "claude-code/";
+
 #[derive(Default)]
 struct SessionBuilder {
     id: String,
@@ -917,8 +921,13 @@ fn parse_claude_file(
     // Claude Code 会为同一次响应写入多条相同 message.id 的增量记录：
     // 第一条通常只有 1~9 个 output token，最后一条才是最终累计 usage。
     // 先按 id 保留最后一条，解析完成后再汇总，避免把增量首帧当成整轮用量。
-    let mut latest_turns: HashMap<String, (String, TurnRec)> = HashMap::new();
-    let mut anonymous_turns: Vec<(String, TurnRec)> = Vec::new();
+    //
+    // message.id 的去重不能局限在单个文件内：`/resume` 续接会话时，Claude Code
+    // 会把此前的完整历史（包含原始 message.id 和 usage）逐条复制进新的 jsonl
+    // 文件。若只按文件去重，同一次真实 API 调用会在原会话文件和续接文件里各
+    // 计一次，导致费用/用量翻倍。这里把去重 key 写进 `TurnRec::dedup_key`，
+    // 真正跨文件的去重和会话汇总推迟到 load_claude 里统一处理。
+    let mut latest_turns: HashMap<String, TurnRec> = HashMap::new();
     let fallback_id = claude_session_id(path);
     if fallback_id.is_empty() {
         return (sessions, Vec::new(), 0);
@@ -926,6 +935,7 @@ fn parse_claude_file(
     let Ok(file) = File::open(path) else {
         return (sessions, Vec::new(), 1);
     };
+    let mut anon_seq: u64 = 0;
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         let Ok(value) = serde_json::from_str::<ClaudeLine>(&line) else {
             continue;
@@ -989,9 +999,17 @@ fn parse_claude_file(
                     .and_then(|m| m.model.as_deref())
                     .unwrap_or("")
                     .to_owned();
+                let dedup_key = if message_id.is_empty() {
+                    // 没有稳定 id 的记录（极少见）：用文件路径+自增序号构造唯一
+                    // key，避免被跨文件去重逻辑误判为重复。
+                    anon_seq += 1;
+                    format!("anon:{}:{anon_seq}", path.to_string_lossy())
+                } else {
+                    message_id.to_owned()
+                };
                 let turn = TurnRec {
                     agent: AgentKind::Claude,
-                    session_key: format!("claude-code/{id}"),
+                    session_key: format!("{CLAUDE_SESSION_PREFIX}{id}"),
                     created_at: at,
                     input_tokens: input,
                     output_tokens: output,
@@ -1005,27 +1023,16 @@ fn parse_claude_file(
                     recorded_cost: None,
                     ..Default::default()
                 };
-                if message_id.is_empty() {
-                    anonymous_turns.push((id, turn));
-                } else {
-                    latest_turns.insert(message_id.to_owned(), (id, turn));
-                }
+                latest_turns.insert(dedup_key, turn);
             }
             _ => {}
         }
     }
 
-    let mut turns = Vec::with_capacity(latest_turns.len() + anonymous_turns.len());
-    for (id, turn) in latest_turns.into_values().chain(anonymous_turns) {
-        if let Some(session) = sessions.get_mut(&id) {
-            session.input_tokens += turn.input_tokens;
-            session.output_tokens += turn.output_tokens;
-            session.cached_tokens += turn.cache_read_tokens;
-            session.cache_creation_tokens += turn.cache_creation_tokens;
-            session.cache_creation_5m_tokens += turn.cache_creation_5m_tokens;
-            session.cache_creation_1h_tokens += turn.cache_creation_1h_tokens;
-        }
+    let mut turns = Vec::with_capacity(latest_turns.len());
+    for (dedup_key, mut turn) in latest_turns {
         if turn.created_at >= start && turn.created_at < end {
+            turn.dedup_key = dedup_key;
             turns.push(turn);
         }
     }
@@ -1059,7 +1066,7 @@ pub(crate) fn load_claude(start: i64, end: i64, previous: Option<&LoadedData>) -
             continue;
         }
         files_by_key
-            .entry(format!("claude-code/{id}"))
+            .entry(format!("{CLAUDE_SESSION_PREFIX}{id}"))
             .or_default()
             .push(path);
     }
@@ -1086,7 +1093,7 @@ pub(crate) fn load_claude(start: i64, end: i64, previous: Option<&LoadedData>) -
         .flat_map(|(_, paths)| paths.iter().copied())
         .collect();
     let mut sessions: HashMap<String, SessionBuilder> = HashMap::new();
-    let mut turns = Vec::new();
+    let mut fresh_turns = Vec::new();
     let mut skipped = 0usize;
     let results: Vec<(HashMap<String, SessionBuilder>, Vec<TurnRec>, usize)> = parse_files
         .par_iter()
@@ -1096,7 +1103,10 @@ pub(crate) fn load_claude(start: i64, end: i64, previous: Option<&LoadedData>) -
         // 文件内的 sessionId 可能与按路径推导的不同（subagent 场景），
         // 只在文件恰好对应一个会话时记录映射，否则下次保持重新解析
         let single_key = match partial.len() {
-            1 => partial.keys().next().map(|id| format!("claude-code/{id}")),
+            1 => partial
+                .keys()
+                .next()
+                .map(|id| format!("{CLAUDE_SESSION_PREFIX}{id}")),
             _ => None,
         };
         for (id, session) in partial {
@@ -1113,7 +1123,7 @@ pub(crate) fn load_claude(start: i64, end: i64, previous: Option<&LoadedData>) -
             file_mtime_secs(path),
             single_key.as_deref(),
         );
-        turns.append(&mut new_turns);
+        fresh_turns.append(&mut new_turns);
         skipped += skip;
     }
     // 复用的会话：组内文件沿用原索引
@@ -1134,6 +1144,34 @@ pub(crate) fn load_claude(start: i64, end: i64, previous: Option<&LoadedData>) -
             }
         }
     }
+
+    // 跨文件按 dedup_key（message.id/requestId）去重：`/resume` 续接的会话会把
+    // 历史消息原样复制进新文件，同一次真实调用不能被重复计费。已复用的旧
+    // turn（来自缓存，其会话文件本轮未变化）也要纳入去重集合，否则"旧会话
+    // 命中缓存 + 续接出来的新会话被重新解析"这种组合会漏掉跨会话的重复。
+    let mut seen_dedup_keys: HashSet<String> = reused_turns
+        .iter()
+        .filter(|turn| !turn.dedup_key.is_empty())
+        .map(|turn| turn.dedup_key.clone())
+        .collect();
+    let mut turns: Vec<TurnRec> = Vec::with_capacity(fresh_turns.len());
+    for turn in fresh_turns {
+        if !seen_dedup_keys.insert(turn.dedup_key.clone()) {
+            continue;
+        }
+        if let Some(raw_id) = turn.session_key.strip_prefix(CLAUDE_SESSION_PREFIX) {
+            if let Some(session) = sessions.get_mut(raw_id) {
+                session.input_tokens += turn.input_tokens;
+                session.output_tokens += turn.output_tokens;
+                session.cached_tokens += turn.cache_read_tokens;
+                session.cache_creation_tokens += turn.cache_creation_tokens;
+                session.cache_creation_5m_tokens += turn.cache_creation_5m_tokens;
+                session.cache_creation_1h_tokens += turn.cache_creation_1h_tokens;
+            }
+        }
+        turns.push(turn);
+    }
+
     data.sessions = sessions
         .into_values()
         .map(|session| session.finish(agent))
@@ -2937,8 +2975,12 @@ mod tests {
         assert_eq!(skipped, 0);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].output_tokens, 250.0);
-        assert_eq!(sessions["session-1"].output_tokens, 250.0);
-        assert_eq!(sessions["session-1"].cache_creation_tokens, 5201.0);
+        assert_eq!(turns[0].cache_creation_tokens, 5201.0);
+        // dedup_key 来自 message.id，供 load_claude 跨文件（/resume 续接会话）
+        // 去重使用；parse_claude_file 本身不再把 token 汇总进 SessionBuilder，
+        // 那一步被推迟到 load_claude 里完成跨文件去重之后。
+        assert_eq!(turns[0].dedup_key, "msg-1");
+        assert_eq!(sessions["session-1"].output_tokens, 0.0);
     }
 
     #[test]
