@@ -552,17 +552,19 @@ pub fn parse_claude_usage(usage: &Value, plan: Option<String>) -> QuotaResult {
         let Some(pct) = json_field(w, &["utilization"]).and_then(Value::as_f64) else {
             continue;
         };
-        let resets_at = json_field(w, &["resets_at"]).and_then(parse_when).or_else(|| {
-            // 当 resets_at 为 null 时，按窗口类型估算下一次重置时间
-            match label {
-                WindowLabel::FiveHour => Some(now_sec() + 5 * 3600),
-                WindowLabel::SevenDay
-                | WindowLabel::SevenDayOauthApps
-                | WindowLabel::SevenDayOpus
-                | WindowLabel::SevenDaySonnet => Some(now_sec() + 7 * 86400),
-                _ => None,
-            }
-        });
+        let resets_at = json_field(w, &["resets_at"])
+            .and_then(parse_when)
+            .or_else(|| {
+                // 当 resets_at 为 null 时，按窗口类型估算下一次重置时间
+                match label {
+                    WindowLabel::FiveHour => Some(now_sec() + 5 * 3600),
+                    WindowLabel::SevenDay
+                    | WindowLabel::SevenDayOauthApps
+                    | WindowLabel::SevenDayOpus
+                    | WindowLabel::SevenDaySonnet => Some(now_sec() + 7 * 86400),
+                    _ => None,
+                }
+            });
         windows.push(QuotaWindow {
             label: label.clone(),
             used_percent: pct,
@@ -1364,7 +1366,8 @@ fn fetch_devin_cli(token: &str, _org_id: &str) -> Result<QuotaResult, String> {
     // 发送请求
     let agent = http_agent();
     let auth = format!("Basic {token}-{token}");
-    let url = "https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus";
+    let url =
+        "https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus";
     let resp = agent
         .post(url)
         .header("authorization", &auth)
@@ -1377,8 +1380,7 @@ fn fetch_devin_cli(token: &str, _org_id: &str) -> Result<QuotaResult, String> {
     // 读取二进制响应体
     let resp_bytes: Vec<u8> = {
         let mut r = resp.into_body();
-        r.read_to_vec()
-            .map_err(|e: ureq::Error| e.to_string())?
+        r.read_to_vec().map_err(|e: ureq::Error| e.to_string())?
     };
 
     // 解析响应：F1 (UserStatus) -> F13 (QuotaInfo)
@@ -1665,7 +1667,7 @@ devin_webapp_host = "app.devin.ai"
         // F1 = 42 (varint)
         msg.push(0x08); // tag: field 1, wire type 0
         msg.push(0x2a); // 42
-        // F2 = "hello" (length-delimited)
+                        // F2 = "hello" (length-delimited)
         msg.push(0x12); // tag: field 2, wire type 2
         msg.push(0x05); // length 5
         msg.extend_from_slice(b"hello");
@@ -1674,10 +1676,10 @@ devin_webapp_host = "app.devin.ai"
         // F14 = 72
         sub.push(0x70); // tag: field 14, wire type 0
         sub.push(0x48); // 72
-        // F15 = 68
+                        // F15 = 68
         sub.push(0x78); // tag: field 15, wire type 0
         sub.push(0x44); // 68
-        // F1 (msg) = { F2 = "Pro" }
+                        // F1 (msg) = { F2 = "Pro" }
         let mut inner = Vec::new();
         inner.push(0x12); // tag: field 2, wire type 2
         inner.push(0x03); // length 3
@@ -1730,8 +1732,10 @@ devin_webapp_host = "app.devin.ai"
                     println!("plan: {:?}", r.plan);
                     println!("windows: {:?}", r.windows);
                     println!("extra: {:?}", r.extra);
-                    assert!(r.plan.is_some() || !r.windows.is_empty(),
-                        "should get some quota data from API");
+                    assert!(
+                        r.plan.is_some() || !r.windows.is_empty(),
+                        "should get some quota data from API"
+                    );
                 }
                 Err(e) => {
                     // 网络不可用时不应该 panic，只打印

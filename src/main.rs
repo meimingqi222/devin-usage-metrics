@@ -2483,11 +2483,7 @@ impl Root {
             }
             Ok(result) => {
                 if let Some(plan) = &result.plan {
-                    let plan_color = if plan == "API MODE" {
-                        0x34d399
-                    } else {
-                        ACCENT
-                    };
+                    let plan_color = if plan == "API MODE" { 0x34d399 } else { ACCENT };
                     d = d.child(
                         div().flex().child(
                             div()
