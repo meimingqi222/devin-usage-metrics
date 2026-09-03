@@ -151,8 +151,12 @@ struct Root {
     sync_id: u64,
     /// 上次同步时间（HH:MM:SS）
     sync_last_at: String,
+    /// 上次同步完成的单调时钟时间，用于判断刷新后是否需要补同步。
+    sync_last_completed: Option<Instant>,
     /// 同步失败原因（成功时为 None）
     sync_message: Option<String>,
+    /// 连续临时失败次数，用于指数退避；成功后清零。
+    sync_retry_attempt: u8,
     /// 同步是否已开启（持久化在 sync.json）
     sync_enabled: bool,
     /// 自建同步 API 地址；用户只需填写这一项。
@@ -253,8 +257,13 @@ impl Root {
                     this.rebuild_sessions();
                     cx.notify();
                 }
-                // Reload 只刷新本地 UI，不再隐式触发上传；后续由每小时调度处理。
-                if this.sync_enabled && !this.sync_busy && this.sync_last_at.is_empty() {
+                // 刷新完成后，如果距离上次同步已超过 5 分钟，则补做一次同步。
+                // 首次加载因没有上次同步时间，也会立即同步一次。
+                let refresh_sync_due = this
+                    .sync_last_completed
+                    .map(|at| at.elapsed() >= Duration::from_secs(5 * 60))
+                    .unwrap_or(true);
+                if this.sync_enabled && !this.sync_busy && refresh_sync_due {
                     this.start_sync(cx);
                 }
             })
@@ -348,6 +357,8 @@ impl Root {
             self.known_devices = Vec::new();
             self.sync_message = None;
             self.sync_last_at.clear();
+            self.sync_last_completed = None;
+            self.sync_retry_attempt = 0;
             self.remerge_all_agents();
             self.rebuild_buckets();
             self.rebuild_sessions();
@@ -633,17 +644,26 @@ impl Root {
                     return;
                 }
                 this.sync_busy = false;
-                this.sync_last_at = chrono::Local::now().format("%H:%M:%S").to_string();
 
                 this.sync_message = match (export_result.as_ref(), import_error.as_ref()) {
                     (Err(e), _) => Some(e.clone()),
                     (Ok(_), Some(e)) => Some(e.clone()),
                     (Ok(_), None) => None,
                 };
+                let sync_succeeded = this.sync_message.is_none();
+                if sync_succeeded {
+                    this.sync_last_completed = Some(Instant::now());
+                    this.sync_last_at = chrono::Local::now().format("%H:%M:%S").to_string();
+                }
+                let retryable_failure = this
+                    .sync_message
+                    .as_deref()
+                    .is_some_and(sync::is_retryable_error);
                 if let Some(error) = this.sync_message.as_deref() {
                     sync::record_transient_failure(error);
                 } else {
                     sync::clear_transient_failure();
+                    this.sync_retry_attempt = 0;
                 }
 
                 // 导入失败时保留上次成功的远程数据，避免设备列表被清空。
@@ -655,11 +675,18 @@ impl Root {
                     this.rebuild_sessions();
                 }
 
-                // 4. 自动模式下安排下一次定时同步
+                // 临时故障采用有限次数的指数退避，避免网络恢复前每小时才重试，
+                // 也避免持续重试打满服务端；非临时错误仍按正常周期重试。
                 if this.sync_enabled {
                     if let Some(remaining) = sync::cooldown_remaining() {
                         this.sync_tick_after(remaining, cx);
+                    } else if retryable_failure && this.sync_retry_attempt < 3 {
+                        let delays = [30, 120, 600];
+                        let delay = delays[this.sync_retry_attempt as usize];
+                        this.sync_retry_attempt += 1;
+                        this.sync_tick_after(Duration::from_secs(delay), cx);
                     } else {
+                        this.sync_retry_attempt = 0;
                         this.sync_tick(cx);
                     }
                 }
@@ -2871,7 +2898,9 @@ fn main() {
                         sync_busy: false,
                         sync_id: 0,
                         sync_last_at: String::new(),
+                        sync_last_completed: None,
                         sync_message: None,
+                        sync_retry_attempt: 0,
                         sync_enabled: sync_cfg.enabled && sync::github_sync_session_is_valid(),
                         sync_api_url: sync_cfg.api_url,
                         github_login_busy: false,

@@ -151,6 +151,34 @@ pub fn clear_transient_failure() {
     }
 }
 
+/// 判断同步失败是否可能是临时故障，供前端决定是否采用短延迟重试。
+pub fn is_retryable_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "http 408",
+        "http 425",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "timeout",
+        "timed out",
+        "connection",
+        "connect",
+        "network",
+        "dns",
+        "tls",
+        "transport",
+        "连接",
+        "网络",
+        "超时",
+        "解析地址",
+    ]
+    .iter()
+    .any(|part| lower.contains(part))
+}
+
 /// 配置文件路径，与 device.json 同目录。
 fn config_file_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("devin-usage-metrics/sync.json"))
