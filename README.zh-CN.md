@@ -95,6 +95,10 @@ cargo test
 
 CLI 默认统计 Claude Code 最近 30 天的数据；支持 `all`、`devin`、`claude`、`codex`、`antigravity`、`grok`、`zcode`、`opencode` 和 `pi`。`--by-agent` 可在 `all` 汇总下增加逐 Agent 分项。运行 `cargo run -- --cli --help` 查看全部选项。
 
+## 价格表自动更新
+
+非 Devin 模型价格会自动从 `https://models.opencode.ai/api.json`（与 OpenCode 同源）刷新：先加载编译期嵌入的 `models-dev-pricing.json` 快照，再用本地缓存（`cache_dir/devin-usage-metrics/models-dev.json`）覆盖。缓存缺失或超过 24h 时拉取——GUI 启动后在后台检查一次，CLI 每次运行时检查一次。离线或拉取失败时静默沿用旧数据，并记 1h 退避。可通过 `DEVIN_USAGE_MODELS_URL`（数据源）、`DEVIN_USAGE_MODELS_PATH`（缓存路径）、`DEVIN_USAGE_DISABLE_MODELS_FETCH=1`（只用内嵌快照）覆盖。
+
 ## 打包为 .app
 
 `Cargo.toml` 中已配置 `[package.metadata.bundle]`，可配合 [`cargo-bundle`](https://crates.io/crates/cargo-bundle) 打包：

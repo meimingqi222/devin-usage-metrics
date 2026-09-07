@@ -1,6 +1,6 @@
 //! 模型定价表与费用计算。
 //!
-//! 两个 JSON 快照在编译期嵌入二进制：
+//! 两个 JSON 快照在编译期嵌入二进制（离线兜底）：
 //! - `devin-model-pricing.json` — Devin 官方发布的模型价格表
 //!   (https://docs.devinenterprise.com/desktop/models)，`model_uid` 与
 //!   sessions.db 中的 `model` 字段完全一致，覆盖所有思考等级变体。
@@ -8,16 +8,34 @@
 //!   覆盖 Claude / GPT / Gemini 等家族的裸 model id，供 Amp、Claude Code、
 //!   Codex、Antigravity 使用。
 //!
+//! `models-dev` 部分会自动更新（对标 OpenCode 的 models-dev.ts）：
+//! 启动时先加载内嵌快照，再用本地缓存覆盖；缓存缺失或超过 24h 时从
+//! 上游（与 OpenCode 默认同源）拉取刷新，原子写文件，失败静默保留旧数据
+//! 并记 1h 退避（离线环境不会每次启动都付出网络超时）。
+//! GUI 启动后在后台检查一次（新价格下次数据加载时生效），
+//! CLI 每次运行时检查一次。
+//!
 //! 所有价格均以"美元 / 百万 token"为单位。
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::sync::{OnceLock, RwLock};
+use std::time::Duration;
 
 use serde::Deserialize;
 
 const DEVIN_PRICING_JSON: &str = include_str!("devin-model-pricing.json");
 const MODELS_DEV_PRICING_JSON: &str = include_str!("models-dev-pricing.json");
 const GPT_5_6_LONG_CONTEXT_THRESHOLD: f64 = 272_000.0;
+
+/// models.dev 价格源，与 OpenCode 默认同源。
+/// 可用 `DEVIN_USAGE_MODELS_URL` 覆盖地址，`DEVIN_USAGE_MODELS_PATH` 覆盖本地缓存路径，
+/// `DEVIN_USAGE_DISABLE_MODELS_FETCH=1` 完全禁用网络更新（纯内嵌快照）。
+const MODELS_DEV_URL: &str = "https://models.opencode.ai/api.json";
+/// 本地价格缓存有效期：超过后下次检查时触发刷新。
+const MODELS_DEV_CACHE_TTL_SECS: u64 = 24 * 3600;
+/// 拉取失败后的退避间隔：避免离线环境下每次启动都付出完整网络超时。
+const MODELS_DEV_RETRY_BACKOFF_SECS: u64 = 3600;
 
 /// 单个模型的定价信息，所有字段均为"美元 / 百万 token"。
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -121,11 +139,12 @@ fn gpt_5_6_long_context_pricing(model: &str) -> Option<Pricing> {
 }
 
 /// 嵌入的定价表，运行期只读。
+/// `models_dev` 用锁包装，支持后台刷新热更新（读多写少，日常查找无影响）。
 pub struct PricingTable {
     devin: HashMap<String, Pricing>,
     /// Devin 表的 label → Pricing 反向索引（如 "GPT-5.6 Luna XHigh Thinking" → 定价）
     devin_labels: HashMap<String, Pricing>,
-    models_dev: HashMap<String, Pricing>,
+    models_dev: RwLock<HashMap<String, Pricing>>,
 }
 
 impl PricingTable {
@@ -142,16 +161,25 @@ impl PricingTable {
                         .map(|label| (label.to_ascii_lowercase(), p.clone()))
                 })
                 .collect();
-            let models_dev = parse_pricing_json(MODELS_DEV_PRICING_JSON);
+            let mut models_dev = parse_pricing_json(MODELS_DEV_PRICING_JSON);
+            // 自动更新的价格缓存覆盖内嵌快照：新模型（如 gemini-3.8-flash）
+            // 无需发版就能计价；无缓存或禁用更新时退回内嵌快照。
+            if !models_fetch_disabled() {
+                if let Some(path) = models_dev_cache_path() {
+                    if let Some(cached) = load_cached_models_dev(&path) {
+                        models_dev.extend(cached);
+                    }
+                }
+            }
             PricingTable {
                 devin,
                 devin_labels,
-                models_dev,
+                models_dev: RwLock::new(models_dev),
             }
         })
     }
 
-    /// 按模型名查找定价，返回表中条目的引用（表是编译期嵌入的静态数据）。
+    /// 按模型名查找定价，返回 owned 副本（内部用锁支持后台热更新）。
     /// 查找顺序：
     /// 1. Devin 表精确匹配（model_uid 完全一致）
     /// 2. models.dev 表精确匹配
@@ -160,29 +188,33 @@ impl PricingTable {
     /// 5. 去掉日期后缀后重试（如 "claude-haiku-4-5-20251001" → "claude-haiku-4-5"）
     /// 6. models.dev 表前缀匹配（如 "gpt-5.1-max" → "gpt-5.1"）
     /// 7. 反向前缀匹配
-    pub fn find(&self, model: &str) -> Option<&Pricing> {
+    pub fn find(&self, model: &str) -> Option<Pricing> {
         let normalized = model.trim().to_ascii_lowercase();
         self.find_normalized(&normalized)
     }
 
-    fn find_normalized(&self, model: &str) -> Option<&Pricing> {
+    fn models_dev_exact(&self, key: &str) -> Option<Pricing> {
+        self.models_dev.read().ok()?.get(key).cloned()
+    }
+
+    fn find_normalized(&self, model: &str) -> Option<Pricing> {
         if model.is_empty() {
             return None;
         }
 
         // 1. Devin 表精确匹配（model_uid）
         if let Some(p) = self.devin.get(model) {
-            return Some(p);
+            return Some(p.clone());
         }
 
         // 2. models.dev 表精确匹配
-        if let Some(p) = self.models_dev.get(model) {
+        if let Some(p) = self.models_dev_exact(model) {
             return Some(p);
         }
 
         // 3. Devin label 精确匹配
         if let Some(p) = self.devin_labels.get(model) {
-            return Some(p);
+            return Some(p.clone());
         }
 
         // 4. 去掉 provider 前缀后重试
@@ -212,13 +244,13 @@ impl PricingTable {
         let stripped_date = strip_date_suffix(model);
         if stripped_date != model {
             if let Some(p) = self.devin.get(stripped_date) {
-                return Some(p);
+                return Some(p.clone());
             }
-            if let Some(p) = self.models_dev.get(stripped_date) {
+            if let Some(p) = self.models_dev_exact(stripped_date) {
                 return Some(p);
             }
             if let Some(p) = self.devin_labels.get(stripped_date) {
-                return Some(p);
+                return Some(p.clone());
             }
         }
 
@@ -228,13 +260,15 @@ impl PricingTable {
         }
 
         // 6. models.dev 表前缀匹配 — 找最长的键作为前缀
-        if let Some((_, p)) = self
-            .models_dev
-            .iter()
-            .filter(|(key, _)| model.starts_with(key.as_str()))
-            .max_by_key(|(key, _)| key.len())
-        {
-            return Some(p);
+        if let Ok(guard) = self.models_dev.read() {
+            if let Some(p) = guard
+                .iter()
+                .filter(|(key, _)| model.starts_with(key.as_str()))
+                .max_by_key(|(key, _)| key.len())
+                .map(|(_, v)| v.clone())
+            {
+                return Some(p);
+            }
         }
 
         // 6b. Devin label 前缀匹配 — 如 "GLM-5.2 High" 匹配 label "GLM-5.2"
@@ -244,15 +278,17 @@ impl PricingTable {
             .filter(|(label, _)| model.starts_with(label.as_str()))
             .max_by_key(|(label, _)| label.len())
         {
-            return Some(p);
+            return Some(p.clone());
         }
 
         // 7. 反向前缀匹配 — 键以模型名开头
-        self.models_dev
-            .iter()
-            .filter(|(key, _)| key.starts_with(stripped_date))
-            .max_by_key(|(key, _)| key.len())
-            .map(|(_, v)| v)
+        self.models_dev.read().ok().and_then(|guard| {
+            guard
+                .iter()
+                .filter(|(key, _)| key.starts_with(stripped_date))
+                .max_by_key(|(key, _)| key.len())
+                .map(|(_, v)| v.clone())
+        })
     }
 }
 
@@ -267,6 +303,18 @@ fn parse_pricing_json(json: &str) -> HashMap<String, Pricing> {
             HashMap::new()
         }
     }
+}
+
+/// 无告警版本，供缓存形态探测用（嵌套的原始 api.json 走拍平解析必然失败，
+/// 是预期内的分支，不应打 WARN 吓到用户）。
+fn try_parse_flat_pricing(json: &str) -> HashMap<String, Pricing> {
+    serde_json::from_str::<HashMap<String, Pricing>>(json)
+        .map(|map| {
+            map.into_iter()
+                .map(|(key, value)| (key.to_ascii_lowercase(), value))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 去掉模型名末尾的日期后缀。
@@ -331,6 +379,255 @@ fn normalize_fireworks_p(model: &str) -> String {
         i += 1;
     }
     result
+}
+
+/// 是否禁用价格表网络更新（离线/气隙环境用，退回纯内嵌快照）。
+fn models_fetch_disabled() -> bool {
+    matches!(
+        std::env::var("DEVIN_USAGE_DISABLE_MODELS_FETCH").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+fn models_dev_url() -> String {
+    std::env::var("DEVIN_USAGE_MODELS_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| MODELS_DEV_URL.into())
+}
+
+/// 本地价格缓存路径（对标 OpenCode 存到全局 cache 下的 models.json）。
+/// 可用 `DEVIN_USAGE_MODELS_PATH` 覆盖（测试用）。
+pub fn models_dev_cache_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("DEVIN_USAGE_MODELS_PATH") {
+        if !p.trim().is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    let base = dirs::cache_dir().or_else(dirs::data_dir)?;
+    Some(base.join("devin-usage-metrics").join("models-dev.json"))
+}
+
+fn cache_is_fresh(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age.as_secs() < MODELS_DEV_CACHE_TTL_SECS)
+        .unwrap_or(false)
+}
+
+/// 上次拉取失败的时间戳文件（与缓存同目录）。存在且在退避期内则跳过拉取，
+/// 离线环境不会每次启动都付出完整网络超时；`force` 可绕过退避。
+fn retry_marker_path(cache: &std::path::Path) -> PathBuf {
+    let name = cache
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "models-dev.json".into());
+    cache.with_file_name(format!("{name}.retry"))
+}
+
+fn retry_backoff_active(marker: &std::path::Path) -> bool {
+    std::fs::read_to_string(marker)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .map(|at| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64 - at < MODELS_DEV_RETRY_BACKOFF_SECS as i64)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+fn mark_fetch_failed(marker: &std::path::Path) {
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    std::fs::write(marker, now.to_string()).ok();
+}
+
+/// 把 models.dev/api.json（provider → models → cost 嵌套结构）拍平成
+/// `{model_id: Pricing}`。`provider/model` 形式的 id 会额外登记去前缀别名，
+/// 与 `find()` 的去 provider 前缀逻辑配合。
+/// 阶梯价（`tiers` / `context_over_200k`）暂按平价处理，与旧快照口径一致。
+pub fn extract_models_dev_pricing(value: &serde_json::Value) -> HashMap<String, Pricing> {
+    let mut out = HashMap::new();
+    let Some(providers) = value.as_object() else {
+        return out;
+    };
+    for provider in providers.values() {
+        let Some(models) = provider.get("models").and_then(|m| m.as_object()) else {
+            continue;
+        };
+        for (id, model) in models {
+            let Some(cost) = model.get("cost") else {
+                continue;
+            };
+            let num = |k: &str| {
+                cost.get(k)
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0)
+            };
+            let p = Pricing {
+                i: num("input"),
+                o: num("output"),
+                cw: num("cache_write"),
+                cr: num("cache_read"),
+                l: None,
+            };
+            // 全零条目多为按 plan 计价的占位（如 token-plan），跳过以免污染。
+            if p.i == 0.0 && p.o == 0.0 && p.cw == 0.0 && p.cr == 0.0 {
+                continue;
+            }
+            let key = id.to_ascii_lowercase();
+            if let Some(suffix) = key.rsplit('/').next() {
+                if !suffix.is_empty() && suffix != key.as_str() {
+                    // 别名不覆盖裸 id（裸 id 的 provider 定价更可信）。
+                    out.entry(suffix.to_owned()).or_insert_with(|| p.clone());
+                }
+            }
+            out.insert(key, p);
+        }
+    }
+    out
+}
+
+/// 读取本地价格缓存，兼容两种形态：自动更新存的原始 api.json（嵌套），
+/// 以及拍平后的快照格式。不可用时返回 None（调用方退回内嵌快照）。
+fn load_cached_models_dev(path: &std::path::Path) -> Option<HashMap<String, Pricing>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    // 先试拍平快照；嵌套结构按 Pricing 解析必然失败（字段缺失），再走提取。
+    let flat = try_parse_flat_pricing(&text);
+    if !flat.is_empty() {
+        return Some(flat);
+    }
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let extracted = extract_models_dev_pricing(&value);
+    (!extracted.is_empty()).then_some(extracted)
+}
+
+fn fetch_models_dev_json(url: &str) -> Result<String, String> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .new_agent();
+    let mut body = agent
+        .get(url)
+        .header("User-Agent", "devin-usage-metrics")
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(code) => format!("HTTP {code}"),
+            other => other.to_string(),
+        })?
+        .into_body();
+    body.read_to_string()
+        .map_err(|e: ureq::Error| e.to_string())
+}
+
+/// 同目录临时文件 + rename，保证并发读取方永远看不到半截文件。
+fn save_cache_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp-{}-{nanos}", std::process::id()));
+    let result = (|| {
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        std::fs::remove_file(&tmp).ok();
+    } else {
+        cleanup_stale_tmps(path);
+    }
+    result
+}
+
+/// 进程被杀可能留下 `*.tmp-*` 孤儿文件，成功写入后顺手清理同前缀的旧文件。
+fn cleanup_stale_tmps(path: &std::path::Path) {
+    let (Some(parent), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str()))
+    else {
+        return;
+    };
+    let prefix = format!("{stem}.tmp-");
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) && entry.path() != path {
+            std::fs::remove_file(entry.path()).ok();
+        }
+    }
+}
+
+/// 拉取最新价格并热更新内存表 + 本地缓存。离线/失败时静默保留旧数据。
+/// 返回 true 表示内存表已更新。`force` 跳过新鲜度检查。
+pub fn refresh_models_dev(force: bool) -> bool {
+    if models_fetch_disabled() {
+        return false;
+    }
+    let Some(path) = models_dev_cache_path() else {
+        return false;
+    };
+    if !force && cache_is_fresh(&path) {
+        return false;
+    }
+    let marker = retry_marker_path(&path);
+    if !force && retry_backoff_active(&marker) {
+        return false;
+    }
+    let url = models_dev_url();
+    let text = match fetch_models_dev_json(&url) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("WARN 价格表更新失败（{url}）: {e}，继续使用本地数据");
+            mark_fetch_failed(&marker);
+            return false;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("WARN 价格表解析失败: {e}");
+            mark_fetch_failed(&marker);
+            return false;
+        }
+    };
+    let fetched = extract_models_dev_pricing(&value);
+    if fetched.is_empty() {
+        eprintln!("WARN 价格表更新内容为空，已忽略");
+        mark_fetch_failed(&marker);
+        return false;
+    }
+    // 缓存写失败不影响内存更新（下次启动会重试拉取）。
+    save_cache_atomic(&path, &text).ok();
+    std::fs::remove_file(&marker).ok();
+    let count = fetched.len();
+    if let Ok(mut guard) = PricingTable::instance().models_dev.write() {
+        guard.extend(fetched);
+    }
+    eprintln!("INFO 价格表已更新（{count} 个模型）");
+    true
+}
+
+/// GUI 启动时调用：在后台线程检查一次，调用后立即返回，不阻塞界面。
+/// 拉取到的新价格在下次数据加载时生效（启动时即决定本次视图的价格表，
+/// 常驻期间价格源变化不频繁，不做周期轮询）。
+pub fn ensure_fresh_async() {
+    std::thread::Builder::new()
+        .name("pricing-refresh".into())
+        .spawn(|| {
+            refresh_models_dev(false);
+        })
+        .ok();
 }
 
 /// 计算单轮对话的费用（美元）。模型未知时返回 None。
@@ -622,5 +919,82 @@ mod tests {
             "kimi-k2p5"
         );
         assert_eq!(strip_provider_prefix("gpt-5.1"), "gpt-5.1");
+    }
+
+    #[test]
+    fn extract_flattens_nested_api_and_registers_alias() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{
+                "google": {"models": {"gemini-3.8-flash": {"cost": {"input": 0.75, "output": 3.75, "cache_read": 0.075, "cache_write": 0.08333}}}},
+                "nano-gpt": {"models": {"google/gemini-3.8-flash": {"cost": {"input": 0.8, "output": 4.0}}}},
+                "plan": {"models": {"free-model": {"cost": {"input": 0, "output": 0}}}},
+                "nocost": {"models": {"mystery": {"limit": {}}}}
+            }"#,
+        )
+        .unwrap();
+        let m = extract_models_dev_pricing(&v);
+        let p = m.get("gemini-3.8-flash").expect("应提取到 3.8-flash");
+        assert_eq!((p.i, p.o, p.cr, p.cw), (0.75, 3.75, 0.075, 0.08333));
+        // provider/ 前缀形态保留原键，裸 id 别名不覆盖已有条目
+        assert!(m.get("google/gemini-3.8-flash").is_some());
+        // 全零占位与无 cost 条目应被跳过
+        assert!(m.get("free-model").is_none());
+        assert!(m.get("mystery").is_none());
+    }
+
+    #[test]
+    fn cached_file_loads_both_flat_and_nested_shapes() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("dum-pricing-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 嵌套形态（自动更新缓存的实际存储格式）
+        let nested = dir.join("nested.json");
+        std::fs::write(
+            &nested,
+            r#"{"google":{"models":{"gemini-3.8-flash":{"cost":{"input":0.75,"output":3.75}}}}}"#,
+        )
+        .unwrap();
+        let m = load_cached_models_dev(&nested).expect("嵌套缓存应可加载");
+        assert_eq!(m.get("gemini-3.8-flash").map(|p| p.i), Some(0.75));
+        // 拍平形态（历史快照格式）
+        let flat = dir.join("flat.json");
+        std::fs::write(
+            &flat,
+            r#"{"gemini-3.8-flash":{"i":0.75,"o":3.75,"cw":0.08,"cr":0.07}}"#,
+        )
+        .unwrap();
+        let m = load_cached_models_dev(&flat).expect("拍平缓存应可加载");
+        assert_eq!(m.get("gemini-3.8-flash").map(|p| p.o), Some(3.75));
+        // 缺失/损坏的缓存不影响启动（退回内嵌快照）
+        assert!(load_cached_models_dev(&dir.join("missing.json")).is_none());
+        assert!(!cache_is_fresh(&dir.join("missing.json")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fetch_failure_backoff_roundtrip() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("dum-pricing-retry-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = retry_marker_path(&dir.join("models-dev.json"));
+        // 无标记 → 不退避，照常拉取
+        assert!(!retry_backoff_active(&marker));
+        mark_fetch_failed(&marker);
+        // 刚失败过 → 退避期内跳过拉取
+        assert!(retry_backoff_active(&marker));
+        // 很久以前的时间戳 → 退避结束
+        std::fs::write(&marker, "1").unwrap();
+        assert!(!retry_backoff_active(&marker));
+        // 损坏内容 → 不触发退避（下次照常拉取，而非永久跳过）
+        std::fs::write(&marker, "garbage").unwrap();
+        assert!(!retry_backoff_active(&marker));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

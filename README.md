@@ -95,6 +95,10 @@ cargo test
 
 The CLI defaults to the last 30 days of Claude Code usage. It supports `all`, `devin`, `claude`, `codex`, `antigravity`, `grok`, `zcode`, `opencode`, and `pi`. Use `--by-agent` to include per-agent rows under the `all` totals. Run `cargo run -- --cli --help` for all options.
 
+## Pricing auto-update
+
+Non-Devin model prices are refreshed automatically from `https://models.opencode.ai/api.json` (same source as OpenCode): the embedded `models-dev-pricing.json` snapshot loads first, then a local cache (`cache_dir/devin-usage-metrics/models-dev.json`) overlays it. The cache is fetched when missing or older than 24h — once in the background at GUI startup, once per CLI run. Offline or fetch failures silently keep the old data with a 1h retry backoff. Override with `DEVIN_USAGE_MODELS_URL` (source), `DEVIN_USAGE_MODELS_PATH` (cache path), or `DEVIN_USAGE_DISABLE_MODELS_FETCH=1` (embedded snapshot only).
+
 ## Bundle as .app
 
 `Cargo.toml` already contains a `[package.metadata.bundle]` section. Use [`cargo-bundle`](https://crates.io/crates/cargo-bundle) to package:
