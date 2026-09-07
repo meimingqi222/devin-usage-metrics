@@ -164,6 +164,8 @@ impl PricingTable {
             let mut models_dev = parse_pricing_json(MODELS_DEV_PRICING_JSON);
             // 自动更新的价格缓存覆盖内嵌快照：新模型（如 gemini-3.8-flash）
             // 无需发版就能计价；无缓存或禁用更新时退回内嵌快照。
+            // 单元测试禁用覆盖以保证确定性（覆盖逻辑由 load_cached 等单测覆盖）。
+            #[cfg(not(test))]
             if !models_fetch_disabled() {
                 if let Some(path) = models_dev_cache_path() {
                     if let Some(cached) = load_cached_models_dev(&path) {

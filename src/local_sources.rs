@@ -1786,10 +1786,19 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> AgParse {
     // Google 定价：output 价格包含 thinking tokens，因此 thoughts
     // 并入 output_tokens 按 output 价格计费。
     //
-    // 部分新版会话的 steps.metadata 没有 field 9，但有 field 11
-    // （prompt_token_count），此时仅能获取输入 token 数。
+    // 注意：除完整用量行之外，还有大量仅带 field 11（prompt_token_count）
+    // 的附属步骤行（如 type 132）。实测这类行的 field 11 与相邻完整用量行
+    // 的 prompt 完全相等（全量 48 个会话库逐行比对），是同一轮生成的回显，
+    // 不是独立调用——计入会把输入 token 翻倍。因此仅当会话中一行完整用量
+    // （field 9）都没有时（极少数未产生计费生成的失败会话），才把 field 11
+    // 行当作仅有输入的 turn 保留。
     let key = format!("antigravity/{session_id}");
     let mut turns = Vec::new();
+    let mut has_full_usage = false;
+    // field 11 回退候选项：仅在无任何 field 9 行时才并入会话与 turns。
+    let mut fallback_turns = Vec::new();
+    let mut fallback_input = 0.0;
+    let mut fallback_messages = 0.0;
 
     if let Ok(mut stmt) = conn.prepare("SELECT metadata FROM steps ORDER BY idx") {
         let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0));
@@ -1803,6 +1812,7 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> AgParse {
 
                 // 优先从 field 9（UsageMetadata）读取完整 token 数据
                 if let Some(usage) = pb_field(&row, 9) {
+                    has_full_usage = true;
                     let prompt = pb_path_varint(usage, &[1]).unwrap_or(0) as f64;
                     let candidates = pb_path_varint(usage, &[2]).unwrap_or(0) as f64;
                     let cache_creation = pb_path_varint(usage, &[3]).unwrap_or(0) as f64;
@@ -1835,12 +1845,12 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> AgParse {
                         });
                     }
                 } else if let Some(prompt) = pb_varint_field(&row, 11) {
-                    // 新版 schema：field 11 = prompt_token_count，无 output/cached
+                    // field 11 回显行先暂存；有 field 9 行时会被整体丢弃
                     let prompt = prompt as f64;
-                    session.input_tokens += prompt;
-                    session.agent_messages += 1.0;
+                    fallback_input += prompt;
+                    fallback_messages += 1.0;
                     if at >= start && at < end {
-                        turns.push(TurnRec {
+                        fallback_turns.push(TurnRec {
                             agent: AgentKind::Antigravity,
                             session_key: key.clone(),
                             created_at: at,
@@ -1860,6 +1870,13 @@ fn parse_antigravity_db(path: &Path, start: i64, end: i64) -> AgParse {
                 }
             }
         }
+    }
+
+    // 无完整用量行时才保留 field 11 回退（否则是重复计数的回显行）
+    if !has_full_usage {
+        session.input_tokens += fallback_input;
+        session.agent_messages += fallback_messages;
+        turns.append(&mut fallback_turns);
     }
 
     if session.agent_messages == 0.0 {
@@ -2884,7 +2901,8 @@ fn timestamp_ms_to_sec(ts: Option<i64>) -> i64 {
 mod tests {
     use super::{
         amp_cache_dir, amp_list_cache_path, content_text, load_amp_thread_export_cache,
-        parse_amp_value, parse_claude_file, parse_pi_file, timestamp, AmpListCache, AmpListEntry,
+        parse_amp_value, parse_antigravity_db, parse_claude_file, parse_pi_file, timestamp,
+        AgParse, AmpListCache, AmpListEntry,
     };
     use serde_json::json;
     use std::fs::File;
@@ -3115,5 +3133,122 @@ mod tests {
         assert_ne!(list_path, dir);
         // amp-list.json 应该和 amp-threads/ 在同一父目录
         assert_eq!(list_path.parent(), dir.parent());
+    }
+
+    /// 最小 protobuf 编码器（测试 Antigravity 解析用，只支持 varint 与
+    /// length-delimited 字段，与正式代码的读取子集对应）。
+    fn pb_varint_enc(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if v == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    fn pb_ld(field: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = pb_varint_enc((field << 3 | 2) as u64);
+        out.extend(pb_varint_enc(payload.len() as u64));
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn pb_v(field: u32, v: u64) -> Vec<u8> {
+        let mut out = pb_varint_enc((field << 3) as u64);
+        out.extend(pb_varint_enc(v));
+        out
+    }
+
+    /// 构造 steps.metadata：field 1 = 子消息{field 1 = 时间戳}，
+    /// 可选 field 9 = 用量子消息{1: prompt, 2: 输出, 3: 缓存写入,
+    /// 5: 缓存读取, 10: 思考}，可选 field 11 = prompt 回显。
+    fn ag_meta(
+        ts: u64,
+        usage: Option<(u64, u64, u64, u64, u64)>,
+        prompt11: Option<u64>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend(pb_ld(1, &pb_v(1, ts)));
+        if let Some((p, c, cc, ch, th)) = usage {
+            let mut u = Vec::new();
+            u.extend(pb_v(1, p));
+            u.extend(pb_v(2, c));
+            u.extend(pb_v(3, cc));
+            u.extend(pb_v(5, ch));
+            u.extend(pb_v(10, th));
+            out.extend(pb_ld(9, &u));
+        }
+        if let Some(p) = prompt11 {
+            out.extend(pb_v(11, p));
+        }
+        out
+    }
+
+    fn ag_test_db(name: &str, rows: &[(i64, i64, Vec<u8>)]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("ag-parse-{name}-{}", std::process::id()));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE steps(idx INTEGER, step_type INTEGER, metadata BLOB)",
+            [],
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE gen_metadata(idx INTEGER, data BLOB)", [])
+            .unwrap();
+        for (idx, step_type, meta) in rows {
+            conn.execute(
+                "INSERT INTO steps(idx, step_type, metadata) VALUES (?1, ?2, ?3)",
+                rusqlite::params![idx, step_type, meta],
+            )
+            .unwrap();
+        }
+        path
+    }
+
+    /// field 11 回显行（与相邻完整用量行 prompt 相等）不得重复计数。
+    #[test]
+    fn antigravity_field11_echo_rows_are_not_counted() {
+        let ts = 1_700_000_000u64;
+        let path = ag_test_db(
+            "echo",
+            &[
+                (0, 15, ag_meta(ts, Some((1000, 500, 100, 200, 50)), None)),
+                (1, 132, ag_meta(ts, None, Some(1000))),
+            ],
+        );
+        let AgParse::Ok(boxed) = parse_antigravity_db(&path, 0, i64::MAX) else {
+            panic!("应解析出会话");
+        };
+        let _ = std::fs::remove_file(&path);
+        let (session, turns) = *boxed;
+        assert_eq!(turns.len(), 1);
+        assert_eq!(session.input_tokens, 1000.0);
+        // 输出 = candidates + thoughts
+        assert_eq!(session.output_tokens, 550.0);
+        assert_eq!(session.cached_tokens, 200.0);
+        assert_eq!(session.cache_creation_tokens, 100.0);
+        assert_eq!(session.agent_messages, 1.0);
+    }
+
+    /// 全会话无 field 9 时，field 11 行作为仅输入 turn 保留（失败会话兜底）。
+    #[test]
+    fn antigravity_field11_kept_without_full_usage() {
+        let ts = 1_700_000_000u64;
+        let path = ag_test_db("fallback", &[(0, 15, ag_meta(ts, None, Some(777)))]);
+        let AgParse::Ok(boxed) = parse_antigravity_db(&path, 0, i64::MAX) else {
+            panic!("应解析出会话");
+        };
+        let _ = std::fs::remove_file(&path);
+        let (session, turns) = *boxed;
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].input_tokens, 777.0);
+        assert_eq!(turns[0].output_tokens, 0.0);
+        assert_eq!(session.input_tokens, 777.0);
     }
 }
