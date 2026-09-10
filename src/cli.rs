@@ -227,6 +227,7 @@ fn parse_agent(value: &str) -> Result<Option<AgentKind>, String> {
         "zcode" | "z-code" => Ok(Some(AgentKind::ZCode)),
         "opencode" | "open-code" => Ok(Some(AgentKind::OpenCode)),
         "pi" | "pi-agent" => Ok(Some(AgentKind::Pi)),
+        "mimocode" | "mimo-code" | "mimo" => Ok(Some(AgentKind::MimoCode)),
         _ => Err(i18n::tf(i18n::Key::CliUnsupportedAgent, &[value])),
     }
 }
@@ -493,6 +494,7 @@ fn agent_cli_name(agent: AgentKind) -> &'static str {
         AgentKind::ZCode => "zcode",
         AgentKind::OpenCode => "opencode",
         AgentKind::Pi => "pi",
+        AgentKind::MimoCode => "mimocode",
     }
 }
 

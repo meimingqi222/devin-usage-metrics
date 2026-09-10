@@ -13,7 +13,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::local_sources;
 
 const CACHE_TTL_SECS: i64 = 300; // 5 minutes cache TTL
-const CACHE_SCHEMA_VERSION: u32 = 8;
+const CACHE_SCHEMA_VERSION: u32 = 9;
 
 fn cache_path() -> PathBuf {
     #[cfg(target_os = "windows")]
@@ -96,6 +96,7 @@ pub enum AgentKind {
     ZCode,
     OpenCode,
     Pi,
+    MimoCode,
 }
 
 impl AgentKind {
@@ -103,7 +104,7 @@ impl AgentKind {
     /// exports every thread from the remote service and makes routine loads
     /// and sync collection unacceptably slow. Keep `AgentKind::Amp` itself so
     /// existing caches and synchronized historical records still deserialize.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Devin,
         Self::Claude,
         Self::Codex,
@@ -112,6 +113,7 @@ impl AgentKind {
         Self::ZCode,
         Self::OpenCode,
         Self::Pi,
+        Self::MimoCode,
     ];
 
     pub fn label(self) -> &'static str {
@@ -125,6 +127,7 @@ impl AgentKind {
             Self::ZCode => "ZCode",
             Self::OpenCode => "OpenCode",
             Self::Pi => "pi-agent",
+            Self::MimoCode => "MimoCode",
         }
     }
 
@@ -162,6 +165,12 @@ impl AgentKind {
                     || home().join(".local/share/opencode/opencode.db").exists()
             }
             Self::Pi => home().join(".pi/agent/sessions").exists(),
+            Self::MimoCode => {
+                dirs::data_dir()
+                    .map(|d| d.join("mimocode/mimocode.db").exists())
+                    .unwrap_or(false)
+                    || home().join(".local/share/mimocode/mimocode.db").exists()
+            }
         }
     }
 }
@@ -1163,6 +1172,12 @@ fn load_uncached(start: i64, end: i64, previous: Option<Arc<LoadedData>>) -> Loa
             log_loaded_part("pi-agent", started, &data);
             parts.lock().unwrap().push(data);
         });
+        scope.spawn(|_| {
+            let started = Instant::now();
+            let data = local_sources::load_mimocode(start, end);
+            log_loaded_part("MimoCode", started, &data);
+            parts.lock().unwrap().push(data);
+        });
     });
     let parts = parts.into_inner().unwrap();
 
@@ -1237,6 +1252,7 @@ fn load_selected_agent(
             AgentKind::ZCode => local_sources::load_zcode(start, end),
             AgentKind::OpenCode => local_sources::load_opencode(start, end),
             AgentKind::Pi => local_sources::load_pi(start, end),
+            AgentKind::MimoCode => local_sources::load_mimocode(start, end),
             AgentKind::Devin => unreachable!(),
         };
         stamp_device(&mut data);

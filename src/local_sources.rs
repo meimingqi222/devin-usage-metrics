@@ -2767,6 +2767,265 @@ fn opencode_model_name(provider: &str, model_id: &str) -> String {
     }
 }
 
+fn mimocode_model_name(provider: &str, model_id: &str) -> String {
+    let base = match model_id.find('(') {
+        Some(idx) => &model_id[..idx],
+        None => model_id,
+    };
+    let base = base.trim();
+    if base.is_empty() {
+        return "unknown".into();
+    }
+    // modelID 自带 provider 前缀时（如 "xiaomi/mimo-v2.5"）直接沿用，
+    // 避免拼出 "openrouter/xiaomi/mimo-v2.5" 这种双前缀。
+    if base.contains('/') {
+        return base.to_owned();
+    }
+    if provider.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{provider}/{base}")
+    }
+}
+
+// ==================== MimoCode ====================
+
+/// MimoCode（小米 MiMo）是 OpenCode 分支：`~/.local/share/mimocode/mimocode.db`
+/// 的 `session` / `message` 表结构与旧版 OpenCode 几乎一致，但 session 表没有
+/// agent/model 列（模型与模式从每条 assistant message 的 providerID/modelID/mode
+/// 还原），token 口径为 `tokens.{input,output,cache.read,cache.write}`，
+/// 非零 `cost` 按 agent 自报费用（recorded_cost）计价。
+pub(crate) fn load_mimocode(start: i64, end: i64) -> LoadedData {
+    use rusqlite::{Connection, OpenFlags};
+
+    let agent = AgentKind::MimoCode;
+    let mut candidates = Vec::new();
+    if let Some(data_dir) = dirs::data_dir() {
+        candidates.push(data_dir.join("mimocode").join("mimocode.db"));
+    }
+    candidates.push(home_path(&[".local", "share", "mimocode", "mimocode.db"]));
+
+    let mut data = LoadedData {
+        turns_start: start,
+        turns_end: end,
+        ..Default::default()
+    };
+
+    let db_path = match candidates.into_iter().find(|p| p.exists()) {
+        Some(path) => path,
+        None => {
+            data.errors.push(error(
+                agent,
+                i18n::tf(
+                    i18n::Key::ErrNotFound,
+                    &["~/.local/share/mimocode/mimocode.db"],
+                ),
+            ));
+            return data;
+        }
+    };
+
+    let conn = match Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            data.errors.push(error(
+                agent,
+                i18n::tf(i18n::Key::ErrDbOpen, &["MimoCode", &e.to_string()]),
+            ));
+            return data;
+        }
+    };
+
+    let mut session_builders: HashMap<String, SessionBuilder> = HashMap::new();
+    let mut parent_map: HashMap<String, String> = HashMap::new();
+
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id, parent_id, directory, title, time_created, time_updated FROM session",
+    ) {
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let parent_id: Option<String> = row.get(1)?;
+            let dir: Option<String> = row.get(2)?;
+            let title: Option<String> = row.get(3)?;
+            let time_created: Option<i64> = row.get(4)?;
+            let time_updated: Option<i64> = row.get(5)?;
+            Ok((id, parent_id, dir, title, time_created, time_updated))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                let (id, parent_id, dir, title, time_created, time_updated) = row;
+                if let Some(ref p) = parent_id {
+                    parent_map.insert(id.clone(), p.clone());
+                }
+                let created_sec = timestamp_ms_to_sec(time_created);
+                let updated_sec = timestamp_ms_to_sec(time_updated);
+
+                session_builders.insert(
+                    id.clone(),
+                    SessionBuilder {
+                        id: id.clone(),
+                        title: title
+                            .map(|t| compact_title(&t))
+                            .filter(|t| !t.is_empty())
+                            .unwrap_or_else(|| id.clone()),
+                        cwd: dir.unwrap_or_default(),
+                        mode: String::new(),
+                        source: "local".into(),
+                        created_at: created_sec,
+                        last_activity_at: updated_sec.max(created_sec),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+
+    let resolve_root = |mut sid: String| -> String {
+        let mut depth = 0;
+        while let Some(parent) = parent_map.get(&sid) {
+            sid = parent.clone();
+            depth += 1;
+            if depth > 20 {
+                break;
+            }
+        }
+        sid
+    };
+
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT session_id, time_created, data FROM message WHERE json_extract(data, '$.role') = 'assistant' ORDER BY time_created, rowid",
+    ) {
+        let rows = stmt.query_map([], |row| {
+            let session_id: String = row.get(0)?;
+            let time_created: Option<i64> = row.get(1)?;
+            let payload: String = row.get(2)?;
+            Ok((session_id, time_created, payload))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                let (session_id, time_created, payload) = row;
+                let Ok(v) = serde_json::from_str::<Value>(&payload) else {
+                    continue;
+                };
+                let provider = v.get("providerID").and_then(Value::as_str).unwrap_or("");
+                let model_id = v.get("modelID").and_then(Value::as_str).unwrap_or("");
+                let model = mimocode_model_name(provider, model_id);
+                let mode_str = v
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("build");
+                let tokens = v.get("tokens");
+                let inp = tokens
+                    .and_then(|t| t.get("input"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                let out = tokens
+                    .and_then(|t| t.get("output"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                let cache_rd = tokens
+                    .and_then(|t| t.get("cache"))
+                    .and_then(|c| c.get("read"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                let cache_wr = tokens
+                    .and_then(|t| t.get("cache"))
+                    .and_then(|c| c.get("write"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                let cost = v.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
+                let recorded = if cost > 0.0 { Some(cost) } else { None };
+
+                let start_sec = timestamp_ms_to_sec(time_created);
+                let duration_ms = match (
+                    v.pointer("/time/created").and_then(Value::as_i64),
+                    v.pointer("/time/completed").and_then(Value::as_i64),
+                ) {
+                    (Some(s), Some(c)) if c >= s => (c - s) as f64,
+                    _ => 0.0,
+                };
+
+                let root_id = resolve_root(session_id);
+                let builder =
+                    session_builders
+                        .entry(root_id.clone())
+                        .or_insert_with(|| SessionBuilder {
+                            id: root_id.clone(),
+                            title: root_id.clone(),
+                            cwd: String::new(),
+                            mode: String::new(),
+                            source: "local".into(),
+                            created_at: start_sec,
+                            last_activity_at: start_sec,
+                            ..Default::default()
+                        });
+                builder.input_tokens += inp;
+                builder.output_tokens += out;
+                builder.cached_tokens += cache_rd;
+                builder.cache_creation_tokens += cache_wr;
+                builder.agent_messages += 1.0;
+                if let Some(c) = recorded {
+                    builder.recorded_cost =
+                        Some(builder.recorded_cost.unwrap_or(0.0) + c);
+                }
+                if builder.model.is_empty()
+                    && !matches!(model_id, "" | "<synthetic>" | "unknown")
+                {
+                    builder.model = model.clone();
+                }
+                if builder.mode.is_empty() && !mode_str.is_empty() {
+                    builder.mode = mode_str.to_owned();
+                }
+                builder.observe_time(start_sec);
+
+                if start_sec >= start && start_sec < end {
+                    data.turns.push(TurnRec {
+                        session_key: format!("mimocode/{}", root_id),
+                        created_at: start_sec,
+                        agent: AgentKind::MimoCode,
+                        model,
+                        input_tokens: inp,
+                        output_tokens: out,
+                        cache_read_tokens: cache_rd,
+                        cache_creation_tokens: cache_wr,
+                        cache_creation_5m_tokens: 0.0,
+                        cache_creation_1h_tokens: 0.0,
+                        ttft_ms: 0.0,
+                        total_time_ms: duration_ms,
+                        recorded_cost: recorded,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+
+    let top_sessions: Vec<SessionRec> = session_builders
+        .into_iter()
+        .filter(|(id, _)| !parent_map.contains_key(id))
+        .map(|(_, mut builder)| {
+            if builder.mode.is_empty() {
+                builder.mode = "build".into();
+            }
+            if builder.model.is_empty() {
+                builder.model = "unknown".into();
+            }
+            builder.finish(AgentKind::MimoCode)
+        })
+        .collect();
+
+    data.sessions = top_sessions;
+    data.turns.sort_by_key(|turn| turn.created_at);
+    data
+}
+
 // ==================== pi-agent ====================
 
 fn parse_pi_file(path: &Path, start: i64, end: i64) -> Option<(SessionRec, Vec<TurnRec>)> {
@@ -2901,8 +3160,8 @@ fn timestamp_ms_to_sec(ts: Option<i64>) -> i64 {
 mod tests {
     use super::{
         amp_cache_dir, amp_list_cache_path, content_text, load_amp_thread_export_cache,
-        parse_amp_value, parse_antigravity_db, parse_claude_file, parse_pi_file, timestamp,
-        AgParse, AmpListCache, AmpListEntry,
+        mimocode_model_name, parse_amp_value, parse_antigravity_db, parse_claude_file,
+        parse_pi_file, timestamp, AgParse, AmpListCache, AmpListEntry,
     };
     use serde_json::json;
     use std::fs::File;
@@ -3048,6 +3307,20 @@ mod tests {
         assert_eq!(turns[0].cache_creation_tokens, 10.0);
         assert_eq!(turns[0].recorded_cost, Some(0.125));
         assert_eq!(session.recorded_cost, Some(0.125));
+    }
+
+    #[test]
+    fn mimocode_model_name_keeps_qualified_ids() {
+        assert_eq!(mimocode_model_name("mimo", "mimo-auto"), "mimo/mimo-auto");
+        assert_eq!(
+            mimocode_model_name("openrouter", "xiaomi/mimo-v2.5"),
+            "xiaomi/mimo-v2.5"
+        );
+        assert_eq!(
+            mimocode_model_name("anthropic", "claude-opus-4-7"),
+            "anthropic/claude-opus-4-7"
+        );
+        assert_eq!(mimocode_model_name("", ""), "unknown");
     }
 
     /// 验证线程导出缓存：写入后能从本地文件读回，不需要 CLI 调用。

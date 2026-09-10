@@ -2,12 +2,12 @@
 
 [English](README.md) | **简体中文**
 
-一个原生桌面应用，用于读取 Devin、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode 与 pi-agent 在本地留下的会话数据，并展示 token 用量、模型分布与会话详情。从左侧边栏切换 Agent，界面支持中英双语；本地数据只会在用户开启 GitHub 登录同步后发送到所配置的自建 API。
+一个原生桌面应用，用于读取 Devin、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode、pi-agent 与 MimoCode 在本地留下的会话数据，并展示 token 用量、模型分布与会话详情。从左侧边栏切换 Agent，界面支持中英双语；本地数据只会在用户开启 GitHub 登录同步后发送到所配置的自建 API。
 
 ## 功能
 
 - **用量视图**
-  - 左侧边栏常驻全部受支持的 Agent（Devin、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode、pi-agent）及其会话数
+  - 左侧边栏常驻全部受支持的 Agent（Devin、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode、pi-agent、MimoCode）及其会话数
   - 中英双语界面，默认跟随系统语言；顶栏点「中 / EN」即时切换并记住选择
   - 按日（15 天）/ 周（12 周）/ 月（12 个月）聚合 token 用量
   - 总 Tokens、输入（新）、输出、缓存读取、轮次/会话统计卡片
@@ -35,6 +35,7 @@
   - ZCode：`~/.zcode/cli/db/db.sqlite`
   - OpenCode：`~/.local/share/opencode/opencode.db`（同时覆盖 `opencode` 与 `opencode2`；旧版 `storage/` 下的 JSON 会话已迁移进该库）
   - pi-agent：`~/.pi/agent/sessions/**/*.jsonl`
+  - MimoCode：`~/.local/share/mimocode/mimocode.db`（OpenCode 分支；assistant `message` 行自带 `tokens`，非零 `cost` 按自报费用计价）
   - 各 Agent 按需懒加载，数据源并行解析
   - 使用平台缓存目录中的 5 分钟磁盘缓存，加速二次启动
   - 顶部「重新加载」按钮可强制绕过缓存；通过 mtime 检测未变化的文件，仅重新解析有改动的文件
@@ -93,7 +94,7 @@ cargo build --release
 cargo test
 ```
 
-CLI 默认统计 Claude Code 最近 30 天的数据；支持 `all`、`devin`、`claude`、`codex`、`antigravity`、`grok`、`zcode`、`opencode` 和 `pi`。`--by-agent` 可在 `all` 汇总下增加逐 Agent 分项。运行 `cargo run -- --cli --help` 查看全部选项。
+CLI 默认统计 Claude Code 最近 30 天的数据；支持 `all`、`devin`、`claude`、`codex`、`antigravity`、`grok`、`zcode`、`opencode`、`pi` 和 `mimocode`（`mimo` 别名）。`--by-agent` 可在 `all` 汇总下增加逐 Agent 分项。运行 `cargo run -- --cli --help` 查看全部选项。
 
 ## 价格表自动更新
 
@@ -117,7 +118,7 @@ src/
 ├── main.rs    # GPUI 应用入口、UI 渲染、用量/会话/配额视图、多设备同步交互
 ├── lib.rs     # 模块导出
 ├── data.rs    # 公共记录、Devin SQLite 读取、磁盘缓存、设备标识管理
-├── local_sources.rs # Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode 与 pi-agent 导入器
+├── local_sources.rs # Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode、pi-agent 与 MimoCode 导入器
 ├── sync.rs    # 多设备同步编排、存储传输与 v1 迁移
 ├── sync/v2.rs # 内容寻址、压缩并带完整性校验的同步协议
 ├── pricing.rs # 模型定价表与费用计算
