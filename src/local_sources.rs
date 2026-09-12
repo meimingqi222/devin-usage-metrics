@@ -2842,9 +2842,9 @@ pub(crate) fn load_mimocode(start: i64, end: i64) -> LoadedData {
     let mut session_builders: HashMap<String, SessionBuilder> = HashMap::new();
     let mut parent_map: HashMap<String, String> = HashMap::new();
 
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT id, parent_id, directory, title, time_created, time_updated FROM session",
-    ) {
+    if let Ok(mut stmt) = conn
+        .prepare("SELECT id, parent_id, directory, title, time_created, time_updated FROM session")
+    {
         let rows = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
             let parent_id: Option<String> = row.get(1)?;
