@@ -7,6 +7,7 @@
 )]
 
 mod text_input;
+mod updater_ui;
 
 use agg::{build_buckets_for_device, window_for, Bucket, PeriodKind};
 use chrono::TimeZone;
@@ -181,6 +182,9 @@ struct Root {
     sync_tick_task: Option<Task<()>>,
     /// 正在进行的一次导出+导入（与 load_task 分开，避免点重新加载打断同步）
     sync_task: Option<Task<()>>,
+    /// 应用自动更新
+    update: updater_ui::UpdateState,
+    update_prefs: i18n::UpdatePrefs,
 }
 
 fn open_external_url(url: &str) -> Result<(), String> {
@@ -1181,6 +1185,7 @@ impl Root {
             )
             .child(content)
             .child(sync_toggle)
+            .child(self.update_version_row(cx))
     }
 
     /// 弹窗中的文本输入框。
@@ -2785,6 +2790,7 @@ impl Render for Root {
             .when(self.sync_config_open, |d| {
                 d.child(self.sync_config_modal(window, cx))
             })
+            .when(self.update.show_dialog, |d| d.child(self.update_dialog(cx)))
             .into_any_element()
     }
 }
@@ -2915,10 +2921,13 @@ fn main() {
                         section_sync_open: true,
                         sync_tick_task: None,
                         sync_task: None,
+                        update: updater_ui::UpdateState::default(),
+                        update_prefs: i18n::load_update_prefs(),
                     };
                     root.rebuild_buckets();
                     root.rebuild_sessions();
                     root.start_load(false, cx);
+                    root.start_update_scheduler(cx);
                     root
                 })
             },

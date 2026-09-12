@@ -92,29 +92,69 @@ fn config_path() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|base| base.join("devin-usage-metrics/config.json"))
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize)]
 struct ConfigFile {
+    #[serde(default)]
     lang: String,
+    #[serde(default = "default_true")]
+    auto_check_updates: bool,
+    #[serde(default)]
+    skipped_update_version: Option<String>,
+    #[serde(default)]
+    last_update_check_at: Option<i64>,
 }
 
-fn load_config() -> Option<Lang> {
-    let path = config_path()?;
-    let text = std::fs::read_to_string(path).ok()?;
-    let config: ConfigFile = serde_json::from_str(&text).ok()?;
-    Lang::from_code(&config.lang)
+impl Default for ConfigFile {
+    fn default() -> Self {
+        Self {
+            lang: String::new(),
+            auto_check_updates: true,
+            skipped_update_version: None,
+            last_update_check_at: None,
+        }
+    }
 }
 
-fn save_config(lang: Lang) {
+/// 自动更新相关偏好，与语言一起存在 `config.json`。
+#[derive(Clone, Debug)]
+pub struct UpdatePrefs {
+    pub auto_check_updates: bool,
+    pub skipped_update_version: Option<String>,
+    pub last_update_check_at: Option<i64>,
+}
+
+impl Default for UpdatePrefs {
+    fn default() -> Self {
+        Self {
+            auto_check_updates: true,
+            skipped_update_version: None,
+            last_update_check_at: None,
+        }
+    }
+}
+
+fn load_config_file() -> ConfigFile {
+    let Some(path) = config_path() else {
+        return ConfigFile::default();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return ConfigFile::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn write_config_file(config: &ConfigFile) {
     let Some(path) = config_path() else {
         return;
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let config = ConfigFile {
-        lang: lang.code().to_string(),
-    };
-    let Ok(text) = serde_json::to_string_pretty(&config) else {
+    let Ok(text) = serde_json::to_string_pretty(config) else {
         return;
     };
     // 与 data.rs 的缓存写盘一致：先写临时文件再 rename，避免留下半截 config
@@ -126,6 +166,33 @@ fn save_config(lang: Lang) {
     } else {
         let _ = std::fs::remove_file(&temp);
     }
+}
+
+fn load_config() -> Option<Lang> {
+    Lang::from_code(&load_config_file().lang)
+}
+
+fn save_config(lang: Lang) {
+    let mut config = load_config_file();
+    config.lang = lang.code().to_string();
+    write_config_file(&config);
+}
+
+pub fn load_update_prefs() -> UpdatePrefs {
+    let config = load_config_file();
+    UpdatePrefs {
+        auto_check_updates: config.auto_check_updates,
+        skipped_update_version: config.skipped_update_version,
+        last_update_check_at: config.last_update_check_at,
+    }
+}
+
+pub fn save_update_prefs(prefs: &UpdatePrefs) {
+    let mut config = load_config_file();
+    config.auto_check_updates = prefs.auto_check_updates;
+    config.skipped_update_version = prefs.skipped_update_version.clone();
+    config.last_update_check_at = prefs.last_update_check_at;
+    write_config_file(&config);
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -329,6 +396,22 @@ pub enum Key {
     SyncConfigSave,
     SyncConfigCancel,
     SyncConfigConfigure,
+
+    // 应用自动更新
+    UpdateAvailableShort,
+    UpdateChecking,
+    UpdateDialogTitle,
+    UpdateDownload,
+    UpdateDownloading,
+    UpdateVerifying,
+    UpdateRestartInstall,
+    UpdateInstalling,
+    UpdateReadyHint,
+    UpdateSkipVersion,
+    UpdateLater,
+    UpdateOpenRelease,
+    UpdateRetry,
+    UpdateFailed,
 }
 
 impl Key {
@@ -481,6 +564,20 @@ impl Key {
         Key::SyncConfigSave,
         Key::SyncConfigCancel,
         Key::SyncConfigConfigure,
+        Key::UpdateAvailableShort,
+        Key::UpdateChecking,
+        Key::UpdateDialogTitle,
+        Key::UpdateDownload,
+        Key::UpdateDownloading,
+        Key::UpdateVerifying,
+        Key::UpdateRestartInstall,
+        Key::UpdateInstalling,
+        Key::UpdateReadyHint,
+        Key::UpdateSkipVersion,
+        Key::UpdateLater,
+        Key::UpdateOpenRelease,
+        Key::UpdateRetry,
+        Key::UpdateFailed,
     ];
 }
 
@@ -649,6 +746,20 @@ fn zh(key: Key) -> &'static str {
         Key::SyncConfigSave => "保存",
         Key::SyncConfigCancel => "取消",
         Key::SyncConfigConfigure => "配置…",
+        Key::UpdateAvailableShort => "有新版本",
+        Key::UpdateChecking => "正在检查…",
+        Key::UpdateDialogTitle => "应用更新",
+        Key::UpdateDownload => "下载更新",
+        Key::UpdateDownloading => "正在下载…",
+        Key::UpdateVerifying => "正在校验…",
+        Key::UpdateRestartInstall => "重启安装",
+        Key::UpdateInstalling => "正在安装…",
+        Key::UpdateReadyHint => "新版本已下载并校验通过，重启后即可完成安装。",
+        Key::UpdateSkipVersion => "跳过此版本",
+        Key::UpdateLater => "稍后",
+        Key::UpdateOpenRelease => "打开发布页",
+        Key::UpdateRetry => "重试",
+        Key::UpdateFailed => "更新失败",
     }
 }
 
@@ -816,6 +927,22 @@ Examples:\n  devin-usage-metrics --cli --agent claude --since 2026-08-20 --until
         Key::SyncConfigSave => "Save",
         Key::SyncConfigCancel => "Cancel",
         Key::SyncConfigConfigure => "Configure…",
+        Key::UpdateAvailableShort => "Update available",
+        Key::UpdateChecking => "Checking…",
+        Key::UpdateDialogTitle => "App update",
+        Key::UpdateDownload => "Download",
+        Key::UpdateDownloading => "Downloading…",
+        Key::UpdateVerifying => "Verifying…",
+        Key::UpdateRestartInstall => "Restart to install",
+        Key::UpdateInstalling => "Installing…",
+        Key::UpdateReadyHint => {
+            "The update is downloaded and verified. Restart to finish installing."
+        }
+        Key::UpdateSkipVersion => "Skip this version",
+        Key::UpdateLater => "Later",
+        Key::UpdateOpenRelease => "Open release page",
+        Key::UpdateRetry => "Retry",
+        Key::UpdateFailed => "Update failed",
     }
 }
 
@@ -876,10 +1003,25 @@ mod tests {
         // 直接测内部序列化格式，避免写用户配置目录
         let config = ConfigFile {
             lang: Lang::En.code().to_string(),
+            auto_check_updates: false,
+            skipped_update_version: Some("0.2.0".into()),
+            last_update_check_at: Some(1_700_000_000),
         };
         let text = serde_json::to_string(&config).unwrap();
         let parsed: ConfigFile = serde_json::from_str(&text).unwrap();
         assert_eq!(Lang::from_code(&parsed.lang), Some(Lang::En));
+        assert!(!parsed.auto_check_updates);
+        assert_eq!(parsed.skipped_update_version.as_deref(), Some("0.2.0"));
+        assert_eq!(parsed.last_update_check_at, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn old_config_without_update_fields_defaults() {
+        let parsed: ConfigFile = serde_json::from_str(r#"{"lang":"zh"}"#).unwrap();
+        assert_eq!(Lang::from_code(&parsed.lang), Some(Lang::Zh));
+        assert!(parsed.auto_check_updates);
+        assert!(parsed.skipped_update_version.is_none());
+        assert!(parsed.last_update_check_at.is_none());
     }
 
     #[test]

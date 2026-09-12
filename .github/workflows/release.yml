@@ -51,6 +51,8 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.target }}
           Compress-Archive -Path target/${{ matrix.target }}/release/devin-usage-metrics.exe, assets -DestinationPath ${{ matrix.asset_path }}
+          $hash = (Get-FileHash -Path ${{ matrix.asset_path }} -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.artifact_name }}" | Out-File -Encoding utf8 "${{ matrix.asset_path }}.sha256"
 
       - name: Build macOS Release & Bundle
         if: startsWith(matrix.os, 'macos')
@@ -72,12 +74,15 @@ jobs:
             zip -r ../../../${{ matrix.asset_path }} devin-usage-metrics
             cd ../../..
           fi
+          shasum -a 256 ${{ matrix.asset_path }} | awk '{print $1"  ${{ matrix.artifact_name }}"}' > ${{ matrix.asset_path }}.sha256
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.asset_path }}
+          path: |
+            ${{ matrix.asset_path }}
+            ${{ matrix.asset_path }}.sha256
 
   release:
     name: Create GitHub Release
@@ -95,7 +100,7 @@ jobs:
       - name: Prepare Release Assets
         run: |
           mkdir -p release-assets
-          find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec cp {} release-assets/ \;
+          find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} release-assets/ \;
           ls -la release-assets/
 
       - name: Publish GitHub Release

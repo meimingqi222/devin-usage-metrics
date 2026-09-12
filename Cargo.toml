@@ -21,9 +21,11 @@ sha2 = "0.10"
 zstd = "0.13"
 fs2 = "0.4"
 uuid = { version = "1", features = ["v4"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
+libc = "0.2"
 
 [build-dependencies]
 winres = "0.1.12"

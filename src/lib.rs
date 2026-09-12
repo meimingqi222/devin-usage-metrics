@@ -6,3 +6,4 @@ mod local_sources;
 pub mod pricing;
 pub mod quota;
 pub mod sync;
+pub mod updater;
