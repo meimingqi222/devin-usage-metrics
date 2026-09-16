@@ -22,6 +22,7 @@ pub enum Provider {
     Codex,
     Grok,
     Devin,
+    Antigravity,
 }
 
 impl Provider {
@@ -31,6 +32,7 @@ impl Provider {
             Provider::Codex => "Codex",
             Provider::Grok => "Grok",
             Provider::Devin => "Devin",
+            Provider::Antigravity => "Antigravity",
         }
     }
 }
@@ -72,6 +74,9 @@ pub enum AccountKind {
     ClaudeLocal {
         path: PathBuf,
     },
+    /// macOS Keychain 中的 Claude Code 凭证（`Claude Code-credentials`）。
+    /// Linux/Windows 上不会出现此变体。
+    ClaudeKeychain,
     CodexLocal {
         path: PathBuf,
     },
@@ -87,6 +92,10 @@ pub enum AccountKind {
     DevinCli {
         token: String,
         org_id: String,
+    },
+    /// Antigravity (Google Gemini) 本地 OAuth 凭证。
+    AntigravityLocal {
+        path: PathBuf,
     },
 }
 
@@ -190,6 +199,21 @@ pub fn discover_accounts() -> Vec<Account> {
                 label,
                 kind: AccountKind::ClaudeLocal { path: claude },
             });
+        } else if cfg!(target_os = "macos") && read_claude_keychain().is_some() {
+            // macOS 上 Claude Code 把凭证存在 Keychain 而非文件
+            let label = read_claude_keychain()
+                .and_then(|v| {
+                    json_field(&v, &["claudeAiOauth", "emailAddress"])
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "Claude".into());
+            out.push(Account {
+                key: "claude-keychain".into(),
+                provider: Provider::Claude,
+                label,
+                kind: AccountKind::ClaudeKeychain,
+            });
         }
 
         let codex = h.join(".codex").join("auth.json");
@@ -212,6 +236,47 @@ pub fn discover_accounts() -> Vec<Account> {
                 label,
                 kind: AccountKind::GrokLocal { path: grok },
             });
+        }
+
+        // Antigravity: macOS 用 Keychain（源是新的），其他平台用 ~/.gemini/oauth_creds.json
+        let antigravity = h.join(".gemini").join("oauth_creds.json");
+        #[cfg(target_os = "macos")]
+        {
+            // macOS 上优先用 Keychain（Antigravity 通过 go-keyring 写入），
+            // oauth_creds.json 可能是旧账号的残留文件
+            if read_antigravity_keychain().is_some() {
+                // Keychain 中没有 id_token，需刷新 token 后从 id_token 解析 email
+                let label = read_antigravity_email_from_keychain()
+                    .unwrap_or_else(|| "Antigravity".into());
+                out.push(Account {
+                    key: "antigravity-keychain".into(),
+                    provider: Provider::Antigravity,
+                    label,
+                    kind: AccountKind::AntigravityLocal { path: antigravity },
+                });
+            } else if antigravity.exists() {
+                let label = read_antigravity_email(&antigravity)
+                    .unwrap_or_else(|| "Antigravity".into());
+                out.push(Account {
+                    key: "antigravity-local".into(),
+                    provider: Provider::Antigravity,
+                    label,
+                    kind: AccountKind::AntigravityLocal { path: antigravity },
+                });
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if antigravity.exists() {
+                let label = read_antigravity_email(&antigravity)
+                    .unwrap_or_else(|| "Antigravity".into());
+                out.push(Account {
+                    key: "antigravity-local".into(),
+                    provider: Provider::Antigravity,
+                    label,
+                    kind: AccountKind::AntigravityLocal { path: antigravity },
+                });
+            }
         }
     }
 
@@ -256,6 +321,163 @@ fn read_claude_email(path: &Path) -> Option<String> {
     json_field(&v, &["claudeAiOauth", "emailAddress"])
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// macOS Keychain 读取：`security find-generic-password -s <service> -w`
+#[cfg(target_os = "macos")]
+fn keychain_read(service: &str) -> Option<String> {
+    let output = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", service, "-w"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// macOS Keychain 写入：先删除旧条目再添加，避免重复。
+#[cfg(target_os = "macos")]
+fn keychain_write(service: &str, account: &str, value: &str) {
+    let _ = std::process::Command::new("security")
+        .args(["delete-generic-password", "-s", service])
+        .output();
+    let _ = std::process::Command::new("security")
+        .args([
+            "add-generic-password",
+            "-s",
+            service,
+            "-a",
+            account,
+            "-w",
+            value,
+        ])
+        .output();
+}
+
+/// 读取 Claude Code 的 Keychain 凭证（macOS）。
+/// Keychain 条目 `Claude Code-credentials` 存储与 `.credentials.json` 相同结构的 JSON。
+#[cfg(target_os = "macos")]
+fn read_claude_keychain() -> Option<Value> {
+    let raw = keychain_read("Claude Code-credentials")?;
+    serde_json::from_str(&raw).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_claude_keychain() -> Option<Value> {
+    None
+}
+
+/// 读取 Antigravity 的 Keychain 凭证（macOS）。
+/// Keychain 条目 `gemini`/`antigravity` 存储 base64 编码的 JSON（`go-keyring-base64:` 前缀）。
+#[cfg(target_os = "macos")]
+fn read_antigravity_keychain() -> Option<Value> {
+    let raw = keychain_read("gemini")?;
+    // go-keyring-base64 编码：去掉前缀后 base64 解码
+    let b64 = raw.strip_prefix("go-keyring-base64:").unwrap_or(&raw);
+    let decoded = base64_decode(b64)?;
+    let text = String::from_utf8(decoded).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    // 结构：{ "token": { "access_token":..., "refresh_token":..., "expiry":... }, "auth_method": "consumer" }
+    Some(v)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_antigravity_keychain() -> Option<Value> {
+    None
+}
+
+/// 从 Keychain 读取 Antigravity 凭证后，刷新 token 获取 id_token，
+/// 从中解析 email。Keychain 中不存 id_token，只能通过刷新获得。
+#[cfg(target_os = "macos")]
+fn read_antigravity_email_from_keychain() -> Option<String> {
+    let raw = keychain_read("gemini")?;
+    let b64 = raw.strip_prefix("go-keyring-base64:").unwrap_or(&raw);
+    let decoded = base64_decode(b64)?;
+    let text = String::from_utf8(decoded).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let refresh_token = v
+        .pointer("/token/refresh_token")
+        .and_then(Value::as_str)?;
+    if refresh_token.is_empty() {
+        return None;
+    }
+
+    // 刷新 token，响应中含 id_token
+    let (client_id, client_secret) = antigravity_oauth_client()?;
+    let agent = http_agent();
+    let form = format!(
+        "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
+        urlencoded(&client_id),
+        urlencoded(&client_secret),
+        urlencoded(refresh_token)
+    );
+    let resp = post_form(&agent, "https://oauth2.googleapis.com/token", &form, &[]).ok()?;
+    let id_token = resp.get("id_token").and_then(Value::as_str)?;
+    let parts: Vec<&str> = id_token.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let payload = base64_decode(parts[1])?;
+    let payload_str = String::from_utf8(payload).ok()?;
+    let claims: Value = serde_json::from_str(&payload_str).ok()?;
+    claims.get("email").and_then(Value::as_str).map(str::to_string)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_antigravity_email_from_keychain() -> Option<String> {
+    None
+}
+
+/// 简易 base64 解码器（避免引入 base64 crate 依赖）。
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let table: [i16; 256] = {
+        let mut t = [-1i16; 256];
+        for (i, c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().enumerate() {
+            t[*c as usize] = i as i16;
+        }
+        t
+    };
+    let mut out = Vec::new();
+    let mut buf = 0u32;
+    let mut bits = 0;
+    for ch in input.bytes() {
+        if ch == b'=' {
+            break;
+        }
+        let val = table[ch as usize];
+        if val < 0 {
+            continue; // 跳过空白等非 base64 字符
+        }
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+fn read_antigravity_email(path: &Path) -> Option<String> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    // 从 id_token JWT 中提取 email
+    let id_token = v.get("id_token").and_then(Value::as_str)?;
+    let parts: Vec<&str> = id_token.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let payload = base64_decode(parts[1])?;
+    let payload_str = String::from_utf8(payload).ok()?;
+    let claims: Value = serde_json::from_str(&payload_str).ok()?;
+    claims.get("email").and_then(Value::as_str).map(str::to_string)
 }
 
 fn read_codex_email(path: &Path) -> Option<String> {
@@ -371,10 +593,12 @@ fn parse_when(v: &Value) -> Option<i64> {
 pub fn fetch_account(account: &Account) -> Result<QuotaResult, String> {
     match &account.kind {
         AccountKind::ClaudeLocal { path } => fetch_claude(path),
+        AccountKind::ClaudeKeychain => fetch_claude_keychain(),
         AccountKind::CodexLocal { path } => fetch_codex(path),
         AccountKind::GrokLocal { path } => fetch_grok(path),
         AccountKind::Devin { cookie, org_id } => fetch_devin(cookie, org_id.as_deref()),
         AccountKind::DevinCli { token, org_id } => fetch_devin_cli(token, org_id),
+        AccountKind::AntigravityLocal { path } => fetch_antigravity(path),
     }
 }
 
@@ -511,6 +735,87 @@ fn fetch_claude(path: &Path) -> Result<QuotaResult, String> {
     };
 
     Ok(parse_claude_usage(&usage, plan))
+}
+
+/// macOS Keychain 版 Claude Code 查询：从 `Claude Code-credentials` 读取 JSON，
+/// 刷新后写回 Keychain。
+fn fetch_claude_keychain() -> Result<QuotaResult, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let raw = keychain_read("Claude Code-credentials")
+            .ok_or_else(|| "Claude Code-credentials not found in Keychain".to_string())?;
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("Keychain JSON parse error: {e}"))?;
+        let oauth = json_field(&v, &["claudeAiOauth"])
+            .ok_or_else(|| "Keychain entry missing claudeAiOauth".to_string())?;
+        let mut cred = ClaudeCred {
+            access_token: json_field(oauth, &["accessToken"])
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing accessToken".to_string())?
+                .to_string(),
+            refresh_token: json_field(oauth, &["refreshToken"])
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            expires_at: json_field(oauth, &["expiresAt"]).and_then(parse_when),
+        };
+
+        let agent = http_agent();
+        let headers = |token: &str| -> [(&'static str, String); 3] {
+            [
+                ("authorization", format!("Bearer {token}")),
+                ("anthropic-beta", "oauth-2025-04-20".to_string()),
+                ("user-agent", "claude-cli/1.0.90 (external, cli)".to_string()),
+            ]
+        };
+
+        let mut usage: Result<Value, String>;
+        let mut refreshed = false;
+        loop {
+            let h = headers(&cred.access_token);
+            let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            usage = get_json(&agent, "https://api.anthropic.com/api/oauth/usage", &refs);
+            match &usage {
+                Err(e) if e == "HTTP 401" && !refreshed && !cred.refresh_token.is_empty() => {
+                    refresh_claude(&mut cred)?;
+                    // 写回 Keychain
+                    if let Some(oauth) = v.pointer("/claudeAiOauth").and_then(|o| o.as_object()) {
+                        let mut obj = oauth.clone();
+                        obj.insert("accessToken".into(), Value::String(cred.access_token.clone()));
+                        obj.insert("refreshToken".into(), Value::String(cred.refresh_token.clone()));
+                        if let Some(ts) = cred.expires_at {
+                            obj.insert("expiresAt".into(), Value::from(ts * 1000));
+                        }
+                        let mut full = v.clone();
+                        if let Some(target) = full.pointer_mut("/claudeAiOauth") {
+                            *target = Value::Object(obj);
+                        }
+                        if let Ok(out) = serde_json::to_string(&full) {
+                            keychain_write("Claude Code-credentials", "Claude Code", &out);
+                        }
+                    }
+                    refreshed = true;
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        let usage = usage?;
+
+        let plan = {
+            let h = headers(&cred.access_token);
+            let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            get_json(&agent, "https://api.anthropic.com/api/oauth/profile", &refs)
+                .ok()
+                .and_then(|p| claude_plan(&p))
+        };
+
+        Ok(parse_claude_usage(&usage, plan))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Claude Keychain is only supported on macOS".into())
+    }
 }
 
 fn claude_plan(profile: &Value) -> Option<String> {
@@ -1171,14 +1476,34 @@ fn parse_simple_toml(text: &str, key: &str) -> Option<String> {
 }
 
 /// 读取 Devin CLI 本地凭证：credentials.toml 中的 session token + config.json 中的 org_id。
+///
+/// Devin CLI 在所有平台上都用 XDG 路径：
+/// - credentials.toml → `~/.local/share/devin/credentials.toml`
+/// - config.json → `~/.config/devin/config.json`
+/// 而不是 `dirs::config_dir()`（macOS 上是 `~/Library/Application Support/`）。
 fn read_devin_cli_credentials() -> Option<(String, String)> {
-    let config_dir = dirs::config_dir()?;
-    let cred_path = config_dir.join("devin/credentials.toml");
-    let cred_text = std::fs::read_to_string(&cred_path).ok()?;
+    let home = dirs::home_dir()?;
+
+    // credentials.toml：优先 XDG data dir，回退 config_dir
+    let cred_path = home.join(".local/share/devin/credentials.toml");
+    let cred_text = std::fs::read_to_string(&cred_path)
+        .or_else(|_| {
+            dirs::config_dir()
+                .map(|d| std::fs::read_to_string(d.join("devin/credentials.toml")))
+                .unwrap_or(Err(std::io::Error::other("no config dir")))
+        })
+        .ok()?;
     let token = parse_simple_toml(&cred_text, "windsurf_api_key")?;
 
-    let config_path = config_dir.join("devin/config.json");
-    let config_text = std::fs::read_to_string(&config_path).ok()?;
+    // config.json：优先 XDG config dir，回退 config_dir
+    let config_path = home.join(".config/devin/config.json");
+    let config_text = std::fs::read_to_string(&config_path)
+        .or_else(|_| {
+            dirs::config_dir()
+                .map(|d| std::fs::read_to_string(d.join("devin/config.json")))
+                .unwrap_or(Err(std::io::Error::other("no config dir")))
+        })
+        .ok()?;
     let config: Value = serde_json::from_str(&config_text).ok()?;
     let org_id = json_field(&config, &["devin", "org_id"])
         .and_then(Value::as_str)
@@ -1431,6 +1756,291 @@ fn fetch_devin_cli(token: &str, _org_id: &str) -> Result<QuotaResult, String> {
         windows,
         extra,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Antigravity (Google Gemini Code Assist)
+// ---------------------------------------------------------------------------
+
+/// Antigravity 配额查询端点。
+const ANTIGRAVITY_QUOTA_URL: &str =
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+
+/// 从 Antigravity 的 language_server 二进制中提取 Google OAuth client_id 和 client_secret。
+/// 这些值是 Antigravity 内置的公开 OAuth 凭据，不是用户密钥。
+/// 返回 (client_id, client_secret)。
+fn antigravity_oauth_client() -> Option<(String, String)> {
+    // 优先用环境变量覆盖
+    if let (Ok(id), Ok(secret)) = (
+        std::env::var("ANTIGRAVITY_CLIENT_ID"),
+        std::env::var("ANTIGRAVITY_CLIENT_SECRET"),
+    ) {
+        if !id.is_empty() && !secret.is_empty() {
+            return Some((id, secret));
+        }
+    }
+
+    // 从 language_server 二进制中 strings 提取
+    #[cfg(target_os = "macos")]
+    {
+        let candidates = [
+            "/Applications/Antigravity.app/Contents/Resources/bin/language_server",
+        ];
+        for path in &candidates {
+            let output = std::process::Command::new("strings").arg(path).output().ok()?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            // client_id 格式: <digits>-<alphanum>.apps.googleusercontent.com
+            let client_id = text
+                .lines()
+                .find(|l| l.ends_with(".apps.googleusercontent.com") && l.len() > 30)?
+                .to_string();
+            // client_secret 格式: GOCSPX-<alphanum>
+            let client_secret = text
+                .lines()
+                .find(|l| l.starts_with("GOCSPX-") && l.len() > 15)?
+                .to_string();
+            return Some((client_id, client_secret));
+        }
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+struct AntigravityCred {
+    access_token: String,
+    refresh_token: String,
+    /// unix 秒；None = 未知/已过期，需刷新
+    expires_at: Option<i64>,
+}
+
+/// 从文件或 Keychain 读取 Antigravity OAuth 凭据。
+/// macOS 上优先用 Keychain（源是新的），文件可能是旧账号残留。
+fn read_antigravity_cred(path: &Path) -> Result<AntigravityCred, String> {
+    // macOS 优先读 Keychain
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(raw) = keychain_read("gemini") {
+            let b64 = raw.strip_prefix("go-keyring-base64:").unwrap_or(&raw);
+            if let Some(decoded) = base64_decode(b64) {
+                if let Ok(text) = String::from_utf8(decoded) {
+                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                        if let Some(token) = v.get("token") {
+                            let access = token
+                                .get("access_token")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let refresh = token
+                                .get("refresh_token")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            if !refresh.is_empty() {
+                                return Ok(AntigravityCred {
+                                    access_token: access,
+                                    refresh_token: refresh,
+                                    expires_at: token
+                                        .get("expiry")
+                                        .and_then(Value::as_str)
+                                        .and_then(|s| {
+                                            DateTime::parse_from_rfc3339(s).ok()
+                                        })
+                                        .map(|dt| dt.timestamp()),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 回退到文件
+    if path.exists() {
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        return Ok(AntigravityCred {
+            access_token: v
+                .get("access_token")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            refresh_token: v
+                .get("refresh_token")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            expires_at: v.get("expiry_date").and_then(parse_when),
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Antigravity credentials file not found".into())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Err("Antigravity credentials not found (file or Keychain)".into())
+    }
+}
+
+/// 刷新 Google OAuth access_token。
+fn refresh_antigravity(cred: &mut AntigravityCred) -> Result<(), String> {
+    let (client_id, client_secret) =
+        antigravity_oauth_client().ok_or_else(|| "Antigravity OAuth client not found".to_string())?;
+    let agent = http_agent();
+    let form = format!(
+        "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
+        urlencoded(&client_id),
+        urlencoded(&client_secret),
+        urlencoded(&cred.refresh_token)
+    );
+    let resp = post_form(&agent, "https://oauth2.googleapis.com/token", &form, &[])?;
+    cred.access_token = json_field(&resp, &["access_token"])
+        .and_then(Value::as_str)
+        .ok_or_else(|| "refresh response missing access_token".to_string())?
+        .to_string();
+    let expires_in = json_field(&resp, &["expires_in"]).and_then(Value::as_f64);
+    cred.expires_at = expires_in.map(|s| now_sec() + s as i64);
+    Ok(())
+}
+
+/// 写回刷新后的 token 到文件（Keychain 版由 Antigravity 自身管理，不写回）。
+fn write_back_antigravity(path: &Path, cred: &AntigravityCred) {
+    if !path.exists() {
+        return; // Keychain 模式不写回文件
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("access_token".into(), Value::String(cred.access_token.clone()));
+        if let Some(ts) = cred.expires_at {
+            obj.insert("expiry_date".into(), Value::from(ts * 1000));
+        }
+    }
+    let Ok(out) = serde_json::to_string_pretty(&v) else {
+        return;
+    };
+    atomic_write(path, out.as_bytes());
+}
+
+/// 查询 Antigravity (Gemini Code Assist) 配额。
+///
+/// API 端点：`https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`
+/// 认证：Google OAuth Bearer token
+/// 必须带 `User-Agent: antigravity/<version>` 和 `X-Goog-Api-Client` 头，否则返回 403。
+fn fetch_antigravity(path: &Path) -> Result<QuotaResult, String> {
+    let mut cred = read_antigravity_cred(path)?;
+    if cred.access_token.is_empty() {
+        return Err("Antigravity: no access token".into());
+    }
+
+    let agent = http_agent();
+    let headers = |token: &str| -> [(&'static str, String); 4] {
+        [
+            ("authorization", format!("Bearer {token}")),
+            ("content-type", "application/json".into()),
+            ("user-agent", "antigravity/2.11.0".into()),
+            ("x-goog-api-client", "antigravity/2.11.0".into()),
+        ]
+    };
+
+    let mut body: Result<Value, String>;
+    let mut refreshed = false;
+    loop {
+        let h = headers(&cred.access_token);
+        let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        body = post_json(&agent, ANTIGRAVITY_QUOTA_URL, serde_json::json!({}), &refs);
+        match &body {
+            Err(e) if e.contains("401") && !refreshed && !cred.refresh_token.is_empty() => {
+                refresh_antigravity(&mut cred)?;
+                write_back_antigravity(path, &cred);
+                refreshed = true;
+                continue;
+            }
+            _ => break,
+        }
+    }
+    let response = body?;
+    Ok(parse_antigravity_quota(&response))
+}
+
+/// 解析 Antigravity `retrieveUserQuotaSummary` 响应。
+///
+/// 响应结构：
+/// ```json
+/// {
+///   "groups": [
+///     {
+///       "displayName": "Gemini Models",
+///       "description": "...",
+///       "buckets": [
+///         { "bucketId": "gemini-weekly", "displayName": "Weekly Limit Remaining",
+///           "window": "weekly", "resetTime": "2026-09-23T03:15:56Z",
+///           "remainingFraction": 1.0 },
+///         { "bucketId": "gemini-5h", "displayName": "Five Hour Limit Remaining",
+///           "window": "5h", "resetTime": "...", "remainingFraction": 1.0 }
+///       ]
+///     }
+///   ]
+/// }
+/// ```
+pub fn parse_antigravity_quota(response: &Value) -> QuotaResult {
+    let mut windows = Vec::new();
+
+    if let Some(groups) = response.get("groups").and_then(Value::as_array) {
+        for group in groups {
+            let group_name = group
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            if let Some(buckets) = group.get("buckets").and_then(Value::as_array) {
+                for bucket in buckets {
+                    let window_str = bucket
+                        .get("window")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let remaining = bucket
+                        .get("remainingFraction")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(1.0);
+                    let used_percent = ((1.0 - remaining) * 100.0).max(0.0).min(999.0);
+                    let resets_at = bucket
+                        .get("resetTime")
+                        .and_then(Value::as_str)
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.timestamp());
+
+                    // 窗口标签：用组名区分不同模型组的同名窗口
+                    let label = match window_str {
+                        "weekly" => WindowLabel::Custom(format!("{group_name} – Weekly")),
+                        "5h" => WindowLabel::Custom(format!("{group_name} – 5h")),
+                        other => WindowLabel::Custom(format!("{group_name} – {other}")),
+                    };
+
+                    windows.push(QuotaWindow {
+                        label,
+                        used_percent,
+                        resets_at,
+                    });
+                }
+            }
+        }
+    }
+
+    QuotaResult {
+        plan: None,
+        windows,
+        extra: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1745,5 +2355,77 @@ devin_webapp_host = "app.devin.ai"
         } else {
             println!("No Devin CLI credentials found (skipping)");
         }
+    }
+
+    #[test]
+    fn parse_antigravity_quota_basic() {
+        let response: Value = serde_json::from_str(
+            r#"{
+              "groups": [
+                {
+                  "displayName": "Gemini Models",
+                  "description": "Models within this group: Gemini Flash, Gemini Pro",
+                  "buckets": [
+                    {
+                      "bucketId": "gemini-weekly",
+                      "displayName": "Weekly Limit Remaining",
+                      "window": "weekly",
+                      "resetTime": "2026-09-23T03:15:56Z",
+                      "remainingFraction": 0.75
+                    },
+                    {
+                      "bucketId": "gemini-5h",
+                      "displayName": "Five Hour Limit Remaining",
+                      "window": "5h",
+                      "resetTime": "2026-09-16T08:15:56Z",
+                      "remainingFraction": 1.0
+                    }
+                  ]
+                },
+                {
+                  "displayName": "Claude and GPT models",
+                  "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+                  "buckets": [
+                    {
+                      "bucketId": "3p-weekly",
+                      "displayName": "Weekly Limit Remaining",
+                      "window": "weekly",
+                      "resetTime": "2026-09-20T09:35:50Z",
+                      "remainingFraction": 0.5
+                    }
+                  ]
+                }
+              ],
+              "description": "Within each group, models share a weekly limit and a 5-hour limit."
+            }"#,
+        )
+        .unwrap();
+
+        let r = parse_antigravity_quota(&response);
+        assert_eq!(r.plan, None);
+        assert_eq!(r.windows.len(), 3);
+
+        // Gemini weekly: 75% remaining → 25% used
+        assert!(matches!(&r.windows[0].label, WindowLabel::Custom(s) if s.contains("Gemini") && s.contains("Weekly")));
+        assert!((r.windows[0].used_percent - 25.0).abs() < 1e-9);
+        assert!(r.windows[0].resets_at.is_some());
+
+        // Gemini 5h: 100% remaining → 0% used
+        assert!(matches!(&r.windows[1].label, WindowLabel::Custom(s) if s.contains("Gemini") && s.contains("5h")));
+        assert!((r.windows[1].used_percent - 0.0).abs() < 1e-9);
+
+        // 3p weekly: 50% remaining → 50% used
+        assert!(matches!(&r.windows[2].label, WindowLabel::Custom(s) if s.contains("Claude") && s.contains("Weekly")));
+        assert!((r.windows[2].used_percent - 50.0).abs() < 1e-9);
+
+        assert_eq!(r.extra, None);
+    }
+
+    #[test]
+    fn parse_antigravity_quota_empty() {
+        let response: Value = serde_json::json!({});
+        let r = parse_antigravity_quota(&response);
+        assert_eq!(r.windows.len(), 0);
+        assert_eq!(r.extra, None);
     }
 }

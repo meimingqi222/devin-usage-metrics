@@ -2585,6 +2585,7 @@ fn provider_color(provider: quota::Provider) -> u32 {
         quota::Provider::Codex => 0x3ddc97,
         quota::Provider::Grok => 0xe6e6ee,
         quota::Provider::Devin => 0x4cc2ff,
+        quota::Provider::Antigravity => 0x4285f4,
     }
 }
 
