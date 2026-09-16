@@ -16,8 +16,9 @@ sys-locale = "0.3"
 unicode-width = "0.2"
 ureq = { version = "3", features = ["json"] }
 rfd = "0.17"
-keyring = { version = "4", features = ["v1"] }
 sha2 = "0.10"
+aes-gcm = "0.10"
+rand = "0.8"
 zstd = "0.13"
 fs2 = "0.4"
 uuid = { version = "1", features = ["v4"] }

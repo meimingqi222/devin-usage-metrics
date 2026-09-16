@@ -241,10 +241,14 @@ fn content_fingerprint(package: &DevicePackage) -> Result<String, String> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
-// ── GitHub 同步会话（系统钥匙串）──────────────────────────────────────
+// ── GitHub 同步会话（本地加密文件，不使用系统钥匙串）──────────────────
+//
+// 目标是启动/同步零钥匙串弹窗。密钥由本机 device_id 派生，文件 0600。
+// 这能防止明文误读；能读取你用户目录的攻击者仍可能解密——与钥匙串相比
+// 防护更弱，换取无系统授权弹窗。同步 token 风险低于 GitHub PAT。
 
-const KEYRING_SERVICE: &str = "devin-usage-metrics";
-const KEYRING_GITHUB_SYNC_SESSION: &str = "github-sync-session";
+const SESSION_ENC_MAGIC: &[u8; 5] = b"DUMS1";
+const SESSION_KEY_SALT: &[u8] = b"devin-usage-metrics/github-sync-session/v1";
 
 /// 服务端在 GitHub Device Flow 成功后签发的同步会话；GitHub access token 不会写入本机。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -254,30 +258,178 @@ pub struct GitHubSyncSession {
     pub expires_at: i64,
 }
 
-pub fn save_github_sync_session(session: &GitHubSyncSession) -> Result<(), String> {
-    let payload = serde_json::to_string(session).map_err(|e| format!("会话序列化失败: {e}"))?;
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_GITHUB_SYNC_SESSION)
-        .map_err(|e| format!("钥匙串初始化失败: {e}"))?;
-    entry
-        .set_password(&payload)
-        .map_err(|e| format!("GitHub 同步会话存储失败: {e}"))
+/// 非敏感元数据：登录名与过期时间。启动/UI 只读此文件，无需解密 token。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct GitHubSyncSessionMeta {
+    #[serde(default)]
+    pub login: String,
+    #[serde(default)]
+    pub expires_at: i64,
 }
 
-pub fn load_github_sync_session() -> Option<GitHubSyncSession> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_GITHUB_SYNC_SESSION).ok()?;
-    serde_json::from_str(&entry.get_password().ok()?).ok()
+fn session_enc_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("devin-usage-metrics/github-sync-session.enc"))
 }
 
-pub fn delete_github_sync_session() {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_GITHUB_SYNC_SESSION) {
-        let _ = entry.delete_credential();
+fn session_meta_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("devin-usage-metrics/github-sync-session.meta.json"))
+}
+
+fn session_cache() -> &'static std::sync::Mutex<Option<GitHubSyncSession>> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<Option<GitHubSyncSession>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// AES-256 密钥：盐 + 本机 device_id。device_id 绑定磁盘上的这台机器。
+fn session_enc_key() -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SESSION_KEY_SALT);
+    hasher.update(0u8.to_be_bytes());
+    hasher.update(data::device_id().as_bytes());
+    hasher.finalize().into()
+}
+
+fn encrypt_session(plain: &[u8]) -> Result<Vec<u8>, String> {
+    use aes_gcm::aead::{Aead, KeyInit, OsRng};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use rand::RngCore;
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&session_enc_key()));
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, plain)
+        .map_err(|e| format!("会话加密失败: {e}"))?;
+    let mut out = Vec::with_capacity(SESSION_ENC_MAGIC.len() + 12 + ciphertext.len());
+    out.extend_from_slice(SESSION_ENC_MAGIC);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+fn decrypt_session(blob: &[u8]) -> Result<Vec<u8>, String> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+
+    if blob.len() < SESSION_ENC_MAGIC.len() + 12 + 16
+        || &blob[..SESSION_ENC_MAGIC.len()] != SESSION_ENC_MAGIC
+    {
+        return Err("会话文件格式无效".into());
+    }
+    let nonce_bytes = &blob[SESSION_ENC_MAGIC.len()..SESSION_ENC_MAGIC.len() + 12];
+    let ciphertext = &blob[SESSION_ENC_MAGIC.len() + 12..];
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&session_enc_key()));
+    let nonce = Nonce::from_slice(nonce_bytes);
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| "会话解密失败（文件损坏或密钥不匹配）".into())
+}
+
+fn write_session_meta(session: &GitHubSyncSession) {
+    let Some(path) = session_meta_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let meta = GitHubSyncSessionMeta {
+        login: session.login.clone(),
+        expires_at: session.expires_at,
+    };
+    let Ok(text) = serde_json::to_string_pretty(&meta) else {
+        return;
+    };
+    let _ = fs::write(path, text);
+}
+
+fn delete_session_meta() {
+    if let Some(path) = session_meta_path() {
+        let _ = fs::remove_file(path);
     }
 }
 
+fn write_session_file(session: &GitHubSyncSession) -> Result<(), String> {
+    let Some(path) = session_enc_path() else {
+        return Err("无法定位配置目录".into());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    }
+    let payload = serde_json::to_vec(session).map_err(|e| format!("会话序列化失败: {e}"))?;
+    let blob = encrypt_session(&payload)?;
+    let tmp = path.with_extension("enc.tmp");
+    fs::write(&tmp, &blob).map_err(|e| format!("写入会话文件失败: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    }
+    fs::rename(&tmp, &path).map_err(|e| format!("替换会话文件失败: {e}"))?;
+    Ok(())
+}
+
+fn read_session_file() -> Option<GitHubSyncSession> {
+    let path = session_enc_path()?;
+    let blob = fs::read(path).ok()?;
+    let plain = decrypt_session(&blob).ok()?;
+    serde_json::from_slice(&plain).ok()
+}
+
+/// 读取非敏感会话元数据。**不读 token、不碰钥匙串。**
+pub fn github_sync_session_meta() -> GitHubSyncSessionMeta {
+    if let Ok(cache) = session_cache().lock() {
+        if let Some(session) = cache.as_ref() {
+            return GitHubSyncSessionMeta {
+                login: session.login.clone(),
+                expires_at: session.expires_at,
+            };
+        }
+    }
+    session_meta_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// 仅根据 meta 判断会话是否仍有效，用于启动/开关同步时的静默检查。
 pub fn github_sync_session_is_valid() -> bool {
-    load_github_sync_session()
-        .map(|session| session.expires_at > chrono::Utc::now().timestamp())
-        .unwrap_or(false)
+    github_sync_session_meta().expires_at > chrono::Utc::now().timestamp()
+}
+
+pub fn save_github_sync_session(session: &GitHubSyncSession) -> Result<(), String> {
+    write_session_file(session)?;
+    if let Ok(mut cache) = session_cache().lock() {
+        *cache = Some(session.clone());
+    }
+    write_session_meta(session);
+    Ok(())
+}
+
+/// 读取完整会话（含 token）。从加密文件或内存缓存加载，**不访问钥匙串。**
+pub fn load_github_sync_session() -> Option<GitHubSyncSession> {
+    if let Ok(cache) = session_cache().lock() {
+        if let Some(session) = cache.as_ref() {
+            return Some(session.clone());
+        }
+    }
+    let session = read_session_file()?;
+    if let Ok(mut cache) = session_cache().lock() {
+        *cache = Some(session.clone());
+    }
+    write_session_meta(&session);
+    Some(session)
+}
+
+pub fn delete_github_sync_session() {
+    if let Some(path) = session_enc_path() {
+        let _ = fs::remove_file(path);
+    }
+    if let Ok(mut cache) = session_cache().lock() {
+        *cache = None;
+    }
+    delete_session_meta();
 }
 
 /// GitHub Device Flow 的一次待完成授权。客户端只展示验证码并轮询自建 API，

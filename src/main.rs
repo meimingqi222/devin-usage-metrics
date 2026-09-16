@@ -139,6 +139,10 @@ struct Root {
     quota_tick_task: Option<Task<()>>,
     quota_updated_at: String,
     quota_message: Option<String>,
+    /// 用户是否已显式同意读取 macOS Keychain（持久化）
+    quota_keychain_allowed: bool,
+    /// 本次会话内「暂不」隐藏提示
+    quota_keychain_dismissed: bool,
     // 多设备同步
     /// None = 汇总所有设备；Some(id) = 只看指定设备
     device_filter: Option<String>,
@@ -740,10 +744,11 @@ impl Root {
         let load_id = self.quota_load_id;
         self.quota_loading = true;
         self.quota_message = None;
+        let allow_keychain = self.quota_keychain_allowed;
         cx.notify();
 
         let load = cx.background_executor().spawn(async move {
-            let accounts = quota::discover_accounts();
+            let accounts = quota::discover_accounts(allow_keychain);
             accounts
                 .iter()
                 .map(|account| QuotaCard {
@@ -770,6 +775,27 @@ impl Root {
             })
             .ok();
         }));
+    }
+
+    /// 用户在 UI 中显式同意后，才允许发现/读取 Keychain 账号。
+    fn allow_quota_keychain(&mut self, cx: &mut Context<Self>) {
+        quota::set_keychain_allowed(true);
+        self.quota_keychain_allowed = true;
+        self.quota_keychain_dismissed = false;
+        self.start_quota_load(cx);
+    }
+
+    /// 本次会话内隐藏钥匙串提示，不写入持久化偏好。
+    fn dismiss_quota_keychain(&mut self, cx: &mut Context<Self>) {
+        self.quota_keychain_dismissed = true;
+        cx.notify();
+    }
+
+    fn show_quota_keychain_banner(&self) -> bool {
+        cfg!(target_os = "macos")
+            && !self.quota_keychain_allowed
+            && !self.quota_keychain_dismissed
+            && quota::macos_may_have_keychain_accounts()
     }
 
     /// 每 30 秒重绘一次，驱动重置倒计时；离开 Quota Tab 或清空后自动停止。
@@ -1221,16 +1247,24 @@ impl Root {
     }
 
     /// 同步设置弹窗：只保留 API 地址和 GitHub 登录。
+    /// 只读本地 meta / 加密会话文件，不访问系统钥匙串。
     fn sync_config_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let url_input = self.sync_config_input(self.modal_url_input.clone(), window, cx);
-        let session = sync::load_github_sync_session();
-        let logged_in = session
-            .as_ref()
-            .filter(|session| session.expires_at > chrono::Utc::now().timestamp());
+        let mut meta = sync::github_sync_session_meta();
+        if meta.expires_at <= chrono::Utc::now().timestamp() {
+            // 尝试从加密会话文件恢复 meta（不碰钥匙串）
+            if let Some(session) = sync::load_github_sync_session() {
+                meta = sync::GitHubSyncSessionMeta {
+                    login: session.login.clone(),
+                    expires_at: session.expires_at,
+                };
+            }
+        }
+        let logged_in = meta.expires_at > chrono::Utc::now().timestamp();
         let login_label = if self.github_login_busy {
             "等待 GitHub 授权…"
-        } else if let Some(session) = logged_in {
-            if session.login.is_empty() {
+        } else if logged_in {
+            if meta.login.is_empty() {
                 "已登录 GitHub"
             } else {
                 "重新登录 GitHub"
@@ -1249,8 +1283,12 @@ impl Root {
                     }
                 })
                 .unwrap_or_else(|| "正在准备浏览器登录…".into())
-        } else if let Some(session) = logged_in {
-            format!("已登录 GitHub：{}", session.login)
+        } else if logged_in {
+            if meta.login.is_empty() {
+                "已登录 GitHub".into()
+            } else {
+                format!("已登录 GitHub：{}", meta.login)
+            }
         } else {
             "未登录；同一 GitHub 账号的设备会自动同步".into()
         };
@@ -1327,7 +1365,7 @@ impl Root {
                     )
                 },
             )
-            .when(logged_in.is_some(), |d| {
+            .when(logged_in, |d| {
                 d.child(
                     div()
                         .id("modal-github-logout")
@@ -2382,6 +2420,10 @@ impl Root {
             body = body.child(div().text_xs().text_color(rgb(0xf87171)).child(msg.clone()));
         }
 
+        if self.show_quota_keychain_banner() {
+            body = body.child(self.quota_keychain_banner(cx));
+        }
+
         if self.quota_loading && self.quota_cards.is_empty() {
             return body.child(
                 div()
@@ -2415,6 +2457,62 @@ impl Root {
             .map(|card| self.quota_card(card, cx))
             .collect();
         body.child(div().flex().flex_wrap().gap_3().children(cards))
+    }
+
+    /// macOS：解释为何需要钥匙串，并提供显式同意入口。同意前不读 Keychain。
+    fn quota_keychain_banner(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .p_3()
+            .rounded_md()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(i18n::t(i18n::Key::QuotaKeychainNotice)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("quota-keychain-allow")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .bg(rgb(ACCENT))
+                            .text_color(rgb(0x0a0a0c))
+                            .cursor_pointer()
+                            .hover(|h| h.bg(rgb(0x6ad4ff)))
+                            .child(i18n::t(i18n::Key::QuotaKeychainAllow))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.allow_quota_keychain(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("quota-keychain-dismiss")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .cursor_pointer()
+                            .hover(|h| h.bg(rgb(PANEL2)))
+                            .child(i18n::t(i18n::Key::QuotaKeychainDismiss))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.dismiss_quota_keychain(cx);
+                            })),
+                    ),
+            )
     }
 
     fn quota_card(&self, card: &QuotaCard, cx: &mut Context<Self>) -> gpui::Div {
@@ -2898,6 +2996,8 @@ fn main() {
                         quota_tick_task: None,
                         quota_updated_at: String::new(),
                         quota_message: None,
+                        quota_keychain_allowed: quota::keychain_allowed(),
+                        quota_keychain_dismissed: false,
                         device_filter: Some(local_id),
                         remote_data: Arc::new(LoadedData::default()),
                         known_devices: Vec::new(),
@@ -2907,6 +3007,7 @@ fn main() {
                         sync_last_completed: None,
                         sync_message: None,
                         sync_retry_attempt: 0,
+                        // 只根据本地 meta 判断，不读钥匙串；真正同步时再取 token
                         sync_enabled: sync_cfg.enabled && sync::github_sync_session_is_valid(),
                         sync_api_url: sync_cfg.api_url,
                         github_login_busy: false,

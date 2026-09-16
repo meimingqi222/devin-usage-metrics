@@ -333,6 +333,9 @@ pub enum Key {
     QuotaResetsIn,
     QuotaExtra,
     QuotaError,
+    QuotaKeychainNotice,
+    QuotaKeychainAllow,
+    QuotaKeychainDismiss,
 
     CliUnpricedModels,
     CliPartialCostShort,
@@ -505,6 +508,9 @@ impl Key {
         Key::QuotaResetsIn,
         Key::QuotaExtra,
         Key::QuotaError,
+        Key::QuotaKeychainNotice,
+        Key::QuotaKeychainAllow,
+        Key::QuotaKeychainDismiss,
         Key::CliUnpricedModels,
         Key::CliPartialCostShort,
         Key::CliPartialCostDetail,
@@ -680,6 +686,11 @@ fn zh(key: Key) -> &'static str {
         Key::QuotaResetsIn => "{0} 后重置",
         Key::QuotaExtra => "附加：{0}",
         Key::QuotaError => "查询失败：{0}",
+        Key::QuotaKeychainNotice => {
+            "检测到本机可能有 Claude Code / Antigravity 登录信息存在「钥匙串」中。读取它们才能查询订阅配额；凭证仅在本机使用，不会上传。首次读取时系统可能会弹出授权框。"
+        }
+        Key::QuotaKeychainAllow => "允许读取钥匙串",
+        Key::QuotaKeychainDismiss => "暂不",
         Key::CliUnpricedModels => "警告：以下模型未找到定价，Cost 未包含它们：{0}",
         Key::CliPartialCostShort => "≥{0}",
         Key::CliPartialCostDetail => "{0}（仅 {1}/{2} 轮可定价，实际费用不低于此值）",
@@ -857,6 +868,11 @@ fn en(key: Key) -> &'static str {
         Key::QuotaResetsIn => "resets in {0}",
         Key::QuotaExtra => "Extra: {0}",
         Key::QuotaError => "Query failed: {0}",
+        Key::QuotaKeychainNotice => {
+            "Claude Code / Antigravity logins may be stored in the macOS Keychain. Reading them is required to query subscription quotas. Credentials stay on this machine. The system may show an authorization prompt on first access."
+        }
+        Key::QuotaKeychainAllow => "Allow Keychain access",
+        Key::QuotaKeychainDismiss => "Not now",
         Key::CliUnpricedModels => {
             "Warning: no pricing found for these models; Cost excludes them: {0}"
         }
