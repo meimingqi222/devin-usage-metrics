@@ -117,6 +117,22 @@ struct SessionRow {
     total: f64,
 }
 
+/// 会话级 token 合计（input + output + cache_read）。
+///
+/// 优先用 `sessions.metadata.response_dimensions` 里的累计值；但 Devin 常常不
+/// 写这个字段（本机 85 个会话里 22 个在窗口内有真实用量而 metadata 合计为 0），
+/// 直接取用会把这些会话显示成 0。此时回退到窗口内实际 turn 的合计。
+fn session_token_total(session: &data::SessionRec, turns: &[&data::TurnRec]) -> f64 {
+    let from_meta = session.input_tokens + session.output_tokens + session.cached_tokens;
+    if from_meta > 0.0 || turns.is_empty() {
+        return from_meta;
+    }
+    turns
+        .iter()
+        .map(|turn| turn.input_tokens + turn.output_tokens + turn.cache_read_tokens)
+        .sum()
+}
+
 struct Root {
     data: Arc<LoadedData>,
     loaded_agents: HashMap<AgentKind, Arc<LoadedData>>,
@@ -848,16 +864,16 @@ impl Root {
             .filter(|s| s.agent == self.agent)
             .filter(|s| device.as_deref().is_none_or(|d| s.device_id == d))
             .map(|s| {
-                let total = s.input_tokens + s.output_tokens + s.cached_tokens;
+                let session_turns: Vec<&data::TurnRec> = turns_by_session
+                    .get(s.key.as_str())
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .collect();
+                let total = session_token_total(s, &session_turns);
                 // 与每日汇总一致：当前加载窗口内按实际 turn 模型逐轮计价。
-                let cost_summary = agg::cost_summary_for_turns(
-                    turns_by_session
-                        .get(s.key.as_str())
-                        .into_iter()
-                        .flatten()
-                        .copied(),
-                    &s.display_model(),
-                );
+                let cost_summary =
+                    agg::cost_summary_for_turns(session_turns.iter().copied(), &s.display_model());
                 let cost_str = match cost_summary.cost {
                     Some(cost) if cost_summary.is_partial() => {
                         i18n::tf(i18n::Key::CliPartialCostShort, &[&pricing::fmt_cost(cost)])
@@ -2272,7 +2288,18 @@ impl Root {
             .collect();
         ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let ttft_med = ttfts.get(ttfts.len() / 2).copied().unwrap_or(0.0);
-        let total = s.input_tokens + s.output_tokens + s.cached_tokens;
+        // 会话详情与列表用同一套口径，避免同一会话在两个视图里显示不同用量。
+        let token_total = session_token_total(s, &turns);
+        let meta_total = s.input_tokens + s.output_tokens + s.cached_tokens;
+        let (t_in, t_out, t_cached) = if meta_total > 0.0 || turns.is_empty() {
+            (s.input_tokens, s.output_tokens, s.cached_tokens)
+        } else {
+            (
+                turns.iter().map(|t| t.input_tokens).sum(),
+                turns.iter().map(|t| t.output_tokens).sum(),
+                turns.iter().map(|t| t.cache_read_tokens).sum(),
+            )
+        };
         let cost_summary = agg::cost_summary_for_turns(turns.iter().copied(), &s.display_model());
         let adaptive = s.selected_model == "adaptive";
         let model_text = if adaptive {
@@ -2356,10 +2383,10 @@ impl Root {
                 i18n::tf(
                     i18n::Key::TokenBreakdown,
                     &[
-                        &fmt_tokens(s.input_tokens),
-                        &fmt_tokens(s.output_tokens),
-                        &fmt_tokens(s.cached_tokens),
-                        &fmt_tokens(total),
+                        &fmt_tokens(t_in),
+                        &fmt_tokens(t_out),
+                        &fmt_tokens(t_cached),
+                        &fmt_tokens(token_total),
                     ],
                 ),
             ))
@@ -3038,4 +3065,46 @@ fn main() {
 
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_token_total;
+    use devin_usage_metrics::data::{AgentKind, SessionRec, TurnRec};
+
+    fn turn(input: f64, output: f64, cached: f64) -> TurnRec {
+        TurnRec {
+            agent: AgentKind::Devin,
+            session_key: "cli/s1".into(),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cached,
+            ..Default::default()
+        }
+    }
+
+    /// 回归：Devin 常常不写 `sessions.metadata.response_dimensions`，此时会话级
+    /// 合计必须用窗口内 turn 的实际用量兜底，否则会话列表会把有真实用量的会话
+    /// 显示成 0（本机实测 39 个窗口内会话里 22 个是 0，合计 3.17 亿 token）。
+    #[test]
+    fn session_total_falls_back_to_turns_when_metadata_is_missing() {
+        let turns = vec![turn(10.0, 2.0, 3.0), turn(1.0, 1.0, 1.0)];
+        let refs: Vec<&TurnRec> = turns.iter().collect();
+
+        let empty_meta = SessionRec {
+            agent: AgentKind::Devin,
+            ..Default::default()
+        };
+        assert_eq!(session_token_total(&empty_meta, &refs), 18.0);
+
+        // metadata 有值时以它为准：它覆盖整个会话，不随加载窗口变化。
+        let with_meta = SessionRec {
+            input_tokens: 100.0,
+            ..empty_meta.clone()
+        };
+        assert_eq!(session_token_total(&with_meta, &refs), 100.0);
+
+        // 没有 turn 时保持 0，不编造用量。
+        assert_eq!(session_token_total(&empty_meta, &[]), 0.0);
+    }
 }

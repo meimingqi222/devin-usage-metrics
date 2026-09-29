@@ -13,7 +13,25 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::local_sources;
 
 const CACHE_TTL_SECS: i64 = 300; // 5 minutes cache TTL
-const CACHE_SCHEMA_VERSION: u32 = 9;
+/// 缓存结构版本。任何会影响 turn 集合/时间戳的解析改动都必须递增，否则旧的
+/// (且不带 dedup_key 的) 快照会被当作增量基线复用，修复无法生效。
+const CACHE_SCHEMA_VERSION: u32 = 10;
+
+/// `message_nodes.created_at` 是节点**落盘**时间，不是真实生成时间：Devin 在
+/// 会话恢复/压缩时会把同一条消息以新的 created_at 重写一遍。实测比真实生成时间
+/// 晚，中位数约 1.6 小时，最大 1.5 天。SQL 里按 created_at 做时间范围裁剪时，
+/// 上界必须向外放宽这么多，否则窗口末尾的真实 turn 会漏掉；精确过滤交给 Rust
+/// 侧的 `metadata.started_generation_at`。
+const ROW_TIME_SLACK_SECS: i64 = 7 * 86400;
+/// 下界方向的余量。落盘时间理论上不早于生成时间（实测最小差 -0.2s，属时钟抖动），
+/// 留 1 天已足够，同时避免增量查询把扫描范围撑得太大。
+const ROW_TIME_SLACK_LOWER_SECS: i64 = 86400;
+
+/// 单个数据源的会话上限。超出时按 `last_activity_at` 保留最近的若干个。
+/// 上限不能解除：turn 查询用 `session_id IN (...)` 绑定参数，SQLite 的变量上限是
+/// 32766，无上界时会话一多查询会直接报错。同时取值要足够大，并且真的截断时打
+/// 告警，避免用户看到一份没有提示的残缺统计。
+const MAX_SESSIONS_PER_SOURCE: usize = 20_000;
 
 fn cache_path() -> PathBuf {
     #[cfg(target_os = "windows")]
@@ -615,6 +633,13 @@ struct DevinMetadata {
     generation_model: Option<String>,
     #[serde(default)]
     request_id: Option<String>,
+    /// 该轮真实开始生成的时间（RFC3339 UTC）。所有兄弟节点副本共享同一个值，
+    /// 是唯一可靠的 turn 时间来源。
+    #[serde(default)]
+    started_generation_at: Option<String>,
+    /// 该轮生成完成的时间（RFC3339 UTC），作为 started_generation_at 的兜底。
+    #[serde(default)]
+    created_at: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -797,18 +822,29 @@ fn parse_metadata(meta_json: &str) -> (Option<String>, f64, f64, f64, f64) {
     (real_model, i, o, c, m)
 }
 
-fn load_sessions_from(conn: &Connection, source: &str, out: &mut Vec<SessionRec>) {
-    let sql = "SELECT id, ifnull(title,''), ifnull(working_directory,''), \
+/// 读取会话列表。
+///
+/// 返回窗口内**所有**会话的 (id, created_at, last_activity_at)，包括 `hidden`
+/// 的会话：hidden 只影响会话列表要不要显示它，不影响它真实花掉的 token。用量
+/// 统计按 turn 汇总，如果只查未隐藏会话，被隐藏会话的消费会静默消失。
+fn load_sessions_from(
+    conn: &Connection,
+    source: &str,
+    out: &mut Vec<SessionRec>,
+) -> Vec<(String, i64, i64)> {
+    let sql = format!(
+        "SELECT id, ifnull(title,''), ifnull(working_directory,''), \
                ifnull(model,''), ifnull(agent_mode,''), created_at, last_activity_at, \
-               ifnull(metadata,'') FROM sessions \
-               WHERE hidden = 0 OR hidden IS NULL \
-               ORDER BY last_activity_at DESC LIMIT 1500";
-    let mut stmt = match conn.prepare(sql) {
+               ifnull(metadata,''), ifnull(hidden,0) FROM sessions \
+               ORDER BY last_activity_at DESC LIMIT {}",
+        MAX_SESSIONS_PER_SOURCE + 1
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(e) => {
             out.reserve(0);
             eprintln!("prepare failed for {source}: {e}");
-            return;
+            return Vec::new();
         }
     };
     let rows = stmt.query_map([], |r| {
@@ -821,17 +857,29 @@ fn load_sessions_from(conn: &Connection, source: &str, out: &mut Vec<SessionRec>
             r.get::<_, i64>(5)?,
             r.get::<_, i64>(6)?,
             r.get::<_, String>(7)?,
+            r.get::<_, i64>(8)?,
         ))
     });
     let rows = match rows {
         Ok(r) => r,
         Err(e) => {
             eprintln!("query failed for {source}: {e}");
-            return;
+            return Vec::new();
         }
     };
+    let mut all = Vec::new();
+    let mut truncated = 0usize;
     for row in rows.flatten() {
-        let (id, title, wd, model, mode, created, last_act, meta) = row;
+        let (id, title, wd, model, mode, created, last_act, meta, hidden) = row;
+        if all.len() >= MAX_SESSIONS_PER_SOURCE {
+            // 多取一行的哨兵：能取到说明已经截断，报出来而不是默默丢掉。
+            truncated += 1;
+            continue;
+        }
+        all.push((id.clone(), created, last_act));
+        if hidden != 0 {
+            continue;
+        }
         let (real_model, ti, to, tc, msgs) = parse_metadata(&meta);
         out.push(SessionRec {
             agent: AgentKind::Devin,
@@ -856,6 +904,15 @@ fn load_sessions_from(conn: &Connection, source: &str, out: &mut Vec<SessionRec>
             ..Default::default()
         });
     }
+    if truncated > 0 {
+        log_event(format!(
+            "devin sessions truncated source={source} over_limit={truncated} kept={MAX_SESSIONS_PER_SOURCE}"
+        ));
+        eprintln!(
+            "WARN {source}: 会话数超过上限 {MAX_SESSIONS_PER_SOURCE}，已忽略更早的会话，统计会偏低"
+        );
+    }
+    all
 }
 
 /// Load per-turn metrics for sessions overlapping [start, end).
@@ -884,8 +941,12 @@ fn load_turns_from(
     // 的反序列化器提取需要的字段。
     // LIKE 在 SQLite 的 C 层完成大 JSON 正文扫描：没有真实 metrics 的节点不再
     // 物化成 Rust 字符串。用 "ttft_ms" 而不是 "metrics"——后者作为 key 在所有
-    // 节点上都存在（值为 null），没有筛选力；ttft_ms 只出现在有真实指标的节点，
-    // 实测命中率约 56%。正文恰好含该字样的误报交给 Rust 侧过滤，不影响正确性。
+    // 节点上都存在（值为 null），没有筛选力。实测 "ttft_ms" 是「该节点带有真实
+    // metrics 对象」的精确代理（匹配集与 metrics != null 完全重合）；正文恰好
+    // 含该字样的误报交给 Rust 侧过滤，不影响正确性。
+    //
+    // created_at 是**落盘**时间，可能比 metadata 里的真实生成时间晚若干天，所以
+    // 这里向两侧放宽 ROW_TIME_SLACK_SECS，精确过滤交给下面按 metadata 时间的判断。
     let sql = format!(
         "SELECT session_id, created_at, chat_message \
          FROM message_nodes \
@@ -895,6 +956,8 @@ fn load_turns_from(
         session_ids.len() + 1,
         session_ids.len() + 2
     );
+    let query_start = start.saturating_sub(ROW_TIME_SLACK_LOWER_SECS);
+    let query_end = end.saturating_add(ROW_TIME_SLACK_SECS);
 
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -909,8 +972,8 @@ fn load_turns_from(
     for sid in session_ids {
         params.push(sid);
     }
-    params.push(&start);
-    params.push(&end);
+    params.push(&query_start);
+    params.push(&query_end);
 
     let rows = stmt.query_map(params.as_slice(), |r| {
         Ok((
@@ -928,13 +991,14 @@ fn load_turns_from(
         }
     };
 
-    // Devin 会把同一次响应以多个 message_nodes 兄弟节点持久化；这些节点共享
-    // message_id/request_id。优先用稳定的 message_id 去重，避免依赖批量写入时间戳。
+    // Devin 会把同一次响应以多个 message_nodes 兄弟节点持久化（实测平均 2.5 份，
+    // 最多 9 份）；这些节点共享 message_id/request_id。用稳定的 message_id 去重，
+    // 并且**不依赖查询窗口**：每条记录带上 dedup_key，缓存快照里的旧 turn 也参与
+    // 同一个去重集合，避免「不同窗口各自留下一份副本」导致重复计数。
     let mut seen_message_ids = HashSet::new();
     for row in rows.flatten() {
-        let (session_id, created_at, chat_message) = row;
-        // SQL 已用 LIKE 预筛（见上），这里是第二道保险：跳过 ttft_ms 不在场的
-        // 节点；正文恰好含该字样的误报会被 metrics: None / ttft <= 0 正常过滤。
+        let (session_id, row_created_at, chat_message) = row;
+        // SQL 已用 LIKE 预筛（见上），这里是第二道保险。
         if !chat_message.contains("\"ttft_ms\"") {
             continue;
         }
@@ -944,23 +1008,37 @@ fn load_turns_from(
         let Some(metadata) = message.metadata.as_ref() else {
             continue;
         };
+        // metrics 存在就说明是一次真实 inference：`telemetry.operation` 全部是
+        // "inference"，token 字段齐全。曾经用 `ttft_ms > 0` 当「有真实指标」的
+        // 代理，结果把 37% 的真实调用（ttft_ms 为 null 的 tool_calls 轮次，
+        // 30 天窗口内约 39% 的 cache_read token）整段丢弃。ttft 只能当可选指标。
         let Some(metrics) = metadata.metrics.as_ref() else {
             continue;
         };
-        let ttft = metrics.ttft_ms.unwrap_or(0.0);
-        if ttft <= 0.0 {
-            continue;
-        }
+        let ttft = metrics.ttft_ms.unwrap_or(0.0).max(0.0);
         let source_id = message
             .message_id
             .as_deref()
             .filter(|id| !id.is_empty())
             .or_else(|| metadata.request_id.as_deref().filter(|id| !id.is_empty()));
-        if let Some(source_id) = source_id {
-            let scoped_id = format!("{session_id}\0{source_id}");
-            if !seen_message_ids.insert(scoped_id) {
+        // 真实生成时间：metadata 里的 RFC3339；缺失时回退到落盘时间。
+        let created_at = metadata
+            .started_generation_at
+            .as_deref()
+            .or(metadata.created_at.as_deref())
+            .and_then(parse_rfc3339_secs)
+            .filter(|at| *at > 0)
+            .unwrap_or(row_created_at);
+        // 同一逻辑 turn 的若干副本共享同一个 metadata 时间，所以先去重再按窗口
+        // 过滤，结果与窗口无关。
+        let dedup_key = source_id.map(|id| format!("{session_id}\0{id}"));
+        if let Some(key) = dedup_key.as_deref() {
+            if !seen_message_ids.insert(key.to_owned()) {
                 continue;
             }
+        }
+        if created_at < start || created_at >= end {
+            continue;
         }
         let model = metadata
             .generation_model
@@ -981,9 +1059,17 @@ fn load_turns_from(
             ttft_ms: ttft,
             total_time_ms: metrics.total_time_ms.unwrap_or(0.0),
             recorded_cost: None,
+            dedup_key: dedup_key.unwrap_or_default(),
             ..Default::default()
         });
     }
+}
+
+/// 解析 RFC3339 时间戳（Devin metadata 用 UTC 的 "...Z" 形式）为 Unix 秒。
+fn parse_rfc3339_secs(text: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|date| date.timestamp())
 }
 
 fn turn_key(turn: &TurnRec) -> String {
@@ -1002,9 +1088,25 @@ fn turn_key(turn: &TurnRec) -> String {
     )
 }
 
+/// turn 的唯一身份：有 dedup_key 的用 dedup_key（跨查询窗口稳定），否则退回
+/// 内容指纹。缓存快照和新解析结果必须用同一套身份判定，否则增量合并无法识别
+/// 同一条记录的两次副本。
+fn turn_identity(turn: &TurnRec) -> String {
+    if turn.dedup_key.is_empty() {
+        turn_key(turn)
+    } else {
+        format!(
+            "{}:{}:{}",
+            turn.agent.label(),
+            turn.session_key,
+            turn.dedup_key
+        )
+    }
+}
+
 fn dedup_cached_turns(turns: &mut Vec<TurnRec>) {
     let mut seen = HashSet::new();
-    turns.retain(|turn| seen.insert(turn_key(turn)));
+    turns.retain(|turn| seen.insert(turn_identity(turn)));
 }
 
 fn load_source(
@@ -1037,14 +1139,14 @@ fn load_source(
         }
     };
     let sessions_started = Instant::now();
-    load_sessions_from(&conn, &source, &mut data.sessions);
+    let all_sessions = load_sessions_from(&conn, &source, &mut data.sessions);
     let sessions_elapsed = sessions_started.elapsed();
-    // 全量范围用于判断会话是否与当前页重叠
-    let all_ids: Vec<String> = data
-        .sessions
+    // 全量范围用于判断会话是否与当前页重叠。这里用含 hidden 的完整列表，
+    // 否则被隐藏会话的 turn 会被一并排除出用量统计。
+    let all_ids: Vec<String> = all_sessions
         .iter()
-        .filter(|session| session.last_activity_at >= start && session.created_at < end)
-        .map(|session| session.id.clone())
+        .filter(|(_, created_at, last_activity_at)| *last_activity_at >= start && *created_at < end)
+        .map(|(id, _, _)| id.clone())
         .collect();
     let prefix = format!("{source}/");
     let mut cached_turns: Vec<TurnRec> = previous
@@ -1070,11 +1172,16 @@ fn load_source(
     // 增量查询时只传入可能在 [query_start, end) 窗口内有新 turn 的会话。
     // 一个会话的最后活动时间 < query_start 时，不可能在该窗口内有新消息，
     // 排除后可将 IN 列表从 ~195 缩小到几个，大幅减少 SQLite 扫描量。
+    // last_activity_at 也是落盘时间，和行的 created_at 一样可能落后于真实生成
+    // 时间，因此同样向外放宽，宁可多查几个会话不能漏。
     let ids: Vec<String> = if query_start > start {
-        data.sessions
+        let floor = query_start.saturating_sub(ROW_TIME_SLACK_LOWER_SECS);
+        all_sessions
             .iter()
-            .filter(|session| session.last_activity_at >= query_start && session.created_at < end)
-            .map(|session| session.id.clone())
+            .filter(|(_, created_at, last_activity_at)| {
+                *last_activity_at >= floor && *created_at < end
+            })
+            .map(|(id, _, _)| id.clone())
             .collect()
     } else {
         all_ids.clone()
@@ -1083,12 +1190,13 @@ fn load_source(
     load_turns_from(&conn, &source, &ids, query_start, end, &mut data.turns);
     let queried_turns = data.turns.len();
     if !cached_turns.is_empty() {
-        let seen: HashSet<String> = cached_turns.iter().map(turn_key).collect();
+        let seen: HashSet<String> = cached_turns.iter().map(turn_identity).collect();
         let mut merged = cached_turns;
         for turn in data.turns.drain(..) {
-            // 查询窗口包含最新缓存时间点；这里只排除与缓存重叠的记录。查询结果
-            // 已按 message_id 去重，不能再把两个指标恰好相同的真实请求合并掉。
-            if !seen.contains(&turn_key(&turn)) {
+            // 查询窗口包含最新缓存时间点；这里只排除与缓存重叠的记录。
+            // 用 turn_identity（dedup_key 优先）而不是内容指纹：同一条逻辑 turn
+            // 在不同窗口下的落盘时间不同，内容指纹认不出来，会被重复计入。
+            if !seen.contains(&turn_identity(&turn)) {
                 merged.push(turn);
             }
         }
@@ -1345,7 +1453,9 @@ pub fn reload_all(start: i64, end: i64) -> LoadedData {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_covers, dedup_cached_turns, load_turns_from, AgentKind, TurnRec};
+    use super::{
+        cache_covers, dedup_cached_turns, load_sessions_from, load_turns_from, AgentKind, TurnRec,
+    };
     use rusqlite::{params, Connection};
 
     #[test]
@@ -1484,5 +1594,217 @@ mod tests {
         dedup_cached_turns(&mut turns);
 
         assert_eq!(turns.len(), 2);
+    }
+
+    /// 回归：`hidden = 1` 只应影响会话列表，不应影响用量统计。被隐藏的会话同样
+    /// 真实花掉了 token，若把它的 id 从 turn 查询里一并排除，这部分消费会静默
+    /// 消失（本机实测：1 个隐藏会话 / 3 input + 425 output + 61,686 cache_write）。
+    #[test]
+    fn devin_hidden_sessions_still_contribute_their_turns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT, title TEXT, working_directory TEXT, model TEXT, \
+             agent_mode TEXT, created_at INTEGER, last_activity_at INTEGER, metadata TEXT, \
+             hidden INTEGER)",
+            [],
+        )
+        .unwrap();
+        for (id, hidden) in [("visible", 0_i64), ("hidden-one", 1_i64)] {
+            conn.execute(
+                "INSERT INTO sessions VALUES (?1, '', '', '', '', 100, 200, '', ?2)",
+                params![id, hidden],
+            )
+            .unwrap();
+        }
+
+        let mut sessions = Vec::new();
+        let all = load_sessions_from(&conn, "cli", &mut sessions);
+
+        assert_eq!(sessions.len(), 1, "隐藏会话不进会话列表");
+        assert_eq!(sessions[0].id, "visible");
+        assert_eq!(all.len(), 2, "但它的 id 必须留给 turn 查询用");
+        assert!(all.iter().any(|(id, _, _)| id == "hidden-one"));
+    }
+
+    /// 回归：`ttft_ms` 为 null 的节点也是真实 inference（`telemetry.operation`
+    /// 全是 "inference"，token 字段齐全）。以前用 `ttft_ms > 0` 当“有真实指标”的
+    /// 代理，30 天窗口内会丢掉 36% 的轮次和 39% 的 cache_read token。
+    #[test]
+    fn devin_turns_without_ttft_are_still_counted() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE message_nodes (session_id TEXT, created_at INTEGER, chat_message TEXT)",
+            [],
+        )
+        .unwrap();
+        // tool_calls 类型的响应常写成 ttft_ms: null
+        let no_ttft = serde_json::json!({
+            "message_id": "tool-turn",
+            "metadata": {
+                "generation_model": "glm-5-2",
+                "finish_reason": "tool_calls",
+                "metrics": {
+                    "ttft_ms": null,
+                    "input_tokens": 668,
+                    "output_tokens": 347,
+                    "cache_read_tokens": 25684,
+                    "cache_creation_tokens": null,
+                    "total_time_ms": 3054
+                }
+            }
+        })
+        .to_string();
+        let with_ttft = serde_json::json!({
+            "message_id": "streamed-turn",
+            "metadata": {
+                "generation_model": "glm-5-2",
+                "metrics": {
+                    "ttft_ms": 2142,
+                    "input_tokens": 331,
+                    "output_tokens": 1164,
+                    "cache_read_tokens": 54337,
+                    "cache_creation_tokens": null,
+                    "total_time_ms": 24885
+                }
+            }
+        })
+        .to_string();
+        for node in [&no_ttft, &with_ttft] {
+            conn.execute(
+                "INSERT INTO message_nodes VALUES (?1, ?2, ?3)",
+                params!["session-1", 100_i64, node],
+            )
+            .unwrap();
+        }
+
+        let mut turns = Vec::new();
+        load_turns_from(&conn, "cli", &["session-1".to_string()], 0, 200, &mut turns);
+
+        assert_eq!(turns.len(), 2, "ttft_ms 为 null 的真实轮次不能被丢掉");
+        let tool_turn = turns
+            .iter()
+            .find(|turn| turn.input_tokens == 668.0)
+            .expect("缺 ttft 的轮次必须在结果里");
+        assert_eq!(tool_turn.ttft_ms, 0.0, "缺 ttft 时按 0 处理，不影响计费");
+        assert_eq!(tool_turn.cache_read_tokens, 25_684.0);
+    }
+
+    /// 回归：`message_nodes.created_at` 是节点回写时间（实测中位数滞后 1.6h，
+    /// 最大 1.5 天），真实生成时间在 `metadata.started_generation_at`。按行时间
+    /// 分天会让 21% 的轮次落到错误的日期，而且落点随查询窗口变化。
+    #[test]
+    fn devin_turn_time_comes_from_metadata_not_row_write_time() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE message_nodes (session_id TEXT, created_at INTEGER, chat_message TEXT)",
+            [],
+        )
+        .unwrap();
+        let node = |message_id: &str, started: &str| {
+            serde_json::json!({
+                "message_id": message_id,
+                "metadata": {
+                    "generation_model": "glm-5-2",
+                    "started_generation_at": started,
+                    "created_at": started,
+                    "metrics": {
+                        "ttft_ms": 100,
+                        "input_tokens": 10,
+                        "output_tokens": 1,
+                        "total_time_ms": 1000
+                    }
+                }
+            })
+            .to_string()
+        };
+        // 行回写时间远超窗口上界（200），但真实生成时间是 100（=1970-01-01T00:01:40Z），
+        // 必须算在窗口内。行时间在 slack（7 天）内，SQL 才会把它带出来。
+        conn.execute(
+            "INSERT INTO message_nodes VALUES (?1, ?2, ?3)",
+            params![
+                "session-1",
+                200_000_i64,
+                node("late-write", "1970-01-01T00:01:40Z")
+            ],
+        )
+        .unwrap();
+        // 行时间落在窗口内，但真实生成时间是 300（窗口外）——不能被算进来。
+        conn.execute(
+            "INSERT INTO message_nodes VALUES (?1, ?2, ?3)",
+            params![
+                "session-1",
+                150_i64,
+                node("early-write", "1970-01-01T00:05:00Z")
+            ],
+        )
+        .unwrap();
+
+        let mut turns = Vec::new();
+        load_turns_from(&conn, "cli", &["session-1".to_string()], 0, 200, &mut turns);
+
+        assert_eq!(turns.len(), 1, "必须按 metadata 时间而不是行时间过滤窗口");
+        assert_eq!(turns[0].created_at, 100);
+    }
+
+    /// 回归：同一条逻辑 turn 的多个副本会带上不同的行回写时间。去重必须按
+    /// dedup_key（且缓存快照也参与同一个集合），否则不同查询窗口会各自留下一
+    /// 份副本，总量随刷新次数缓慢膨胀。
+    #[test]
+    fn devin_duplicate_copies_collapse_across_write_times_and_agents() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE message_nodes (session_id TEXT, created_at INTEGER, chat_message TEXT)",
+            [],
+        )
+        .unwrap();
+        let node = serde_json::json!({
+            "message_id": "same-response",
+            "metadata": {
+                "generation_model": "glm-5-2",
+                "started_generation_at": "1970-01-01T00:01:40Z",
+                "metrics": {
+                    "ttft_ms": 2142,
+                    "input_tokens": 331,
+                    "output_tokens": 1164,
+                    "cache_read_tokens": 54337,
+                    "total_time_ms": 24885
+                }
+            }
+        })
+        .to_string();
+        for row_time in [1_000_i64, 100_000, 200_000] {
+            conn.execute(
+                "INSERT INTO message_nodes VALUES (?1, ?2, ?3)",
+                params!["session-1", row_time, node],
+            )
+            .unwrap();
+        }
+
+        let mut turns = Vec::new();
+        load_turns_from(&conn, "cli", &["session-1".to_string()], 0, 300, &mut turns);
+        assert_eq!(turns.len(), 1, "三份副本只能算一轮");
+        assert_eq!(turns[0].created_at, 100);
+        assert_eq!(turns[0].dedup_key, "session-1\0same-response");
+
+        // 缓存快照里已经存在同一 dedup_key、但 created_at 不同的旧 turn 时，
+        // dedup_cached_turns 也必须能把它收敛成一条。
+        let mut old = turns[0].clone();
+        old.created_at = 99;
+        let mut cache = vec![turns[0].clone(), old];
+        dedup_cached_turns(&mut cache);
+        assert_eq!(cache.len(), 1);
+
+        // 同一 dedup_key 语义对 Codex 的 (session#signature) 同样成立。
+        let codex = |created_at: i64| TurnRec {
+            agent: AgentKind::Codex,
+            session_key: "codex/s1".into(),
+            created_at,
+            input_tokens: 5.0,
+            dedup_key: "s1#5:0:0:1".into(),
+            ..Default::default()
+        };
+        let mut codex_turns = vec![codex(100), codex(200)];
+        dedup_cached_turns(&mut codex_turns);
+        assert_eq!(codex_turns.len(), 1);
     }
 }

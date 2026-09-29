@@ -14,7 +14,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-const MAX_SESSION_FILES: usize = 1500;
+/// 单次扫描的文件上限。超过这个数量时只按 mtime 保留最近的若干个。
+/// 注意：截断会导致更早的会话静默丢失，因此取值留出很大余量，并在真的截断时
+/// 写日志 + 打警告，避免用户看到一份没有提示的残缺统计。
+const MAX_SESSION_FILES: usize = 20_000;
 
 /// Claude Code 会话 key 的前缀。构造和拆解必须用同一个常量：拆解侧一旦和
 /// 构造侧对不上，会话汇总会静默归零而不是报错。
@@ -171,7 +174,16 @@ fn recent_files(roots: &[PathBuf], extension: &str) -> Vec<PathBuf> {
                 .unwrap_or(UNIX_EPOCH),
         )
     });
-    files.truncate(MAX_SESSION_FILES);
+    if files.len() > MAX_SESSION_FILES {
+        let dropped = files.len() - MAX_SESSION_FILES;
+        files.truncate(MAX_SESSION_FILES);
+        crate::data::log_event(format!(
+            "recent_files truncated total_over_limit dropped={dropped} kept={MAX_SESSION_FILES} roots={roots:?}"
+        ));
+        eprintln!(
+            "WARN 会话文件数超过上限 {MAX_SESSION_FILES}，已忽略最早的 {dropped} 个文件，统计会偏低"
+        );
+    }
     files
 }
 
@@ -1441,6 +1453,11 @@ pub(crate) fn load_codex(start: i64, end: i64, previous: Option<&LoadedData>) ->
     // then accumulate tokens and turns. This mirrors the sequential behavior.
     let mut seen_usage: HashMap<String, HashSet<String>> = HashMap::new();
     for event in events {
+        // 去重指纹进 TurnRec：Codex 会把同一个 token_count 事件连写两遍
+        // （实测 61,992 → 36,525），而增量 reload 时“未变化文件走缓存、变化文件
+        // 重新解析”的组合会越过 seen_usage，必须让缓存快照里的旧 turn 也能参与
+        // 同一个去重集合。
+        let dedup_key = format!("{}#{}", event.session_id, event.signature);
         if !seen_usage
             .entry(event.session_id.clone())
             .or_default()
@@ -1469,6 +1486,7 @@ pub(crate) fn load_codex(start: i64, end: i64, previous: Option<&LoadedData>) ->
                 ttft_ms: 0.0,
                 total_time_ms: 0.0,
                 recorded_cost: None,
+                dedup_key,
                 ..Default::default()
             });
         }
@@ -2665,20 +2683,26 @@ pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
                 };
                 let model = opencode_model_name(provider.unwrap_or(""), model_id.unwrap_or(""));
                 let tokens = v.get("tokens");
+                // 四个字段统一 clamp 到非负：OpenCode 偶尔会写出负的修正值
+                // （实测 1 行 input=-84240、17 行 output 为负），负 token 在
+                // 面板里没有意义，且不能只 clamp input 而放过 output/cache。
                 let out = tokens
                     .and_then(|t| t.get("output"))
                     .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
+                    .unwrap_or(0.0)
+                    .max(0.0);
                 let cache_rd = tokens
                     .and_then(|t| t.get("cache"))
                     .and_then(|c| c.get("read"))
                     .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
+                    .unwrap_or(0.0)
+                    .max(0.0);
                 let cache_wr = tokens
                     .and_then(|t| t.get("cache"))
                     .and_then(|c| c.get("write"))
                     .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
+                    .unwrap_or(0.0)
+                    .max(0.0);
                 // input 为新增输入（不含 cache read），与 Anthropic 风格一致
                 let inp = tokens
                     .and_then(|t| t.get("input"))
