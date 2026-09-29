@@ -3088,7 +3088,7 @@ mod tests {
     /// 显示成 0（本机实测 39 个窗口内会话里 22 个是 0，合计 3.17 亿 token）。
     #[test]
     fn session_total_falls_back_to_turns_when_metadata_is_missing() {
-        let turns = vec![turn(10.0, 2.0, 3.0), turn(1.0, 1.0, 1.0)];
+        let turns = [turn(10.0, 2.0, 3.0), turn(1.0, 1.0, 1.0)];
         let refs: Vec<&TurnRec> = turns.iter().collect();
 
         let empty_meta = SessionRec {

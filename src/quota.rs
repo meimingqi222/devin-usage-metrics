@@ -1502,7 +1502,8 @@ fn parse_simple_toml(text: &str, key: &str) -> Option<String> {
 /// Devin CLI 在所有平台上都用 XDG 路径：
 /// - credentials.toml → `~/.local/share/devin/credentials.toml`
 /// - config.json → `~/.config/devin/config.json`
-/// 而不是 `dirs::config_dir()`（macOS 上是 `~/Library/Application Support/`）。
+///
+/// 两者都不走 `dirs::config_dir()`（macOS 上是 `~/Library/Application Support/`）。
 fn read_devin_cli_credentials() -> Option<(String, String)> {
     let home = dirs::home_dir()?;
 
@@ -1805,26 +1806,24 @@ fn antigravity_oauth_client() -> Option<(String, String)> {
     // 从 language_server 二进制中 strings 提取
     #[cfg(target_os = "macos")]
     {
-        let candidates = ["/Applications/Antigravity.app/Contents/Resources/bin/language_server"];
-        for path in &candidates {
-            let output = std::process::Command::new("strings")
-                .arg(path)
-                .output()
-                .ok()?;
-            let text = String::from_utf8_lossy(&output.stdout);
-            // client_id 格式: <digits>-<alphanum>.apps.googleusercontent.com
-            let client_id = text
-                .lines()
-                .find(|l| l.ends_with(".apps.googleusercontent.com") && l.len() > 30)?
-                .to_string();
-            // client_secret 格式: GOCSPX-<alphanum>
-            let client_secret = text
-                .lines()
-                .find(|l| l.starts_with("GOCSPX-") && l.len() > 15)?
-                .to_string();
-            return Some((client_id, client_secret));
-        }
-        None
+        let path =
+            Path::new("/Applications/Antigravity.app/Contents/Resources/bin/language_server");
+        let output = std::process::Command::new("strings")
+            .arg(path)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        // client_id 格式: <digits>-<alphanum>.apps.googleusercontent.com
+        let client_id = text
+            .lines()
+            .find(|l| l.ends_with(".apps.googleusercontent.com") && l.len() > 30)?
+            .to_string();
+        // client_secret 格式: GOCSPX-<alphanum>
+        let client_secret = text
+            .lines()
+            .find(|l| l.starts_with("GOCSPX-") && l.len() > 15)?
+            .to_string();
+        Some((client_id, client_secret))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -2032,7 +2031,7 @@ pub fn parse_antigravity_quota(response: &Value) -> QuotaResult {
                         .get("remainingFraction")
                         .and_then(Value::as_f64)
                         .unwrap_or(1.0);
-                    let used_percent = ((1.0 - remaining) * 100.0).max(0.0).min(999.0);
+                    let used_percent = ((1.0 - remaining) * 100.0).clamp(0.0, 999.0);
                     let resets_at = bucket
                         .get("resetTime")
                         .and_then(Value::as_str)
@@ -2288,6 +2287,7 @@ devin_webapp_host = "app.devin.ai"
     }
 
     #[test]
+    #[allow(clippy::vec_init_then_push)] // 逐字节构造 protobuf，保留每一段的注释
     fn pb_find_varint_and_submessage() {
         // 手工构造一个 protobuf 消息:
         // F1 (varint) = 42

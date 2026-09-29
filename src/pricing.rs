@@ -161,6 +161,8 @@ impl PricingTable {
                         .map(|label| (label.to_ascii_lowercase(), p.clone()))
                 })
                 .collect();
+            // test 构建下覆盖被 `cfg` 掉，`mut` 不会用到。
+            #[cfg_attr(test, allow(unused_mut))]
             let mut models_dev = parse_pricing_json(MODELS_DEV_PRICING_JSON);
             // 自动更新的价格缓存覆盖内嵌快照：新模型（如 gemini-3.8-flash）
             // 无需发版就能计价；无缓存或禁用更新时退回内嵌快照。
@@ -938,10 +940,10 @@ mod tests {
         let p = m.get("gemini-3.8-flash").expect("应提取到 3.8-flash");
         assert_eq!((p.i, p.o, p.cr, p.cw), (0.75, 3.75, 0.075, 0.08333));
         // provider/ 前缀形态保留原键，裸 id 别名不覆盖已有条目
-        assert!(m.get("google/gemini-3.8-flash").is_some());
+        assert!(m.contains_key("google/gemini-3.8-flash"));
         // 全零占位与无 cost 条目应被跳过
-        assert!(m.get("free-model").is_none());
-        assert!(m.get("mystery").is_none());
+        assert!(!m.contains_key("free-model"));
+        assert!(!m.contains_key("mystery"));
     }
 
     #[test]
