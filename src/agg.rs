@@ -24,7 +24,12 @@ impl PeriodKind {
 pub struct ModelUsage {
     pub input: f64,
     pub output: f64,
+    /// 缓存**读取**（cache_read）token 数
     pub cached: f64,
+    /// 缓存**写入**（cache_creation）token 数。与 cached 分开统计：两者费率
+    /// 差一个量级（如 claude-opus-5-5-medium 读 $0.2/M、写 $5/M），合并展示
+    /// 会掩盖真正的费用来源。
+    pub cache_write: f64,
     pub turns: u32,
     pub cost: f64,
     /// 该模型是否有已知定价（false 表示费用为估算或缺失）
@@ -32,8 +37,11 @@ pub struct ModelUsage {
 }
 
 impl ModelUsage {
+    /// 与定价口径一致：输入 + 输出 + 缓存读取 + 缓存写入。
+    /// 费用按这四类 token 计算，token 合计也必须包含它们，否则同一行的
+    /// token 数与费用无法互相印证。
     pub fn total(&self) -> f64 {
-        self.input + self.output + self.cached
+        self.input + self.output + self.cached + self.cache_write
     }
 }
 
@@ -45,7 +53,10 @@ pub struct Bucket {
     pub end: i64,
     pub input: f64,
     pub output: f64,
+    /// 缓存**读取**（cache_read）token 数
     pub cached: f64,
+    /// 缓存**写入**（cache_creation）token 数
+    pub cache_write: f64,
     pub turns: u32,
     pub cost: f64,
     pub session_keys: BTreeSet<String>,
@@ -53,8 +64,9 @@ pub struct Bucket {
 }
 
 impl Bucket {
+    /// 与 `ModelUsage::total` 同口径：四类 token 之和。
     pub fn total(&self) -> f64 {
-        self.input + self.output + self.cached
+        self.input + self.output + self.cached + self.cache_write
     }
 }
 
@@ -378,6 +390,7 @@ fn build_buckets_inner(
         b.input += turn.input_tokens;
         b.output += turn.output_tokens;
         b.cached += turn.cache_read_tokens;
+        b.cache_write += turn.cache_creation_tokens;
         b.turns += 1;
         b.session_keys.insert(turn.session_key.clone());
         // 优先使用 turn 自己的模型（Devin 的 generation_model），否则回退到会话 display_model
@@ -411,6 +424,7 @@ fn build_buckets_inner(
                 mu.input += turn.input_tokens;
                 mu.output += turn.output_tokens;
                 mu.cached += turn.cache_read_tokens;
+                mu.cache_write += turn.cache_creation_tokens;
                 mu.turns += 1;
                 if let Some(c) = turn_cost {
                     mu.cost += c;
@@ -424,6 +438,7 @@ fn build_buckets_inner(
                         input: turn.input_tokens,
                         output: turn.output_tokens,
                         cached: turn.cache_read_tokens,
+                        cache_write: turn.cache_creation_tokens,
                         turns: 1,
                         cost: turn_cost.unwrap_or(0.0),
                         priced: turn_cost.is_some(),
@@ -504,6 +519,40 @@ mod tests {
         assert!(mu.priced);
         let expected = 1000.0 / 1e6 * 1.4 + 100.0 / 1e6 * 4.4;
         assert!((mu.cost - expected).abs() < 1e-9);
+    }
+
+    /// 回归：cache_creation（缓存写入）过去既没进 `by_model` 也没进 bucket 合计，
+    /// 于是「输入 + 输出 + 缓存读取」被当成总计，而费用却是按含写入的公式算的
+    /// （Devin/Claude 的 `cw` 费率可高达读价的 25 倍），同一行的 token 与费用无
+    /// 法对账。本机 09-28 实测：面板 75,747,336 vs 真实 77,320,721。
+    #[test]
+    fn cache_write_tokens_are_part_of_bucket_and_model_totals() {
+        let start = window_start(PeriodKind::Day, 0) + 3600;
+        let data = LoadedData {
+            turns: vec![crate::data::TurnRec {
+                agent: AgentKind::Devin,
+                session_key: "cli/s1".into(),
+                created_at: start,
+                input_tokens: 3.0,
+                output_tokens: 425.0,
+                cache_read_tokens: 0.0,
+                cache_creation_tokens: 61_686.0,
+                model: "summarizer".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let buckets = build_buckets_for(&data, PeriodKind::Day, AgentKind::Devin, 0);
+        let bucket = buckets
+            .iter()
+            .find(|b| b.start <= start && start < b.end)
+            .expect("窗口内必须落到某个 bucket");
+        assert_eq!(bucket.cache_write, 61_686.0);
+        assert_eq!(bucket.total(), 62_114.0);
+        // 模型分布与 bucket 合计必须同口径，否则两处数字无法对账
+        assert_eq!(bucket.by_model["summarizer"].cache_write, 61_686.0);
+        assert_eq!(bucket.by_model["summarizer"].total(), bucket.total());
     }
 
     #[test]

@@ -38,6 +38,8 @@ const ACCENT: u32 = 0x4cc2ff;
 const C_IN: u32 = 0x4cc2ff;
 const C_OUT: u32 = 0x3ddc97;
 const C_CACHED: u32 = 0x8b7cf6;
+/// 缓存写入：与缓存读取同色系但更浅，让堆叠图里两者可区分
+const C_CACHE_WRITE: u32 = 0xc4b5fd;
 const C_COST: u32 = 0xfbbf24;
 /// 同步采集涵盖 CLI、SQLite 与大量 JSONL 文件。限制外层并行度以重叠 I/O，
 /// 同时让各数据源内部的 Rayon 任务共享同一个池，避免过度抢占磁盘和 CPU。
@@ -117,19 +119,30 @@ struct SessionRow {
     total: f64,
 }
 
-/// 会话级 token 合计（input + output + cache_read）。
+/// 会话级 token 合计（input + output + cache_read + cache_creation）。
+///
+/// 口径与定价一致：这四类 token 正是计费公式的输入，漏掉缓存写入会让会话列表
+/// 与每日汇总、CLI 三处对不上。
 ///
 /// 优先用 `sessions.metadata.response_dimensions` 里的累计值；但 Devin 常常不
 /// 写这个字段（本机 85 个会话里 22 个在窗口内有真实用量而 metadata 合计为 0），
 /// 直接取用会把这些会话显示成 0。此时回退到窗口内实际 turn 的合计。
 fn session_token_total(session: &data::SessionRec, turns: &[&data::TurnRec]) -> f64 {
-    let from_meta = session.input_tokens + session.output_tokens + session.cached_tokens;
+    let from_meta = session.input_tokens
+        + session.output_tokens
+        + session.cached_tokens
+        + session.cache_creation_tokens;
     if from_meta > 0.0 || turns.is_empty() {
         return from_meta;
     }
     turns
         .iter()
-        .map(|turn| turn.input_tokens + turn.output_tokens + turn.cache_read_tokens)
+        .map(|turn| {
+            turn.input_tokens
+                + turn.output_tokens
+                + turn.cache_read_tokens
+                + turn.cache_creation_tokens
+        })
         .sum()
 }
 
@@ -1815,7 +1828,7 @@ impl Root {
     fn stat_card(label: &'static str, value: String, color: u32) -> impl IntoElement {
         div()
             .flex_1()
-            .min_w(px(140.))
+            .min_w(px(120.))
             .flex()
             .flex_col()
             .gap_1()
@@ -1841,20 +1854,24 @@ impl Root {
 
     fn usage_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let buckets = &self.buckets;
-        let (mut ti, mut to, mut tc, mut turns, mut cost) = (0.0, 0.0, 0.0, 0u32, 0.0);
+        // 四类 token 全部计入总计：与定价公式、CLI 表格保持一致（见 agg::Bucket::total）
+        let (mut ti, mut to, mut tc, mut tw, mut turns, mut cost) = (0.0, 0.0, 0.0, 0.0, 0u32, 0.0);
         let mut sessions = std::collections::BTreeSet::new();
         for b in buckets {
             ti += b.input;
             to += b.output;
             tc += b.cached;
+            tw += b.cache_write;
             turns += b.turns;
             cost += b.cost;
             sessions.extend(b.session_keys.iter().cloned());
         }
-        let total = ti + to + tc;
+        let total = ti + to + tc + tw;
 
+        // 7 张卡在默认窗口下刚好一行；窗口变窄时换行而不是被裁掉。
         let cards = div()
             .flex()
+            .flex_wrap()
             .w_full()
             .min_w(px(0.))
             .gap_2()
@@ -1872,6 +1889,11 @@ impl Root {
                 i18n::t(i18n::Key::StatOutput),
                 fmt_tokens(to),
                 C_OUT,
+            ))
+            .child(Self::stat_card(
+                i18n::t(i18n::Key::StatCacheWrite),
+                fmt_tokens(tw),
+                C_CACHE_WRITE,
             ))
             .child(Self::stat_card(
                 i18n::t(i18n::Key::StatCached),
@@ -1966,6 +1988,7 @@ impl Root {
             let h_in = scale(b.input);
             let h_out = scale(b.output);
             let h_ca = scale(b.cached);
+            let h_cw = scale(b.cache_write);
             let label_color = if total <= 0.0 { MUTED } else { TEXT };
             cols.push(
                 div()
@@ -1996,6 +2019,7 @@ impl Root {
                             .flex()
                             .flex_col()
                             .justify_end()
+                            .child(div().w_full().h(h_cw).bg(rgba(C_CACHE_WRITE, 0.9)))
                             .child(div().w_full().h(h_ca).bg(rgba(C_CACHED, 0.9)))
                             .child(div().w_full().h(h_in).bg(rgba(C_IN, 0.9)))
                             .child(div().w_full().h(h_out).bg(rgba(C_OUT, 0.9))),
@@ -2035,6 +2059,7 @@ impl Root {
                             .text_color(rgb(TEXT))
                             .child(i18n::t(i18n::Key::ChartTitle)),
                     )
+                    .child(legend(i18n::t(i18n::Key::LegendCacheWrite), C_CACHE_WRITE))
                     .child(legend(i18n::t(i18n::Key::LegendCached), C_CACHED))
                     .child(legend(i18n::t(i18n::Key::LegendIn), C_IN))
                     .child(legend(i18n::t(i18n::Key::LegendOut), C_OUT)),
@@ -2067,6 +2092,7 @@ impl Root {
             .child(cell_r(i18n::t(i18n::Key::ThTurns), 52.))
             .child(cell_r(i18n::t(i18n::Key::ThInput), 70.))
             .child(cell_r(i18n::t(i18n::Key::ThOutput), 70.))
+            .child(cell_r(i18n::t(i18n::Key::ThCacheWrite), 76.))
             .child(cell_r(i18n::t(i18n::Key::ThCache), 76.))
             .child(cell_r(i18n::t(i18n::Key::ThTotal), 76.))
             .child(cell_r(i18n::t(i18n::Key::ThCost), 70.))
@@ -2128,6 +2154,7 @@ impl Root {
                     .child(cell_r(&format!("{}", b.turns), 52.))
                     .child(cell_r(&fmt_tokens(b.input), 70.))
                     .child(cell_r(&fmt_tokens(b.output), 70.))
+                    .child(cell_r(&fmt_tokens(b.cache_write), 76.))
                     .child(cell_r(&fmt_tokens(b.cached), 76.))
                     .child(cell_r(&fmt_tokens(b.total()), 76.))
                     .child(cell_r(&pricing::fmt_cost(b.cost), 70.))
@@ -2290,14 +2317,21 @@ impl Root {
         let ttft_med = ttfts.get(ttfts.len() / 2).copied().unwrap_or(0.0);
         // 会话详情与列表用同一套口径，避免同一会话在两个视图里显示不同用量。
         let token_total = session_token_total(s, &turns);
-        let meta_total = s.input_tokens + s.output_tokens + s.cached_tokens;
-        let (t_in, t_out, t_cached) = if meta_total > 0.0 || turns.is_empty() {
-            (s.input_tokens, s.output_tokens, s.cached_tokens)
+        let meta_total =
+            s.input_tokens + s.output_tokens + s.cached_tokens + s.cache_creation_tokens;
+        let (t_in, t_out, t_cached, t_cache_write) = if meta_total > 0.0 || turns.is_empty() {
+            (
+                s.input_tokens,
+                s.output_tokens,
+                s.cached_tokens,
+                s.cache_creation_tokens,
+            )
         } else {
             (
                 turns.iter().map(|t| t.input_tokens).sum(),
                 turns.iter().map(|t| t.output_tokens).sum(),
                 turns.iter().map(|t| t.cache_read_tokens).sum(),
+                turns.iter().map(|t| t.cache_creation_tokens).sum(),
             )
         };
         let cost_summary = agg::cost_summary_for_turns(turns.iter().copied(), &s.display_model());
@@ -2385,6 +2419,7 @@ impl Root {
                     &[
                         &fmt_tokens(t_in),
                         &fmt_tokens(t_out),
+                        &fmt_tokens(t_cache_write),
                         &fmt_tokens(t_cached),
                         &fmt_tokens(token_total),
                     ],
@@ -3072,13 +3107,14 @@ mod tests {
     use super::session_token_total;
     use devin_usage_metrics::data::{AgentKind, SessionRec, TurnRec};
 
-    fn turn(input: f64, output: f64, cached: f64) -> TurnRec {
+    fn turn(input: f64, output: f64, cached: f64, cache_create: f64) -> TurnRec {
         TurnRec {
             agent: AgentKind::Devin,
             session_key: "cli/s1".into(),
             input_tokens: input,
             output_tokens: output,
             cache_read_tokens: cached,
+            cache_creation_tokens: cache_create,
             ..Default::default()
         }
     }
@@ -3086,23 +3122,25 @@ mod tests {
     /// 回归：Devin 常常不写 `sessions.metadata.response_dimensions`，此时会话级
     /// 合计必须用窗口内 turn 的实际用量兜底，否则会话列表会把有真实用量的会话
     /// 显示成 0（本机实测 39 个窗口内会话里 22 个是 0，合计 3.17 亿 token）。
+    /// 同时确认四类 token 都计入：缓存写入漏计会让会话列表比每日汇总和 CLI 偏低。
     #[test]
     fn session_total_falls_back_to_turns_when_metadata_is_missing() {
-        let turns = [turn(10.0, 2.0, 3.0), turn(1.0, 1.0, 1.0)];
+        let turns = [turn(10.0, 2.0, 3.0, 4.0), turn(1.0, 1.0, 1.0, 0.5)];
         let refs: Vec<&TurnRec> = turns.iter().collect();
 
         let empty_meta = SessionRec {
             agent: AgentKind::Devin,
             ..Default::default()
         };
-        assert_eq!(session_token_total(&empty_meta, &refs), 18.0);
+        assert_eq!(session_token_total(&empty_meta, &refs), 22.5);
 
         // metadata 有值时以它为准：它覆盖整个会话，不随加载窗口变化。
         let with_meta = SessionRec {
             input_tokens: 100.0,
+            cache_creation_tokens: 61_686.0,
             ..empty_meta.clone()
         };
-        assert_eq!(session_token_total(&with_meta, &refs), 100.0);
+        assert_eq!(session_token_total(&with_meta, &refs), 61_786.0);
 
         // 没有 turn 时保持 0，不编造用量。
         assert_eq!(session_token_total(&empty_meta, &[]), 0.0);
