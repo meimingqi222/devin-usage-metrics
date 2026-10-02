@@ -2107,16 +2107,20 @@ impl Root {
             );
         let mut rows: Vec<gpui::Div> = Vec::new();
         for b in self.buckets.iter().rev() {
-            let mut models: Vec<(String, f64)> = b
-                .by_model
-                .iter()
-                .map(|(m, u)| (m.clone(), u.total()))
-                .collect();
-            models.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let mut models: Vec<_> = b.by_model.iter().collect();
+            models.sort_by(|a, b| {
+                b.1.total()
+                    .partial_cmp(&a.1.total())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             let model_bits: Vec<gpui::Div> = models
                 .iter()
-                .filter(|(_, t)| *t > 0.0)
-                .map(|(m, t)| {
+                .filter(|(_, usage)| usage.total() > 0.0)
+                .map(|(m, usage)| {
+                    let mut label = format!("{} {}", m, fmt_tokens(usage.total()));
+                    if usage.cost > 0.0 {
+                        label.push_str(&format!(" ({})", pricing::fmt_cost(usage.cost)));
+                    }
                     div()
                         .flex()
                         .items_center()
@@ -2129,7 +2133,7 @@ impl Root {
                                 .rounded_full()
                                 .bg(rgb(model_color(m))),
                         )
-                        .child(format!("{} {}", m, fmt_tokens(*t)))
+                        .child(label)
                 })
                 .collect();
             let empty = b.total() <= 0.0;
