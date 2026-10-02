@@ -124,7 +124,8 @@ src/
 ├── pricing.rs # Model pricing table and cost calculation
 ├── i18n.rs    # Chinese/English UI strings, language detection and preference file
 ├── cli.rs     # --cli mode: daily usage rollup, table and CSV output
-├── devin-model-pricing.json    # Official Devin model price list (embedded at compile time)
+├── devin-pro-pricing.json      # Offline fallback for official Pro/Self-serve prices; refreshed online
+├── devin-model-pricing.json    # Legacy Devin snapshot for compatible model lookups
 ├── models-dev-pricing.json     # Non-Devin model prices extracted from models.dev
 └── agg.rs     # Day/week/month bucketing and per-model grouping (with per-device filtering)
 tests/

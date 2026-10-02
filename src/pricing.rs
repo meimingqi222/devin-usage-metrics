@@ -1,6 +1,8 @@
 //! 模型定价表与费用计算。
 //!
-//! 两个 JSON 快照在编译期嵌入二进制（离线兜底）：
+//! JSON 快照在编译期嵌入二进制（离线兜底）：
+//! - `devin-pro-pricing.json` — 官方 Self-serve/Pro 价格，Devin 用量专用；
+//!   从 https://docs.devin.ai/desktop/models.md 在线刷新，缓存 24h。
 //! - `devin-model-pricing.json` — Devin 官方发布的模型价格表
 //!   (https://docs.devinenterprise.com/desktop/models)，`model_uid` 与
 //!   sessions.db 中的 `model` 字段完全一致，覆盖所有思考等级变体。
@@ -25,6 +27,8 @@ use std::time::Duration;
 use serde::Deserialize;
 
 const DEVIN_PRICING_JSON: &str = include_str!("devin-model-pricing.json");
+const DEVIN_PRO_PRICING_JSON: &str = include_str!("devin-pro-pricing.json");
+const DEVIN_PRO_URL: &str = "https://docs.devin.ai/desktop/models.md";
 const MODELS_DEV_PRICING_JSON: &str = include_str!("models-dev-pricing.json");
 const GPT_5_6_LONG_CONTEXT_THRESHOLD: f64 = 272_000.0;
 
@@ -119,7 +123,7 @@ fn gpt_5_6_long_context_pricing(model: &str) -> Option<Pricing> {
         || model.contains("gpt-5.6-sol")
         || model.contains("gpt-5.6 sol")
     {
-        (10.0, 45.0, 1.0, 12.5)
+        (8.0, 30.0, 0.8, 10.0)
     } else if model.contains("gpt-5-6-terra")
         || model.contains("gpt-5.6-terra")
         || model.contains("gpt-5.6 terra")
@@ -144,6 +148,7 @@ pub struct PricingTable {
     devin: HashMap<String, Pricing>,
     /// Devin 表的 label → Pricing 反向索引（如 "GPT-5.6 Luna XHigh Thinking" → 定价）
     devin_labels: HashMap<String, Pricing>,
+    devin_pro: RwLock<HashMap<String, Pricing>>,
     models_dev: RwLock<HashMap<String, Pricing>>,
 }
 
@@ -161,9 +166,17 @@ impl PricingTable {
                         .map(|label| (label.to_ascii_lowercase(), p.clone()))
                 })
                 .collect();
-            // test 构建下覆盖被 `cfg` 掉，`mut` 不会用到。
             #[cfg_attr(test, allow(unused_mut))]
             let mut models_dev = parse_pricing_json(MODELS_DEV_PRICING_JSON);
+            let mut devin_pro = parse_pricing_json(DEVIN_PRO_PRICING_JSON);
+            if !cfg!(test) && !models_fetch_disabled() {
+                if let Some(cached) = devin_pro_cache_path()
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .and_then(|text| extract_devin_pro_pricing(&text).ok())
+                {
+                    devin_pro = cached;
+                }
+            }
             // 自动更新的价格缓存覆盖内嵌快照：新模型（如 gemini-3.8-flash）
             // 无需发版就能计价；无缓存或禁用更新时退回内嵌快照。
             // 单元测试禁用覆盖以保证确定性（覆盖逻辑由 load_cached 等单测覆盖）。
@@ -178,6 +191,7 @@ impl PricingTable {
             PricingTable {
                 devin,
                 devin_labels,
+                devin_pro: RwLock::new(devin_pro),
                 models_dev: RwLock::new(models_dev),
             }
         })
@@ -195,6 +209,28 @@ impl PricingTable {
     pub fn find(&self, model: &str) -> Option<Pricing> {
         let normalized = model.trim().to_ascii_lowercase();
         self.find_normalized(&normalized)
+    }
+
+    /// Devin Self-serve/Pro prices; missing entries never use enterprise prices.
+    pub fn find_devin_pro(&self, model: &str) -> Option<Pricing> {
+        let normalized = model.trim().to_ascii_lowercase();
+        let model = strip_provider_prefix(&normalized);
+        let aliases = [model.to_string(), model.replace('.', "-")];
+        let prices = self.devin_pro.read().ok()?;
+        for alias in &aliases {
+            if let Some(price) = prices.get(alias) {
+                return Some(price.clone());
+            }
+        }
+        prices
+            .values()
+            .filter_map(|price| {
+                let label = price.l.as_ref()?.to_ascii_lowercase();
+                (model == label || model.starts_with(&format!("{label} ")))
+                    .then_some((label.len(), price))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, price)| price.clone())
     }
 
     fn models_dev_exact(&self, key: &str) -> Option<Pricing> {
@@ -410,6 +446,95 @@ pub fn models_dev_cache_path() -> Option<PathBuf> {
     }
     let base = dirs::cache_dir().or_else(dirs::data_dir)?;
     Some(base.join("devin-usage-metrics").join("models-dev.json"))
+}
+
+fn devin_pro_cache_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("DEVIN_USAGE_PRO_PRICING_PATH") {
+        if !path.trim().is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    Some(
+        dirs::cache_dir()
+            .or_else(dirs::data_dir)?
+            .join("devin-usage-metrics")
+            .join("devin-pro-models.md"),
+    )
+}
+
+#[derive(Deserialize)]
+struct DevinPriceRow {
+    tier: String,
+    model_uid: String,
+    label: String,
+    input_cost_per_million_usd: f64,
+    output_cost_per_million_usd: f64,
+    cache_write_cost_per_million_usd: f64,
+    cache_read_cost_per_million_usd: f64,
+}
+
+fn extract_devin_pro_pricing(text: &str) -> Result<HashMap<String, Pricing>, String> {
+    let marker = "export const modelCostData = ";
+    let data = text.split_once(marker).ok_or("missing modelCostData")?.1;
+    let mut deserializer = serde_json::Deserializer::from_str(data);
+    let rows =
+        Vec::<DevinPriceRow>::deserialize(&mut deserializer).map_err(|error| error.to_string())?;
+    let mut prices = HashMap::new();
+    for row in rows.into_iter().filter(|row| row.tier == "TEAMS_TIER_PRO") {
+        let price = Pricing {
+            i: row.input_cost_per_million_usd,
+            o: row.output_cost_per_million_usd,
+            cw: row.cache_write_cost_per_million_usd,
+            cr: row.cache_read_cost_per_million_usd,
+            l: Some(row.label),
+        };
+        if row.model_uid.trim().is_empty()
+            || [price.i, price.o, price.cw, price.cr]
+                .iter()
+                .any(|rate| !rate.is_finite() || *rate < 0.)
+            || prices
+                .insert(row.model_uid.to_ascii_lowercase(), price)
+                .is_some()
+        {
+            return Err("invalid or duplicate Pro model price".into());
+        }
+    }
+    if prices.is_empty() {
+        return Err("no Pro model prices".into());
+    }
+    Ok(prices)
+}
+
+/// Refresh official Self-serve/Pro data, preserving the last good table on failure.
+pub fn refresh_devin_pro(force: bool) -> bool {
+    if models_fetch_disabled() {
+        return false;
+    }
+    let Some(path) = devin_pro_cache_path() else {
+        return false;
+    };
+    let marker = retry_marker_path(&path);
+    if !force && (cache_is_fresh(&path) || retry_backoff_active(&marker)) {
+        return false;
+    }
+    let url = std::env::var("DEVIN_USAGE_PRO_PRICING_URL").unwrap_or_else(|_| DEVIN_PRO_URL.into());
+    let result = fetch_models_dev_json(&url)
+        .and_then(|text| extract_devin_pro_pricing(&text).map(|prices| (text, prices)));
+    let (text, prices) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("WARN Devin Pro price refresh failed: {error}; keeping cached prices");
+            mark_fetch_failed(&marker);
+            return false;
+        }
+    };
+    let Ok(mut table) = PricingTable::instance().devin_pro.write() else {
+        return false;
+    };
+    *table = prices;
+    save_cache_atomic(&path, &text).ok();
+    std::fs::remove_file(marker).ok();
+    true
 }
 
 fn cache_is_fresh(path: &std::path::Path) -> bool {
@@ -629,6 +754,7 @@ pub fn ensure_fresh_async() {
     std::thread::Builder::new()
         .name("pricing-refresh".into())
         .spawn(|| {
+            refresh_devin_pro(false);
             refresh_models_dev(false);
         })
         .ok();
@@ -657,7 +783,41 @@ pub fn single_turn_cost(
     cached: f64,
     cache_creation: f64,
 ) -> Option<f64> {
-    let base = PricingTable::instance().find(model)?;
+    devin_pro_turn_cost(
+        model,
+        input,
+        output,
+        cached,
+        cache_creation,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
+/// Pro promotions use the usage date, so old free SWE-2 turns remain free.
+pub fn devin_pro_turn_cost(
+    model: &str,
+    input: f64,
+    output: f64,
+    cached: f64,
+    cache_creation: f64,
+    created_at: i64,
+) -> Option<f64> {
+    let mut base = PricingTable::instance().find_devin_pro(model)?;
+    let normalized = model.trim().to_ascii_lowercase();
+    let label = base.l.as_deref().unwrap_or("").to_ascii_lowercase();
+    if normalized.starts_with("swe-2-") || label.starts_with("swe-2 ") {
+        let date = chrono::DateTime::from_timestamp(created_at, 0)?.date_naive();
+        if date <= chrono::NaiveDate::from_ymd_opt(2026, 10, 15)? {
+            return Some(0.);
+        }
+        // Published list price after the promotion. A newer nonzero official
+        // price takes precedence over the initial zero-price snapshot.
+        if base.i == 0. && base.o == 0. && base.cr == 0. && base.cw == 0. {
+            base.i = 3.;
+            base.o = 15.;
+            base.cr = 0.3;
+        }
+    }
     let prompt = input + cached + cache_creation;
     if prompt > GPT_5_6_LONG_CONTEXT_THRESHOLD {
         if let Some(long_context) = gpt_5_6_long_context_pricing(model) {
@@ -697,6 +857,69 @@ pub fn fmt_cost(usd: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pro_prices_keep_zero_and_do_not_use_enterprise_fallback() {
+        let table = PricingTable::instance();
+        assert_eq!(table.find_devin_pro("swe-2-high").unwrap().i, 0.);
+        assert_eq!(table.find("swe-2-high").unwrap().i, 0.75);
+        let opus = table.find_devin_pro("claude-opus-5-5-medium").unwrap();
+        assert_eq!((opus.i, opus.o, opus.cw, opus.cr), (4., 20., 5., 0.2));
+        assert!(table.find_devin_pro("unknown-model").is_none());
+    }
+
+    #[test]
+    fn swe_pro_promotion_uses_turn_date_and_expiry() {
+        let day = |year, month, day| {
+            chrono::NaiveDate::from_ymd_opt(year, month, day)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp()
+        };
+        for model in ["swe-2-high", "swe-2-medium", "swe-2-max", "SWE-2 High"] {
+            assert_eq!(
+                devin_pro_turn_cost(model, 1e6, 1e6, 1e6, 0., day(2026, 10, 15)),
+                Some(0.)
+            );
+            let after = devin_pro_turn_cost(model, 1e6, 1e6, 1e6, 0., day(2026, 10, 16)).unwrap();
+            assert!((after - 18.3).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn official_document_parser_filters_tiers_and_validates_rates() {
+        let row = |tier, model, rate| {
+            serde_json::json!({
+                "tier": tier, "model_uid": model, "label": model,
+                "input_cost_per_million_usd": rate,
+                "output_cost_per_million_usd": rate,
+                "cache_write_cost_per_million_usd": 0.,
+                "cache_read_cost_per_million_usd": 0.
+            })
+        };
+        let document = |rows: Vec<serde_json::Value>| {
+            format!(
+                "# Models\nexport const modelCostData = {};\nexport const Component = () => null;",
+                serde_json::to_string(&rows).unwrap()
+            )
+        };
+        let pro = row("TEAMS_TIER_PRO", "swe-2-high", 0.);
+        let prices = extract_devin_pro_pricing(&document(vec![
+            row("TEAMS_TIER_ENTERPRISE_SAAS", "swe-2-high", 0.75),
+            pro.clone(),
+        ]))
+        .unwrap();
+        assert_eq!(prices.len(), 1);
+        assert_eq!(prices["swe-2-high"].i, 0.);
+        assert!(extract_devin_pro_pricing(&document(vec![pro.clone(), pro])).is_err());
+        assert!(
+            extract_devin_pro_pricing(&document(vec![row("TEAMS_TIER_PRO", "bad", -1.)])).is_err()
+        );
+        assert!(extract_devin_pro_pricing("invalid document").is_err());
+        assert!(extract_devin_pro_pricing("export const modelCostData = [];").is_err());
+    }
 
     #[test]
     fn devin_models_are_priced() {

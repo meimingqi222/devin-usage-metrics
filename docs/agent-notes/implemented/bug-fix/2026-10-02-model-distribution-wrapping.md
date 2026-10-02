@@ -1,27 +1,28 @@
-# Agent Note: Wrap long model usage labels within their column
+# Agent Note: Keep model distributions complete and show costs in expandable rows
 
 Status: implemented
 
 ## Problem
 
-The model distribution column wraps between model entries, but each entry has an unconstrained intrinsic text width. At the default window size, long adaptive model names plus token counts and costs exceed the column and are clipped, hiding amounts.
+The previous flex-wrap component rendered ordinary String labels as single letters in the actual desktop table even though the isolated StyledText test passed. Parenthesized model fees also consumed scarce distribution-column width.
 
 ## Decision
 
-The shared model entry limits its width to the column, allows the label's container to shrink to zero minimum width, and uses normal whitespace wrapping. Its color dot keeps a fixed size and aligns with the first text line. The parent column spaces entries with gaps instead of a trailing margin that consumes width outside the entry's constraint. Row heights follow the wrapped text.
+Summary rows use compact model summaries; multiple models show a proportional bar, top model and extra-model count. Clicking a multi-model summary expands a separate detail panel with model names, token share, turns, input, output, cache-write, cache-read, total and cost. Long detail names wrap. Each detail numeric column has a fixed shared width; rows grow with their text. Known free models show $0.00; missing prices show an em dash. A single-model row already contains its model totals and needs no expansion. Rebuilding buckets resets expansion; the table can hide inactive buckets.
 
 ## Alternatives considered
 
-Ellipsis and tooltips still hide amounts at the default size. Increasing the default window width only postpones the issue. Giving every entry a full-width row would discard the existing compact arrangement at wider widths.
+Intrinsic-width flex-wrap entries reproduced clipping with ordinary strings. Ellipsis and wider windows hide or postpone the problem. Parenthesized fees made narrow labels harder to read; independent detail columns make each model fee explicit.
 
 ## Consequences
 
-Long labels remain complete at narrow widths; short labels still share a line when space permits. The extracted component is used by both the desktop table and the native layout regression fixture. No prices or token totals change.
+Model fees no longer compete for space inside summary labels. Numeric detail columns stay aligned at default and wider window sizes. Detail panels use the existing scrolling usage view. Token aggregation is unchanged; the separate Pro pricing note owns billing-source changes.
 
 ## Verification
 
 - `tests/model_distribution_layout.rs::long_model_labels_wrap_inside_the_column`
+- `tests/model_distribution_layout.rs::summary_layout_renders_correctly_without_abnormal_gaps`
 
-Run on an interactive Windows desktop with cargo test --test model_distribution_layout -- --ignored --test-threads=1. The test is explicitly ignored during ordinary CI because it creates a native GPUI window and measures real shaped text.
+The interactive Windows test checks ordinary String entry widths, shaped glyph positions, complete wrapped labels, and full summary/detail table rows. Run cargo test --test model_distribution_layout -- --ignored --test-threads=1.
 
-Proved: Before the style fix, the native test failed because the SWE adaptive label reached x=238 in a 160px column without wrapping. After the fix, the same test passed at 160, 216, 320, and 700px widths, preserving every label character and growing narrow labels vertically.
+Proved: Restoring the preceding committed component made the strengthened test fail: a plain entry occupied only 109.333336px of a 160px column. Restoring the fix passed all 16 plain-entry probes and 20 shaped-label/full-row probes. Native application previews at default and narrower widths were separately captured and inspected; actual clicks collapsed and re-expanded the September 23 details, including the free compactor fee.

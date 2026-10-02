@@ -24,11 +24,7 @@ impl PeriodKind {
 pub struct ModelUsage {
     pub input: f64,
     pub output: f64,
-    /// 缓存**读取**（cache_read）token 数
     pub cached: f64,
-    /// 缓存**写入**（cache_creation）token 数。与 cached 分开统计：两者费率
-    /// 差一个量级（如 claude-opus-5-5-medium 读 $0.2/M、写 $5/M），合并展示
-    /// 会掩盖真正的费用来源。
     pub cache_write: f64,
     pub turns: u32,
     pub cost: f64,
@@ -37,9 +33,6 @@ pub struct ModelUsage {
 }
 
 impl ModelUsage {
-    /// 与定价口径一致：输入 + 输出 + 缓存读取 + 缓存写入。
-    /// 费用按这四类 token 计算，token 合计也必须包含它们，否则同一行的
-    /// token 数与费用无法互相印证。
     pub fn total(&self) -> f64 {
         self.input + self.output + self.cached + self.cache_write
     }
@@ -53,9 +46,7 @@ pub struct Bucket {
     pub end: i64,
     pub input: f64,
     pub output: f64,
-    /// 缓存**读取**（cache_read）token 数
     pub cached: f64,
-    /// 缓存**写入**（cache_creation）token 数
     pub cache_write: f64,
     pub turns: u32,
     pub cost: f64,
@@ -64,7 +55,6 @@ pub struct Bucket {
 }
 
 impl Bucket {
-    /// 与 `ModelUsage::total` 同口径：四类 token 之和。
     pub fn total(&self) -> f64 {
         self.input + self.output + self.cached + self.cache_write
     }
@@ -137,6 +127,22 @@ pub fn window_start(kind: PeriodKind, page: usize) -> i64 {
     window_for(kind, page).0
 }
 
+/// 格式化指定周期和页码的时间区间字符串（如 "09-18 ~ 10-02"）。
+pub fn format_window_range(kind: PeriodKind, page: usize) -> String {
+    let (start_ts, end_ts) = window_for(kind, page);
+    let start_dt = chrono::DateTime::from_timestamp(start_ts, 0)
+        .map(|d| d.with_timezone(&chrono::Local))
+        .unwrap_or_default();
+    let end_dt = chrono::DateTime::from_timestamp(end_ts.saturating_sub(1), 0)
+        .map(|d| d.with_timezone(&chrono::Local))
+        .unwrap_or_default();
+    match kind {
+        PeriodKind::Day => format!("{} ~ {}", start_dt.format("%m-%d"), end_dt.format("%m-%d")),
+        PeriodKind::Week => format!("{} ~ {}", start_dt.format("%m-%d"), end_dt.format("%m-%d")),
+        PeriodKind::Month => format!("{} ~ {}", start_dt.format("%Y-%m"), end_dt.format("%Y-%m")),
+    }
+}
+
 pub fn build_buckets(data: &LoadedData, kind: PeriodKind) -> Vec<Bucket> {
     build_buckets_inner(data, kind, None, None, 0)
 }
@@ -181,12 +187,13 @@ pub fn cost_for_turn(turn: &crate::data::TurnRec, model: &str) -> Option<f64> {
         });
     }
     if turn.agent == AgentKind::Devin {
-        crate::pricing::single_turn_cost(
+        crate::pricing::devin_pro_turn_cost(
             model,
             turn.input_tokens,
             turn.output_tokens,
             turn.cache_read_tokens,
             turn.cache_creation_tokens,
+            turn.created_at,
         )
     } else {
         crate::pricing::turn_cost(
@@ -484,7 +491,18 @@ mod tests {
             assert_eq!(bucket.input, 200.0);
             assert_eq!(bucket.cached, 600.0);
             assert_eq!(bucket.cache_write, 1000.0);
+            let session = crate::data::SessionRec {
+                input_tokens: bucket.input,
+                output_tokens: bucket.output,
+                cached_tokens: bucket.cached,
+                cache_creation_tokens: bucket.cache_write,
+                cache_creation_5m_tokens: 400.0,
+                cache_creation_1h_tokens: 600.0,
+                ..Default::default()
+            };
+            assert_eq!(session.total_tokens(), bucket.total());
         }
+        assert_eq!(crate::data::SessionRec::default().total_tokens(), 0.0);
     }
 
     #[test]
@@ -507,6 +525,40 @@ mod tests {
             assert_eq!(previous_buckets.first().unwrap().start, previous_start);
             assert_eq!(previous_buckets.last().unwrap().end, previous_end);
         }
+    }
+
+    #[test]
+    fn swe_2_adaptive_models_use_pro_free_promotion() {
+        let start = window_start(PeriodKind::Day, 0) + 3600;
+        let data = LoadedData {
+            sessions: vec![crate::data::SessionRec {
+                agent: AgentKind::Devin,
+                key: "swe2".into(),
+                selected_model: "adaptive".into(),
+                ..Default::default()
+            }],
+            turns: ["swe-2-high", "swe-2-max", "swe-2-medium"]
+                .map(|model| crate::data::TurnRec {
+                    agent: AgentKind::Devin,
+                    session_key: "swe2".into(),
+                    created_at: start,
+                    model: model.into(),
+                    input_tokens: 1_000_000.,
+                    output_tokens: 1_000_000.,
+                    cache_read_tokens: 1_000_000.,
+                    ..Default::default()
+                })
+                .to_vec(),
+            ..Default::default()
+        };
+        let buckets = build_buckets_for(&data, PeriodKind::Day, AgentKind::Devin, 0);
+        let bucket = buckets.iter().find(|bucket| bucket.turns > 0).unwrap();
+        for model in ["swe-2-high", "swe-2-max", "swe-2-medium"] {
+            let usage = &bucket.by_model[&format!("{model}(adaptive)")];
+            assert!(usage.priced, "missing price for {model}");
+            assert_eq!(usage.cost, 0.);
+        }
+        assert_eq!(bucket.cost, 0.);
     }
 
     #[test]
@@ -547,45 +599,10 @@ mod tests {
         assert!(by_model.contains_key("glm-5-2(adaptive)"));
         assert!(by_model.contains_key("compactor"));
         assert!(!by_model.contains_key("glm-5-2"));
-        // 定价仍按原始模型名计算（glm-5-2: input $1.4/M + output $4.4/M）
+        // Pro lists GLM-5.2 as free; this is a known price, not missing data.
         let mu = &by_model["glm-5-2(adaptive)"];
         assert!(mu.priced);
-        let expected = 1000.0 / 1e6 * 1.4 + 100.0 / 1e6 * 4.4;
-        assert!((mu.cost - expected).abs() < 1e-9);
-    }
-
-    /// 回归：cache_creation（缓存写入）过去既没进 `by_model` 也没进 bucket 合计，
-    /// 于是「输入 + 输出 + 缓存读取」被当成总计，而费用却是按含写入的公式算的
-    /// （Devin/Claude 的 `cw` 费率可高达读价的 25 倍），同一行的 token 与费用无
-    /// 法对账。本机 09-28 实测：面板 75,747,336 vs 真实 77,320,721。
-    #[test]
-    fn cache_write_tokens_are_part_of_bucket_and_model_totals() {
-        let start = window_start(PeriodKind::Day, 0) + 3600;
-        let data = LoadedData {
-            turns: vec![crate::data::TurnRec {
-                agent: AgentKind::Devin,
-                session_key: "cli/s1".into(),
-                created_at: start,
-                input_tokens: 3.0,
-                output_tokens: 425.0,
-                cache_read_tokens: 0.0,
-                cache_creation_tokens: 61_686.0,
-                model: "summarizer".into(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-
-        let buckets = build_buckets_for(&data, PeriodKind::Day, AgentKind::Devin, 0);
-        let bucket = buckets
-            .iter()
-            .find(|b| b.start <= start && start < b.end)
-            .expect("窗口内必须落到某个 bucket");
-        assert_eq!(bucket.cache_write, 61_686.0);
-        assert_eq!(bucket.total(), 62_114.0);
-        // 模型分布与 bucket 合计必须同口径，否则两处数字无法对账
-        assert_eq!(bucket.by_model["summarizer"].cache_write, 61_686.0);
-        assert_eq!(bucket.by_model["summarizer"].total(), bucket.total());
+        assert_eq!(mu.cost, 0.);
     }
 
     #[test]
@@ -616,11 +633,11 @@ mod tests {
             ..Default::default()
         };
 
-        // 预分组路径与单会话路径口径一致（glm-5-2 output $4.4/M；compactor 无定价不计入）
+        // Pro GLM is free; compactor remains unpriced.
         let grouped = agg_group(&data, "cli/a");
         let direct = cost_for_session_turns(&data, &data.sessions[0]);
         assert_eq!(grouped, direct);
-        assert_eq!(grouped, Some(100.0 / 1e6 * 4.4));
+        assert_eq!(grouped, Some(0.));
         let summary = cost_summary_for_turns(
             data.turns.iter().filter(|turn| turn.session_key == "cli/a"),
             &data.sessions[0].display_model(),
@@ -628,7 +645,7 @@ mod tests {
         assert!(summary.is_partial());
         assert_eq!(summary.priced_turns, 1);
         assert_eq!(summary.total_turns, 2);
-        assert_eq!(agg_group(&data, "cli/b"), Some(200.0 / 1e6 * 4.4),);
+        assert_eq!(agg_group(&data, "cli/b"), Some(0.));
     }
 
     /// 模拟 rebuild_sessions 里的预分组调用方式
@@ -656,14 +673,14 @@ mod tests {
     fn long_context_tier_is_devin_only() {
         let make_turn = |agent| crate::data::TurnRec {
             agent,
-            model: "gpt-5.6-sol".into(),
+            model: "gpt-5-6-sol-high".into(),
             input_tokens: 300_000.0,
             ..Default::default()
         };
-        let devin = cost_for_turn(&make_turn(AgentKind::Devin), "gpt-5.6-sol").unwrap();
-        let codex = cost_for_turn(&make_turn(AgentKind::Codex), "gpt-5.6-sol").unwrap();
-        assert!((devin - 3.0).abs() < 1e-12);
-        assert!((codex - 1.5).abs() < 1e-12);
+        let devin = cost_for_turn(&make_turn(AgentKind::Devin), "gpt-5-6-sol-high").unwrap();
+        let codex = cost_for_turn(&make_turn(AgentKind::Codex), "gpt-5-6-sol-high").unwrap();
+        assert!((devin - 2.4).abs() < 1e-12);
+        assert!((codex - 1.2).abs() < 1e-12);
     }
 
     #[test]

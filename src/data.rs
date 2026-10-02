@@ -691,6 +691,10 @@ pub struct SessionRec {
 }
 
 impl SessionRec {
+    pub fn total_tokens(&self) -> f64 {
+        self.input_tokens + self.output_tokens + self.cached_tokens + self.cache_creation_tokens
+    }
+
     pub fn display_model(&self) -> String {
         self.real_model
             .clone()

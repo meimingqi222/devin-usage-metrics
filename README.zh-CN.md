@@ -124,7 +124,8 @@ src/
 ├── pricing.rs # 模型定价表与费用计算
 ├── i18n.rs    # 中英双语文案、系统语言探测与偏好读写
 ├── cli.rs     # --cli 模式：按日用量汇总、表格与 CSV 输出
-├── devin-model-pricing.json    # Devin 官方模型价格表（编译期嵌入）
+├── devin-pro-pricing.json      # Devin Pro/Self-serve 官方价格的离线兜底，运行时在线刷新
+├── devin-model-pricing.json    # 旧 Devin 价格快照（兼容其他模型查找）
 ├── models-dev-pricing.json     # 从 models.dev 提取的非 Devin 模型价格子集
 └── agg.rs     # 按日/周/月的桶聚合与模型分组（支持按设备过滤）
 tests/

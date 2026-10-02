@@ -9,6 +9,7 @@
 mod model_distribution;
 mod text_input;
 mod updater_ui;
+mod usage_table;
 
 use agg::{build_buckets_for_device, window_for, Bucket, PeriodKind};
 use chrono::TimeZone;
@@ -155,6 +156,8 @@ struct Root {
     period: PeriodKind,
     page: usize,
     buckets: Vec<Bucket>,
+    expanded_buckets: std::collections::HashSet<i64>,
+    hide_empty_buckets: bool,
     sessions_rows: Vec<SessionRow>,
     selected: Option<String>,
     loaded_at: String,
@@ -335,6 +338,7 @@ impl Root {
     }
 
     fn rebuild_buckets(&mut self) {
+        self.expanded_buckets.clear();
         self.buckets = build_buckets_for_device(
             &self.data,
             self.period,
@@ -1902,7 +1906,11 @@ impl Root {
                 C_CACHED,
             ))
             .child(Self::stat_card(
-                i18n::t(i18n::Key::StatCost),
+                i18n::t(if self.agent == AgentKind::Devin {
+                    i18n::Key::StatCostPro
+                } else {
+                    i18n::Key::StatCost
+                }),
                 pricing::fmt_cost(cost),
                 C_COST,
             ))
@@ -2076,84 +2084,247 @@ impl Root {
             )
     }
 
-    fn bucket_table(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let header = div()
-            .flex()
-            .w_full()
-            .min_w(px(0.))
-            .gap_2()
-            .px_2()
-            .py_1()
-            .text_xs()
-            .text_color(rgb(MUTED))
-            .border_b_1()
-            .border_color(rgb(BORDER))
-            .child(cell(i18n::t(i18n::Key::ThPeriod), 90.))
-            .child(cell_r(i18n::t(i18n::Key::ThSessions), 60.))
-            .child(cell_r(i18n::t(i18n::Key::ThTurns), 52.))
-            .child(cell_r(i18n::t(i18n::Key::ThInput), 70.))
-            .child(cell_r(i18n::t(i18n::Key::ThOutput), 70.))
-            .child(cell_r(i18n::t(i18n::Key::ThCacheWrite), 76.))
-            .child(cell_r(i18n::t(i18n::Key::ThCache), 76.))
-            .child(cell_r(i18n::t(i18n::Key::ThTotal), 76.))
-            .child(cell_r(i18n::t(i18n::Key::ThCost), 70.))
-            .child(
+    fn bucket_table(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let header = usage_table::usage_row(
+            i18n::t(i18n::Key::ThPeriod).to_string(),
+            [
+                i18n::t(i18n::Key::ThSessions).to_string(),
+                i18n::t(i18n::Key::ThTurns).to_string(),
+                i18n::t(i18n::Key::ThInput).to_string(),
+                i18n::t(i18n::Key::ThOutput).to_string(),
+                i18n::t(i18n::Key::CliCacheCreate).to_string(),
+                i18n::t(i18n::Key::ThCache).to_string(),
+                i18n::t(i18n::Key::ThTotal).to_string(),
+                i18n::t(i18n::Key::ThCost).to_string(),
+            ],
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .child(i18n::t(i18n::Key::ThModelMix)),
+            false,
+        )
+        .text_color(rgb(MUTED));
+        let mut rows = Vec::new();
+        for bucket in self.buckets.iter().rev() {
+            if self.hide_empty_buckets && bucket.total() == 0.0 && bucket.turns == 0 {
+                continue;
+            }
+            let mut models: Vec<_> = bucket
+                .by_model
+                .iter()
+                .filter(|(_, usage)| usage.total() > 0.)
+                .collect();
+            models.sort_by(|left, right| {
+                right
+                    .1
+                    .total()
+                    .total_cmp(&left.1.total())
+                    .then_with(|| left.0.cmp(right.0))
+            });
+            let can_expand = models.len() > 1;
+            let expanded = can_expand && self.expanded_buckets.contains(&bucket.start);
+            let key = bucket.start;
+            let label = div()
+                .flex()
+                .items_start()
+                .gap_1()
+                .child(div().w(px(10.)).flex_none().child(if !can_expand {
+                    ""
+                } else if expanded {
+                    "▾"
+                } else {
+                    "▸"
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(format!("{} {}", bucket.label, bucket.sub)),
+                );
+            let distribution = if models.is_empty() {
                 div()
                     .flex_1()
                     .min_w(px(0.))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(i18n::t(i18n::Key::ThModelMix)),
-            );
-        let mut rows: Vec<gpui::Div> = Vec::new();
-        for b in self.buckets.iter().rev() {
-            let mut models: Vec<_> = b.by_model.iter().collect();
-            models.sort_by(|a, b| {
-                b.1.total()
-                    .partial_cmp(&a.1.total())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let model_bits: Vec<gpui::Div> = models
-                .iter()
-                .filter(|(_, usage)| usage.total() > 0.0)
-                .map(|(m, usage)| {
-                    let mut label = format!("{} {}", m, fmt_tokens(usage.total()));
-                    if usage.cost > 0.0 {
-                        label.push_str(&format!(" ({})", pricing::fmt_cost(usage.cost)));
-                    }
-                    model_distribution::model_usage_entry(label, model_color(m))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("-")
+            } else if models.len() == 1 {
+                let (model, usage) = &models[0];
+                let label = format!("{} {}", model, fmt_tokens(usage.total()));
+                model_distribution::model_summary_single(label, model_color(model))
+            } else {
+                let bucket_total = bucket.total();
+                let segments: Vec<(u32, f32)> = models
+                    .iter()
+                    .map(|(model, usage)| {
+                        let ratio = if bucket_total > 0. {
+                            (usage.total() / bucket_total) as f32
+                        } else {
+                            0.0
+                        };
+                        (model_color(model), ratio)
+                    })
+                    .collect();
+                let (top_model, top_usage) = &models[0];
+                let top_pct = if bucket_total > 0. {
+                    ((top_usage.total() / bucket_total) * 100.0).round() as u32
+                } else {
+                    0
+                };
+                model_distribution::model_summary_stacked(
+                    segments,
+                    top_model.to_string(),
+                    model_color(top_model),
+                    format!("{top_pct}%"),
+                    models.len() - 1,
+                )
+            };
+            rows.push(
+                usage_table::usage_row(
+                    label,
+                    [
+                        bucket.session_keys.len().to_string(),
+                        bucket.turns.to_string(),
+                        fmt_tokens(bucket.input),
+                        fmt_tokens(bucket.output),
+                        fmt_tokens(bucket.cache_write),
+                        fmt_tokens(bucket.cached),
+                        fmt_tokens(bucket.total()),
+                        pricing::fmt_cost(bucket.cost),
+                    ],
+                    distribution,
+                    false,
+                )
+                .id(SharedString::from(format!("bucket-{key}")))
+                .text_color(if bucket.total() > 0. {
+                    rgba(TEXT, 1.)
+                } else {
+                    rgba(MUTED, 0.5)
                 })
-                .collect();
-            let empty = b.total() <= 0.0;
+                .when(can_expand, |row| {
+                    row.cursor_pointer()
+                        .hover(|row| row.bg(rgb(PANEL2)))
+                        .on_click(cx.listener(move |root, _, _, cx| {
+                            if !root.expanded_buckets.remove(&key) {
+                                root.expanded_buckets.insert(key);
+                            }
+                            cx.notify();
+                        }))
+                })
+                .into_any_element(),
+            );
+            if expanded {
+                let bucket_total = bucket.total();
+                let sub_headers = [
+                    i18n::t(i18n::Key::ThModel).to_string(),
+                    i18n::t(i18n::Key::ThShare).to_string(),
+                    i18n::t(i18n::Key::ThTurns).to_string(),
+                    i18n::t(i18n::Key::ThInput).to_string(),
+                    i18n::t(i18n::Key::ThOutput).to_string(),
+                    i18n::t(i18n::Key::CliCacheCreate).to_string(),
+                    i18n::t(i18n::Key::CliCacheRead).to_string(),
+                    i18n::t(i18n::Key::ThTotal).to_string(),
+                    i18n::t(i18n::Key::ThCost).to_string(),
+                ];
+                let breakdown_rows: Vec<usage_table::ModelBreakdownItem> = models
+                    .iter()
+                    .map(|(model, usage)| {
+                        let pct = if bucket_total > 0. {
+                            (usage.total() / bucket_total) * 100.0
+                        } else {
+                            0.0
+                        };
+                        let share = if pct >= 0.1 || pct == 0.0 {
+                            format!("{:.1}%", pct)
+                        } else {
+                            "<0.1%".to_string()
+                        };
+                        let cost = if usage.cost > 0. {
+                            pricing::fmt_cost(usage.cost)
+                        } else if usage.priced {
+                            "$0.00".into()
+                        } else {
+                            "—".into()
+                        };
+                        usage_table::ModelBreakdownItem {
+                            name: model.to_string(),
+                            color: model_color(model),
+                            share,
+                            turns: usage.turns.to_string(),
+                            input: fmt_tokens(usage.input),
+                            output: fmt_tokens(usage.output),
+                            cache_creation: fmt_tokens(usage.cache_write),
+                            cached: fmt_tokens(usage.cached),
+                            total: fmt_tokens(usage.total()),
+                            cost,
+                        }
+                    })
+                    .collect();
+
+                let subpanel = usage_table::model_breakdown_panel(
+                    i18n::tf(i18n::Key::ModelBreakdownTitle, &[&bucket.label]),
+                    i18n::tf(i18n::Key::ModelCountSummary, &[&models.len().to_string()]),
+                    sub_headers,
+                    breakdown_rows,
+                );
+                rows.push(subpanel.into_any_element());
+            }
+        }
+
+        let table_toolbar = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .pb_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(TEXT))
+                    .child(i18n::t(i18n::Key::ThPeriod)),
+            )
+            .child(
+                div()
+                    .id("toggle-hide-empty")
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_sm()
+                    .text_xs()
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .when(self.hide_empty_buckets, |d| {
+                        d.text_color(rgb(ACCENT)).bg(rgba(ACCENT, 0.15))
+                    })
+                    .when(!self.hide_empty_buckets, |d| {
+                        d.text_color(rgb(MUTED))
+                            .hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
+                    })
+                    .child(if self.hide_empty_buckets {
+                        "☑"
+                    } else {
+                        "☐"
+                    })
+                    .child(i18n::t(i18n::Key::HideEmptyDays))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.hide_empty_buckets = !this.hide_empty_buckets;
+                        cx.notify();
+                    })),
+            );
+
+        if rows.is_empty() {
             rows.push(
                 div()
-                    .flex()
-                    .w_full()
-                    .min_w(px(0.))
-                    .gap_2()
-                    .px_2()
-                    .py_1()
+                    .py_6()
+                    .text_center()
                     .text_xs()
-                    .text_color(if empty {
-                        rgba(MUTED, 0.5)
-                    } else {
-                        rgba(TEXT, 1.0)
-                    })
-                    .border_b_1()
-                    .border_color(rgba(BORDER, 0.5))
-                    .child(div().w(px(90.)).child(format!("{} {}", b.label, b.sub)))
-                    .child(cell_r(&format!("{}", b.session_keys.len()), 60.))
-                    .child(cell_r(&format!("{}", b.turns), 52.))
-                    .child(cell_r(&fmt_tokens(b.input), 70.))
-                    .child(cell_r(&fmt_tokens(b.output), 70.))
-                    .child(cell_r(&fmt_tokens(b.cache_write), 76.))
-                    .child(cell_r(&fmt_tokens(b.cached), 76.))
-                    .child(cell_r(&fmt_tokens(b.total()), 76.))
-                    .child(cell_r(&pricing::fmt_cost(b.cost), 70.))
-                    .child(model_distribution::model_distribution(model_bits)),
+                    .text_color(rgb(MUTED))
+                    .child("当前周期无活动记录")
+                    .into_any_element(),
             );
         }
+
         div()
             .w_full()
             .min_w(px(0.))
@@ -2164,6 +2335,7 @@ impl Root {
             .border_color(rgb(BORDER))
             .flex()
             .flex_col()
+            .child(table_toolbar)
             .child(header)
             .children(rows)
     }
@@ -3029,6 +3201,8 @@ fn main() {
                         period: PeriodKind::Day,
                         page: 0,
                         buckets: Vec::new(),
+                        expanded_buckets: std::collections::HashSet::new(),
+                        hide_empty_buckets: true,
                         sessions_rows: Vec::new(),
                         selected: None,
                         loaded_at: i18n::t(i18n::Key::Loading).into(),

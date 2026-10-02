@@ -73,6 +73,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     // 价格表自动更新（对标 OpenCode）：缓存缺失或超过 24h 时同步拉取一次。
     // 离线/失败时静默沿用内嵌快照，并记 1h 退避（退避期内直接跳过，不阻塞统计）。
     pricing::refresh_models_dev(false);
+    pricing::refresh_devin_pro(false);
     let today = Local::now().date_naive();
     let until = options.until.unwrap_or(today);
     let since = resolve_since(until, options.since, options.days)?;
