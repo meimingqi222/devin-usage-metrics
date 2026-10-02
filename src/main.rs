@@ -6,6 +6,7 @@
     windows_subsystem = "windows"
 )]
 
+mod model_distribution;
 mod text_input;
 mod updater_ui;
 
@@ -2121,19 +2122,7 @@ impl Root {
                     if usage.cost > 0.0 {
                         label.push_str(&format!(" ({})", pricing::fmt_cost(usage.cost)));
                     }
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .mr_2()
-                        .child(
-                            div()
-                                .w(px(7.))
-                                .h(px(7.))
-                                .rounded_full()
-                                .bg(rgb(model_color(m))),
-                        )
-                        .child(label)
+                    model_distribution::model_usage_entry(label, model_color(m))
                 })
                 .collect();
             let empty = b.total() <= 0.0;
@@ -2162,15 +2151,7 @@ impl Root {
                     .child(cell_r(&fmt_tokens(b.cached), 76.))
                     .child(cell_r(&fmt_tokens(b.total()), 76.))
                     .child(cell_r(&pricing::fmt_cost(b.cost), 70.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .overflow_hidden()
-                            .flex()
-                            .flex_wrap()
-                            .children(model_bits),
-                    ),
+                    .child(model_distribution::model_distribution(model_bits)),
             );
         }
         div()
