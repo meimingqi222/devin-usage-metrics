@@ -455,6 +455,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn totals_include_cache_writes_once_across_periods_and_models() {
+        let created_at = Local::now().timestamp();
+        let data = LoadedData {
+            turns: vec![
+                crate::data::TurnRec {
+                    agent: AgentKind::Claude,
+                    session_key: "claude/cache-write".into(),
+                    created_at,
+                    model: "unknown".into(),
+                    input_tokens: 100.0,
+                    output_tokens: 20.0,
+                    cache_read_tokens: 300.0,
+                    cache_creation_tokens: 500.0,
+                    cache_creation_5m_tokens: 200.0,
+                    cache_creation_1h_tokens: 300.0,
+                    ..Default::default()
+                };
+                2
+            ],
+            ..Default::default()
+        };
+        for period in [PeriodKind::Day, PeriodKind::Week, PeriodKind::Month] {
+            let buckets = build_buckets_for(&data, period, AgentKind::Claude, 0);
+            let bucket = buckets.iter().find(|b| b.turns > 0).unwrap();
+            assert_eq!(bucket.total(), 1840.0);
+            assert_eq!(bucket.by_model["unknown"].total(), 1840.0);
+            assert_eq!(bucket.input, 200.0);
+            assert_eq!(bucket.cached, 600.0);
+            assert_eq!(bucket.cache_write, 1000.0);
+        }
+    }
+
+    #[test]
     fn paged_windows_are_adjacent() {
         for kind in [PeriodKind::Day, PeriodKind::Week, PeriodKind::Month] {
             let (current_start, current_end) = window_for(kind, 0);

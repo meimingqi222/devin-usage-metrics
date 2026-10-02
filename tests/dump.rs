@@ -31,7 +31,12 @@ fn dump_recent_usage() {
             .collect();
         let tokens: f64 = turns
             .iter()
-            .map(|turn| turn.input_tokens + turn.output_tokens + turn.cache_read_tokens)
+            .map(|turn| {
+                turn.input_tokens
+                    + turn.output_tokens
+                    + turn.cache_read_tokens
+                    + turn.cache_creation_tokens
+            })
             .sum();
         println!(
             "{}: {} sessions, {} turns, {} tokens",
