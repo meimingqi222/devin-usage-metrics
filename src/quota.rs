@@ -295,7 +295,9 @@ pub fn discover_accounts(allow_keychain: bool) -> Vec<Account> {
         }
 
         // Antigravity: macOS 上 Keychain 是当前源；未同意时只读文件，绝不碰钥匙串
-        let antigravity = h.join(".gemini").join("oauth_creds.json");
+        let antigravity = antigravity_state_path()
+            .filter(|path| read_antigravity_state_token(path).is_some())
+            .unwrap_or_else(|| h.join(".gemini").join("oauth_creds.json"));
         if allow_keychain && cfg!(target_os = "macos") && keychain_item_exists("gemini") {
             out.push(Account {
                 key: "antigravity-keychain".into(),
@@ -474,6 +476,9 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 fn read_antigravity_email(path: &Path) -> Option<String> {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("vscdb") {
+        return read_antigravity_state_email(path);
+    }
     let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     // 从 id_token JWT 中提取 email
     let id_token = v.get("id_token").and_then(Value::as_str)?;
@@ -1803,6 +1808,14 @@ fn antigravity_oauth_client() -> Option<(String, String)> {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        let path = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+            .join("Programs/Antigravity/resources/bin/language_server.exe");
+        let binary = std::fs::read(path).ok()?;
+        antigravity_windows_client(&binary)
+    }
+
     // 从 language_server 二进制中 strings 提取
     #[cfg(target_os = "macos")]
     {
@@ -1825,10 +1838,216 @@ fn antigravity_oauth_client() -> Option<(String, String)> {
             .to_string();
         Some((client_id, client_secret))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         None
     }
+}
+
+fn antigravity_windows_client(binary: &[u8]) -> Option<(String, String)> {
+    fn u16_at(b: &[u8], p: usize) -> Option<u16> {
+        Some(u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?))
+    }
+    fn u32_at(b: &[u8], p: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?))
+    }
+    let pe = u32_at(binary, 60)? as usize;
+    if binary.get(pe..pe + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let table = pe.checked_add(24 + u16_at(binary, pe + 20)? as usize)?;
+    let mut sections = Vec::new();
+    for index in 0..u16_at(binary, pe + 6)? as usize {
+        let p = table.checked_add(index.checked_mul(40)?)?;
+        sections.push((
+            u32_at(binary, p + 12)? as usize,
+            u32_at(binary, p + 16)? as usize,
+            u32_at(binary, p + 20)? as usize,
+        ));
+    }
+    let file_offset = |rva: i64| -> Option<usize> {
+        let rva = usize::try_from(rva).ok()?;
+        sections.iter().find_map(|&(start, size, raw)| {
+            (rva >= start && rva - start < size)
+                .then(|| raw.checked_add(rva - start))
+                .flatten()
+        })
+    };
+    let mut pairs = Vec::new();
+    for &(rva, size, raw) in &sections {
+        let bytes = binary.get(raw..raw.checked_add(size)?)?;
+        let mut previous_id: Option<(usize, String)> = None;
+        for (offset, instruction) in bytes.windows(7).enumerate() {
+            if !matches!(instruction[0], 0x48 | 0x4c)
+                || instruction[1] != 0x8d
+                || instruction[2] & 0xc7 != 5
+            {
+                continue;
+            }
+            let displacement = i32::from_le_bytes(instruction[3..7].try_into().ok()?);
+            let Some(target) = file_offset((rva + offset + 7) as i64 + i64::from(displacement))
+            else {
+                continue;
+            };
+            let Some(text) = binary.get(target..target.saturating_add(100)) else {
+                continue;
+            };
+            if text.starts_with(b"1071006060591-") {
+                let suffix = b".apps.googleusercontent.com";
+                if let Some(end) = text.windows(suffix.len()).position(|part| part == suffix) {
+                    previous_id = Some((
+                        offset,
+                        String::from_utf8(text[..end + suffix.len()].to_vec()).ok()?,
+                    ));
+                }
+            } else if text.starts_with(b"GOCSPX-") {
+                if let Some((id_offset, id)) = &previous_id {
+                    // The Go OAuth config constructor references its two strings
+                    // together. Do not mix the separate Cloud Auth client pair.
+                    if offset - id_offset <= 128 {
+                        let secret = std::str::from_utf8(&text[..35]).ok()?;
+                        if secret
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                        {
+                            pairs.push((id.clone(), secret.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+    if pairs.len() == 1 {
+        pairs.pop()
+    } else {
+        None
+    }
+}
+
+fn antigravity_state_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        Some(
+            PathBuf::from(std::env::var_os("APPDATA")?)
+                .join("Antigravity/User/globalStorage/state.vscdb"),
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+fn protobuf_bytes(input: &[u8], wanted: u64) -> Option<Vec<&[u8]>> {
+    fn varint(input: &[u8], offset: &mut usize) -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = *input.get(*offset)?;
+            *offset += 1;
+            if shift == 63 && byte > 1 {
+                return None;
+            }
+            value |= u64::from(byte & 127) << shift;
+            if byte < 128 {
+                return Some(value);
+            }
+        }
+        None
+    }
+    let mut result = Vec::new();
+    let mut offset = 0;
+    while offset < input.len() {
+        let tag = varint(input, &mut offset)?;
+        if tag >> 3 == 0 {
+            return None;
+        }
+        match tag & 7 {
+            0 => {
+                varint(input, &mut offset)?;
+            }
+            1 => {
+                offset = offset.checked_add(8)?;
+            }
+            2 => {
+                let len = usize::try_from(varint(input, &mut offset)?).ok()?;
+                let end = offset.checked_add(len)?;
+                let bytes = input.get(offset..end)?;
+                if tag >> 3 == wanted {
+                    result.push(bytes);
+                }
+                offset = end;
+            }
+            5 => {
+                offset = offset.checked_add(4)?;
+            }
+            _ => return None,
+        }
+        if offset > input.len() {
+            return None;
+        }
+    }
+    Some(result)
+}
+
+fn antigravity_state_credentials(raw: &str) -> Option<AntigravityCred> {
+    let state = base64_decode(raw)?;
+    for entry in protobuf_bytes(&state, 1)? {
+        let keys = protobuf_bytes(entry, 1)?;
+        if keys.first().copied()? != b"oauthTokenInfoSentinelKey" {
+            continue;
+        }
+        let values = protobuf_bytes(entry, 2)?;
+        let wrapped = protobuf_bytes(values.first().copied()?, 1)?;
+        let encoded = std::str::from_utf8(wrapped.first().copied()?).ok()?;
+        let token_info = base64_decode(encoded)?;
+        let tokens = protobuf_bytes(&token_info, 1)?;
+        let token = std::str::from_utf8(tokens.first().copied()?).ok()?;
+        if !token.is_empty() {
+            let refresh = protobuf_bytes(&token_info, 3)?;
+            let refresh_token = refresh
+                .first()
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .unwrap_or_default()
+                .to_string();
+            return Some(AntigravityCred {
+                access_token: token.to_string(),
+                refresh_token,
+                expires_at: None,
+            });
+        }
+    }
+    None
+}
+
+fn read_antigravity_state_token(path: &Path) -> Option<AntigravityCred> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let raw: String = connection
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = 'antigravityUnifiedStateSync.oauthToken'",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    antigravity_state_credentials(&raw)
+}
+
+fn read_antigravity_state_email(path: &Path) -> Option<String> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let raw: String = connection
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = 'antigravityAuthStatus'",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    value.get("email")?.as_str().map(str::to_string)
 }
 
 struct AntigravityCred {
@@ -1881,6 +2100,12 @@ fn read_antigravity_cred(path: &Path, from_keychain: bool) -> Result<Antigravity
         return Err("Antigravity Keychain credentials unavailable".into());
     }
 
+    if path.extension().and_then(|ext| ext.to_str()) == Some("vscdb") {
+        return read_antigravity_state_token(path).ok_or_else(|| {
+            "Antigravity current login token unavailable; reopen Antigravity and sign in".into()
+        });
+    }
+
     // 文件路径
     if path.exists() {
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
@@ -1926,6 +2151,9 @@ fn refresh_antigravity(cred: &mut AntigravityCred) -> Result<(), String> {
 
 /// 写回刷新后的 token 到文件（Keychain 版由 Antigravity 自身管理，不写回）。
 fn write_back_antigravity(path: &Path, cred: &AntigravityCred) {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("vscdb") {
+        return;
+    }
     if !path.exists() {
         return; // Keychain 模式不写回文件
     }
@@ -2122,6 +2350,44 @@ fn i18n_lang() -> crate::i18n::Lang {
 mod tests {
     use super::*;
 
+    #[test]
+    fn antigravity_state_token_reads_current_access_and_refresh() {
+        let cred = antigravity_state_credentials("CkMKGW9hdXRoVG9rZW5JbmZvU2VudGluZWxLZXkSJgokQ2d0bVlXdGxMV0ZqWTJWemN4b01abUZyWlMxeVpXWnlaWE5v").unwrap();
+        assert_eq!(cred.access_token, "fake-access");
+        assert_eq!(cred.refresh_token, "fake-refresh");
+        assert!(antigravity_state_credentials("invalid").is_none());
+        assert!(protobuf_bytes(&[10, 255], 1).is_none());
+    }
+
+    #[test]
+    fn antigravity_windows_client_pairs_config_references() {
+        let mut binary = vec![0u8; 2048];
+        binary[60..64].copy_from_slice(&128u32.to_le_bytes());
+        binary[128..132].copy_from_slice(b"PE\0\0");
+        binary[134..136].copy_from_slice(&1u16.to_le_bytes());
+        binary[164..168].copy_from_slice(&4096u32.to_le_bytes());
+        binary[168..172].copy_from_slice(&1536u32.to_le_bytes());
+        binary[172..176].copy_from_slice(&512u32.to_le_bytes());
+        let id = format!(
+            "{}{}.{}",
+            "1071006060591-", "test", "apps.googleusercontent.com"
+        )
+        .into_bytes();
+        let secret = format!("{}{}", "GOCSPX-", "x".repeat(28)).into_bytes();
+        binary[1000..1000 + id.len()].copy_from_slice(&id);
+        binary[1200..1200 + secret.len()].copy_from_slice(&secret);
+        for (instruction, target) in [(600usize, 1000usize), (618, 1200)] {
+            binary[instruction..instruction + 3].copy_from_slice(&[0x48, 0x8d, 0x0d]);
+            binary[instruction + 3..instruction + 7]
+                .copy_from_slice(&((target as i32) - (instruction as i32) - 7).to_le_bytes());
+        }
+        let pair = antigravity_windows_client(&binary).unwrap();
+        assert_eq!(pair.0, String::from_utf8(id.to_vec()).unwrap());
+        assert_eq!(pair.1, String::from_utf8(secret.to_vec()).unwrap());
+        binary[618] = 0;
+        assert!(antigravity_windows_client(&binary).is_none());
+        assert!(antigravity_windows_client(&[0; 10]).is_none());
+    }
     #[test]
     fn parse_claude_usage_windows() {
         let usage: Value = serde_json::from_str(
