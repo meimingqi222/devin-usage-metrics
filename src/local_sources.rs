@@ -981,6 +981,16 @@ fn parse_claude_file(
                 }
             }
             "assistant" => {
+                // 会话级模型按文件顺序取最后出现的非空值，与 Codex 的
+                // active_model 语义一致（覆盖 /model 中途切换的场景）。
+                if let Some(model) = value
+                    .message
+                    .as_ref()
+                    .and_then(|m| m.model.as_deref())
+                    .filter(|m| !m.is_empty())
+                {
+                    session.model = model.to_owned();
+                }
                 let Some(usage) = value.message.as_ref().and_then(|m| m.usage.as_ref()) else {
                     continue;
                 };
@@ -3282,6 +3292,53 @@ mod tests {
         // 那一步被推迟到 load_claude 里完成跨文件去重之后。
         assert_eq!(turns[0].dedup_key, "msg-1");
         assert_eq!(sessions["session-1"].output_tokens, 0.0);
+    }
+
+    #[test]
+    fn claude_session_model_uses_last_non_empty_model() {
+        let path =
+            std::env::temp_dir().join(format!("claude-session-model-{}.jsonl", std::process::id()));
+        let file = File::create(&path).unwrap();
+        let mut writer = BufWriter::new(file);
+        for (id, model) in [("msg-1", "claude-opus-5"), ("msg-2", "claude-sonnet-5")] {
+            writeln!(
+                writer,
+                "{}",
+                json!({
+                    "type": "assistant",
+                    "sessionId": "session-1",
+                    "timestamp": "2026-08-28T00:23:33.297Z",
+                    "message": {
+                        "id": id,
+                        "model": model,
+                        "usage": { "input_tokens": 1, "output_tokens": 1 }
+                    }
+                })
+            )
+            .unwrap();
+        }
+        // 末尾缺失 model 的 assistant 行不应覆盖已记录的模型
+        writeln!(
+            writer,
+            "{}",
+            json!({
+                "type": "assistant",
+                "sessionId": "session-1",
+                "timestamp": "2026-08-28T00:24:00.000Z",
+                "message": {
+                    "id": "msg-3",
+                    "usage": { "input_tokens": 1, "output_tokens": 1 }
+                }
+            })
+        )
+        .unwrap();
+        writer.flush().unwrap();
+
+        let (sessions, _, skipped) = parse_claude_file(&path, 0, i64::MAX);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(skipped, 0);
+        assert_eq!(sessions["session-1"].model, "claude-sonnet-5");
     }
 
     #[test]

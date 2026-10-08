@@ -15,7 +15,7 @@ use crate::local_sources;
 const CACHE_TTL_SECS: i64 = 300; // 5 minutes cache TTL
 /// 缓存结构版本。任何会影响 turn 集合/时间戳的解析改动都必须递增，否则旧的
 /// (且不带 dedup_key 的) 快照会被当作增量基线复用，修复无法生效。
-const CACHE_SCHEMA_VERSION: u32 = 10;
+const CACHE_SCHEMA_VERSION: u32 = 11;
 
 /// `message_nodes.created_at` 是节点**落盘**时间，不是真实生成时间：Devin 在
 /// 会话恢复/压缩时会把同一条消息以新的 created_at 重写一遍。实测比真实生成时间
