@@ -1816,27 +1816,23 @@ fn antigravity_oauth_client() -> Option<(String, String)> {
         antigravity_windows_client(&binary)
     }
 
-    // 从 language_server 二进制中 strings 提取
+    // Go 二进制中的字符串不是 NUL 结尾，`strings` 会把相邻字符串连成一行，
+    // 按行匹配不可靠；改为与 Windows 相同的思路：解析指令对字符串的引用。
     #[cfg(target_os = "macos")]
     {
-        let path =
-            Path::new("/Applications/Antigravity.app/Contents/Resources/bin/language_server");
-        let output = std::process::Command::new("strings")
-            .arg(path)
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        // client_id 格式: <digits>-<alphanum>.apps.googleusercontent.com
-        let client_id = text
-            .lines()
-            .find(|l| l.ends_with(".apps.googleusercontent.com") && l.len() > 30)?
-            .to_string();
-        // client_secret 格式: GOCSPX-<alphanum>
-        let client_secret = text
-            .lines()
-            .find(|l| l.starts_with("GOCSPX-") && l.len() > 15)?
-            .to_string();
-        Some((client_id, client_secret))
+        let mut candidates = vec![PathBuf::from(
+            "/Applications/Antigravity.app/Contents/Resources/bin/language_server",
+        )];
+        if let Some(h) = home() {
+            candidates.push(
+                h.join("Applications/Antigravity.app/Contents/Resources/bin/language_server"),
+            );
+        }
+        candidates.iter().find_map(|path| {
+            std::fs::read(path)
+                .ok()
+                .and_then(|binary| antigravity_macho_client(&binary))
+        })
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -1912,6 +1908,123 @@ fn antigravity_windows_client(binary: &[u8]) -> Option<(String, String)> {
                         {
                             pairs.push((id.clone(), secret.to_string()));
                         }
+                    }
+                }
+            }
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+    if pairs.len() == 1 {
+        pairs.pop()
+    } else {
+        None
+    }
+}
+
+/// macOS arm64 版：Mach-O `__text` 中 Go 用 `adrp + add` 指令对加载字符串地址。
+/// 与 `antigravity_windows_client` 相同：仅当 OAuth client_id 引用之后 128 字节
+/// 内出现 GOCSPX- 引用时才配对，避免混到单独的 Cloud Auth 客户端。
+fn antigravity_macho_client(binary: &[u8]) -> Option<(String, String)> {
+    fn u32_at(b: &[u8], p: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?))
+    }
+    fn u64_at(b: &[u8], p: usize) -> Option<u64> {
+        Some(u64::from_le_bytes(b.get(p..p + 8)?.try_into().ok()?))
+    }
+    // Mach-O 64-bit little-endian（arm64/x86_64 thin binary）
+    if u32_at(binary, 0)? != 0xFEEDFACF {
+        return None;
+    }
+    let ncmds = u32_at(binary, 16)? as usize;
+    let mut sections: Vec<(u64, u64, u64)> = Vec::new(); // (vmaddr, size, fileoff)
+    let mut text: Option<(u64, u64, u64)> = None;
+    let mut pos = 32usize; // mach_header_64 之后是 load commands
+    for _ in 0..ncmds {
+        let cmd = u32_at(binary, pos)?;
+        let cmdsize = u32_at(binary, pos + 4)? as usize;
+        if cmd == 0x19 && cmdsize >= 72 {
+            // LC_SEGMENT_64：nsects 在 +64，section_64 数组从 +72 起，每项 80 字节
+            let nsects = u32_at(binary, pos + 64)? as usize;
+            for i in 0..nsects {
+                let s = pos.checked_add(72 + i.checked_mul(80)?)?;
+                let name = binary.get(s..s + 16)?;
+                let addr = u64_at(binary, s + 32)?;
+                let size = u64_at(binary, s + 40)?;
+                let fileoff = u64::from(u32_at(binary, s + 48)?);
+                sections.push((addr, size, fileoff));
+                if name.starts_with(b"__text") {
+                    text = Some((addr, size, fileoff));
+                }
+            }
+        }
+        pos = pos.checked_add(cmdsize.max(8))?;
+    }
+    let (text_va, text_size, text_fileoff) = text?;
+    let file_offset = |va: u64| -> Option<usize> {
+        sections.iter().find_map(|&(addr, size, fileoff)| {
+            (va >= addr && va - addr < size)
+                .then(|| usize::try_from(fileoff + (va - addr)).ok())
+                .flatten()
+        })
+    };
+    let text_start = usize::try_from(text_fileoff).ok()?;
+    let text_len = text_start
+        .checked_add(usize::try_from(text_size).ok()?)?
+        .min(binary.len())
+        .saturating_sub(text_start);
+    let mut pairs = Vec::new();
+    let mut previous_id: Option<(usize, String)> = None;
+    let mut offset = 0usize;
+    while offset + 8 <= text_len {
+        let p = text_start + offset;
+        let w1 = u32_at(binary, p)?;
+        let w2 = u32_at(binary, p + 4)?;
+        offset += 4;
+        // ADRP Xd, #imm（bit31=1，bits28-24=10000）
+        if w1 & 0x9F00_0000 != 0x9000_0000 {
+            continue;
+        }
+        // ADD Xd2, Xn, #imm12（64 位、sh=0），且 Xn 必须是 ADRP 的目标寄存器
+        if w2 & 0xFFC0_0000 != 0x9100_0000 || (w2 >> 5) & 31 != w1 & 31 {
+            continue;
+        }
+        let imm = ((w1 >> 5) & 0x3_FFFF) << 2 | (w1 >> 29) & 3;
+        let imm = if imm & (1 << 20) != 0 {
+            imm as i64 - (1 << 21)
+        } else {
+            imm as i64
+        };
+        let pc = text_va + (offset - 4) as u64;
+        let target = (pc & !0xFFF)
+            .wrapping_add_signed(imm << 12)
+            .wrapping_add(((w2 >> 10) & 0xFFF) as u64);
+        let Some(target) = file_offset(target) else {
+            continue;
+        };
+        let Some(text_bytes) = binary.get(target..target.saturating_add(100)) else {
+            continue;
+        };
+        if text_bytes.starts_with(b"1071006060591-") {
+            let suffix = b".apps.googleusercontent.com";
+            if let Some(end) = text_bytes
+                .windows(suffix.len())
+                .position(|part| part == suffix)
+            {
+                previous_id = Some((
+                    offset - 4,
+                    String::from_utf8(text_bytes[..end + suffix.len()].to_vec()).ok()?,
+                ));
+            }
+        } else if text_bytes.starts_with(b"GOCSPX-") {
+            if let Some((id_offset, id)) = &previous_id {
+                if offset - 4 - id_offset <= 128 {
+                    let secret = std::str::from_utf8(&text_bytes[..35]).ok()?;
+                    if secret
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    {
+                        pairs.push((id.clone(), secret.to_string()));
                     }
                 }
             }
@@ -2388,6 +2501,65 @@ mod tests {
         assert!(antigravity_windows_client(&binary).is_none());
         assert!(antigravity_windows_client(&[0; 10]).is_none());
     }
+
+    #[test]
+    fn antigravity_macho_client_pairs_config_references() {
+        let mut binary = vec![0u8; 2048];
+        // mach_header_64：magic + ncmds=1，load command 从 32 开始
+        binary[0..4].copy_from_slice(&0xFEEDFACFu32.to_le_bytes());
+        binary[16..20].copy_from_slice(&1u32.to_le_bytes());
+        // LC_SEGMENT_64 "__TEXT"：vmaddr=0, fileoff=0, nsects=2
+        binary[32..36].copy_from_slice(&0x19u32.to_le_bytes());
+        binary[36..40].copy_from_slice(&232u32.to_le_bytes());
+        binary[40..46].copy_from_slice(b"__TEXT");
+        binary[64..72].copy_from_slice(&2048u64.to_le_bytes()); // vmsize
+        binary[80..88].copy_from_slice(&2048u64.to_le_bytes()); // filesize
+        binary[96..100].copy_from_slice(&2u32.to_le_bytes());
+        // section_64 __text：addr=0, size=512, offset=0
+        binary[104..110].copy_from_slice(b"__text");
+        binary[136..144].copy_from_slice(&0u64.to_le_bytes());
+        binary[144..152].copy_from_slice(&512u64.to_le_bytes());
+        binary[152..156].copy_from_slice(&0u32.to_le_bytes());
+        // section_64 __cstring：addr=512, size=1536, offset=512
+        binary[184..193].copy_from_slice(b"__cstring");
+        binary[216..224].copy_from_slice(&512u64.to_le_bytes());
+        binary[224..232].copy_from_slice(&1536u64.to_le_bytes());
+        binary[232..236].copy_from_slice(&512u32.to_le_bytes());
+
+        let id = format!(
+            "{}{}.{}",
+            "1071006060591-", "test", "apps.googleusercontent.com"
+        )
+        .into_bytes();
+        let secret = format!("{}{}", "GOCSPX-", "x".repeat(28)).into_bytes();
+        binary[600..600 + id.len()].copy_from_slice(&id);
+        binary[700..700 + secret.len()].copy_from_slice(&secret);
+        // adrp x8, 0 ; add x9, x8, #600 与 adrp x10, 0 ; add x11, x10, #700
+        binary[200..204].copy_from_slice(&(0x9000_0008u32).to_le_bytes());
+        binary[204..208].copy_from_slice(&(0x9100_0000u32 | 600 << 10 | 8 << 5 | 9).to_le_bytes());
+        binary[208..212].copy_from_slice(&(0x9000_000Au32).to_le_bytes());
+        binary[212..216]
+            .copy_from_slice(&(0x9100_0000u32 | 700 << 10 | 10 << 5 | 11).to_le_bytes());
+
+        let pair = antigravity_macho_client(&binary).unwrap();
+        assert_eq!(pair.0, String::from_utf8(id.to_vec()).unwrap());
+        assert_eq!(pair.1, String::from_utf8(secret.to_vec()).unwrap());
+        binary[212] = 0;
+        assert!(antigravity_macho_client(&binary).is_none());
+        assert!(antigravity_macho_client(&[0; 10]).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires installed Antigravity on macOS"]
+    fn antigravity_macho_client_reads_installed_binary() {
+        let binary =
+            std::fs::read("/Applications/Antigravity.app/Contents/Resources/bin/language_server")
+                .expect("installed language_server");
+        let (id, secret) = antigravity_macho_client(&binary).expect("client pair");
+        assert!(id.ends_with(".apps.googleusercontent.com"));
+        assert!(secret.starts_with("GOCSPX-"));
+    }
+
     #[test]
     fn parse_claude_usage_windows() {
         let usage: Value = serde_json::from_str(
