@@ -370,15 +370,18 @@ impl Root {
 
         let mut row = div()
             .id("sidebar-update-row")
-            .mx_2()
-            .mb_2()
             .flex()
             .items_center()
-            .justify_between()
-            .px_3()
-            .py_2()
+            .px_2()
+            .py(px(2.))
+            .h(px(24.))
             .rounded_md()
-            .child(div().text_xs().child(SharedString::from(label)));
+            .child(
+                div()
+                    .text_xs()
+                    .line_height(px(16.))
+                    .child(SharedString::from(label)),
+            );
 
         if attention {
             row = row

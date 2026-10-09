@@ -32,3 +32,22 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+  sync-server:
+    name: Sync server race / vet
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sync-server
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sync-server/go.mod
+          cache: false
+      - name: Run race tests
+        run: go test -race ./...
+      - name: Vet
+        run: go vet ./...

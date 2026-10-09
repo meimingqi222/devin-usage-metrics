@@ -11,12 +11,12 @@ mod text_input;
 mod updater_ui;
 mod usage_table;
 
-use agg::{build_buckets_for_device, window_for, Bucket, PeriodKind};
+use agg::{build_buckets_for_device, format_window_range, window_for, Bucket, PeriodKind};
 use chrono::TimeZone;
 use data::{AgentKind, LoadedData};
 use devin_usage_metrics::{agg, cli, data, i18n, pricing, quota, sync};
 use gpui::{
-    actions, div, point, prelude::*, px, relative, rgb, size, Animation, AnimationExt as _, App,
+    actions, div, point, prelude::*, px, relative, rgb, size, Animation, AnimationExt as _, AnyElement, App,
     Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyBinding, KeyDownEvent,
     MouseButton, Render, SharedString, Task, TitlebarOptions, Window, WindowBounds,
     WindowControlArea, WindowOptions,
@@ -86,11 +86,18 @@ fn model_color(name: &str) -> u32 {
     MODEL_COLORS[h % MODEL_COLORS.len()]
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum ViewMode {
+    #[default]
+    AgentHistory,
+    LiveQuota,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum Tab {
+    #[default]
     Usage,
     Sessions,
-    Quota,
 }
 
 /// 左侧边栏可折叠的分区。
@@ -98,7 +105,13 @@ enum Tab {
 enum SidebarSection {
     Agents,
     Devices,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum SettingsTab {
+    #[default]
     Sync,
+    General,
 }
 
 /// 订阅配额卡片：一个账号一条，结果在后台查询完成后整体替换。
@@ -152,12 +165,12 @@ struct Root {
     data: Arc<LoadedData>,
     loaded_agents: HashMap<AgentKind, Arc<LoadedData>>,
     agent: AgentKind,
+    view_mode: ViewMode,
     tab: Tab,
     period: PeriodKind,
     page: usize,
     buckets: Vec<Bucket>,
     expanded_buckets: std::collections::HashSet<i64>,
-    hide_empty_buckets: bool,
     sessions_rows: Vec<SessionRow>,
     selected: Option<String>,
     loaded_at: String,
@@ -214,7 +227,11 @@ struct Root {
     /// 左侧边栏各分区展开状态
     section_agents_open: bool,
     section_devices_open: bool,
-    section_sync_open: bool,
+    section_other_agents_open: bool,
+    /// 设置弹窗当前激活的 Tab
+    settings_tab: SettingsTab,
+    /// 是否隐藏无活动日期
+    hide_empty_buckets: bool,
     /// 自动同步定时任务
     sync_tick_task: Option<Task<()>>,
     /// 正在进行的一次导出+导入（与 load_task 分开，避免点重新加载打断同步）
@@ -237,8 +254,22 @@ fn open_external_url(url: &str) -> Result<(), String> {
 }
 
 impl Root {
+    fn switch_to_quota(&mut self, cx: &mut Context<Self>) {
+        if self.view_mode == ViewMode::LiveQuota {
+            cx.notify();
+            return;
+        }
+        self.view_mode = ViewMode::LiveQuota;
+        if !self.quota_loading && self.quota_updated_at.is_empty() {
+            self.start_quota_load(cx);
+        }
+        cx.notify();
+    }
+
     fn switch_agent(&mut self, target_agent: AgentKind, cx: &mut Context<Self>) {
-        if self.agent == target_agent && self.has_loaded {
+        let was_quota = self.view_mode == ViewMode::LiveQuota;
+        self.view_mode = ViewMode::AgentHistory;
+        if !was_quota && self.agent == target_agent && self.has_loaded {
             cx.notify();
             return;
         }
@@ -349,17 +380,16 @@ impl Root {
     }
 
     fn switch_tab(&mut self, kind: Tab, cx: &mut Context<Self>) {
+        self.view_mode = ViewMode::AgentHistory;
         self.tab = kind;
-        // 首次进入 Quota Tab 时自动拉取一次
-        if kind == Tab::Quota && !self.quota_loading && self.quota_updated_at.is_empty() {
-            self.start_quota_load(cx);
-        }
         cx.notify();
     }
 
     /// 切换设备筛选。None = 汇总所有设备。
     fn switch_device(&mut self, device_id: Option<String>, cx: &mut Context<Self>) {
-        if self.device_filter == device_id {
+        let was_quota = self.view_mode == ViewMode::LiveQuota;
+        self.view_mode = ViewMode::AgentHistory;
+        if !was_quota && self.device_filter == device_id {
             cx.notify();
             return;
         }
@@ -588,7 +618,6 @@ impl Root {
         match section {
             SidebarSection::Agents => self.section_agents_open = !self.section_agents_open,
             SidebarSection::Devices => self.section_devices_open = !self.section_devices_open,
-            SidebarSection::Sync => self.section_sync_open = !self.section_sync_open,
         }
         cx.notify();
     }
@@ -802,7 +831,7 @@ impl Root {
                 this.quota_loading = false;
                 this.quota_cards = cards;
                 this.quota_updated_at = chrono::Local::now().format("%H:%M:%S").to_string();
-                if this.tab == Tab::Quota {
+                if this.view_mode == ViewMode::LiveQuota {
                     cx.notify();
                 }
                 this.quota_tick(cx);
@@ -832,13 +861,13 @@ impl Root {
             && quota::macos_may_have_keychain_accounts()
     }
 
-    /// 每 30 秒重绘一次，驱动重置倒计时；离开 Quota Tab 或清空后自动停止。
+    /// 每 30 秒重绘一次，驱动重置倒计时；离开 LiveQuota 页面或清空后自动停止。
     fn quota_tick(&mut self, cx: &mut Context<Self>) {
         let timer = cx.background_executor().timer(Duration::from_secs(30));
         self.quota_tick_task = Some(cx.spawn(async move |this, cx| {
             timer.await;
             this.update(cx, |this, cx| {
-                if this.tab == Tab::Quota && !this.quota_cards.is_empty() {
+                if this.view_mode == ViewMode::LiveQuota && !this.quota_cards.is_empty() {
                     cx.notify();
                     this.quota_tick(cx);
                 }
@@ -949,14 +978,11 @@ impl Root {
     /// 已安装的 agent 排在上方（正常样式），未安装的排在下方（灰色样式）。
     /// 左侧边栏：应用名 + 可滚动/可折叠的分区（agents、设备、同步设置）。
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut sorted_agents = AgentKind::ALL.to_vec();
-        sorted_agents.sort_by_key(|kind| if kind.is_installed() { 0 } else { 1 });
-
-        let items = sorted_agents.into_iter().map(|kind| {
-            let is_selected = kind == self.agent;
+        let is_history_mode = self.view_mode == ViewMode::AgentHistory;
+        let render_agent_item = |kind: AgentKind, this_agent: AgentKind, loaded_agents: &HashMap<AgentKind, Arc<LoadedData>>| {
+            let is_selected = is_history_mode && kind == this_agent;
             let installed = kind.is_installed();
-            let count = self
-                .loaded_agents
+            let count = loaded_agents
                 .get(&kind)
                 .map(|d| d.sessions.iter().filter(|s| s.agent == kind).count());
 
@@ -1007,7 +1033,57 @@ impl Root {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.switch_agent(kind, cx);
                 }))
-        });
+        };
+
+        let mut active_kinds = Vec::new();
+        let mut other_kinds = Vec::new();
+        for kind in AgentKind::ALL {
+            let has_sessions = self
+                .loaded_agents
+                .get(&kind)
+                .map(|d| d.sessions.iter().any(|s| s.agent == kind))
+                .unwrap_or(false);
+            if kind.is_installed() || has_sessions || kind == self.agent {
+                active_kinds.push(kind);
+            } else {
+                other_kinds.push(kind);
+            }
+        }
+
+        let active_items = active_kinds
+            .into_iter()
+            .map(|kind| render_agent_item(kind, self.agent, &self.loaded_agents));
+
+        let other_count = other_kinds.len();
+        let other_arrow = if self.section_other_agents_open { "▾" } else { "▸" };
+        let other_toggle_btn = if other_count > 0 {
+            Some(
+                div()
+                    .id("toggle-more-agents")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .cursor_pointer()
+                    .hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
+                    .child(format!("{other_arrow} {}", i18n::tf(i18n::Key::MoreAgents, &[&other_count.to_string()])))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.section_other_agents_open = !this.section_other_agents_open;
+                        cx.notify();
+                    })),
+            )
+        } else {
+            None
+        };
+        let other_items = if self.section_other_agents_open {
+            other_kinds
+                .into_iter()
+                .map(|kind| render_agent_item(kind, self.agent, &self.loaded_agents))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
         // ── 设备选择区 ──
         let local_id = data::device_id();
@@ -1123,23 +1199,8 @@ impl Root {
             i18n::t(i18n::Key::DevicesSection),
             self.section_devices_open,
         );
-        let sync_header = section_header(SidebarSection::Sync, "同步", self.section_sync_open);
 
-        let sync_config_btn = div()
-            .id("sync-config-open")
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .text_xs()
-            .text_color(rgb(MUTED))
-            .cursor_pointer()
-            .hover(|h| h.bg(rgb(PANEL2)))
-            .child(i18n::t(i18n::Key::SyncConfigConfigure))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.open_sync_config(window, cx);
-            }));
-
-        // 可滚动内容区
+        // 可滚动内容区：只有数据筛选（代理、设备），不再混杂设置入口
         let content = div()
             .id("sidebar-scroll")
             .flex_1()
@@ -1149,7 +1210,16 @@ impl Root {
             .flex_col()
             .child(agents_header)
             .when(self.section_agents_open, |d| {
-                d.child(div().flex().flex_col().pl(px(12.)).pr_2().children(items))
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .pl(px(12.))
+                        .pr_2()
+                        .children(active_items)
+                        .children(other_toggle_btn)
+                        .children(other_items),
+                )
             })
             .child(devices_header)
             .when(self.section_devices_open, |d| {
@@ -1161,17 +1231,6 @@ impl Root {
                         .pr_2()
                         .child(all_btn)
                         .children(device_btns),
-                )
-            })
-            .child(sync_header)
-            .when(self.section_sync_open, |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .pl(px(12.))
-                        .pr_2()
-                        .child(sync_config_btn),
                 )
             });
 
@@ -1223,6 +1282,106 @@ impl Root {
                     .child(detail)
             }));
 
+        // 统一集中设置入口
+        let settings_btn = div()
+            .id("settings-open")
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py(px(2.))
+            .h(px(24.))
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(rgb(MUTED))
+            .hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(14.))
+                    .h(px(14.))
+                    .text_xs()
+                    .line_height(px(14.))
+                    .child("⚙"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .line_height(px(16.))
+                    .child(i18n::t(i18n::Key::Settings)),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_sync_config(window, cx);
+            }));
+
+        let footer_row = div()
+            .id("sidebar-footer")
+            .mx_2()
+            .mb_2()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(settings_btn)
+            .child(self.update_version_row(cx));
+
+        let quota_active = self.view_mode == ViewMode::LiveQuota;
+        let quota_nav_btn = div()
+            .id("nav-live-quota")
+            .mx_2()
+            .mb_2()
+            .px_2()
+            .py(px(6.))
+            .rounded_md()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_between()
+            .when(quota_active, |d| {
+                d.bg(rgba(ACCENT, 0.18))
+            })
+            .when(!quota_active, |d| {
+                d.hover(|h| h.bg(rgb(PANEL2)))
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(7.))
+                            .h(px(7.))
+                            .rounded_full()
+                            .bg(rgb(if quota_active { ACCENT } else { 0x3ddc97 })),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(if quota_active {
+                                gpui::FontWeight::BOLD
+                            } else {
+                                gpui::FontWeight::MEDIUM
+                            })
+                            .text_color(if quota_active { rgb(ACCENT) } else { rgb(TEXT) })
+                            .child(i18n::t(i18n::Key::LiveQuotaNav)),
+                    ),
+            )
+            .children(if !self.quota_cards.is_empty() {
+                Some(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(self.quota_cards.len().to_string()),
+                )
+            } else {
+                None
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.switch_to_quota(cx);
+            }));
+
         div()
             .id("sidebar")
             .flex_shrink_0()
@@ -1230,22 +1389,58 @@ impl Root {
             .h_full()
             .flex()
             .flex_col()
-            // 顶部留出 macOS 红绿灯按钮的悬浮空间
-            .pt(px(40.))
             .bg(rgb(PANEL))
+            // 左上角平台差异：macOS 红绿灯悬浮在侧边栏顶部，标题需下移让位；
+            // Windows 没有系统按钮，标题上移为与右侧工具栏同高的 48px 行。
+            .when(cfg!(target_os = "macos"), |d| {
+                d.child(
+                    div()
+                        .w_full()
+                        .h(px(40.))
+                        .window_control_area(WindowControlArea::Drag),
+                )
+                .child(
+                    div()
+                        .px_4()
+                        .pb_2()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(rgb(TEXT))
+                        .window_control_area(WindowControlArea::Drag)
+                        .child("Agent Usage Metrics"),
+                )
+            })
+            .when(!cfg!(target_os = "macos"), |d| {
+                d.child(
+                    div()
+                        .w_full()
+                        .h(px(48.))
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .window_control_area(WindowControlArea::Drag)
+                        .child(
+                            div()
+                                .text_xs()
+                                .whitespace_nowrap()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(rgb(TEXT))
+                                .child("Agent Usage Metrics"),
+                        ),
+                )
+            })
+            .child(quota_nav_btn)
             .child(
                 div()
-                    .px_4()
-                    .pb_2()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(TEXT))
-                    .window_control_area(WindowControlArea::Drag)
-                    .child("Agent Usage Metrics"),
+                    .mx_3()
+                    .mb_1()
+                    .border_b_1()
+                    .border_color(rgb(BORDER)),
             )
             .child(content)
             .child(sync_toggle)
-            .child(self.update_version_row(cx))
+            .child(footer_row)
     }
 
     /// 弹窗中的文本输入框。
@@ -1280,101 +1475,141 @@ impl Root {
             .child(input)
     }
 
-    /// 同步设置弹窗：只保留 API 地址和 GitHub 登录。
-    /// 只读本地 meta / 加密会话文件，不访问系统钥匙串。
+    /// 集中设置弹窗：包含多设备同步与常规偏好（语言等）。
     fn sync_config_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let url_input = self.sync_config_input(self.modal_url_input.clone(), window, cx);
-        let mut meta = sync::github_sync_session_meta();
-        if meta.expires_at <= chrono::Utc::now().timestamp() {
-            // 尝试从加密会话文件恢复 meta（不碰钥匙串）
-            if let Some(session) = sync::load_github_sync_session() {
-                meta = sync::GitHubSyncSessionMeta {
-                    login: session.login.clone(),
-                    expires_at: session.expires_at,
-                };
-            }
-        }
-        let logged_in = meta.expires_at > chrono::Utc::now().timestamp();
-        let login_label = if self.github_login_busy {
-            "等待 GitHub 授权…"
-        } else if logged_in {
-            if meta.login.is_empty() {
-                "已登录 GitHub"
-            } else {
-                "重新登录 GitHub"
-            }
-        } else {
-            "登录 GitHub"
-        };
-        let login_status = if self.github_login_busy {
-            self.github_login_code
-                .as_ref()
-                .map(|code| {
-                    if self.github_login_code_copied {
-                        format!("验证码 {code} 已复制，请到浏览器粘贴")
-                    } else {
-                        format!("浏览器已打开，请输入验证码：{code}")
-                    }
+        let tab_btn = |tab: SettingsTab, label: &'static str| {
+            let is_sel = self.settings_tab == tab;
+            div()
+                .id(SharedString::from(format!("settings-tab-{tab:?}")))
+                .px_3()
+                .py_1()
+                .rounded_sm()
+                .text_xs()
+                .cursor_pointer()
+                .when(is_sel, |d| {
+                    d.bg(rgba(ACCENT, 0.2))
+                        .text_color(rgb(ACCENT))
+                        .font_weight(gpui::FontWeight::BOLD)
                 })
-                .unwrap_or_else(|| "正在准备浏览器登录…".into())
-        } else if logged_in {
-            if meta.login.is_empty() {
-                "已登录 GitHub".into()
-            } else {
-                format!("已登录 GitHub：{}", meta.login)
-            }
-        } else {
-            "未登录；同一 GitHub 账号的设备会自动同步".into()
+                .when(!is_sel, |d| {
+                    d.text_color(rgb(MUTED))
+                        .hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
+                })
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings_tab = tab;
+                    cx.notify();
+                }))
         };
 
-        let card = div()
-            .w(px(360.))
-            .p_4()
-            .rounded_lg()
-            .bg(rgb(PANEL))
-            .border_1()
-            .border_color(rgb(BORDER))
-            .shadow_md()
+        let title_bar = div()
             .flex()
-            .flex_col()
-            .gap_3()
+            .items_center()
+            .justify_between()
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .text_sm()
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(rgb(TEXT))
-                    .child(i18n::t(i18n::Key::SyncConfigTitle)),
+                    .child("⚙")
+                    .child(i18n::t(i18n::Key::Settings)),
             )
             .child(
                 div()
+                    .id("modal-close-x")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child("同步 API 地址"),
-            )
-            .child(url_input)
-            .child(div().text_xs().text_color(rgb(MUTED)).child(login_status))
-            .child(
-                div()
-                    .id("modal-github-login")
-                    .px_3()
-                    .py_2()
-                    .rounded_sm()
-                    .text_center()
-                    .text_xs()
-                    .text_color(rgb(0x0a0a0c))
-                    .bg(rgb(ACCENT))
-                    .when(!self.github_login_busy, |button| {
-                        button
-                            .cursor_pointer()
-                            .hover(|h| h.bg(rgb(0x6ad4ff)))
-                            .on_click(cx.listener(|this, _, _, cx| this.start_github_login(cx)))
-                    })
-                    .child(login_label),
-            )
-            .when(
-                self.github_login_busy && self.github_login_code.is_some(),
-                |card| {
-                    card.child(
+                    .cursor_pointer()
+                    .hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
+                    .child("✕")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.cancel_sync_config(cx);
+                    })),
+            );
+
+        let nav_tabs = div()
+            .flex()
+            .gap_1()
+            .pb_2()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(tab_btn(SettingsTab::Sync, i18n::t(i18n::Key::SettingsSync)))
+            .child(tab_btn(SettingsTab::General, i18n::t(i18n::Key::SettingsGeneral)));
+
+        let content_body: AnyElement = match self.settings_tab {
+            SettingsTab::Sync => {
+                let url_input = self.sync_config_input(self.modal_url_input.clone(), window, cx);
+                let session = sync::load_github_sync_session();
+                let logged_in = session
+                    .as_ref()
+                    .filter(|session| session.expires_at > chrono::Utc::now().timestamp());
+                let login_label = if self.github_login_busy {
+                    "等待 GitHub 授权…"
+                } else if let Some(session) = logged_in {
+                    if session.login.is_empty() {
+                        "已登录 GitHub"
+                    } else {
+                        "重新登录 GitHub"
+                    }
+                } else {
+                    "登录 GitHub"
+                };
+                let login_status = if self.github_login_busy {
+                    self.github_login_code
+                        .as_ref()
+                        .map(|code| {
+                            if self.github_login_code_copied {
+                                format!("验证码 {code} 已复制，请到浏览器粘贴")
+                            } else {
+                                format!("浏览器已打开，请输入验证码：{code}")
+                            }
+                        })
+                        .unwrap_or_else(|| "正在准备浏览器登录…".into())
+                } else if let Some(session) = logged_in {
+                    format!("已登录 GitHub：{}", session.login)
+                } else {
+                    "未登录；同一 GitHub 账号的设备会自动同步".into()
+                };
+
+                let mut sync_box = div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("同步 API 地址"),
+                    )
+                    .child(url_input)
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(login_status))
+                    .child(
+                        div()
+                            .id("modal-github-login")
+                            .px_3()
+                            .py_2()
+                            .rounded_sm()
+                            .text_center()
+                            .text_xs()
+                            .text_color(rgb(0x0a0a0c))
+                            .bg(rgb(ACCENT))
+                            .when(!self.github_login_busy, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .hover(|h| h.bg(rgb(0x6ad4ff)))
+                                    .on_click(cx.listener(|this, _, _, cx| this.start_github_login(cx)))
+                            })
+                            .child(login_label),
+                    );
+
+                if self.github_login_busy && self.github_login_code.is_some() {
+                    sync_box = sync_box.child(
                         div()
                             .id("modal-github-copy-code")
                             .px_3()
@@ -1396,35 +1631,141 @@ impl Root {
                             .on_click(
                                 cx.listener(|this, _, _, cx| this.copy_github_login_code(cx)),
                             ),
-                    )
-                },
-            )
-            .when(logged_in, |d| {
-                d.child(
+                    );
+                }
+
+                if logged_in.is_some() {
+                    sync_box = sync_box.child(
+                        div()
+                            .id("modal-github-logout")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .cursor_pointer()
+                            .hover(|h| h.bg(rgb(PANEL2)))
+                            .child("退出 GitHub")
+                            .on_click(cx.listener(|this, _, _, cx| this.logout_github(cx))),
+                    );
+                }
+
+                sync_box = sync_box.child(
                     div()
-                        .id("modal-github-logout")
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child("同一 GitHub 账号的设备会合并到同一份同步数据"),
+                );
+
+                sync_box.into_any_element()
+            }
+            SettingsTab::General => {
+                let cur_lang = i18n::lang();
+                let lang_btn = |lang: i18n::Lang, label: &'static str| {
+                    let active = cur_lang == lang;
+                    div()
+                        .id(SharedString::from(format!("settings-lang-{}", lang.short_label())))
                         .px_3()
                         .py_1()
                         .rounded_sm()
                         .text_xs()
-                        .text_color(rgb(MUTED))
                         .cursor_pointer()
-                        .hover(|h| h.bg(rgb(PANEL2)))
-                        .child("退出 GitHub")
-                        .on_click(cx.listener(|this, _, _, cx| this.logout_github(cx))),
-                )
-            })
-            .child(
+                        .when(active, |d| {
+                            d.bg(rgba(ACCENT, 0.2))
+                                .text_color(rgb(ACCENT))
+                                .font_weight(gpui::FontWeight::BOLD)
+                        })
+                        .when(!active, |d| {
+                            d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
+                        })
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            i18n::set_lang(lang);
+                            this.rebuild_buckets();
+                            this.rebuild_sessions();
+                            cx.notify();
+                        }))
+                };
+
                 div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("同一 GitHub 账号的设备会合并到同一份同步数据"),
-            )
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .py_1()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(MUTED))
+                                    .child(i18n::t(i18n::Key::Language)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(lang_btn(i18n::Lang::Zh, "简体中文"))
+                                    .child(lang_btn(i18n::Lang::En, "English")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(rgb(BORDER))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child("关于本应用"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(TEXT))
+                                    .child("Agent Usage Metrics v0.2.1"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child("本地 Coding Agent 用量与配额监控工具"),
+                            ),
+                    )
+                    .into_any_element()
+            }
+        };
+
+        let card = div()
+            .w(px(380.))
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .shadow_md()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(title_bar)
+            .child(nav_tabs)
+            .child(content_body)
             .child(
                 div()
                     .flex()
                     .justify_end()
                     .gap_2()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
                     .child(
                         div()
                             .id("modal-cancel")
@@ -1476,16 +1817,16 @@ impl Root {
             .child(card)
     }
     fn top_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_quota_mode = self.view_mode == ViewMode::LiveQuota;
         let tab = self.tab;
         let period = self.period;
         let page = self.page;
-        let show_period = tab == Tab::Usage;
-        let show_quota = tab == Tab::Quota;
+        let show_period = !is_quota_mode && tab == Tab::Usage;
         let loaded_at = self.loaded_at.clone();
         let quota_updated_at = self.quota_updated_at.clone();
 
         let tab_btn = |kind: Tab, name: &'static str| {
-            let active = tab == kind;
+            let active = !is_quota_mode && tab == kind;
             div()
                 .id(SharedString::from(format!("tab-{kind:?}")))
                 .px_3()
@@ -1533,32 +1874,42 @@ impl Root {
                 }))
         };
 
-        // 顶栏语言切换：与周期按钮同款的紧凑两段式
-        let lang_btn = |target: i18n::Lang| {
-            let active = i18n::lang() == target;
-            div()
-                .id(SharedString::from(format!("lang-{}", target.short_label())))
-                .px_2()
-                .py(px(2.))
-                .rounded_sm()
-                .text_xs()
-                .cursor_pointer()
-                .when(active, |d| d.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
-                .when(!active, |d| {
-                    d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)))
-                })
-                .child(target.short_label())
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    i18n::set_lang(target);
-                    this.rebuild_buckets();
-                    this.rebuild_sessions();
-                    cx.notify();
-                }))
-        };
+        let range_label = format_window_range(self.period, self.page);
 
-        let prev_page = div()
-            .id("prev-page")
+        // ◀ 更早历史（增加 page 偏移）
+        let earlier_btn = div()
+            .id("history-earlier")
+            .px_2()
+            .py(px(2.))
+            .rounded_sm()
+            .text_xs()
+            .cursor_pointer()
+            .text_color(rgb(MUTED))
+            .hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child("◀")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.page = this.page.saturating_add(1);
+                if this.page_needs_load() {
+                    this.start_load(true, cx);
+                } else {
+                    this.rebuild_buckets();
+                    cx.notify();
+                }
+            }));
+
+        let range_indicator = div()
+            .px_2()
+            .py(px(2.))
+            .rounded_sm()
+            .text_xs()
+            .text_color(rgb(TEXT))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .child(range_label);
+
+        // ▶ 更近历史 / 向今天（减少 page 偏移；page == 0 时置灰禁用）
+        let later_btn = div()
+            .id("history-later")
             .px_2()
             .py(px(2.))
             .rounded_sm()
@@ -1566,7 +1917,7 @@ impl Root {
             .when(page > 0, |d| {
                 d.cursor_pointer()
                     .text_color(rgb(MUTED))
-                    .hover(|h| h.bg(rgb(PANEL2)))
+                    .hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.page = this.page.saturating_sub(1);
                         if this.page_needs_load() {
@@ -1581,175 +1932,213 @@ impl Root {
                 d.text_color(rgba(MUTED, 0.3)).cursor_default()
             })
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(i18n::t(i18n::Key::PrevPage));
+            .child("▶");
 
-        let next_page = div()
-            .id("next-page")
+        let jump_today_btn = if page > 0 {
+            Some(
+                div()
+                    .id("jump-today")
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_sm()
+                    .text_xs()
+                    .cursor_pointer()
+                    .text_color(rgb(ACCENT))
+                    .hover(|h| h.bg(rgba(ACCENT, 0.15)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(i18n::t(i18n::Key::JumpToday))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.page = 0;
+                        if this.page_needs_load() {
+                            this.start_load(true, cx);
+                        } else {
+                            this.rebuild_buckets();
+                            cx.notify();
+                        }
+                    })),
+            )
+        } else {
+            None
+        };
+
+        let reload_btn = div()
+            .id("reload")
             .px_2()
             .py(px(2.))
             .rounded_sm()
             .text_xs()
-            .cursor_pointer()
-            .text_color(rgb(MUTED))
-            .hover(|h| h.bg(rgb(PANEL2)))
+            .flex()
+            .items_center()
+            .gap_2()
+            .when(!self.loading, |d| {
+                d.cursor_pointer()
+                    .text_color(rgb(MUTED))
+                    .hover(|h| h.bg(rgb(PANEL2)))
+            })
+            .when(self.loading, |d| d.text_color(rgba(MUTED, 0.55)))
+            .child(if self.loading {
+                loading_dots(5., 1.).into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(if self.loading {
+                i18n::t(i18n::Key::Reloading)
+            } else {
+                i18n::t(i18n::Key::Reload)
+            })
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(i18n::t(i18n::Key::NextPage))
             .on_click(cx.listener(|this, _, _, cx| {
-                this.page = this.page.saturating_add(1);
-                if this.page_needs_load() {
+                if !this.loading {
                     this.start_load(true, cx);
-                } else {
-                    this.rebuild_buckets();
-                    cx.notify();
                 }
             }));
+
+        let quota_refresh_btn = div()
+            .id("quota-refresh")
+            .px_2()
+            .py(px(2.))
+            .rounded_sm()
+            .text_xs()
+            .flex()
+            .items_center()
+            .gap_2()
+            .when(!self.quota_loading, |b| {
+                b.cursor_pointer()
+                    .text_color(rgb(MUTED))
+                    .hover(|h| h.bg(rgb(PANEL2)))
+            })
+            .when(self.quota_loading, |b| b.text_color(rgba(MUTED, 0.55)))
+            .child(if self.quota_loading {
+                loading_dots(5., 1.).into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(if self.quota_loading {
+                i18n::t(i18n::Key::QuotaRefreshing)
+            } else {
+                i18n::t(i18n::Key::QuotaRefresh)
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| {
+                if !this.quota_loading {
+                    this.start_quota_load(cx);
+                }
+            }));
+
+        let right_status = if is_quota_mode {
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .flex_shrink_0()
+                .child(quota_refresh_btn)
+                .when(!quota_updated_at.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(i18n::tf(i18n::Key::QuotaUpdated, &[&quota_updated_at])),
+                    )
+                })
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .flex_shrink_0()
+                .child(reload_btn)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(i18n::tf(i18n::Key::DataAsOf, &[&loaded_at])),
+                )
+        };
+
+        let left_controls = if is_quota_mode {
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(rgb(TEXT))
+                        .child(i18n::t(i18n::Key::LiveQuotaTitle)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(i18n::t(i18n::Key::LiveQuotaSubtitle)),
+                )
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .child(tab_btn(Tab::Usage, i18n::t(i18n::Key::Usage)))
+                .child(tab_btn(Tab::Sessions, i18n::t(i18n::Key::Sessions)))
+                .when(show_period, |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .pl_2()
+                            .border_l_1()
+                            .border_color(rgb(BORDER))
+                            .child(period_btn(PeriodKind::Day))
+                            .child(period_btn(PeriodKind::Week))
+                            .child(period_btn(PeriodKind::Month)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .pl_2()
+                            .border_l_1()
+                            .border_color(rgb(BORDER))
+                            .child(earlier_btn)
+                            .child(range_indicator)
+                            .child(later_btn)
+                            .children(jump_today_btn),
+                    )
+                })
+        };
+
+        let right_bar = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .flex_shrink_0()
+            .child(right_status)
+            .when(cfg!(target_os = "windows"), |bar| {
+                bar.child(self.windows_caption_buttons(window))
+            });
 
         div()
             .flex()
             .w_full()
             .min_w(px(0.))
             .items_center()
-            .gap_3()
-            .px_4()
+            .pl_4()
+            .pr(if cfg!(target_os = "windows") {
+                px(0.)
+            } else {
+                px(16.)
+            })
             .h(px(48.))
             // 一体化标题栏：顶栏区域负责窗口拖拽，内部按钮点击不受影响
             .window_control_area(WindowControlArea::Drag)
-            .child(tab_btn(Tab::Usage, i18n::t(i18n::Key::Usage)))
-            .child(tab_btn(Tab::Sessions, i18n::t(i18n::Key::Sessions)))
-            .child(tab_btn(Tab::Quota, i18n::t(i18n::Key::QuotaTab)))
-            .when(show_period, |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .pl_3()
-                        .border_l_1()
-                        .border_color(rgb(BORDER))
-                        .child(period_btn(PeriodKind::Day))
-                        .child(period_btn(PeriodKind::Week))
-                        .child(period_btn(PeriodKind::Month)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .pl_3()
-                        .border_l_1()
-                        .border_color(rgb(BORDER))
-                        .child(prev_page)
-                        .child(next_page),
-                )
-            })
-            .when(show_quota, |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .pl_3()
-                        .border_l_1()
-                        .border_color(rgb(BORDER))
-                        .child(
-                            div()
-                                .id("quota-refresh")
-                                .px_2()
-                                .py(px(2.))
-                                .rounded_sm()
-                                .text_xs()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .when(!self.quota_loading, |b| {
-                                    b.cursor_pointer()
-                                        .text_color(rgb(MUTED))
-                                        .hover(|h| h.bg(rgb(PANEL2)))
-                                })
-                                .when(self.quota_loading, |b| b.text_color(rgba(MUTED, 0.55)))
-                                .child(if self.quota_loading {
-                                    loading_dots(5., 1.).into_any_element()
-                                } else {
-                                    div().into_any_element()
-                                })
-                                .child(if self.quota_loading {
-                                    i18n::t(i18n::Key::QuotaRefreshing)
-                                } else {
-                                    i18n::t(i18n::Key::QuotaRefresh)
-                                })
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if !this.quota_loading {
-                                        this.start_quota_load(cx);
-                                    }
-                                })),
-                        ),
-                )
-            })
-            .child(div().flex_1())
-            .child(
-                div()
-                    .id("reload")
-                    .px_2()
-                    .py(px(2.))
-                    .rounded_sm()
-                    .text_xs()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .when(!self.loading, |d| {
-                        d.cursor_pointer()
-                            .text_color(rgb(MUTED))
-                            .hover(|h| h.bg(rgb(PANEL2)))
-                    })
-                    .when(self.loading, |d| d.text_color(rgba(MUTED, 0.55)))
-                    .child(if self.loading {
-                        loading_dots(5., 1.).into_any_element()
-                    } else {
-                        div().into_any_element()
-                    })
-                    .child(if self.loading {
-                        i18n::t(i18n::Key::Reloading)
-                    } else {
-                        i18n::t(i18n::Key::Reload)
-                    })
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if !this.loading {
-                            this.start_load(true, cx);
-                        }
-                    })),
-            )
-            // 多设备同步开关已移到侧边栏底部
-            .when(!show_quota, |d| {
-                d.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(MUTED))
-                        .child(i18n::tf(i18n::Key::DataAsOf, &[&loaded_at])),
-                )
-            })
-            .when(show_quota && !quota_updated_at.is_empty(), |d| {
-                d.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(MUTED))
-                        .child(i18n::tf(i18n::Key::QuotaUpdated, &[&quota_updated_at])),
-                )
-            })
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .pl_3()
-                    .border_l_1()
-                    .border_color(rgb(BORDER))
-                    .child(lang_btn(i18n::Lang::Zh))
-                    .child(lang_btn(i18n::Lang::En)),
-            )
-            // Windows 没有系统标题栏按钮（窗口样式不含 WS_CAPTION），
-            // 在顶栏右端自绘 最小化/最大化/关闭
-            .when(cfg!(target_os = "windows"), |bar| {
-                bar.child(self.windows_caption_buttons(window))
-            })
+            .child(left_controls)
+            .child(div().flex_1().min_w(px(8.)))
+            .child(right_bar)
     }
 
     /// Windows 专用的窗口控制按钮。不要挂 on_click：这些区域会被系统
@@ -1785,6 +2174,7 @@ impl Root {
             };
         div()
             .flex()
+            .flex_shrink_0()
             .h_full()
             .child(caption_button(
                 "win-min",
@@ -1859,7 +2249,6 @@ impl Root {
 
     fn usage_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let buckets = &self.buckets;
-        // 四类 token 全部计入总计：与定价公式、CLI 表格保持一致（见 agg::Bucket::total）
         let (mut ti, mut to, mut tc, mut tw, mut turns, mut cost) = (0.0, 0.0, 0.0, 0.0, 0u32, 0.0);
         let mut sessions = std::collections::BTreeSet::new();
         for b in buckets {
@@ -1871,6 +2260,7 @@ impl Root {
             cost += b.cost;
             sessions.extend(b.session_keys.iter().cloned());
         }
+        // 四类 token 全部计入总计：与定价公式、CLI 表格保持一致（见 agg::Bucket::total）
         let total = ti + to + tc + tw;
 
         // 7 张卡在默认窗口下刚好一行；窗口变窄时换行而不是被裁掉。
@@ -1935,6 +2325,15 @@ impl Root {
         );
         let chart = self.chart();
         let table = self.bucket_table(cx);
+        let range_str = format_window_range(self.period, self.page);
+        let period_indicator = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .text_color(rgb(MUTED))
+            .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgb(ACCENT)))
+            .child(i18n::tf(i18n::Key::PeriodRangeLabel, &[&range_str]));
 
         // 统计卡与图表固定，仅底部明细表格独立滚动
         div()
@@ -1947,6 +2346,7 @@ impl Root {
             .flex_col()
             .gap_3()
             .overflow_hidden()
+            .child(period_indicator)
             .child(cards)
             .when(turns == 0, |d| {
                 d.child(
@@ -2124,22 +2524,34 @@ impl Root {
             let can_expand = models.len() > 1;
             let expanded = can_expand && self.expanded_buckets.contains(&bucket.start);
             let key = bucket.start;
+            let label_text = if bucket.sub.is_empty() {
+                bucket.label.clone()
+            } else {
+                format!("{} {}", bucket.label, bucket.sub)
+            };
             let label = div()
                 .flex()
-                .items_start()
+                .items_center()
                 .gap_1()
-                .child(div().w(px(10.)).flex_none().child(if !can_expand {
-                    ""
-                } else if expanded {
-                    "▾"
-                } else {
-                    "▸"
-                }))
+                .child(
+                    div()
+                        .w(px(10.))
+                        .flex_none()
+                        .text_center()
+                        .child(if !can_expand {
+                            ""
+                        } else if expanded {
+                            "▾"
+                        } else {
+                            "▸"
+                        }),
+                )
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.))
-                        .child(format!("{} {}", bucket.label, bucket.sub)),
+                        .whitespace_nowrap()
+                        .child(label_text),
                 );
             let distribution = if models.is_empty() {
                 div()
@@ -2298,14 +2710,9 @@ impl Root {
                         d.text_color(rgb(ACCENT)).bg(rgba(ACCENT, 0.15))
                     })
                     .when(!self.hide_empty_buckets, |d| {
-                        d.text_color(rgb(MUTED))
-                            .hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
+                        d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
                     })
-                    .child(if self.hide_empty_buckets {
-                        "☑"
-                    } else {
-                        "☐"
-                    })
+                    .child(if self.hide_empty_buckets { "☑" } else { "☐" })
                     .child(i18n::t(i18n::Key::HideEmptyDays))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.hide_empty_buckets = !this.hide_empty_buckets;
@@ -2985,8 +3392,7 @@ fn collect_local_export(start: i64, end: i64) -> LoadedData {
         })
         .collect();
     for (_, mut agent_data) in loaded {
-        combined.sessions.append(&mut agent_data.sessions);
-        combined.turns.append(&mut agent_data.turns);
+        append_export_source(&mut combined, &mut agent_data);
     }
     if let Some(fingerprints) = fingerprints {
         if let Ok(bytes) =
@@ -3004,6 +3410,12 @@ fn collect_local_export(start: i64, end: i64) -> LoadedData {
         started.elapsed().as_millis()
     ));
     combined
+}
+
+fn append_export_source(combined: &mut LoadedData, source: &mut LoadedData) {
+    combined.sessions.append(&mut source.sessions);
+    combined.turns.append(&mut source.turns);
+    combined.errors.append(&mut source.errors);
 }
 
 fn legend(name: &'static str, color: u32) -> impl IntoElement {
@@ -3064,10 +3476,12 @@ impl Render for Root {
             return self.loading_view().into_any_element();
         }
 
-        let content = match self.tab {
-            Tab::Usage => self.usage_view(cx).into_any_element(),
-            Tab::Sessions => self.sessions_view(cx).into_any_element(),
-            Tab::Quota => self.quota_view(cx).into_any_element(),
+        let content = match self.view_mode {
+            ViewMode::LiveQuota => self.quota_view(cx).into_any_element(),
+            ViewMode::AgentHistory => match self.tab {
+                Tab::Usage => self.usage_view(cx).into_any_element(),
+                Tab::Sessions => self.sessions_view(cx).into_any_element(),
+            },
         };
         let errors: Vec<String> = self
             .data
@@ -3084,15 +3498,17 @@ impl Render for Root {
             .flex_col()
             .relative()
             .child(self.top_bar(window, cx));
-        for e in errors {
-            right = right.child(
-                div()
-                    .px_4()
-                    .py_1()
-                    .text_xs()
-                    .text_color(rgb(0xf87171))
-                    .child(i18n::tf(i18n::Key::DataWarning, &[&e])),
-            );
+        if self.view_mode == ViewMode::AgentHistory {
+            for e in errors {
+                right = right.child(
+                    div()
+                        .px_4()
+                        .py_1()
+                        .text_xs()
+                        .text_color(rgb(0xf87171))
+                        .child(i18n::tf(i18n::Key::DataWarning, &[&e])),
+                );
+            }
         }
         right = right.child(content);
 
@@ -3169,7 +3585,7 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         text_input::bind_keys(cx);
 
-        let bounds = Bounds::centered(None, size(px(1180.), px(760.)), cx);
+        let bounds = Bounds::centered(None, size(px(1240.), px(780.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -3197,12 +3613,12 @@ fn main() {
                         data: Arc::new(LoadedData::default()),
                         loaded_agents: HashMap::new(),
                         agent: AgentKind::Devin,
+                        view_mode: ViewMode::AgentHistory,
                         tab: Tab::Usage,
                         period: PeriodKind::Day,
                         page: 0,
                         buckets: Vec::new(),
                         expanded_buckets: std::collections::HashSet::new(),
-                        hide_empty_buckets: true,
                         sessions_rows: Vec::new(),
                         selected: None,
                         loaded_at: i18n::t(i18n::Key::Loading).into(),
@@ -3241,7 +3657,9 @@ fn main() {
                         modal_focus: cx.focus_handle(),
                         section_agents_open: true,
                         section_devices_open: true,
-                        section_sync_open: true,
+                        section_other_agents_open: false,
+                        settings_tab: SettingsTab::Sync,
+                        hide_empty_buckets: false,
                         sync_tick_task: None,
                         sync_task: None,
                         update: updater_ui::UpdateState::default(),
@@ -3303,5 +3721,31 @@ mod tests {
 
         // 没有 turn 时保持 0，不编造用量。
         assert_eq!(session_token_total(&empty_meta, &[]), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod sync_collection_tests {
+    use super::*;
+
+    #[test]
+    fn successful_source_does_not_hide_another_sources_failure() {
+        let mut combined = LoadedData::default();
+        let mut successful = LoadedData {
+            turns: vec![data::TurnRec::default()],
+            ..Default::default()
+        };
+        let mut failed = LoadedData {
+            errors: vec![data::DataError {
+                agent: AgentKind::Devin,
+                message: "database unavailable".into(),
+            }],
+            ..Default::default()
+        };
+        append_export_source(&mut combined, &mut successful);
+        append_export_source(&mut combined, &mut failed);
+        assert_eq!(combined.turns.len(), 1);
+        assert_eq!(combined.errors.len(), 1);
+        assert_eq!(combined.errors[0].message, "database unavailable");
     }
 }

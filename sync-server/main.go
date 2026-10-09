@@ -39,7 +39,31 @@ type server struct {
 	httpClient     *http.Client
 	quotaBytes     int64
 	grace          time.Duration
-	mu             sync.Mutex
+	tenants        sync.Map
+}
+
+type tenantState struct {
+	mu         sync.Mutex
+	usageReady bool
+	bytes      int64
+	objects    int
+}
+
+func (s *server) tenantState(tenant string) *tenantState {
+	state, _ := s.tenants.LoadOrStore(tenant, &tenantState{})
+	return state.(*tenantState)
+}
+
+// Caller holds state.mu. Writes update totals after the first directory scan.
+func (s *server) cachedUsage(tenant string, state *tenantState) (int64, int, error) {
+	if !state.usageReady {
+		bytes, objects, err := s.tenantUsage(tenant)
+		if err != nil {
+			return 0, 0, err
+		}
+		state.bytes, state.objects, state.usageReady = bytes, objects, true
+	}
+	return state.bytes, state.objects, nil
 }
 
 func main() {
@@ -341,6 +365,9 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	state := s.tenantState(tenant)
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	entries, err := os.ReadDir(filepath.Join(s.root, tenant))
 	if errors.Is(err, os.ErrNotExist) {
 		writeJSON(w, http.StatusOK, []string{})
@@ -365,7 +392,10 @@ func (s *server) usage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	used, objects, err := s.tenantUsage(tenant)
+	state := s.tenantState(tenant)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	used, objects, err := s.cachedUsage(tenant, state)
 	if err != nil {
 		http.Error(w, "read storage", http.StatusInternalServerError)
 		return
@@ -385,8 +415,9 @@ func (s *server) gc(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	state := s.tenantState(tenant)
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	deleted, err := s.gcTenant(tenant, time.Now())
 	if err != nil {
 		http.Error(w, "gc storage", http.StatusInternalServerError)
@@ -444,8 +475,10 @@ func (s *server) write(w http.ResponseWriter, r *http.Request, path string) {
 		http.Error(w, "object exceeds 8 MiB limit", http.StatusRequestEntityTooLarge)
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	tenant := filepath.Base(filepath.Dir(path))
+	state := s.tenantState(tenant)
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	existing, err := os.ReadFile(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		http.Error(w, "read object", http.StatusInternalServerError)
@@ -462,7 +495,7 @@ func (s *server) write(w http.ResponseWriter, r *http.Request, path string) {
 	if exists {
 		oldSize = int64(len(existing))
 	}
-	used, _, usageErr := s.tenantUsage(filepath.Base(filepath.Dir(path)))
+	used, _, usageErr := s.cachedUsage(tenant, state)
 	if usageErr != nil {
 		http.Error(w, "read storage", http.StatusInternalServerError)
 		return
@@ -483,7 +516,12 @@ func (s *server) write(w http.ResponseWriter, r *http.Request, path string) {
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
-	if _, err := tmp.Write(bytes); err != nil || tmp.Sync() != nil || tmp.Close() != nil {
+	_, writeErr := tmp.Write(bytes)
+	if writeErr == nil {
+		writeErr = tmp.Sync()
+	}
+	closeErr := tmp.Close()
+	if writeErr != nil || closeErr != nil {
 		http.Error(w, "write object", http.StatusInternalServerError)
 		return
 	}
@@ -491,7 +529,12 @@ func (s *server) write(w http.ResponseWriter, r *http.Request, path string) {
 		http.Error(w, "commit object", http.StatusInternalServerError)
 		return
 	}
+	state.bytes += int64(len(bytes)) - oldSize
+	if !exists {
+		state.objects++
+	}
 	if !exists && strings.HasPrefix(filepath.Base(path), "v3-head-") {
+		state.usageReady = false // migration marker changes usage outside this PUT
 		// 首次 v3 发布时落一个不可变迁移时间点。后续 head 更新不会重置它，
 		// 因而可以在所有旧设备连续使用 v3 满 14 天后安全清理 v1/v2。
 		_ = s.writeMigrationMarker(filepath.Dir(path), filepath.Base(path), time.Now())
@@ -540,11 +583,9 @@ func (s *server) dailyGC() {
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
 	for range ticker.C {
-		s.mu.Lock()
 		entries, err := os.ReadDir(s.root)
 		if err != nil {
 			log.Printf("list storage for gc: %v", err)
-			s.mu.Unlock()
 			continue
 		}
 		for _, entry := range entries {
@@ -552,13 +593,16 @@ func (s *server) dailyGC() {
 				continue
 			}
 			tenant := entry.Name()
-			if deleted, err := s.gcTenant(tenant, time.Now()); err != nil {
+			state := s.tenantState(tenant)
+			state.mu.Lock()
+			deleted, err := s.gcTenant(tenant, time.Now())
+			state.mu.Unlock()
+			if err != nil {
 				log.Printf("gc tenant=%s: %v", tenant, err)
 			} else if deleted > 0 {
 				log.Printf("gc tenant=%s deleted=%d", tenant, deleted)
 			}
 		}
-		s.mu.Unlock()
 	}
 }
 
@@ -567,6 +611,8 @@ func (s *server) dailyGC() {
 // interrupted concurrent uploads. Unreferenced files need to survive the same
 // grace period before deletion.
 func (s *server) gcTenant(tenant string, now time.Time) (int, error) {
+	// Also invalidate on a partial deletion or error. Caller holds the tenant lock.
+	s.tenantState(tenant).usageReady = false
 	dir := filepath.Join(s.root, tenant)
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -582,13 +628,19 @@ func (s *server) gcTenant(tenant string, now time.Time) (int, error) {
 		if strings.HasPrefix(name, "v3-head-") && strings.HasSuffix(name, ".json") {
 			marked[name] = true
 			bytes, err := os.ReadFile(filepath.Join(dir, name))
-			if err == nil {
-				markHeadManifests(bytes, manifests)
+			if err != nil {
+				return 0, fmt.Errorf("read GC head %s: %w", name, err)
+			}
+			if err := markHeadManifests(bytes, manifests); err != nil {
+				return 0, fmt.Errorf("parse GC head %s: %w", name, err)
 			}
 		}
 		if strings.HasPrefix(name, "v3-manifest-") && strings.HasSuffix(name, ".json") {
 			info, infoErr := entry.Info()
-			if infoErr == nil && now.Sub(info.ModTime()) <= s.grace {
+			if infoErr != nil {
+				return 0, infoErr
+			}
+			if now.Sub(info.ModTime()) <= s.grace {
 				manifests[name] = true
 			}
 		}
@@ -597,9 +649,14 @@ func (s *server) gcTenant(tenant string, now time.Time) (int, error) {
 		marked[name] = true
 		bytes, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
-			continue
+			return 0, fmt.Errorf("read GC manifest %s: %w", name, err)
 		}
-		markManifestObjects(bytes, marked, now.Add(-v3Retention).UTC().Format("2006-01-02"))
+		if name != "v3-manifest-"+strings.Trim(quoteETag(bytes), `"`)+".json" {
+			return 0, fmt.Errorf("GC manifest hash mismatch: %s", name)
+		}
+		if err := markManifestObjects(bytes, marked, now.Add(-v3Retention).UTC().Format("2006-01-02")); err != nil {
+			return 0, fmt.Errorf("parse GC manifest %s: %w", name, err)
+		}
 	}
 	legacyReady := v2MigrationReady(dir, entries, now)
 	deleted := 0
@@ -659,22 +716,26 @@ func v2MigrationReady(dir string, entries []os.DirEntry, now time.Time) bool {
 	return true
 }
 
-func markHeadManifests(bytes []byte, marked map[string]bool) {
+func markHeadManifests(bytes []byte, marked map[string]bool) error {
 	var value struct {
 		Manifest         string `json:"manifest"`
 		PreviousManifest string `json:"previous_manifest"`
 	}
-	if json.Unmarshal(bytes, &value) != nil {
-		return
+	if err := json.Unmarshal(bytes, &value); err != nil {
+		return err
+	}
+	if !validHash(value.Manifest) || (value.PreviousManifest != "" && !validHash(value.PreviousManifest)) {
+		return errors.New("invalid manifest reference")
 	}
 	for _, hash := range []string{value.Manifest, value.PreviousManifest} {
 		if validHash(hash) {
 			marked["v3-manifest-"+hash+".json"] = true
 		}
 	}
+	return nil
 }
 
-func markManifestObjects(bytes []byte, marked map[string]bool, retentionDay string) {
+func markManifestObjects(bytes []byte, marked map[string]bool, retentionDay string) error {
 	var value struct {
 		Blocks []struct {
 			File   string `json:"file"`
@@ -685,19 +746,29 @@ func markManifestObjects(bytes []byte, marked map[string]bool, retentionDay stri
 			UTCDay string `json:"utc_day"`
 		} `json:"sessions"`
 	}
-	if json.Unmarshal(bytes, &value) != nil {
-		return
+	if err := json.Unmarshal(bytes, &value); err != nil {
+		return err
+	}
+	if value.Blocks == nil || value.Sessions == nil {
+		return errors.New("missing manifest object arrays")
 	}
 	for _, reference := range value.Blocks {
+		if !validObjectName(reference.File, "v3-block-", ".zst") {
+			return errors.New("invalid block reference")
+		}
 		if (reference.UTCDay == "" || reference.UTCDay >= retentionDay) && validObjectName(reference.File, "v3-block-", ".zst") {
 			marked[reference.File] = true
 		}
 	}
 	for _, reference := range value.Sessions {
+		if !validObjectName(reference.File, "v3-session-", ".zst") {
+			return errors.New("invalid session reference")
+		}
 		if (reference.UTCDay == "" || reference.UTCDay >= retentionDay) && validObjectName(reference.File, "v3-session-", ".zst") {
 			marked[reference.File] = true
 		}
 	}
+	return nil
 }
 
 func validHash(value string) bool {

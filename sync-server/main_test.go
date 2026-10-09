@@ -79,12 +79,13 @@ func TestGCMarksHeadManifestReferencesAndRemovesOldOrphan(t *testing.T) {
 	}
 	hash := strings.Repeat("a", 64)
 	block := "v3-block-" + hash + ".zst"
-	manifestHash := strings.Repeat("b", 64)
+	manifestBytes := []byte(`{"blocks":[{"file":"` + block + `"}],"sessions":[]}`)
+	manifestHash := strings.Trim(quoteETag(manifestBytes), `"`)
 	manifest := "v3-manifest-" + manifestHash + ".json"
 	if err := os.WriteFile(filepath.Join(tenant, block), []byte("kept"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(tenant, manifest), []byte(`{"blocks":[{"file":"`+block+`"}],"sessions":[]}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(tenant, manifest), manifestBytes, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(tenant, "v3-head-device.json"), []byte(`{"manifest":"`+manifestHash+`"}`), 0o600); err != nil {
@@ -118,7 +119,15 @@ func TestGCRemovesLegacyOnlyAfterEveryDeviceMigratesForFourteenDays(t *testing.T
 		t.Fatal(err)
 	}
 	for _, name := range []string{"v2-head-abc.json", "v2-object-" + strings.Repeat("a", 64) + ".json.zst", "device-abc.json", "v3-head-abc.json"} {
-		if err := os.WriteFile(filepath.Join(tenant, name), []byte("{}"), 0o600); err != nil {
+		body := []byte("{}")
+		if strings.HasPrefix(name, "v3-head-") {
+			hash := strings.Trim(quoteETag([]byte(`{"blocks":[],"sessions":[]}`)), `"`)
+			body = []byte(`{"manifest":"` + hash + `"}`)
+			if err := os.WriteFile(filepath.Join(tenant, "v3-manifest-"+hash+".json"), []byte(`{"blocks":[],"sessions":[]}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(tenant, name), body, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -154,7 +163,15 @@ func TestGCKeepsLegacyUntilEveryDeviceHasCompletedMigrationGrace(t *testing.T) {
 	}
 	now := time.Now()
 	for _, name := range []string{"v2-head-first.json", "v2-head-second.json", "v3-head-first.json", "v3-head-second.json"} {
-		if err := os.WriteFile(filepath.Join(tenant, name), []byte("{}"), 0o600); err != nil {
+		body := []byte("{}")
+		if strings.HasPrefix(name, "v3-head-") {
+			hash := strings.Trim(quoteETag([]byte(`{"blocks":[],"sessions":[]}`)), `"`)
+			body = []byte(`{"manifest":"` + hash + `"}`)
+			if err := os.WriteFile(filepath.Join(tenant, "v3-manifest-"+hash+".json"), []byte(`{"blocks":[],"sessions":[]}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(tenant, name), body, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -192,13 +209,14 @@ func TestGCExpiresV3ObjectsOutsideRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 	blockHash := strings.Repeat("a", 64)
-	manifestHash := strings.Repeat("b", 64)
 	block := "v3-block-" + blockHash + ".zst"
+	manifestBytes := []byte(`{"blocks":[{"file":"` + block + `","utc_day":"2000-01-01"}],"sessions":[]}`)
+	manifestHash := strings.Trim(quoteETag(manifestBytes), `"`)
 	manifest := "v3-manifest-" + manifestHash + ".json"
 	if err := os.WriteFile(filepath.Join(tenant, block), []byte("expired"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(tenant, manifest), []byte(`{"blocks":[{"file":"`+block+`","utc_day":"2000-01-01"}],"sessions":[]}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(tenant, manifest), manifestBytes, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(tenant, "v3-head-device.json"), []byte(`{"manifest":"`+manifestHash+`"}`), 0o600); err != nil {
@@ -323,5 +341,149 @@ func TestGitHubDeviceLoginMapsSameAccountToStableTenant(t *testing.T) {
 	mux.ServeHTTP(objectResponse, objectRequest)
 	if objectResponse.Code != http.StatusOK {
 		t.Fatalf("session cannot access stable tenant: status=%d body=%s", objectResponse.Code, objectResponse.Body.String())
+	}
+}
+func TestGCStopsOnCorruptRoots(t *testing.T) {
+	for _, corrupt := range []string{"head", "manifest", "missing-manifest", "valid-json-corruption", "missing-arrays", "invalid-reference"} {
+		t.Run(corrupt, func(t *testing.T) {
+			root := t.TempDir()
+			s := newTestCore(root, 0)
+			dir := filepath.Join(root, "tester")
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			block := "v3-block-" + strings.Repeat("b", 64) + ".zst"
+			manifest := `{"blocks":[{"file":"` + block + `"}],"sessions":[]}`
+			if corrupt == "missing-arrays" {
+				manifest = "{}"
+			}
+			if corrupt == "invalid-reference" {
+				manifest = `{"blocks":[{"file":"invalid"}],"sessions":[]}`
+			}
+			hash := strings.Trim(quoteETag([]byte(manifest)), `"`)
+			head := `{"manifest":"` + hash + `"}`
+			if corrupt == "head" {
+				head = "{"
+			}
+			if corrupt == "manifest" {
+				manifest = "{"
+			}
+			if corrupt == "valid-json-corruption" {
+				manifest = `{"blocks":[],"sessions":[]}`
+			}
+			files := map[string]string{"v3-head-device.json": head, block: "valuable data"}
+			if corrupt != "missing-manifest" {
+				files["v3-manifest-"+hash+".json"] = manifest
+			}
+			old := time.Now().Add(-2 * time.Hour)
+			for name, body := range files {
+				p := filepath.Join(dir, name)
+				if err := os.WriteFile(p, []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chtimes(p, old, old); err != nil {
+					t.Fatal(err)
+				}
+			}
+			deleted, err := s.gcTenant("tester", time.Now())
+			if err == nil || deleted != 0 {
+				t.Fatalf("unsafe GC: deleted=%d err=%v", deleted, err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, block)); err != nil {
+				t.Fatalf("referenced data removed: %v", err)
+			}
+		})
+	}
+}
+
+func TestConcurrentWritesRespectCachedQuota(t *testing.T) {
+	handler := newTestServerWithQuota(t, 100)
+	results := make(chan int, 20)
+	for i := 0; i < 20; i++ {
+		go func(i int) {
+			results <- request(handler, http.MethodPut, "/v1/objects/obj-"+strconv.Itoa(i), "0123456789", nil).Code
+		}(i)
+	}
+	accepted := 0
+	for i := 0; i < 20; i++ {
+		switch status := <-results; status {
+		case http.StatusNoContent:
+			accepted++
+		case http.StatusInsufficientStorage:
+		default:
+			t.Fatalf("unexpected PUT status %d", status)
+		}
+	}
+	if accepted != 10 {
+		t.Fatalf("quota accepted %d writes; want 10", accepted)
+	}
+	got := request(handler, http.MethodGet, "/v1/usage", "", nil)
+	var usage struct {
+		Bytes   int64 `json:"used_bytes"`
+		Objects int   `json:"objects"`
+	}
+	if err := json.Unmarshal(got.Body.Bytes(), &usage); err != nil {
+		t.Fatal(err)
+	}
+	if usage.Bytes != 100 || usage.Objects != 10 {
+		t.Fatalf("usage=%+v", usage)
+	}
+}
+
+func TestCachedUsageTracksOverwriteAndGC(t *testing.T) {
+	core := newTestCore(t.TempDir(), 100)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/usage", core.usage)
+	mux.HandleFunc("POST /v1/gc", core.gc)
+	mux.HandleFunc("/v1/objects/", core.object)
+	for _, body := range []string{"12345", "12"} {
+		if got := request(mux, http.MethodPut, "/v1/objects/a", body, nil); got.Code != http.StatusNoContent {
+			t.Fatal(got.Code)
+		}
+	}
+	state := core.tenantState(testTenant)
+	if state.bytes != 2 || state.objects != 1 {
+		t.Fatalf("overwrite accounting %+v", state)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(filepath.Join(core.root, testTenant, "a"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if got := request(mux, http.MethodPost, "/v1/gc", "", nil); got.Code != http.StatusOK {
+		t.Fatal(got.Code)
+	}
+	if state.usageReady {
+		t.Fatal("GC must invalidate usage totals")
+	}
+	if got := request(mux, http.MethodGet, "/v1/usage", "", nil); got.Code != http.StatusOK {
+		t.Fatal(got.Code)
+	}
+	if state.bytes != 0 || state.objects != 0 {
+		t.Fatalf("GC accounting %+v", state)
+	}
+	if got := request(mux, http.MethodPut, "/v1/objects/b", "123", nil); got.Code != http.StatusNoContent {
+		t.Fatal(got.Code)
+	}
+	if state.bytes != 3 || state.objects != 1 {
+		t.Fatalf("post-GC accounting %+v", state)
+	}
+}
+
+func TestBusyTenantDoesNotBlockOtherTenant(t *testing.T) {
+	core := newTestCore(t.TempDir(), 100)
+	busy := core.tenantState("github-456")
+	busy.mu.Lock()
+	defer busy.mu.Unlock()
+	finished := make(chan int, 1)
+	go func() {
+		finished <- request(http.HandlerFunc(core.object), http.MethodPut, "/v1/objects/a", "123", nil).Code
+	}()
+	select {
+	case status := <-finished:
+		if status != http.StatusNoContent {
+			t.Fatal(status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a different tenant is blocked by the busy tenant")
 	}
 }
