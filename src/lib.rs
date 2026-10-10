@@ -1,5 +1,7 @@
 pub mod agg;
 pub mod cli;
+pub mod compaction;
+pub mod compaction_config;
 pub mod data;
 pub mod i18n;
 mod local_sources;

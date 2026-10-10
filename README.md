@@ -18,6 +18,13 @@ A native desktop app that reads local sessions from Devin, Claude Code, Codex, A
   - Shows title, working directory, agent mode, selected model, message count, total tokens
   - Resolves `adaptive` routing to the real backing model
   - Click any session for details: median TTFT, turn count, agent messages, time span
+- **Compaction advice**
+  - Claude Code / Codex recommendations using the same time range and device filter as Usage, with cost curves and local configuration previews
+  - Replays per-call token history at 10K-token intervals using the existing model price table; shows observed compaction points, suggested trigger thresholds, simulated API-equivalent costs and sample counts
+  - Requires at least 50 valid calls and 3 suspected compactions per device/model (Codex pools models for its global setting). Main contexts, Claude subagents and model-switch segments are isolated; old synced records without context identity are skipped
+  - Chooses the largest threshold within 1% of the cheapest replay and keeps the historical threshold if savings are below 3%; never recommends expanding beyond the observed threshold
+  - Apply writes only the selected local field: Claude `modelSettings.<model>.autoCompactWindow` receives the suggested trigger + 33K reserve; Codex `model_auto_compact_token_limit` receives the trigger and applies globally. Existing fields are journaled for Undo across app restarts; unrelated settings are preserved, and detected external edits or environment overrides prevent overwrites. Remote-device advice is analysis only
+  - This is a heuristic cost estimate against the observed historical point, not current configuration, a quality guarantee, actual bill or subscription-quota prediction. Start a new agent session after applying; project/profile settings and terminal environment may override the user-level config. The Claude conversion follows current Magpie semantics and can vary by agent version
 - **Multi-device sync**
   - Enter one self-hosted sync API address and sign in with GitHub; devices using the same GitHub account share one sync dataset
   - Sync is off by default; toggle it from the top bar ("Sync Off / Sync On"), then it runs fully automatically
@@ -137,6 +144,7 @@ assets/
 ## Data and privacy
 
 - Opens Devin databases read-only and only reads the other agents' JSON/JSONL files
+- Only an explicit Apply/Undo action writes Claude/Codex user settings. Undo metadata stays local and is not synced
 - Cache file is written via atomic rename to avoid partial files
 - Makes no network requests; everything shown comes from the local machine and the user's configured shared sync folder
 - Multi-device sync data is written only to your configured self-hosted API; GitHub is used solely for account identity

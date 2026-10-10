@@ -1401,6 +1401,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sys-locale",
+ "tempfile",
+ "toml_edit 0.22.27",
  "unicode-width",
  "ureq",
  "uuid",

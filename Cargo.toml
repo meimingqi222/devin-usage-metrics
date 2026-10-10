@@ -24,6 +24,8 @@ fs2 = "0.4"
 uuid = { version = "1", features = ["v4"] }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 libc = "0.2"
+toml_edit = "0.22"
+tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"

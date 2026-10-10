@@ -15,7 +15,7 @@ use crate::local_sources;
 const CACHE_TTL_SECS: i64 = 300; // 5 minutes cache TTL
 /// 缓存结构版本。任何会影响 turn 集合/时间戳的解析改动都必须递增，否则旧的
 /// (且不带 dedup_key 的) 快照会被当作增量基线复用，修复无法生效。
-const CACHE_SCHEMA_VERSION: u32 = 11;
+const CACHE_SCHEMA_VERSION: u32 = 12;
 
 /// `message_nodes.created_at` 是节点**落盘**时间，不是真实生成时间：Devin 在
 /// 会话恢复/压缩时会把同一条消息以新的 created_at 重写一遍。实测比真实生成时间
@@ -730,6 +730,13 @@ pub struct TurnRec {
     /// 该 turn 实际使用的模型（Devin 为 generation_model，其他为 session model）
     #[serde(default)]
     pub model: String,
+    /// Independent context within a session ("main" or a Claude subagent id).
+    /// Empty in older snapshots; those records are not safe for context replay.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context_stream: String,
+    /// Transcript order disambiguates multiple calls within one timestamp second.
+    #[serde(default)]
+    pub context_order: u64,
     pub ttft_ms: f64,
     pub total_time_ms: f64,
     /// Agent 自身记录的该轮费用（美元），如 Grok 的 costUsdTicks / 1e10。

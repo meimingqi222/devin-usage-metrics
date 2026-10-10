@@ -6,6 +6,7 @@
     windows_subsystem = "windows"
 )]
 
+mod compaction_ui;
 mod model_distribution;
 mod text_input;
 mod updater_ui;
@@ -14,7 +15,7 @@ mod usage_table;
 use agg::{build_buckets_for_device, format_window_range, window_for, Bucket, PeriodKind};
 use chrono::TimeZone;
 use data::{AgentKind, LoadedData};
-use devin_usage_metrics::{agg, cli, data, i18n, pricing, quota, sync};
+use devin_usage_metrics::{agg, cli, compaction, data, i18n, pricing, quota, sync};
 use gpui::{
     actions, div, point, prelude::*, px, relative, rgb, size, Animation, AnimationExt as _,
     AnyElement, App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyBinding,
@@ -98,6 +99,7 @@ enum Tab {
     #[default]
     Usage,
     Sessions,
+    Compaction,
 }
 
 /// 左侧边栏可折叠的分区。
@@ -172,6 +174,11 @@ struct Root {
     buckets: Vec<Bucket>,
     expanded_buckets: std::collections::HashSet<i64>,
     sessions_rows: Vec<SessionRow>,
+    compaction_report: Option<compaction::Report>,
+    compaction_key: Option<(usize, AgentKind, PeriodKind, usize, Option<String>)>,
+    compaction_task: Option<Task<()>>,
+    compaction_config_task: Option<Task<()>>,
+    compaction_notice: Option<(bool, String)>,
     selected: Option<String>,
     loaded_at: String,
     loading: bool,
@@ -1829,7 +1836,7 @@ impl Root {
         let tab = self.tab;
         let period = self.period;
         let page = self.page;
-        let show_period = !is_quota_mode && tab == Tab::Usage;
+        let show_period = !is_quota_mode && matches!(tab, Tab::Usage | Tab::Compaction);
         let loaded_at = self.loaded_at.clone();
         let quota_updated_at = self.quota_updated_at.clone();
 
@@ -2092,6 +2099,7 @@ impl Root {
                 .overflow_hidden()
                 .child(tab_btn(Tab::Usage, i18n::t(i18n::Key::Usage)))
                 .child(tab_btn(Tab::Sessions, i18n::t(i18n::Key::Sessions)))
+                .child(tab_btn(Tab::Compaction, i18n::t(i18n::Key::Compaction)))
                 .when(show_period, |d| {
                     d.child(
                         div()
@@ -2758,6 +2766,285 @@ impl Root {
             .child(table_toolbar)
             .child(header)
             .children(rows)
+    }
+
+    fn update_compaction(&mut self, cx: &mut Context<Self>) {
+        let key = (
+            Arc::as_ptr(&self.data) as usize,
+            self.agent,
+            self.period,
+            self.page,
+            self.device_filter.clone(),
+        );
+        if self.compaction_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.compaction_key = Some(key.clone());
+        self.compaction_report = None;
+        self.compaction_notice = None;
+        let data = self.data.clone();
+        let agent = self.agent;
+        let device = self.device_filter.clone();
+        let (start, end) = window_for(self.period, self.page);
+        let work = cx
+            .background_executor()
+            .spawn(async move { compaction::analyze(&data, agent, device.as_deref(), start, end) });
+        self.compaction_task = Some(cx.spawn(async move |this, cx| {
+            let report = work.await;
+            this.update(cx, |this, cx| {
+                if this.compaction_key.as_ref() == Some(&key) {
+                    this.compaction_report = Some(report);
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn compaction_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use compaction::Status;
+        use i18n::{t, tf, Key};
+        let mut body = div()
+            .id("compaction-scroll")
+            .size_full()
+            .min_w(px(0.))
+            .overflow_y_scroll()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child(t(Key::Compaction)),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .whitespace_normal()
+                    .child(t(Key::CompactionIntro)),
+            );
+        if !matches!(self.agent, AgentKind::Claude | AgentKind::Codex) {
+            return body.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .whitespace_normal()
+                    .child(t(Key::CompactionUnsupported)),
+            );
+        }
+        if let Some((ok, message)) = &self.compaction_notice {
+            body = body.child(
+                div()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(PANEL2))
+                    .text_sm()
+                    .text_color(rgb(if *ok { C_OUT } else { C_COST }))
+                    .whitespace_normal()
+                    .child(message.clone()),
+            );
+        }
+        // Saved local changes do not depend on the current transcript range.
+        if let Ok(models) =
+            devin_usage_metrics::compaction_config::Target::pending_local(self.agent)
+        {
+            for model in models {
+                let displayed = self.compaction_report.as_ref().is_some_and(|report| {
+                    report.recommendations.iter().any(|r| {
+                        (r.device_id.is_empty() || r.device_id == data::device_id())
+                            && devin_usage_metrics::compaction_config::Target::local(
+                                self.agent, &r.model,
+                            )
+                            .is_ok_and(|target| {
+                                target.key
+                                    == if self.agent == AgentKind::Claude {
+                                        format!("modelSettings.{model}.autoCompactWindow")
+                                    } else {
+                                        "model_auto_compact_token_limit".into()
+                                    }
+                            })
+                    })
+                });
+                if !displayed {
+                    body = body.child(
+                        div()
+                            .p_4()
+                            .rounded_md()
+                            .bg(rgb(PANEL))
+                            .child(self.compaction_config_panel("", &model, None, cx)),
+                    );
+                }
+            }
+        }
+        let Some(report) = &self.compaction_report else {
+            return body.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child(t(Key::Loading)),
+            );
+        };
+        if report.skipped > 0 {
+            body = body.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(C_COST))
+                    .whitespace_normal()
+                    .child(tf(Key::CompactionSkipped, &[&report.skipped.to_string()])),
+            );
+        }
+        if report.recommendations.is_empty() {
+            body = body.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .whitespace_normal()
+                    .child(t(Key::CompactionEmpty)),
+            );
+        }
+        for r in &report.recommendations {
+            let device = if r.device_name.is_empty() {
+                &r.device_id
+            } else {
+                &r.device_name
+            };
+            let mut card = div()
+                .w_full()
+                .min_w(px(0.))
+                .flex_none()
+                .p_4()
+                .rounded_md()
+                .bg(rgb(PANEL))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .whitespace_normal()
+                        .child(format!("{} · {}", r.model, device)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .whitespace_normal()
+                        .child(tf(
+                            Key::CompactionSample,
+                            &[
+                                &r.calls.to_string(),
+                                &r.streams.to_string(),
+                                &r.compactions.to_string(),
+                            ],
+                        )),
+                );
+            if matches!(r.status, Status::Recommend | Status::Keep) {
+                let metric = |label, value, color| {
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(label))
+                        .child(
+                            div()
+                                .text_2xl()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(rgb(color))
+                                .child(value),
+                        )
+                };
+                card = card
+                    .child(
+                        div()
+                            .flex()
+                            .gap_4()
+                            .py_2()
+                            .child(metric(
+                                t(Key::CompactionRecommended),
+                                fmt_tokens(r.recommended as f64),
+                                ACCENT,
+                            ))
+                            .child(metric(
+                                t(Key::CompactionObserved),
+                                fmt_tokens(r.observed as f64),
+                                TEXT,
+                            ))
+                            .child(metric(
+                                t(Key::CompactionSaving),
+                                format!("{:.1}%", r.savings_fraction() * 100.),
+                                C_OUT,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .whitespace_normal()
+                            .child(tf(
+                                Key::CompactionCosts,
+                                &[
+                                    &pricing::fmt_cost(r.baseline_cost),
+                                    &pricing::fmt_cost(r.recommended_cost),
+                                ],
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .whitespace_normal()
+                            .child(tf(
+                                Key::CompactionFacts,
+                                &[
+                                    &fmt_tokens(r.growth as f64),
+                                    &fmt_tokens(r.after as f64),
+                                    &fmt_tokens(r.rework as f64),
+                                ],
+                            )),
+                    );
+                if r.curve.len() > 1 {
+                    card = card.child(compaction_ui::curve(r));
+                }
+            }
+            let note = match r.status {
+                Status::NotEnoughCalls => Some(Key::CompactionFewCalls),
+                Status::NotEnoughCompactions => Some(Key::CompactionFewCuts),
+                Status::UnknownPricing => Some(Key::CompactionNoPrice),
+                Status::Keep => Some(Key::CompactionKeep),
+                Status::Recommend => None,
+            };
+            if let Some(note) = note {
+                card = card.child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .whitespace_normal()
+                        .child(t(note)),
+                );
+            }
+            card = card.child(self.compaction_config_panel(
+                &r.device_id,
+                &r.model,
+                (r.status == Status::Recommend).then_some(r.recommended),
+                cx,
+            ));
+            body = body.child(card);
+        }
+        body.child(
+            div()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .whitespace_normal()
+                .child(t(Key::CompactionCaveat)),
+        )
     }
 
     fn sessions_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3502,12 +3789,16 @@ impl Render for Root {
         if self.loading && !self.has_loaded {
             return self.loading_view().into_any_element();
         }
+        if self.view_mode == ViewMode::AgentHistory && self.tab == Tab::Compaction {
+            self.update_compaction(cx);
+        }
 
         let content = match self.view_mode {
             ViewMode::LiveQuota => self.quota_view(cx).into_any_element(),
             ViewMode::AgentHistory => match self.tab {
                 Tab::Usage => self.usage_view(cx).into_any_element(),
                 Tab::Sessions => self.sessions_view(cx).into_any_element(),
+                Tab::Compaction => self.compaction_view(cx).into_any_element(),
             },
         };
         let errors: Vec<String> = self
@@ -3647,6 +3938,11 @@ fn main() {
                         buckets: Vec::new(),
                         expanded_buckets: std::collections::HashSet::new(),
                         sessions_rows: Vec::new(),
+                        compaction_report: None,
+                        compaction_key: None,
+                        compaction_task: None,
+                        compaction_config_task: None,
+                        compaction_notice: None,
                         selected: None,
                         loaded_at: i18n::t(i18n::Key::Loading).into(),
                         loading: false,

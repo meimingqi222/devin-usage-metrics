@@ -947,8 +947,25 @@ fn parse_claude_file(
     let Ok(file) = File::open(path) else {
         return (sessions, Vec::new(), 1);
     };
+    let context_stream = if path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|s| s.to_str())
+        == Some("subagents")
+    {
+        format!(
+            "subagent/{}",
+            path.file_stem().unwrap_or_default().to_string_lossy()
+        )
+    } else {
+        "main".to_owned()
+    };
     let mut anon_seq: u64 = 0;
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    for (order, line) in BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .enumerate()
+    {
         let Ok(value) = serde_json::from_str::<ClaudeLine>(&line) else {
             continue;
         };
@@ -1040,6 +1057,8 @@ fn parse_claude_file(
                     cache_creation_5m_tokens: cc_5m,
                     cache_creation_1h_tokens: cc_1h,
                     model: turn_model,
+                    context_stream: context_stream.clone(),
+                    context_order: order as u64,
                     ttft_ms: 0.0,
                     total_time_ms: 0.0,
                     recorded_cost: None,
@@ -1216,6 +1235,8 @@ pub(crate) fn load_claude(start: i64, end: i64, previous: Option<&LoadedData>) -
 struct CodexEvent {
     session_id: String,
     created_at: i64,
+    model: String,
+    context_order: u64,
     input_tokens: f64,
     output_tokens: f64,
     cached_tokens: f64,
@@ -1276,7 +1297,11 @@ fn parse_codex_file(path: &Path) -> (HashMap<String, SessionBuilder>, Vec<CodexE
     };
     let mut active_id = fallback_id;
     let mut active_model = String::new();
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    for (order, line) in BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .enumerate()
+    {
         let Ok(value) = serde_json::from_str::<CodexLine>(&line) else {
             continue;
         };
@@ -1360,6 +1385,8 @@ fn parse_codex_file(path: &Path) -> (HashMap<String, SessionBuilder>, Vec<CodexE
                     events.push(CodexEvent {
                         session_id: active_id.clone(),
                         created_at: at,
+                        model: active_model.clone(),
+                        context_order: order as u64,
                         input_tokens: input,
                         output_tokens: output,
                         cached_tokens: cached,
@@ -1492,7 +1519,9 @@ pub(crate) fn load_codex(start: i64, end: i64, previous: Option<&LoadedData>) ->
                 cache_creation_tokens: event.cache_write_tokens,
                 cache_creation_5m_tokens: 0.0,
                 cache_creation_1h_tokens: 0.0,
-                model: String::new(),
+                model: event.model,
+                context_stream: "main".to_owned(),
+                context_order: event.context_order,
                 ttft_ms: 0.0,
                 total_time_ms: 0.0,
                 recorded_cost: None,
@@ -3195,7 +3224,7 @@ mod tests {
     use super::{
         amp_cache_dir, amp_list_cache_path, content_text, load_amp_thread_export_cache,
         mimocode_model_name, parse_amp_value, parse_antigravity_db, parse_claude_file,
-        parse_pi_file, timestamp, AgParse, AmpListCache, AmpListEntry,
+        parse_codex_file, parse_pi_file, timestamp, AgParse, AmpListCache, AmpListEntry,
     };
     use serde_json::json;
     use std::fs::File;
@@ -3291,7 +3320,55 @@ mod tests {
         // 去重使用；parse_claude_file 本身不再把 token 汇总进 SessionBuilder，
         // 那一步被推迟到 load_claude 里完成跨文件去重之后。
         assert_eq!(turns[0].dedup_key, "msg-1");
+        assert_eq!(turns[0].context_stream, "main");
+        assert_eq!(turns[0].context_order, 1);
         assert_eq!(sessions["session-1"].output_tokens, 0.0);
+    }
+
+    #[test]
+    fn context_replay_metadata_distinguishes_children_and_codex_model_changes() {
+        let dir = std::env::temp_dir().join(format!("context-metadata-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("parent/subagents")).unwrap();
+        let child = dir.join("parent/subagents/agent-child.jsonl");
+        std::fs::write(
+            &child,
+            json!({
+                "type": "assistant", "sessionId": "parent", "timestamp": "2026-10-01T10:00:00Z",
+                "message": { "model": "claude-opus-4-6", "usage": { "input_tokens": 123 } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (_, turns, _) = parse_claude_file(&child, 0, i64::MAX);
+        assert_eq!(turns[0].session_key, "claude-code/parent");
+        assert_eq!(turns[0].context_stream, "subagent/agent-child");
+        let codex = dir.join("codex.jsonl");
+        let mut lines = vec![json!({"type": "session_meta", "payload": {"id": "codex-session"}})];
+        for (i, model) in ["gpt-5.2", "gpt-5.1"].iter().enumerate() {
+            lines.push(json!({"type": "turn_context", "payload": {"model": model}}));
+            lines.push(json!({"type": "event_msg", "timestamp": "2026-10-01T10:00:00Z", "payload": {
+                "type": "token_count", "info": {
+                    "last_token_usage": {"input_tokens": 12000, "cached_input_tokens": 10000, "output_tokens": 800},
+                    "total_token_usage": {"input_tokens": 12000 * (i + 1)}
+                }
+            }}));
+        }
+        std::fs::write(
+            &codex,
+            lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let (_, events, _) = parse_codex_file(&codex);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].model, "gpt-5.2");
+        assert_eq!(events[1].model, "gpt-5.1");
+        assert_eq!(events[0].input_tokens + events[0].cached_tokens, 12000.0);
+        assert!(events[1].context_order > events[0].context_order);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
