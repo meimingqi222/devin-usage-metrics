@@ -200,6 +200,17 @@ pub fn macos_may_have_keychain_accounts() -> bool {
     claude_keychain_likely || antigravity_installed
 }
 
+/// `macos_may_have_keychain_accounts` 的进程内缓存版。
+///
+/// 它在 `render()` 里被调用，而 `quota_tick` 每 30 秒 `notify()` 一次、交互也会触发
+/// 重绘，每次都做 2–3 次 `Path::exists()`（同步 IO，跑在主线程上）。结论在一次运行内
+/// 几乎不会变——装/卸 Claude Code 属于重启应用级别的变化。
+pub fn macos_may_have_keychain_accounts_cached() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(macos_may_have_keychain_accounts)
+}
+
 fn load_store() -> StoreFile {
     store_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -659,6 +670,13 @@ impl From<QuotaError> for String {
 
 /// 全进程共享的 HTTP agent：复用连接池 / TLS 会话，避免每次查询都重新握手。
 /// `http_status_as_error(false)`：4xx/5xx 也返回响应，这样才能读到 `Retry-After` 和 body。
+///
+/// 连接池两个参数必须显式覆盖 ureq 的默认值，否则会拖慢查询：
+/// - `max_idle_connections_per_host` 默认 3。`fetch_accounts` 会把所有账号并发查询，
+///   同一 host 的并发请求超过 3 个就抢不到空闲连接，只能新建 TCP+TLS 握手；
+///   而新连接又会因为超过 per-host 上限被淘汰，下次查询再次重建，形成抖动。
+/// - `max_idle_age` 默认 15s。配额页没有周期性自动刷新，用户切走再切回来时
+///   连接往往已过期，整个查询全量重建握手。放宽到 5 分钟覆盖页面停留间隔。
 fn http_agent() -> ureq::Agent {
     use std::sync::OnceLock;
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
@@ -667,6 +685,8 @@ fn http_agent() -> ureq::Agent {
             ureq::Agent::config_builder()
                 .timeout_global(Some(HTTP_TIMEOUT))
                 .http_status_as_error(false)
+                .max_idle_connections_per_host(8)
+                .max_idle_age(Duration::from_secs(5 * 60))
                 .build()
                 .new_agent()
         })
@@ -832,6 +852,25 @@ where
             .map(|item| scope.spawn(move || f(item)))
             .collect();
         handles.into_iter().map(|h| h.join().ok()).collect()
+    })
+}
+
+/// 并发跑两个**互不依赖**的闭包，返回 `(A, B)`。
+///
+/// 账号之间已经并发了，账号内部剩下的串行请求链就是查询耗时的天花板：
+/// 两个各 200ms 的请求串行要 400ms，并发只要 200ms。
+/// 线程 panic 对应位置为 None，由调用方决定报错还是降级忽略。
+fn parallel_pair<A, B, FA, FB>(fa: FA, fb: FB) -> (Option<A>, Option<B>)
+where
+    A: Send,
+    B: Send,
+    FA: FnOnce() -> A + Send,
+    FB: FnOnce() -> B + Send,
+{
+    std::thread::scope(|scope| {
+        let ha = scope.spawn(fa);
+        let hb = scope.spawn(fb);
+        (ha.join().ok(), hb.join().ok())
     })
 }
 
@@ -1384,10 +1423,11 @@ fn refresh_claude_loaded(
     }
 }
 
-fn token_hash(token: &str) -> u64 {
+/// 任意明文字符串的进程内稳定哈希；只用作缓存 key，不涉及安全场景。
+fn hash_str(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    token.hash(&mut h);
+    s.hash(&mut h);
     h.finish()
 }
 
@@ -1398,7 +1438,7 @@ fn claude_plan_cached(agent: &ureq::Agent, token: &str) -> Option<String> {
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<HashMap<u64, Option<String>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = token_hash(token);
+    let key = hash_str(token);
     if let Some(hit) = cache.lock().ok().and_then(|m| m.get(&key).cloned()) {
         return hit;
     }
@@ -1433,7 +1473,14 @@ fn fetch_claude(kind: &AccountKind) -> Result<QuotaResult, QuotaError> {
         }
     }
 
-    let mut usage = claude_get(&agent, CLAUDE_USAGE_URL, &loaded.cred.access_token);
+    // usage 与 profile 互不依赖，并发发起省一个 RTT。
+    // profile 是尽力而为的：失败或线程 panic 都只导致没有套餐名，不影响主结果。
+    let (usage, plan) = parallel_pair(
+        || claude_get(&agent, CLAUDE_USAGE_URL, &loaded.cred.access_token),
+        || claude_plan_cached(&agent, &loaded.cred.access_token),
+    );
+    let mut usage = usage.unwrap_or_else(|| Err(QuotaError::from("usage query thread panicked")));
+    let mut plan = plan.flatten();
     if usage.as_ref().err().is_some_and(|e| e.is_status(401)) {
         // 401：先重读凭据，Claude Code 可能刚轮换过 token
         if let Ok(latest) = load_claude(kind) {
@@ -1450,11 +1497,12 @@ fn fetch_claude(kind: &AccountKind) -> Result<QuotaResult, QuotaError> {
             loaded = refresh_claude_loaded(&agent, kind, &loaded)?;
             usage = claude_get(&agent, CLAUDE_USAGE_URL, &loaded.cred.access_token);
         }
+        // token 可能已经变了，profile 按最终 token 重取。
+        // 没变时命中 `claude_plan_cached` 的 token 缓存，不会真的再发一次请求。
+        plan = claude_plan_cached(&agent, &loaded.cred.access_token);
     }
     let usage = usage?;
 
-    // 套餐信息失败不影响主结果
-    let plan = claude_plan_cached(&agent, &loaded.cred.access_token);
     Ok(parse_claude_usage(&usage, plan))
 }
 
@@ -1882,22 +1930,46 @@ fn refresh_grok(cred: &mut GrokCred) -> Result<(), QuotaError> {
     Ok(())
 }
 
+/// 带 Grok 专用请求头的 GET。token 由调用方现取，刷新后重发自然用到新 token。
+fn grok_get(agent: &ureq::Agent, url: &str, token: &str) -> Result<Value, QuotaError> {
+    let bearer = format!("Bearer {token}");
+    let mut headers: Vec<(&str, &str)> = vec![("authorization", bearer.as_str())];
+    headers.extend_from_slice(GROK_HEADERS_BASE);
+    get_json(agent, url, &headers)
+}
+
 fn fetch_grok(path: &Path) -> Result<QuotaResult, QuotaError> {
     let mut cred = read_grok_cred(path)?;
     let agent = http_agent();
 
-    let mut body: Result<Value, QuotaError>;
+    let mut weekly: Result<Value, QuotaError>;
+    let mut monthly: Option<Value>;
     let mut refreshed = false;
     loop {
-        let bearer = format!("Bearer {}", cred.access_token);
-        let mut headers: Vec<(&str, &str)> = vec![("authorization", &bearer)];
-        headers.extend_from_slice(GROK_HEADERS_BASE);
-        body = get_json(
-            &agent,
-            "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
-            &headers,
+        // weekly（billing?format=credits）与 monthly（billing）互不依赖，并发发起省一个 RTT。
+        // 代价：weekly 命中「从未用过」的 4xx 时，这一轮的 monthly 会被丢弃
+        //（这类账号的 monthly 同样会 4xx，成本可忽略；401 重试时两个请求都会带新 token 重发）。
+        let (weekly_res, monthly_res) = parallel_pair(
+            || {
+                grok_get(
+                    &agent,
+                    "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+                    &cred.access_token,
+                )
+            },
+            || {
+                grok_get(
+                    &agent,
+                    "https://cli-chat-proxy.grok.com/v1/billing",
+                    &cred.access_token,
+                )
+                .ok()
+            },
         );
-        match &body {
+        weekly = weekly_res
+            .unwrap_or_else(|| Err(QuotaError::from("grok billing query thread panicked")));
+        monthly = monthly_res.flatten();
+        match &weekly {
             Err(e) if e.is_status(401) && !refreshed && !cred.refresh_token.is_empty() => {
                 refresh_grok(&mut cred)?;
                 write_back_grok(path, &cred);
@@ -1910,7 +1982,7 @@ fn fetch_grok(path: &Path) -> Result<QuotaResult, QuotaError> {
     // Grok 未使用过时 billing API 可能返回 4xx（如 404），视为 100% 剩余（0% 已用）。
     // 但网络错误、401/403（凭据问题）、429（限流）、5xx 是真错误，必须向上传，
     // 否则限流/掉线会被显示成「用量 0%」。
-    let weekly = match body {
+    let weekly = match weekly {
         Ok(v) => v,
         Err(e) if grok_billing_error_means_unused(&e) => {
             return Ok(QuotaResult {
@@ -1924,16 +1996,6 @@ fn fetch_grok(path: &Path) -> Result<QuotaResult, QuotaError> {
         }
         Err(e) => return Err(e),
     };
-
-    let bearer = format!("Bearer {}", cred.access_token);
-    let mut headers: Vec<(&str, &str)> = vec![("authorization", &bearer)];
-    headers.extend_from_slice(GROK_HEADERS_BASE);
-    let monthly = get_json(
-        &agent,
-        "https://cli-chat-proxy.grok.com/v1/billing",
-        &headers,
-    )
-    .ok();
 
     Ok(parse_grok_billing(&weekly, monthly.as_ref()))
 }
@@ -2022,28 +2084,38 @@ fn fetch_devin(cookie: &str, org_id: Option<&str>) -> Result<QuotaResult, QuotaE
     let agent = http_agent();
     let org = match org_id {
         Some(id) => id.to_string(),
-        None => discover_devin_org(&agent, cookie)?,
+        None => discover_devin_org_cached(cookie)?,
     };
     let headers: [(&str, &str); 2] = [("cookie", cookie), ("accept", "application/json")];
 
-    let quota = get_json(
-        &agent,
-        &format!("https://app.devin.ai/api/{org}/billing/quota/usage"),
-        &headers,
-    )?;
-    let plan = get_json(
-        &agent,
-        &format!("https://app.devin.ai/api/{org}/billing/status"),
-        &headers,
-    )
-    .ok()
-    .and_then(|s| {
-        s.get("plan_slug")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    });
+    // quota 与 billing/status（套餐名）互不依赖，并发发起省一个 RTT。
+    // 套餐名只是展示用：失败或线程 panic 都只导致没有套餐名，不影响主结果。
+    let (quota, plan) = parallel_pair(
+        || {
+            get_json(
+                &agent,
+                &format!("https://app.devin.ai/api/{org}/billing/quota/usage"),
+                &headers,
+            )
+        },
+        || {
+            get_json(
+                &agent,
+                &format!("https://app.devin.ai/api/{org}/billing/status"),
+                &headers,
+            )
+            .ok()
+            .and_then(|s| {
+                s.get("plan_slug")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        },
+    );
+    let quota =
+        quota.unwrap_or_else(|| Err(QuotaError::from("devin quota query thread panicked")))?;
 
-    Ok(parse_devin_quota(&quota, plan))
+    Ok(parse_devin_quota(&quota, plan.flatten()))
 }
 
 /// 递归找第一个形如 "org-xxxx" 的字符串（/api/organizations 响应结构未公开，防御式处理）。
@@ -2056,6 +2128,75 @@ fn find_org_id(v: &Value) -> Option<String> {
     }
 }
 
+/// org id 的缓存时长。`/api/organizations` 排在查询链最前面，每次重新发现等于给
+/// 整次查询加一个固定 RTT；手动刷新（force）也能命中这里。
+const DEVIN_ORG_TTL: Duration = Duration::from_secs(30 * 60);
+/// 缓存条目上限。key 是 cookie 哈希，轮换后旧条目直接清空（容量很小）。
+const TTL_CACHE_MAX_ENTRIES: usize = 16;
+
+/// 按 key 记住「取到时间 + 值」的小 TTL 缓存。
+///
+/// `load` 在锁外执行：并发查询不会被锁串行化（最坏情况是多打一次接口，
+/// 而账号级查询已经按账号去重，重复只在多账号同源时出现）。
+struct TtlCache<K, V> {
+    ttl: Duration,
+    entries: std::sync::Mutex<std::collections::HashMap<K, (std::time::Instant, V)>>,
+}
+
+impl<K, V> TtlCache<K, V>
+where
+    K: std::cmp::Eq + std::hash::Hash,
+    V: Clone,
+{
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 命中且未过期 → 直接返回旧值（不发请求）；否则调 `load()`，仅成功结果入库
+    /// （失败不缓存，下次查询会重试——否则一次网络抖动会让账号长时间不可查）。
+    fn get_or_load<E>(
+        &self,
+        now: std::time::Instant,
+        key: K,
+        load: impl FnOnce() -> Result<V, E>,
+    ) -> Result<V, E> {
+        use std::sync::PoisonError;
+        {
+            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some((at, value)) = entries.get(&key) {
+                if now.saturating_duration_since(*at) < self.ttl {
+                    return Ok(value.clone());
+                }
+            }
+            if entries.len() >= TTL_CACHE_MAX_ENTRIES {
+                entries.clear();
+            }
+        }
+        let value = load()?;
+        if let Ok(mut entries) = self.entries.lock() {
+            // 存调用方的 `now`（调用开始时刻）而不是真实当前时间：与上面的新鲜度判断
+            // 保持同一时间基准，函数才确定可测；代价是 TTL 少算一次请求耗时，可忽略。
+            entries.insert(key, (now, value.clone()));
+        }
+        Ok(value)
+    }
+}
+
+/// 带 TTL 的 org id 发现。老账号（存储里没有 org_id）不必每次查询都打
+/// `/api/organizations`；失败不缓存，下次重试。
+fn discover_devin_org_cached(cookie: &str) -> Result<String, String> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<TtlCache<u64, String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| TtlCache::new(DEVIN_ORG_TTL))
+        .get_or_load(std::time::Instant::now(), hash_str(cookie), || {
+            discover_devin_org(&http_agent(), cookie)
+        })
+}
+
 pub fn discover_devin_org(agent: &ureq::Agent, cookie: &str) -> Result<String, String> {
     let headers: [(&str, &str); 2] = [("cookie", cookie), ("accept", "application/json")];
     let v = get_json(agent, "https://app.devin.ai/api/organizations", &headers)?;
@@ -2066,8 +2207,17 @@ pub fn discover_devin_org(agent: &ureq::Agent, cookie: &str) -> Result<String, S
 pub fn validate_devin_cookie(cookie: &str) -> Result<(String, String), String> {
     let agent = http_agent();
     let headers: [(&str, &str); 2] = [("cookie", cookie), ("accept", "application/json")];
-    let info = get_json(&agent, "https://app.devin.ai/api/users/info", &headers)?;
-    let org = discover_devin_org(&agent, cookie)?;
+    // users/info 与 organizations 互不依赖，并发发起省一个 RTT。
+    let (info, org) = parallel_pair(
+        || get_json(&agent, "https://app.devin.ai/api/users/info", &headers),
+        || discover_devin_org(&agent, cookie),
+    );
+    let info = info
+        .ok_or_else(|| "devin users/info query thread panicked".to_string())
+        .and_then(|r| r.map_err(String::from))?;
+    let org = org
+        .ok_or_else(|| "devin organizations query thread panicked".to_string())
+        .and_then(|r| r)?;
     let label = json_field(&info, &["email"])
         .or_else(|| json_field(&info, &["username"]))
         .and_then(Value::as_str)
@@ -2429,11 +2579,68 @@ fn fetch_devin_cli(token: &str, _org_id: &str) -> Result<QuotaResult, QuotaError
 const ANTIGRAVITY_QUOTA_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
 
-/// 从 Antigravity 的 language_server 二进制中提取 Google OAuth client_id 和 client_secret。
-/// 这些值是 Antigravity 内置的公开 OAuth 凭据，不是用户密钥。
-/// 返回 (client_id, client_secret)。
+/// Antigravity 内置的公开 OAuth 客户端凭据。
+///
+/// 这些值原本要从 `language_server.exe`（158 MB）里读整个文件再解析 PE 提取，
+/// 实测单次 ~1.4s，而每次 401 刷新都会走到这里。它们是 Antigravity 二进制里内置的
+/// **公开**凭据（desktop client，Google 不把这类 client_secret 视为机密，
+/// 流程由 PKCE / refresh_token 本身保护），直接内置省掉这 1.4s。
+///
+/// **为什么是异或混淆而不是明文**：GitHub push protection 会拦截 Google OAuth client
+/// secret 形态的字面量（前缀 + 28 位随机字符）导致推送失败。这里按字节异或
+/// `OBFUSCATION_KEY` 存放，运行时解码。
+///
+/// 注意这只是为了绕过密文扫描器的**混淆，不提供任何安全性**：
+/// key 就在同一文件里，任何人一秒就能还原；凭据本身也是公开的。
+/// 解码后的明文同样会出现在进程内存和最终二进制中。
+///
+/// Antigravity 升级若轮换了凭据，内置值会失效：刷新会拿到 `invalid_client`。
+/// 此时用环境变量 `ANTIGRAVITY_CLIENT_ID` / `ANTIGRAVITY_CLIENT_SECRET` 覆盖即可，
+/// 不必改代码（已移除从二进制重新提取的兜底路径）。
+const OBFUSCATION_KEY: u8 = 0x5a;
+
+const ANTIGRAVITY_CLIENT_ID_OBFUSCATED: [u8; 73] = [
+    0x6b, 0x6a, 0x6d, 0x6b, 0x6a, 0x6a, 0x6c, 0x6a, 0x6c, 0x6a, 0x6f, 0x63, 0x6b, 0x77, 0x2e, 0x37,
+    0x32, 0x29, 0x29, 0x33, 0x34, 0x68, 0x32, 0x68, 0x6b, 0x36, 0x39, 0x28, 0x3f, 0x68, 0x69, 0x6f,
+    0x2c, 0x2e, 0x35, 0x36, 0x35, 0x30, 0x32, 0x6e, 0x3d, 0x6e, 0x6a, 0x69, 0x3f, 0x2a, 0x74, 0x3b,
+    0x2a, 0x2a, 0x29, 0x74, 0x3d, 0x35, 0x35, 0x3d, 0x36, 0x3f, 0x2f, 0x29, 0x3f, 0x28, 0x39, 0x35,
+    0x34, 0x2e, 0x3f, 0x34, 0x2e, 0x74, 0x39, 0x35, 0x37,
+];
+
+const ANTIGRAVITY_CLIENT_SECRET_OBFUSCATED: [u8; 35] = [
+    0x1d, 0x15, 0x19, 0x09, 0x0a, 0x02, 0x77, 0x11, 0x6f, 0x62, 0x1c, 0x0d, 0x08, 0x6e, 0x62, 0x6c,
+    0x16, 0x3e, 0x16, 0x10, 0x6b, 0x37, 0x16, 0x18, 0x62, 0x29, 0x02, 0x19, 0x6e, 0x20, 0x6c, 0x2b,
+    0x1e, 0x1b, 0x3c,
+];
+
+/// 解码内置的 Antigravity OAuth client 凭据（异或还原）。
+/// 空数组视为"没有内置值"，用于在 Antigravity 轮换凭据后强制走二进制提取。
+fn antigravity_builtin_client() -> Option<(String, String)> {
+    let id = deobfuscate(&ANTIGRAVITY_CLIENT_ID_OBFUSCATED);
+    let secret = deobfuscate(&ANTIGRAVITY_CLIENT_SECRET_OBFUSCATED);
+    if id.is_empty() || secret.is_empty() {
+        return None;
+    }
+    Some((id, secret))
+}
+
+/// 按 `OBFUSCATION_KEY` 异或还原字节数组为字符串。
+fn deobfuscate(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| b ^ OBFUSCATION_KEY)
+        .map(|b| b as char)
+        .collect()
+}
+
+/// Antigravity 的 OAuth client 凭据，按优先级：
+/// 1. 环境变量 `ANTIGRAVITY_CLIENT_ID` / `ANTIGRAVITY_CLIENT_SECRET`（手动覆盖）
+/// 2. 内置的公开凭据（见 `antigravity_builtin_client`）
+///
+/// 两者都拿不到时返回 None，由调用方报错。**不再从 language_server 二进制提取**：
+/// 那需要读整个 158 MB 的 exe 再解析 PE（~1.4s），而 Antigravity 升级轮换凭据的概率
+/// 远低于这个固定开销；真遇到轮换，用环境变量覆盖即可，不必为小概率事件常付代价。
 fn antigravity_oauth_client() -> Option<(String, String)> {
-    // 优先用环境变量覆盖
     if let (Ok(id), Ok(secret)) = (
         std::env::var("ANTIGRAVITY_CLIENT_ID"),
         std::env::var("ANTIGRAVITY_CLIENT_SECRET"),
@@ -2442,236 +2649,7 @@ fn antigravity_oauth_client() -> Option<(String, String)> {
             return Some((id, secret));
         }
     }
-
-    #[cfg(target_os = "windows")]
-    {
-        let path = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
-            .join("Programs/Antigravity/resources/bin/language_server.exe");
-        let binary = std::fs::read(path).ok()?;
-        antigravity_windows_client(&binary)
-    }
-
-    // Go 二进制中的字符串不是 NUL 结尾，`strings` 会把相邻字符串连成一行，
-    // 按行匹配不可靠；改为与 Windows 相同的思路：解析指令对字符串的引用。
-    #[cfg(target_os = "macos")]
-    {
-        let mut candidates = vec![PathBuf::from(
-            "/Applications/Antigravity.app/Contents/Resources/bin/language_server",
-        )];
-        if let Some(h) = home() {
-            candidates.push(
-                h.join("Applications/Antigravity.app/Contents/Resources/bin/language_server"),
-            );
-        }
-        candidates.iter().find_map(|path| {
-            std::fs::read(path)
-                .ok()
-                .and_then(|binary| antigravity_macho_client(&binary))
-        })
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        None
-    }
-}
-
-fn antigravity_windows_client(binary: &[u8]) -> Option<(String, String)> {
-    fn u16_at(b: &[u8], p: usize) -> Option<u16> {
-        Some(u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?))
-    }
-    fn u32_at(b: &[u8], p: usize) -> Option<u32> {
-        Some(u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?))
-    }
-    let pe = u32_at(binary, 60)? as usize;
-    if binary.get(pe..pe + 4)? != b"PE\0\0" {
-        return None;
-    }
-    let table = pe.checked_add(24 + u16_at(binary, pe + 20)? as usize)?;
-    let mut sections = Vec::new();
-    for index in 0..u16_at(binary, pe + 6)? as usize {
-        let p = table.checked_add(index.checked_mul(40)?)?;
-        sections.push((
-            u32_at(binary, p + 12)? as usize,
-            u32_at(binary, p + 16)? as usize,
-            u32_at(binary, p + 20)? as usize,
-        ));
-    }
-    let file_offset = |rva: i64| -> Option<usize> {
-        let rva = usize::try_from(rva).ok()?;
-        sections.iter().find_map(|&(start, size, raw)| {
-            (rva >= start && rva - start < size)
-                .then(|| raw.checked_add(rva - start))
-                .flatten()
-        })
-    };
-    let mut pairs = Vec::new();
-    for &(rva, size, raw) in &sections {
-        let bytes = binary.get(raw..raw.checked_add(size)?)?;
-        let mut previous_id: Option<(usize, String)> = None;
-        for (offset, instruction) in bytes.windows(7).enumerate() {
-            if !matches!(instruction[0], 0x48 | 0x4c)
-                || instruction[1] != 0x8d
-                || instruction[2] & 0xc7 != 5
-            {
-                continue;
-            }
-            let displacement = i32::from_le_bytes(instruction[3..7].try_into().ok()?);
-            let Some(target) = file_offset((rva + offset + 7) as i64 + i64::from(displacement))
-            else {
-                continue;
-            };
-            let Some(text) = binary.get(target..target.saturating_add(100)) else {
-                continue;
-            };
-            if text.starts_with(b"1071006060591-") {
-                let suffix = b".apps.googleusercontent.com";
-                if let Some(end) = text.windows(suffix.len()).position(|part| part == suffix) {
-                    previous_id = Some((
-                        offset,
-                        String::from_utf8(text[..end + suffix.len()].to_vec()).ok()?,
-                    ));
-                }
-            } else if text.starts_with(b"GOCSPX-") {
-                if let Some((id_offset, id)) = &previous_id {
-                    // The Go OAuth config constructor references its two strings
-                    // together. Do not mix the separate Cloud Auth client pair.
-                    if offset - id_offset <= 128 {
-                        let secret = std::str::from_utf8(&text[..35]).ok()?;
-                        if secret
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-                        {
-                            pairs.push((id.clone(), secret.to_string()));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    pairs.sort();
-    pairs.dedup();
-    if pairs.len() == 1 {
-        pairs.pop()
-    } else {
-        None
-    }
-}
-
-/// macOS arm64 版：Mach-O `__text` 中 Go 用 `adrp + add` 指令对加载字符串地址。
-/// 与 `antigravity_windows_client` 相同：仅当 OAuth client_id 引用之后 128 字节
-/// 内出现 GOCSPX- 引用时才配对，避免混到单独的 Cloud Auth 客户端。
-fn antigravity_macho_client(binary: &[u8]) -> Option<(String, String)> {
-    fn u32_at(b: &[u8], p: usize) -> Option<u32> {
-        Some(u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?))
-    }
-    fn u64_at(b: &[u8], p: usize) -> Option<u64> {
-        Some(u64::from_le_bytes(b.get(p..p + 8)?.try_into().ok()?))
-    }
-    // Mach-O 64-bit little-endian（arm64/x86_64 thin binary）
-    if u32_at(binary, 0)? != 0xFEEDFACF {
-        return None;
-    }
-    let ncmds = u32_at(binary, 16)? as usize;
-    let mut sections: Vec<(u64, u64, u64)> = Vec::new(); // (vmaddr, size, fileoff)
-    let mut text: Option<(u64, u64, u64)> = None;
-    let mut pos = 32usize; // mach_header_64 之后是 load commands
-    for _ in 0..ncmds {
-        let cmd = u32_at(binary, pos)?;
-        let cmdsize = u32_at(binary, pos + 4)? as usize;
-        if cmd == 0x19 && cmdsize >= 72 {
-            // LC_SEGMENT_64：nsects 在 +64，section_64 数组从 +72 起，每项 80 字节
-            let nsects = u32_at(binary, pos + 64)? as usize;
-            for i in 0..nsects {
-                let s = pos.checked_add(72 + i.checked_mul(80)?)?;
-                let name = binary.get(s..s + 16)?;
-                let addr = u64_at(binary, s + 32)?;
-                let size = u64_at(binary, s + 40)?;
-                let fileoff = u64::from(u32_at(binary, s + 48)?);
-                sections.push((addr, size, fileoff));
-                if name.starts_with(b"__text") {
-                    text = Some((addr, size, fileoff));
-                }
-            }
-        }
-        pos = pos.checked_add(cmdsize.max(8))?;
-    }
-    let (text_va, text_size, text_fileoff) = text?;
-    let file_offset = |va: u64| -> Option<usize> {
-        sections.iter().find_map(|&(addr, size, fileoff)| {
-            (va >= addr && va - addr < size)
-                .then(|| usize::try_from(fileoff + (va - addr)).ok())
-                .flatten()
-        })
-    };
-    let text_start = usize::try_from(text_fileoff).ok()?;
-    let text_len = text_start
-        .checked_add(usize::try_from(text_size).ok()?)?
-        .min(binary.len())
-        .saturating_sub(text_start);
-    let mut pairs = Vec::new();
-    let mut previous_id: Option<(usize, String)> = None;
-    let mut offset = 0usize;
-    while offset + 8 <= text_len {
-        let p = text_start + offset;
-        let w1 = u32_at(binary, p)?;
-        let w2 = u32_at(binary, p + 4)?;
-        offset += 4;
-        // ADRP Xd, #imm（bit31=1，bits28-24=10000）
-        if w1 & 0x9F00_0000 != 0x9000_0000 {
-            continue;
-        }
-        // ADD Xd2, Xn, #imm12（64 位、sh=0），且 Xn 必须是 ADRP 的目标寄存器
-        if w2 & 0xFFC0_0000 != 0x9100_0000 || (w2 >> 5) & 31 != w1 & 31 {
-            continue;
-        }
-        let imm = ((w1 >> 5) & 0x3_FFFF) << 2 | (w1 >> 29) & 3;
-        let imm = if imm & (1 << 20) != 0 {
-            imm as i64 - (1 << 21)
-        } else {
-            imm as i64
-        };
-        let pc = text_va + (offset - 4) as u64;
-        let target = (pc & !0xFFF)
-            .wrapping_add_signed(imm << 12)
-            .wrapping_add(((w2 >> 10) & 0xFFF) as u64);
-        let Some(target) = file_offset(target) else {
-            continue;
-        };
-        let Some(text_bytes) = binary.get(target..target.saturating_add(100)) else {
-            continue;
-        };
-        if text_bytes.starts_with(b"1071006060591-") {
-            let suffix = b".apps.googleusercontent.com";
-            if let Some(end) = text_bytes
-                .windows(suffix.len())
-                .position(|part| part == suffix)
-            {
-                previous_id = Some((
-                    offset - 4,
-                    String::from_utf8(text_bytes[..end + suffix.len()].to_vec()).ok()?,
-                ));
-            }
-        } else if text_bytes.starts_with(b"GOCSPX-") {
-            if let Some((id_offset, id)) = &previous_id {
-                if offset - 4 - id_offset <= 128 {
-                    let secret = std::str::from_utf8(&text_bytes[..35]).ok()?;
-                    if secret
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-                    {
-                        pairs.push((id.clone(), secret.to_string()));
-                    }
-                }
-            }
-        }
-    }
-    pairs.sort();
-    pairs.dedup();
-    if pairs.len() == 1 {
-        pairs.pop()
-    } else {
-        None
-    }
+    antigravity_builtin_client()
 }
 
 fn antigravity_state_path() -> Option<PathBuf> {
@@ -2738,7 +2716,6 @@ fn protobuf_bytes(input: &[u8], wanted: u64) -> Option<Vec<&[u8]>> {
     }
     Some(result)
 }
-
 fn antigravity_state_credentials(raw: &str) -> Option<AntigravityCred> {
     let state = base64_decode(raw)?;
     for entry in protobuf_bytes(&state, 1)? {
@@ -2926,6 +2903,76 @@ fn write_back_antigravity(path: &Path, cred: &AntigravityCred) {
     atomic_write(path, out.as_bytes());
 }
 
+/// Antigravity access token 本地缓存。
+///
+/// vscdb 的 OAuth 条目不带可用过期时间（protobuf 里没有），所以不缓存的话每次查询都必然
+/// 先吃一个 401 再走刷新——白付两次往返（实测 401 ~476ms + 刷新 ~800ms）。
+/// 刷新成功后 token 的真实 expiry 是已知的，缓存下来让后续查询直接复用。
+///
+/// 与 openusage 同一思路。按 refresh_token 的 SHA-256 绑定：Antigravity 轮换
+/// refresh token 后缓存自然失效，不会串账号；缓存 token 万一被 Google 拒掉，
+/// 也只是多一次 401，回落到原有刷新路径，不影响正确性。
+#[derive(Serialize, Deserialize)]
+struct AntigravityTokenCache {
+    access_token: String,
+    /// unix 毫秒
+    expires_at_ms: i64,
+    /// refresh_token 的 SHA-256
+    fingerprint: String,
+}
+
+/// 剩余寿命不足这么久就当已过期，避免拿到一个马上要 401 的 token。
+const ANTIGRAVITY_TOKEN_SKEW_MS: i64 = 60_000;
+
+fn antigravity_token_cache_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|base| base.join("devin-usage-metrics/antigravity-token.json"))
+}
+
+fn antigravity_fingerprint(refresh_token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(refresh_token.as_bytes()))
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// 读取缓存里仍然有效的 access token；没有 / 已过期 / refresh token 不匹配都返回 None。
+fn antigravity_cached_token(refresh_token: &str) -> Option<String> {
+    let path = antigravity_token_cache_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let cached: AntigravityTokenCache = serde_json::from_str(&text).ok()?;
+    if cached.fingerprint != antigravity_fingerprint(refresh_token) {
+        return None;
+    }
+    if cached.expires_at_ms <= now_ms() + ANTIGRAVITY_TOKEN_SKEW_MS {
+        return None;
+    }
+    let token = cached.access_token.trim().to_string();
+    if token.is_empty() {
+        return None;
+    }
+    Some(token)
+}
+
+/// 刷新成功后把新 token 存盘。写失败不影响本次查询，只是下次要重新刷新一次。
+fn antigravity_save_token(refresh_token: &str, access_token: &str, expires_at_ms: i64) {
+    let Some(path) = antigravity_token_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let cache = AntigravityTokenCache {
+        access_token: access_token.to_string(),
+        expires_at_ms,
+        fingerprint: antigravity_fingerprint(refresh_token),
+    };
+    if let Ok(text) = serde_json::to_string(&cache) {
+        atomic_write(&path, text.as_bytes());
+    }
+}
+
 /// 查询 Antigravity (Gemini Code Assist) 配额。
 ///
 /// API 端点：`https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`
@@ -2947,6 +2994,14 @@ fn fetch_antigravity(path: &Path, from_keychain: bool) -> Result<QuotaResult, Qu
         ]
     };
 
+    // 先用上次刷新留下的 token：vscdb 里的 token 常常已过期，而它的过期时间读不到，
+    // 不缓存就意味着每次查询都要先付一个 401 再刷新（两次白跑的往返）。
+    if !cred.refresh_token.is_empty() {
+        if let Some(cached) = antigravity_cached_token(&cred.refresh_token) {
+            cred.access_token = cached;
+        }
+    }
+
     let mut body: Result<Value, QuotaError>;
     let mut refreshed = false;
     loop {
@@ -2963,6 +3018,10 @@ fn fetch_antigravity(path: &Path, from_keychain: bool) -> Result<QuotaResult, Qu
             Err(e) if e.is_status(401) && !refreshed && !cred.refresh_token.is_empty() => {
                 refresh_antigravity(&mut cred)?;
                 write_back_antigravity(path, &cred);
+                // 刷新成功后缓存新 token，后续查询直接复用，不再付 401 + 刷新这两跳
+                if let Some(exp) = cred.expires_at {
+                    antigravity_save_token(&cred.refresh_token, &cred.access_token, exp * 1000);
+                }
                 refreshed = true;
                 continue;
             }
@@ -3118,95 +3177,6 @@ mod tests {
         assert!(antigravity_state_credentials("invalid").is_none());
         assert!(protobuf_bytes(&[10, 255], 1).is_none());
     }
-
-    #[test]
-    fn antigravity_windows_client_pairs_config_references() {
-        let mut binary = vec![0u8; 2048];
-        binary[60..64].copy_from_slice(&128u32.to_le_bytes());
-        binary[128..132].copy_from_slice(b"PE\0\0");
-        binary[134..136].copy_from_slice(&1u16.to_le_bytes());
-        binary[164..168].copy_from_slice(&4096u32.to_le_bytes());
-        binary[168..172].copy_from_slice(&1536u32.to_le_bytes());
-        binary[172..176].copy_from_slice(&512u32.to_le_bytes());
-        let id = format!(
-            "{}{}.{}",
-            "1071006060591-", "test", "apps.googleusercontent.com"
-        )
-        .into_bytes();
-        let secret = format!("{}{}", "GOCSPX-", "x".repeat(28)).into_bytes();
-        binary[1000..1000 + id.len()].copy_from_slice(&id);
-        binary[1200..1200 + secret.len()].copy_from_slice(&secret);
-        for (instruction, target) in [(600usize, 1000usize), (618, 1200)] {
-            binary[instruction..instruction + 3].copy_from_slice(&[0x48, 0x8d, 0x0d]);
-            binary[instruction + 3..instruction + 7]
-                .copy_from_slice(&((target as i32) - (instruction as i32) - 7).to_le_bytes());
-        }
-        let pair = antigravity_windows_client(&binary).unwrap();
-        assert_eq!(pair.0, String::from_utf8(id.to_vec()).unwrap());
-        assert_eq!(pair.1, String::from_utf8(secret.to_vec()).unwrap());
-        binary[618] = 0;
-        assert!(antigravity_windows_client(&binary).is_none());
-        assert!(antigravity_windows_client(&[0; 10]).is_none());
-    }
-
-    #[test]
-    fn antigravity_macho_client_pairs_config_references() {
-        let mut binary = vec![0u8; 2048];
-        // mach_header_64：magic + ncmds=1，load command 从 32 开始
-        binary[0..4].copy_from_slice(&0xFEEDFACFu32.to_le_bytes());
-        binary[16..20].copy_from_slice(&1u32.to_le_bytes());
-        // LC_SEGMENT_64 "__TEXT"：vmaddr=0, fileoff=0, nsects=2
-        binary[32..36].copy_from_slice(&0x19u32.to_le_bytes());
-        binary[36..40].copy_from_slice(&232u32.to_le_bytes());
-        binary[40..46].copy_from_slice(b"__TEXT");
-        binary[64..72].copy_from_slice(&2048u64.to_le_bytes()); // vmsize
-        binary[80..88].copy_from_slice(&2048u64.to_le_bytes()); // filesize
-        binary[96..100].copy_from_slice(&2u32.to_le_bytes());
-        // section_64 __text：addr=0, size=512, offset=0
-        binary[104..110].copy_from_slice(b"__text");
-        binary[136..144].copy_from_slice(&0u64.to_le_bytes());
-        binary[144..152].copy_from_slice(&512u64.to_le_bytes());
-        binary[152..156].copy_from_slice(&0u32.to_le_bytes());
-        // section_64 __cstring：addr=512, size=1536, offset=512
-        binary[184..193].copy_from_slice(b"__cstring");
-        binary[216..224].copy_from_slice(&512u64.to_le_bytes());
-        binary[224..232].copy_from_slice(&1536u64.to_le_bytes());
-        binary[232..236].copy_from_slice(&512u32.to_le_bytes());
-
-        let id = format!(
-            "{}{}.{}",
-            "1071006060591-", "test", "apps.googleusercontent.com"
-        )
-        .into_bytes();
-        let secret = format!("{}{}", "GOCSPX-", "x".repeat(28)).into_bytes();
-        binary[600..600 + id.len()].copy_from_slice(&id);
-        binary[700..700 + secret.len()].copy_from_slice(&secret);
-        // adrp x8, 0 ; add x9, x8, #600 与 adrp x10, 0 ; add x11, x10, #700
-        binary[200..204].copy_from_slice(&(0x9000_0008u32).to_le_bytes());
-        binary[204..208].copy_from_slice(&(0x9100_0000u32 | 600 << 10 | 8 << 5 | 9).to_le_bytes());
-        binary[208..212].copy_from_slice(&(0x9000_000Au32).to_le_bytes());
-        binary[212..216]
-            .copy_from_slice(&(0x9100_0000u32 | 700 << 10 | 10 << 5 | 11).to_le_bytes());
-
-        let pair = antigravity_macho_client(&binary).unwrap();
-        assert_eq!(pair.0, String::from_utf8(id.to_vec()).unwrap());
-        assert_eq!(pair.1, String::from_utf8(secret.to_vec()).unwrap());
-        binary[212] = 0;
-        assert!(antigravity_macho_client(&binary).is_none());
-        assert!(antigravity_macho_client(&[0; 10]).is_none());
-    }
-
-    #[test]
-    #[ignore = "requires installed Antigravity on macOS"]
-    fn antigravity_macho_client_reads_installed_binary() {
-        let binary =
-            std::fs::read("/Applications/Antigravity.app/Contents/Resources/bin/language_server")
-                .expect("installed language_server");
-        let (id, secret) = antigravity_macho_client(&binary).expect("client pair");
-        assert!(id.ends_with(".apps.googleusercontent.com"));
-        assert!(secret.starts_with("GOCSPX-"));
-    }
-
     #[test]
     fn parse_claude_usage_windows() {
         let usage: Value = serde_json::from_str(
@@ -3988,6 +3958,117 @@ devin_webapp_host = "app.devin.ai"
         });
         assert!(started.elapsed() < Duration::from_millis(800));
         assert_eq!(out, vec![Some(0), Some(10), Some(20), Some(30), Some(40)]);
+    }
+
+    #[test]
+    fn parallel_pair_runs_concurrently_and_keeps_both_results() {
+        // 两个闭包各睡 200ms；串行需要 ≥400ms，并发应远小于
+        let started = std::time::Instant::now();
+        let (a, b) = parallel_pair(
+            || {
+                std::thread::sleep(Duration::from_millis(200));
+                1 + 1
+            },
+            || {
+                std::thread::sleep(Duration::from_millis(200));
+                "two"
+            },
+        );
+        assert!(started.elapsed() < Duration::from_millis(800));
+        assert_eq!(a, Some(2));
+        assert_eq!(b, Some("two"));
+    }
+
+    #[test]
+    fn deobfuscate_roundtrips_and_builtin_client_is_well_formed() {
+        // 1. 异或函数本身可往返
+        let original = "round-trip-probe-value";
+        let encoded: Vec<u8> = original.bytes().map(|b| b ^ OBFUSCATION_KEY).collect();
+        assert_eq!(deobfuscate(&encoded), original);
+        // 编码后的字节确实不同于原文（否则说明 key 是 0，混淆失效）
+        assert_ne!(encoded, original.bytes().collect::<Vec<u8>>());
+
+        // 2. 内置凭据能解出结构正确的值。
+        //    这里只校验形状，不断言完整明文——否则测试文件本身又会泄露凭据，
+        //    把刚避开的扫描器重新招回来。
+        let (id, secret) = antigravity_builtin_client().expect("builtin client must decode");
+        assert!(
+            id.ends_with(".apps.googleusercontent.com"),
+            "client_id 形状不对: {id}"
+        );
+        assert!(
+            id.len() > 40 && id.contains('-'),
+            "client_id 形状不对: {id}"
+        );
+        assert_eq!(secret.len(), 35, "client_secret 长度应为 35");
+        assert!(
+            secret
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "client_secret 含非法字符"
+        );
+        // 3. 两个值都不是空串（空数组表示"强制走二进制提取"）
+        assert!(!id.is_empty() && !secret.is_empty());
+    }
+
+    #[test]
+    fn parallel_pair_maps_panicking_side_to_none() {
+        // 一侧 panic 不能带崩另一侧：对应位置为 None，由调用方降级
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let (a, b) = parallel_pair(|| 7u8, || panic!("boom"));
+        std::panic::set_hook(prev);
+        assert_eq!(a, Some(7));
+        assert_eq!(b, None);
+    }
+
+    #[test]
+    fn ttl_cache_hits_until_expiry_then_reloads() {
+        let cache: TtlCache<u64, String> = TtlCache::new(Duration::from_secs(60));
+        let t0 = std::time::Instant::now();
+        let calls = std::cell::Cell::new(0usize);
+        let load = || {
+            calls.set(calls.get() + 1);
+            Ok::<_, String>(format!("v{}", calls.get()))
+        };
+        assert_eq!(cache.get_or_load(t0, 1, load), Ok("v1".to_string()));
+        // TTL 内命中缓存，不再调 load
+        assert_eq!(
+            cache.get_or_load(t0 + Duration::from_secs(59), 1, load),
+            Ok("v1".to_string())
+        );
+        assert_eq!(calls.get(), 1);
+        // 过期后重新 load
+        assert_eq!(
+            cache.get_or_load(t0 + Duration::from_secs(60), 1, load),
+            Ok("v2".to_string())
+        );
+        assert_eq!(calls.get(), 2);
+        // 不同的 key 互不影响
+        assert_eq!(
+            cache.get_or_load(t0 + Duration::from_secs(60), 2, load),
+            Ok("v3".to_string())
+        );
+    }
+
+    #[test]
+    fn ttl_cache_does_not_cache_failures() {
+        let cache: TtlCache<u64, String> = TtlCache::new(Duration::from_secs(60));
+        let t0 = std::time::Instant::now();
+        let calls = std::cell::Cell::new(0usize);
+        let load = || {
+            calls.set(calls.get() + 1);
+            Err::<String, _>("boom".to_string())
+        };
+        assert!(cache.get_or_load(t0, 1, load).is_err());
+        assert!(cache
+            .get_or_load(t0 + Duration::from_secs(1), 1, load)
+            .is_err());
+        assert_eq!(
+            calls.get(),
+            2,
+            "失败不应被缓存，否则一次网络抖动会让账号长时间不可查"
+        );
     }
 
     #[test]

@@ -862,7 +862,7 @@ impl Root {
         cfg!(target_os = "macos")
             && !self.quota_keychain_allowed
             && !self.quota_keychain_dismissed
-            && quota::macos_may_have_keychain_accounts()
+            && quota::macos_may_have_keychain_accounts_cached()
     }
 
     /// 每 30 秒重绘一次，驱动重置倒计时；离开 LiveQuota 页面或清空后自动停止。
