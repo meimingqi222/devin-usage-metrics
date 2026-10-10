@@ -173,9 +173,9 @@ pub fn macos_may_have_keychain_accounts() -> bool {
     let Some(h) = home() else {
         return false;
     };
-    // Claude Code 在 macOS 默认把 OAuth 放 Keychain，而不是 .credentials.json
-    let claude_keychain_likely =
-        h.join(".claude").exists() && !h.join(".claude").join(".credentials.json").exists();
+    // Claude Code 在 macOS 默认把 OAuth 放 Keychain；即使 .claude/.credentials.json 还在，
+    // 也可能只是旧版本遗留的过期副本，所以只要装过 Claude Code 就提示。
+    let claude_keychain_likely = h.join(".claude").exists();
     // Antigravity / Gemini Code Assist
     let antigravity_installed =
         h.join(".gemini").join("antigravity").exists() || h.join(".gemini").join("config").exists();
@@ -224,18 +224,21 @@ fn write_store(path: &Path, store: &StoreFile) {
 /// Unix 上保留原文件权限（新文件默认 0600）：这些文件存放 OAuth token / cookie，
 /// 临时文件若沿用 umask 默认的 0644，替换后会把 `~/.claude/.credentials.json`
 /// 之类的凭据文件变成同机其他用户可读。
-fn atomic_write(path: &Path, data: &[u8]) {
+fn atomic_write(path: &Path, data: &[u8]) -> bool {
     let temp = path.with_extension(format!("tmp-{}", std::process::id()));
     if write_private_file(&temp, data, path).is_err() {
         let _ = std::fs::remove_file(&temp);
-        return;
+        return false;
     }
-    if std::fs::rename(&temp, path).is_err() {
-        let _ = std::fs::remove_file(path);
-        if std::fs::rename(&temp, path).is_err() {
-            let _ = std::fs::remove_file(&temp);
-        }
+    if std::fs::rename(&temp, path).is_ok() {
+        return true;
     }
+    let _ = std::fs::remove_file(path);
+    if std::fs::rename(&temp, path).is_ok() {
+        return true;
+    }
+    let _ = std::fs::remove_file(&temp);
+    false
 }
 
 /// 写 `temp`，权限取 `original` 现有权限，不存在则 0600（非 Unix 平台忽略）。
@@ -282,24 +285,27 @@ pub fn discover_accounts(allow_keychain: bool) -> Vec<Account> {
 
     if let Some(h) = home() {
         let claude = h.join(".claude").join(".credentials.json");
-        if claude.exists() {
+        // macOS：Claude Code 的真实凭据在钥匙串里，`.credentials.json` 可能是旧版本遗留的
+        // 过期副本，所以钥匙串优先（需用户已同意）；文件只作兜底。
+        // 账号展示名仍从文件里取邮箱（钥匙串探测不读密文）。
+        if allow_keychain
+            && cfg!(target_os = "macos")
+            && keychain_item_exists(CLAUDE_KEYCHAIN_SERVICE)
+        {
+            // 只探测条目是否存在；真正读密文发生在 fetch 阶段
+            out.push(Account {
+                key: "claude-keychain".into(),
+                provider: Provider::Claude,
+                label: read_claude_email(&claude).unwrap_or_else(|| "Claude Code".into()),
+                kind: AccountKind::ClaudeKeychain,
+            });
+        } else if claude.exists() {
             let label = read_claude_email(&claude).unwrap_or_else(|| "Claude".into());
             out.push(Account {
                 key: "claude-local".into(),
                 provider: Provider::Claude,
                 label,
                 kind: AccountKind::ClaudeLocal { path: claude },
-            });
-        } else if allow_keychain
-            && cfg!(target_os = "macos")
-            && keychain_item_exists("Claude Code-credentials")
-        {
-            // 只探测条目是否存在；真正读密文发生在 fetch 阶段
-            out.push(Account {
-                key: "claude-keychain".into(),
-                provider: Provider::Claude,
-                label: "Claude Code".into(),
-                kind: AccountKind::ClaudeKeychain,
             });
         }
 
@@ -413,24 +419,14 @@ fn keychain_item_exists(_service: &str) -> bool {
     false
 }
 
-/// 进程内缓存已成功读到的 Keychain 密文，避免每次刷新都再次触发系统授权。
-#[cfg(target_os = "macos")]
-fn keychain_secret_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// macOS Keychain 读取：`security find-generic-password -s <service> -w`
 /// 仅在用户显式同意后、真正查询配额时调用。
+///
+/// **不做进程内缓存**：Claude Code 会轮换钥匙串里的 token，缓存的旧密文
+/// 会让我们拿旧 token/refresh_token 去请求（401 / invalid_grant）。
+/// 用户授权过一次（"始终允许"）之后，`security -w` 不会再弹窗。
 #[cfg(target_os = "macos")]
 fn keychain_read(service: &str) -> Option<String> {
-    if let Ok(map) = keychain_secret_cache().lock() {
-        if let Some(v) = map.get(service) {
-            return Some(v.clone());
-        }
-    }
     let output = std::process::Command::new("security")
         .args(["find-generic-password", "-s", service, "-w"])
         .output()
@@ -443,32 +439,59 @@ fn keychain_read(service: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    let value = trimmed.to_string();
-    if let Ok(mut map) = keychain_secret_cache().lock() {
-        map.insert(service.to_string(), value.clone());
-    }
-    Some(value)
+    Some(trimmed.to_string())
 }
 
-/// macOS Keychain 写入：先删除旧条目再添加，避免重复。
+/// 从 `security find-generic-password -s <service>`（不带 -w）的属性输出里取出 acct。
+/// 形如：`    "acct"<blob>="alice"`。取不到（`<NULL>` / 十六进制形式）返回 None。
+#[cfg(any(target_os = "macos", test))]
+fn parse_keychain_account(output: &str) -> Option<String> {
+    let line = output
+        .lines()
+        .map(str::trim_start)
+        .find(|l| l.starts_with("\"acct\"<blob>="))?;
+    let value = line.split_once('=')?.1.trim();
+    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
+/// macOS Keychain 写入：**原地更新**现有条目（`add-generic-password -U`，沿用原
+/// account），不存在才新建。
+///
+/// 旧实现是「先 delete 再用固定 account 添加」：会删掉 Claude Code 自己的条目
+/// （account 是登录用户名），换成 account 不同、ACL 不同的新条目，Claude Code
+/// 再读就读不到 → 被迫重新登录。
 #[cfg(target_os = "macos")]
-fn keychain_write(service: &str, account: &str, value: &str) {
-    let _ = std::process::Command::new("security")
-        .args(["delete-generic-password", "-s", service])
-        .output();
-    let _ = std::process::Command::new("security")
+fn keychain_write(service: &str, value: &str) -> Result<(), String> {
+    let existing = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", service])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| parse_keychain_account(&String::from_utf8_lossy(&o.stdout)));
+    let account = existing
+        .or_else(|| std::env::var("USER").ok())
+        .ok_or_else(|| "cannot determine Keychain account".to_string())?;
+    let out = std::process::Command::new("security")
         .args([
             "add-generic-password",
+            "-U",
             "-s",
             service,
             "-a",
-            account,
+            &account,
             "-w",
             value,
         ])
-        .output();
-    if let Ok(mut map) = keychain_secret_cache().lock() {
-        map.insert(service.to_string(), value.to_string());
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "security add-generic-password exited with {}",
+            out.status
+        ))
     }
 }
 
@@ -763,8 +786,9 @@ pub fn fetch_account(account: &Account) -> Result<QuotaResult, String> {
 
 fn fetch_account_uncached(account: &Account) -> Result<QuotaResult, QuotaError> {
     match &account.kind {
-        AccountKind::ClaudeLocal { path } => fetch_claude(path),
-        AccountKind::ClaudeKeychain => fetch_claude_keychain(),
+        AccountKind::ClaudeLocal { .. } | AccountKind::ClaudeKeychain => {
+            fetch_claude(&account.kind)
+        }
         AccountKind::CodexLocal { path } => fetch_codex(path),
         AccountKind::GrokLocal { path } => fetch_grok(path),
         AccountKind::Devin { cookie, org_id } => fetch_devin(cookie, org_id.as_deref()),
@@ -783,7 +807,17 @@ fn fetch_account_uncached(account: &Account) -> Result<QuotaResult, QuotaError> 
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_SCOPES: &str =
     "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
+const CLAUDE_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+/// 与 openusage 的 ClaudeUsageClient 保持一致的 claude-cli UA。
+const CLAUDE_UA: &str = "claude-cli/2.1.294 (external, cli)";
+/// Claude Code 在 macOS 上存放 OAuth 凭据的钥匙串条目。
+const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+/// access token 过期前这么久就主动刷新（与 openusage 的 5 分钟一致）。
+const CLAUDE_REFRESH_SKEW_SECS: i64 = 5 * 60;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ClaudeCred {
     access_token: String,
     refresh_token: String,
@@ -791,14 +825,52 @@ struct ClaudeCred {
     expires_at: Option<i64>,
 }
 
-fn read_claude_cred(path: &Path) -> Result<ClaudeCred, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let oauth = json_field(&v, &["claudeAiOauth"]).ok_or_else(|| {
-        "credentials.json missing claudeAiOauth (macOS Keychain not supported yet)".to_string()
-    })?;
+/// 凭据来自哪里；刷新后写回同一处。
+#[derive(Clone, Debug)]
+enum ClaudeSource {
+    File(PathBuf),
+    #[cfg(target_os = "macos")]
+    Keychain,
+}
+
+struct ClaudeLoaded {
+    cred: ClaudeCred,
+    source: ClaudeSource,
+}
+
+/// JSON 解析；`security -w` 遇到含不可打印字符的密文会输出十六进制，兜底解码一次。
+fn decode_json_with_hex_fallback(text: &str) -> Result<Value, String> {
+    let text = text.trim();
+    match serde_json::from_str::<Value>(text) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let hex_like = text.len() % 2 == 0
+                && !text.is_empty()
+                && text.bytes().all(|b| b.is_ascii_hexdigit());
+            if hex_like {
+                let bytes: Option<Vec<u8>> = (0..text.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+                    .collect();
+                if let Some(decoded) = bytes.and_then(|b| String::from_utf8(b).ok()) {
+                    if let Ok(v) = serde_json::from_str::<Value>(decoded.trim()) {
+                        return Ok(v);
+                    }
+                }
+            }
+            Err(e.to_string())
+        }
+    }
+}
+
+/// 从 `{"claudeAiOauth": {...}}` 文档里取凭据。
+fn claude_cred_from_doc(doc: &Value) -> Result<ClaudeCred, String> {
+    let oauth =
+        json_field(doc, &["claudeAiOauth"]).ok_or_else(|| "missing claudeAiOauth".to_string())?;
     let access_token = json_field(oauth, &["accessToken"])
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
         .ok_or_else(|| "missing accessToken".to_string())?
         .to_string();
     let refresh_token = json_field(oauth, &["refreshToken"])
@@ -813,193 +885,323 @@ fn read_claude_cred(path: &Path) -> Result<ClaudeCred, String> {
     })
 }
 
-fn write_back_claude(path: &Path, cred: &ClaudeCred) {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let Ok(mut v) = serde_json::from_str::<Value>(&text) else {
-        return;
-    };
-    if let Some(oauth) = v.pointer_mut("/claudeAiOauth") {
-        if let Some(obj) = oauth.as_object_mut() {
-            obj.insert(
-                "accessToken".into(),
-                Value::String(cred.access_token.clone()),
-            );
-            obj.insert(
-                "refreshToken".into(),
-                Value::String(cred.refresh_token.clone()),
-            );
-            if let Some(ts) = cred.expires_at {
-                obj.insert("expiresAt".into(), Value::from(ts * 1000));
-            }
-        }
-    }
-    let Ok(out) = serde_json::to_string_pretty(&v) else {
-        return;
-    };
-    atomic_write(path, out.as_bytes());
+fn parse_claude_cred(text: &str) -> Result<ClaudeCred, String> {
+    claude_cred_from_doc(&decode_json_with_hex_fallback(text)?)
 }
 
-fn refresh_claude(cred: &mut ClaudeCred) -> Result<(), QuotaError> {
-    let agent = http_agent();
-    let resp = post_json(
-        &agent,
-        "https://platform.claude.com/v1/oauth/token",
-        serde_json::json!({
-            "client_id": CLAUDE_CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": cred.refresh_token,
-            "scope": CLAUDE_SCOPES,
-        }),
-        &[("user-agent", "axios/1.15.2")],
-        Some(REFRESH_TIMEOUT),
-    )?;
-    let access = json_field(&resp, &["access_token"])
-        .and_then(Value::as_str)
-        .ok_or_else(|| "refresh response missing access_token".to_string())?
-        .to_string();
-    cred.access_token = access;
-    if let Some(rt) = json_field(&resp, &["refresh_token"]).and_then(Value::as_str) {
-        cred.refresh_token = rt.to_string();
-    }
-    let expires_in = json_field(&resp, &["expires_in"]).and_then(Value::as_f64);
-    cred.expires_at = expires_in.map(|s| now_sec() + s as i64);
-    Ok(())
+/// 是否需要刷新：已过期或距过期不足 5 分钟。`expires_at` 未知则不主动刷新。
+fn claude_needs_refresh(expires_at: Option<i64>, now: i64) -> bool {
+    expires_at.is_some_and(|exp| exp - now <= CLAUDE_REFRESH_SKEW_SECS)
 }
 
-fn fetch_claude(path: &Path) -> Result<QuotaResult, QuotaError> {
-    let mut cred = read_claude_cred(path)?;
-    let agent = http_agent();
-    let headers = |token: &str| -> [(&'static str, String); 3] {
-        [
-            ("authorization", format!("Bearer {token}")),
-            ("anthropic-beta", "oauth-2025-04-20".to_string()),
-            (
-                "user-agent",
-                "claude-cli/1.0.90 (external, cli)".to_string(),
-            ),
-        ]
+/// 刷新接口返回 400/401 时，只有 OAuth 错误码为 `invalid_grant` 才说明 refresh
+/// token 真的失效（需要重新登录）；其它（网关/WAF 页面、`invalid_request` 等）只报状态码。
+/// 与 openusage 一致：`error` 或 `error_description` 等于 `invalid_grant`，
+/// 同时兼容 `{"error": {"type"|"code": "invalid_grant"}}` 的嵌套形态。
+fn is_invalid_grant(body: Option<&str>) -> bool {
+    let Some(v) = body.and_then(|b| serde_json::from_str::<Value>(b).ok()) else {
+        return false;
     };
-
-    let mut usage: Result<Value, QuotaError>;
-    let mut refreshed = false;
-    loop {
-        let h = headers(&cred.access_token);
-        let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        usage = get_json(&agent, "https://api.anthropic.com/api/oauth/usage", &refs);
-        match &usage {
-            Err(e) if e.is_status(401) && !refreshed && !cred.refresh_token.is_empty() => {
-                refresh_claude(&mut cred)?;
-                write_back_claude(path, &cred);
-                refreshed = true;
-                continue;
-            }
-            _ => break,
-        }
-    }
-    let usage = usage?;
-
-    // 套餐信息失败不影响主结果
-    let plan = {
-        let h = headers(&cred.access_token);
-        let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        get_json(&agent, "https://api.anthropic.com/api/oauth/profile", &refs)
-            .ok()
-            .and_then(|p| claude_plan(&p))
-    };
-
-    Ok(parse_claude_usage(&usage, plan))
+    let is = |x: Option<&Value>| x.and_then(Value::as_str) == Some("invalid_grant");
+    is(v.get("error"))
+        || is(v.get("error_description"))
+        || is(json_field(&v, &["error", "type"]))
+        || is(json_field(&v, &["error", "code"]))
 }
 
-/// macOS Keychain 版 Claude Code 查询：从 `Claude Code-credentials` 读取 JSON，
-/// 刷新后写回 Keychain。
-fn fetch_claude_keychain() -> Result<QuotaResult, QuotaError> {
+/// 把新凭据合并进完整的凭据文档（保留其它字段，如 subscriptionType、scopes、mcpOAuth）。
+/// 文档里没有 `claudeAiOauth` 对象时返回 false。
+fn apply_claude_cred(doc: &mut Value, cred: &ClaudeCred) -> bool {
+    let Some(obj) = doc
+        .pointer_mut("/claudeAiOauth")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    obj.insert(
+        "accessToken".into(),
+        Value::String(cred.access_token.clone()),
+    );
+    obj.insert(
+        "refreshToken".into(),
+        Value::String(cred.refresh_token.clone()),
+    );
+    if let Some(ts) = cred.expires_at {
+        obj.insert("expiresAt".into(), Value::from(ts * 1000));
+    }
+    true
+}
+
+fn load_claude_file(path: &Path) -> Result<ClaudeLoaded, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    Ok(ClaudeLoaded {
+        cred: parse_claude_cred(&text)?,
+        source: ClaudeSource::File(path.to_path_buf()),
+    })
+}
+
+/// 每次查询都**重新**读取凭据（不缓存）：Claude Code 运行中会自行刷新并轮换
+/// token，读旧值会得到 401 / invalid_grant。
+/// macOS 上钥匙串优先（Claude Code 的真实来源，文件可能是旧版本遗留的过期副本），
+/// 钥匙串读不到/解析失败时才回退 `~/.claude/.credentials.json`。
+fn load_claude(kind: &AccountKind) -> Result<ClaudeLoaded, String> {
+    match kind {
+        AccountKind::ClaudeLocal { path } => load_claude_file(path),
+        AccountKind::ClaudeKeychain => load_claude_keychain_first(),
+        _ => Err("not a Claude account".into()),
+    }
+}
+
+fn load_claude_keychain_first() -> Result<ClaudeLoaded, String> {
     #[cfg(target_os = "macos")]
     {
-        let raw = keychain_read("Claude Code-credentials")
-            .ok_or_else(|| "Claude Code-credentials not found in Keychain".to_string())?;
-        let v: Value =
-            serde_json::from_str(&raw).map_err(|e| format!("Keychain JSON parse error: {e}"))?;
-        let oauth = json_field(&v, &["claudeAiOauth"])
-            .ok_or_else(|| "Keychain entry missing claudeAiOauth".to_string())?;
-        let mut cred = ClaudeCred {
-            access_token: json_field(oauth, &["accessToken"])
-                .and_then(Value::as_str)
-                .ok_or_else(|| "missing accessToken".to_string())?
-                .to_string(),
-            refresh_token: json_field(oauth, &["refreshToken"])
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            expires_at: json_field(oauth, &["expiresAt"]).and_then(parse_when),
-        };
-
-        let agent = http_agent();
-        let headers = |token: &str| -> [(&'static str, String); 3] {
-            [
-                ("authorization", format!("Bearer {token}")),
-                ("anthropic-beta", "oauth-2025-04-20".to_string()),
-                (
-                    "user-agent",
-                    "claude-cli/1.0.90 (external, cli)".to_string(),
-                ),
-            ]
-        };
-
-        let mut usage: Result<Value, QuotaError>;
-        let mut refreshed = false;
-        loop {
-            let h = headers(&cred.access_token);
-            let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            usage = get_json(&agent, "https://api.anthropic.com/api/oauth/usage", &refs);
-            match &usage {
-                Err(e) if e.is_status(401) && !refreshed && !cred.refresh_token.is_empty() => {
-                    refresh_claude(&mut cred)?;
-                    // 写回 Keychain
-                    if let Some(oauth) = v.pointer("/claudeAiOauth").and_then(|o| o.as_object()) {
-                        let mut obj = oauth.clone();
-                        obj.insert(
-                            "accessToken".into(),
-                            Value::String(cred.access_token.clone()),
-                        );
-                        obj.insert(
-                            "refreshToken".into(),
-                            Value::String(cred.refresh_token.clone()),
-                        );
-                        if let Some(ts) = cred.expires_at {
-                            obj.insert("expiresAt".into(), Value::from(ts * 1000));
-                        }
-                        let mut full = v.clone();
-                        if let Some(target) = full.pointer_mut("/claudeAiOauth") {
-                            *target = Value::Object(obj);
-                        }
-                        if let Ok(out) = serde_json::to_string(&full) {
-                            keychain_write("Claude Code-credentials", "Claude Code", &out);
-                        }
-                    }
-                    refreshed = true;
-                    continue;
+        let from_keychain = keychain_read(CLAUDE_KEYCHAIN_SERVICE)
+            .ok_or_else(|| format!("{CLAUDE_KEYCHAIN_SERVICE} not found in Keychain"))
+            .and_then(|raw| parse_claude_cred(&raw).map_err(|e| format!("Keychain entry: {e}")));
+        match from_keychain {
+            Ok(cred) => Ok(ClaudeLoaded {
+                cred,
+                source: ClaudeSource::Keychain,
+            }),
+            Err(keychain_err) => {
+                let file = home().map(|h| h.join(".claude").join(".credentials.json"));
+                match file.filter(|p| p.exists()) {
+                    Some(path) => load_claude_file(&path)
+                        .map_err(|file_err| format!("{keychain_err}; {file_err}")),
+                    None => Err(keychain_err),
                 }
-                _ => break,
             }
         }
-        let usage = usage?;
-
-        let plan = {
-            let h = headers(&cred.access_token);
-            let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            get_json(&agent, "https://api.anthropic.com/api/oauth/profile", &refs)
-                .ok()
-                .and_then(|p| claude_plan(&p))
-        };
-
-        Ok(parse_claude_usage(&usage, plan))
     }
     #[cfg(not(target_os = "macos"))]
     {
         Err("Claude Keychain is only supported on macOS".into())
     }
+}
+
+/// 把刷新得到的新凭据写回原来源。写之前重读一次：若来源里的 refresh token 已不是
+/// 我们刷新时用的那个，说明 Claude Code 在此期间自己刷新过，**不覆盖**它的新凭据。
+/// 返回 Ok(true)=已写入，Ok(false)=跳过（被 Claude Code 抢先）。
+fn persist_claude(
+    source: &ClaudeSource,
+    used_refresh_token: &str,
+    new: &ClaudeCred,
+) -> Result<bool, String> {
+    let (mut doc, current) = match source {
+        ClaudeSource::File(path) => {
+            let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            let doc = decode_json_with_hex_fallback(&text)?;
+            let current = claude_cred_from_doc(&doc)?;
+            (doc, current)
+        }
+        #[cfg(target_os = "macos")]
+        ClaudeSource::Keychain => {
+            let raw = keychain_read(CLAUDE_KEYCHAIN_SERVICE)
+                .ok_or_else(|| "Keychain entry disappeared".to_string())?;
+            let doc = decode_json_with_hex_fallback(&raw)?;
+            let current = claude_cred_from_doc(&doc)?;
+            (doc, current)
+        }
+    };
+    if current.refresh_token != used_refresh_token {
+        return Ok(false);
+    }
+    if !apply_claude_cred(&mut doc, new) {
+        return Err("credentials missing claudeAiOauth".into());
+    }
+    match source {
+        ClaudeSource::File(path) => {
+            let out = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+            if !atomic_write(path, out.as_bytes()) {
+                return Err(format!("cannot write {}", path.display()));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        ClaudeSource::Keychain => {
+            let out = serde_json::to_string(&doc).map_err(|e| e.to_string())?;
+            keychain_write(CLAUDE_KEYCHAIN_SERVICE, &out)?;
+        }
+    }
+    Ok(true)
+}
+
+fn claude_get(agent: &ureq::Agent, url: &str, token: &str) -> Result<Value, QuotaError> {
+    let auth = format!("Bearer {}", token.trim());
+    get_json(
+        agent,
+        url,
+        &[
+            ("authorization", auth.as_str()),
+            ("accept", "application/json"),
+            ("content-type", "application/json"),
+            ("anthropic-beta", "oauth-2025-04-20"),
+            ("user-agent", CLAUDE_UA),
+        ],
+    )
+}
+
+/// 调 OAuth refresh 端点换新 token。400/401 解析 body：`invalid_grant` 才报「需重新登录」，
+/// 其它只保留 "HTTP 400/401"。
+fn refresh_claude_network(
+    agent: &ureq::Agent,
+    current: &ClaudeCred,
+) -> Result<ClaudeCred, QuotaError> {
+    let resp = post_json(
+        agent,
+        CLAUDE_TOKEN_URL,
+        serde_json::json!({
+            "client_id": CLAUDE_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": current.refresh_token,
+            "scope": CLAUDE_SCOPES,
+        }),
+        &[("user-agent", "axios/1.15.2")],
+        Some(REFRESH_TIMEOUT),
+    )
+    .map_err(|mut e| {
+        if matches!(e.status, Some(400 | 401)) && is_invalid_grant(e.body.as_deref()) {
+            e.message =
+                "Session expired (invalid_grant); run `claude` to sign in again".to_string();
+        }
+        e
+    })?;
+    let access_token = json_field(&resp, &["access_token"])
+        .and_then(Value::as_str)
+        .ok_or_else(|| QuotaError::from("refresh response missing access_token"))?
+        .to_string();
+    let refresh_token = json_field(&resp, &["refresh_token"])
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| current.refresh_token.clone());
+    let expires_in = json_field(&resp, &["expires_in"]).and_then(Value::as_f64);
+    Ok(ClaudeCred {
+        access_token,
+        refresh_token,
+        expires_at: expires_in.map(|s| now_sec() + s as i64),
+    })
+}
+
+/// 刷新前先重读凭据：
+/// 1. Claude Code 已经换了新的 access token 且未临近过期 → 直接用新的，不发网络请求
+///    （避免拿旧 refresh_token 触发 invalid_grant，也避免我们轮换后挤掉运行中的 Claude Code）；
+/// 2. 否则用**最新**的 refresh token 请求刷新并写回；
+/// 3. 刷新报 invalid_grant 时再重读一次：若 refresh token 在这期间被换过，改用新的。
+fn refresh_claude_loaded(
+    agent: &ureq::Agent,
+    kind: &AccountKind,
+    current: &ClaudeLoaded,
+) -> Result<ClaudeLoaded, QuotaError> {
+    let latest = load_claude(kind)?;
+    if latest.cred.access_token != current.cred.access_token
+        && !claude_needs_refresh(latest.cred.expires_at, now_sec())
+    {
+        return Ok(latest);
+    }
+    if latest.cred.refresh_token.is_empty() {
+        return Err(
+            "Claude token expired and no refresh token; run `claude` to sign in again".into(),
+        );
+    }
+    match refresh_claude_network(agent, &latest.cred) {
+        Ok(new) => {
+            match persist_claude(&latest.source, &latest.cred.refresh_token, &new) {
+                Ok(true) | Ok(false) => {}
+                // 新 token 仍可在本次查询中使用；但旧 refresh token 已被服务端轮换作废，
+                // 写回失败要让用户在日志里能看到原因。
+                Err(e) => eprintln!("quota: failed to persist refreshed Claude credentials: {e}"),
+            }
+            Ok(ClaudeLoaded {
+                cred: new,
+                source: latest.source,
+            })
+        }
+        Err(e) if is_invalid_grant(e.body.as_deref()) => match load_claude(kind) {
+            Ok(again)
+                if !again.cred.refresh_token.is_empty()
+                    && again.cred.refresh_token != latest.cred.refresh_token =>
+            {
+                Ok(again)
+            }
+            _ => Err(e),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+fn token_hash(token: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut h);
+    h.finish()
+}
+
+/// 套餐（profile）每个 access token 只查一次；失败也缓存（None），不重试。
+/// 套餐信息不影响主结果，没必要为它多发一次请求（还容易触发 429）。
+fn claude_plan_cached(agent: &ureq::Agent, token: &str) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<u64, Option<String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = token_hash(token);
+    if let Some(hit) = cache.lock().ok().and_then(|m| m.get(&key).cloned()) {
+        return hit;
+    }
+    let plan = claude_get(agent, CLAUDE_PROFILE_URL, token)
+        .ok()
+        .and_then(|p| claude_plan(&p));
+    if let Ok(mut m) = cache.lock() {
+        if m.len() >= 16 {
+            m.clear(); // token 轮换产生的旧条目，容量很小，直接清空
+        }
+        m.insert(key, plan.clone());
+    }
+    plan
+}
+
+/// Claude Code 用量查询（文件 / macOS 钥匙串两种来源共用）。
+fn fetch_claude(kind: &AccountKind) -> Result<QuotaResult, QuotaError> {
+    let agent = http_agent();
+    let mut loaded = load_claude(kind)?;
+    let mut refreshed = false;
+
+    // 过期前不足 5 分钟（或已过期）才主动刷新；平时直接用现有 token。
+    if claude_needs_refresh(loaded.cred.expires_at, now_sec())
+        && !loaded.cred.refresh_token.is_empty()
+    {
+        match refresh_claude_loaded(&agent, kind, &loaded) {
+            Ok(l) => {
+                loaded = l;
+                refreshed = true;
+            }
+            // 还没真正过期时，刷新失败不致命：继续用现有 token 试一次查询
+            Err(_) if loaded.cred.expires_at.is_some_and(|exp| exp > now_sec()) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    let mut usage = claude_get(&agent, CLAUDE_USAGE_URL, &loaded.cred.access_token);
+    if usage.as_ref().err().is_some_and(|e| e.is_status(401)) {
+        // 401：先重读凭据，Claude Code 可能刚轮换过 token
+        if let Ok(latest) = load_claude(kind) {
+            if latest.cred.access_token != loaded.cred.access_token {
+                loaded = latest;
+                usage = claude_get(&agent, CLAUDE_USAGE_URL, &loaded.cred.access_token);
+            }
+        }
+        // 仍然 401 才（至多一次）刷新
+        if usage.as_ref().err().is_some_and(|e| e.is_status(401))
+            && !refreshed
+            && !loaded.cred.refresh_token.is_empty()
+        {
+            loaded = refresh_claude_loaded(&agent, kind, &loaded)?;
+            usage = claude_get(&agent, CLAUDE_USAGE_URL, &loaded.cred.access_token);
+        }
+    }
+    let usage = usage?;
+
+    // 套餐信息失败不影响主结果
+    let plan = claude_plan_cached(&agent, &loaded.cred.access_token);
+    Ok(parse_claude_usage(&usage, plan))
 }
 
 fn claude_plan(profile: &Value) -> Option<String> {
@@ -3153,5 +3355,138 @@ devin_webapp_host = "app.devin.ai"
         let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const CLAUDE_DOC: &str = r#"{
+        "claudeAiOauth": {
+            "accessToken": "at-old",
+            "refreshToken": "rt-old",
+            "expiresAt": 1790000000000,
+            "subscriptionType": "max",
+            "scopes": ["user:profile"]
+        },
+        "mcpOAuth": {"x": 1}
+    }"#;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("quota-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn claude_refresh_only_within_five_minutes_of_expiry() {
+        let now = 1_000_000;
+        assert!(!claude_needs_refresh(None, now));
+        assert!(!claude_needs_refresh(Some(now + 301), now));
+        assert!(claude_needs_refresh(Some(now + 300), now));
+        assert!(claude_needs_refresh(Some(now + 1), now));
+        assert!(claude_needs_refresh(Some(now), now));
+        assert!(claude_needs_refresh(Some(now - 3600), now));
+    }
+
+    #[test]
+    fn invalid_grant_detection() {
+        assert!(is_invalid_grant(Some(r#"{"error":"invalid_grant"}"#)));
+        assert!(is_invalid_grant(Some(
+            r#"{"error":"x","error_description":"invalid_grant"}"#
+        )));
+        assert!(is_invalid_grant(Some(
+            r#"{"error":{"type":"invalid_grant","message":"Refresh token not found"}}"#
+        )));
+        // 其它 400：不算会话过期
+        assert!(!is_invalid_grant(Some(r#"{"error":"invalid_request"}"#)));
+        assert!(!is_invalid_grant(Some(
+            r#"{"error":{"type":"invalid_request_error"}}"#
+        )));
+        assert!(!is_invalid_grant(Some("<html>Bad gateway</html>")));
+        assert!(!is_invalid_grant(Some("")));
+        assert!(!is_invalid_grant(None));
+    }
+
+    #[test]
+    fn claude_cred_parses_ms_expiry_and_hex_fallback() {
+        let cred = parse_claude_cred(CLAUDE_DOC).unwrap();
+        assert_eq!(cred.access_token, "at-old");
+        assert_eq!(cred.refresh_token, "rt-old");
+        assert_eq!(cred.expires_at, Some(1_790_000_000));
+
+        let compact: String =
+            serde_json::to_string(&serde_json::from_str::<Value>(CLAUDE_DOC).unwrap()).unwrap();
+        let hex: String = compact.bytes().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(parse_claude_cred(&hex).unwrap(), cred);
+
+        assert!(parse_claude_cred("not json").is_err());
+        assert!(parse_claude_cred(r#"{"other":1}"#).is_err());
+        assert!(parse_claude_cred(r#"{"claudeAiOauth":{"accessToken":"  "}}"#).is_err());
+    }
+
+    #[test]
+    fn apply_claude_cred_keeps_other_fields() {
+        let mut doc: Value = serde_json::from_str(CLAUDE_DOC).unwrap();
+        let new = ClaudeCred {
+            access_token: "at-new".into(),
+            refresh_token: "rt-new".into(),
+            expires_at: Some(1_800_000_000),
+        };
+        assert!(apply_claude_cred(&mut doc, &new));
+        assert_eq!(doc["claudeAiOauth"]["accessToken"], "at-new");
+        assert_eq!(doc["claudeAiOauth"]["refreshToken"], "rt-new");
+        assert_eq!(doc["claudeAiOauth"]["expiresAt"], 1_800_000_000_000i64);
+        assert_eq!(doc["claudeAiOauth"]["subscriptionType"], "max");
+        assert_eq!(doc["mcpOAuth"]["x"], 1);
+        assert!(!apply_claude_cred(&mut serde_json::json!({}), &new));
+    }
+
+    #[test]
+    fn persist_claude_skips_when_claude_code_rotated_first() {
+        let dir = temp_dir("persist");
+        let path = dir.join(".credentials.json");
+        std::fs::write(&path, CLAUDE_DOC).unwrap();
+        let source = ClaudeSource::File(path.clone());
+        let new = ClaudeCred {
+            access_token: "at-new".into(),
+            refresh_token: "rt-new".into(),
+            expires_at: Some(1_800_000_000),
+        };
+
+        // 我们刷新时用的 refresh token 已不是文件里的 → 不覆盖
+        assert_eq!(persist_claude(&source, "rt-stale", &new), Ok(false));
+        assert_eq!(
+            parse_claude_cred(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .access_token,
+            "at-old"
+        );
+
+        // 一致 → 写入，且保留其它字段
+        assert_eq!(persist_claude(&source, "rt-old", &new), Ok(true));
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["claudeAiOauth"]["accessToken"], "at-new");
+        assert_eq!(written["claudeAiOauth"]["scopes"][0], "user:profile");
+        assert_eq!(written["mcpOAuth"]["x"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_claude_rereads_file_every_time() {
+        let dir = temp_dir("reread");
+        let path = dir.join(".credentials.json");
+        std::fs::write(&path, CLAUDE_DOC).unwrap();
+        let kind = AccountKind::ClaudeLocal { path: path.clone() };
+        assert_eq!(load_claude(&kind).unwrap().cred.access_token, "at-old");
+        std::fs::write(&path, CLAUDE_DOC.replace("at-old", "at-rotated")).unwrap();
+        assert_eq!(load_claude(&kind).unwrap().cred.access_token, "at-rotated");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keychain_account_is_parsed_from_attributes() {
+        let out = "keychain: \"/Users/a/Library/Keychains/login.keychain-db\"\nclass: \"genp\"\nattributes:\n    0x00000007 <blob>=\"Claude Code-credentials\"\n    \"acct\"<blob>=\"alice\"\n    \"svce\"<blob>=\"Claude Code-credentials\"\n";
+        assert_eq!(parse_keychain_account(out), Some("alice".into()));
+        assert_eq!(parse_keychain_account("    \"acct\"<blob>=<NULL>\n"), None);
+        assert_eq!(parse_keychain_account("nothing here"), None);
     }
 }
