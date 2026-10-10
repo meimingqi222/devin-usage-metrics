@@ -68,6 +68,24 @@ pub struct QuotaResult {
     pub windows: Vec<QuotaWindow>,
     /// 附加说明行（超额余额等），可空
     pub extra: Option<String>,
+    /// 非 None 表示这是缓存/过期数据（限流冷却中或本次查询失败时回退到上次成功结果）
+    pub stale: Option<StaleInfo>,
+}
+
+/// 数据来自缓存而非本次查询。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaleInfo {
+    /// 这份数据是多少秒前查到的
+    pub age_secs: u64,
+    pub reason: StaleReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StaleReason {
+    /// 429 冷却中，`retry_in_secs` 秒后才会再次请求
+    RateLimited { retry_in_secs: u64 },
+    /// 本次查询失败（错误信息）
+    Error(String),
 }
 
 pub enum AccountKind {
@@ -780,8 +798,41 @@ fn parse_when(v: &Value) -> Option<i64> {
 // 查询入口
 // ---------------------------------------------------------------------------
 
+/// 查询一个账号（走 TTL 缓存、429 冷却、失败退避）。
 pub fn fetch_account(account: &Account) -> Result<QuotaResult, String> {
-    fetch_account_uncached(account).map_err(String::from)
+    fetch_account_opts(account, false)
+}
+
+/// `force=true`（用户手动刷新）绕过 TTL 缓存和失败退避，但**仍然尊重 429 冷却**——
+/// 冷却期内再请求只会继续被限流。
+pub fn fetch_account_opts(account: &Account, force: bool) -> Result<QuotaResult, String> {
+    let entry = account_entry(&account.key, account_fingerprint(&account.kind));
+    cached_fetch(&entry, force, || fetch_account_uncached(account)).map_err(String::from)
+}
+
+/// 并发查询所有账号，返回顺序与 `accounts` 一致（UI 卡片顺序不变）。
+pub fn fetch_accounts(accounts: &[Account], force: bool) -> Vec<Result<QuotaResult, String>> {
+    parallel_map(accounts, |a| fetch_account_opts(a, force))
+        .into_iter()
+        .map(|r| r.unwrap_or_else(|| Err("quota query thread panicked".to_string())))
+        .collect()
+}
+
+/// 每个元素一个线程（账号数很少），结果按输入顺序返回；线程 panic 对应位置为 None。
+fn parallel_map<T, R, F>(items: &[T], f: F) -> Vec<Option<R>>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    std::thread::scope(|scope| {
+        let f = &f;
+        let handles: Vec<_> = items
+            .iter()
+            .map(|item| scope.spawn(move || f(item)))
+            .collect();
+        handles.into_iter().map(|h| h.join().ok()).collect()
+    })
 }
 
 fn fetch_account_uncached(account: &Account) -> Result<QuotaResult, QuotaError> {
@@ -798,6 +849,211 @@ fn fetch_account_uncached(account: &Account) -> Result<QuotaResult, QuotaError> 
             from_keychain,
         } => fetch_antigravity(path, *from_keychain),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 结果缓存 / 429 冷却 / 失败退避（按账号）
+// ---------------------------------------------------------------------------
+
+/// 成功结果的缓存有效期（与 openusage 的默认刷新间隔一致）。
+pub const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+/// 429 没带 `Retry-After` 时的冷却时间。
+const RATE_LIMIT_DEFAULT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+/// `Retry-After` 过大时的上限，避免一次异常响应让账号长时间不可查。
+const RATE_LIMIT_MAX_COOLDOWN: Duration = Duration::from_secs(60 * 60);
+/// 失败（非 429）后的退避：期间自动刷新直接返回上次结果/错误，不再打接口。
+const FAILURE_BACKOFF: Duration = Duration::from_secs(60);
+/// 兜底展示的旧结果最长年龄；再老的数据（窗口早已重置）不如直接报错。
+const MAX_STALE_AGE: Duration = Duration::from_secs(2 * 60 * 60);
+
+#[derive(Default)]
+struct AccountState {
+    /// 上次成功的结果及时间
+    last_ok: Option<(std::time::Instant, QuotaResult)>,
+    /// 429 冷却截止时间
+    cooldown_until: Option<std::time::Instant>,
+    /// 失败退避截止时间及当时的错误
+    backoff: Option<(std::time::Instant, QuotaError)>,
+}
+
+enum Decision {
+    /// 需要真正发请求
+    Fetch,
+    /// 无需请求，直接返回（缓存命中 / 冷却中 / 退避中）
+    Done(Result<QuotaResult, QuotaError>),
+}
+
+/// 上次成功结果的副本，标注为缓存/过期数据。太旧或不存在返回 None。
+fn stale_copy(
+    state: &AccountState,
+    now: std::time::Instant,
+    reason: StaleReason,
+) -> Option<QuotaResult> {
+    let (at, result) = state.last_ok.as_ref()?;
+    let age = now.saturating_duration_since(*at);
+    if age > MAX_STALE_AGE {
+        return None;
+    }
+    let mut out = result.clone();
+    out.stale = Some(StaleInfo {
+        age_secs: age.as_secs(),
+        reason,
+    });
+    Some(out)
+}
+
+/// 纯逻辑：根据当前状态决定是否发请求。
+fn decide(state: &AccountState, now: std::time::Instant, force: bool) -> Decision {
+    // 1. 429 冷却（手动刷新也不能绕过）
+    if let Some(until) = state.cooldown_until {
+        if now < until {
+            let retry_in = until.saturating_duration_since(now);
+            let secs = retry_in.as_secs() + u64::from(retry_in.subsec_nanos() > 0);
+            let reason = StaleReason::RateLimited {
+                retry_in_secs: secs,
+            };
+            return Decision::Done(stale_copy(state, now, reason).ok_or_else(|| QuotaError {
+                message: format!("HTTP 429 (retry in {})", fmt_retry_in(secs)),
+                status: Some(429),
+                retry_after_secs: Some(secs),
+                body: None,
+            }));
+        }
+    }
+    if !force {
+        // 2. TTL 缓存
+        if let Some((at, result)) = &state.last_ok {
+            if now.saturating_duration_since(*at) < CACHE_TTL {
+                return Decision::Done(Ok(result.clone()));
+            }
+        }
+        // 3. 失败退避
+        if let Some((until, err)) = &state.backoff {
+            if now < *until {
+                let reason = StaleReason::Error(err.message.clone());
+                return Decision::Done(stale_copy(state, now, reason).ok_or_else(|| err.clone()));
+            }
+        }
+    }
+    Decision::Fetch
+}
+
+/// 纯逻辑：记录一次真实请求的结果，更新冷却/退避/缓存，并给出最终返回值
+/// （失败时尽量回退到上次成功的结果）。
+fn record(
+    state: &mut AccountState,
+    now: std::time::Instant,
+    result: Result<QuotaResult, QuotaError>,
+) -> Result<QuotaResult, QuotaError> {
+    match result {
+        Ok(r) => {
+            state.last_ok = Some((now, r.clone()));
+            state.cooldown_until = None;
+            state.backoff = None;
+            Ok(r)
+        }
+        Err(e) if e.is_status(429) => {
+            let cooldown = e
+                .retry_after_secs
+                .map(Duration::from_secs)
+                .unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN)
+                .clamp(FAILURE_BACKOFF, RATE_LIMIT_MAX_COOLDOWN);
+            state.cooldown_until = Some(now + cooldown);
+            let reason = StaleReason::RateLimited {
+                retry_in_secs: cooldown.as_secs(),
+            };
+            stale_copy(state, now, reason).ok_or(e)
+        }
+        Err(e) => {
+            state.backoff = Some((now + FAILURE_BACKOFF, e.clone()));
+            let reason = StaleReason::Error(e.message.clone());
+            stale_copy(state, now, reason).ok_or(e)
+        }
+    }
+}
+
+fn fmt_retry_in(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{}m", secs.div_ceil(60))
+    } else {
+        format!("{secs}s")
+    }
+}
+
+struct AccountEntry {
+    fingerprint: u64,
+    /// 同一账号同一时间只有一次真实请求（例如上一轮加载还没结束又触发了新一轮）
+    fetch_lock: std::sync::Mutex<()>,
+    state: std::sync::Mutex<AccountState>,
+}
+
+/// 凭据身份指纹：账号被删除/换号后 key（如 `devin-0`）会复用，指纹变了就丢弃旧缓存。
+fn account_fingerprint(kind: &AccountKind) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match kind {
+        AccountKind::ClaudeLocal { path } => ("claude-local", path).hash(&mut h),
+        AccountKind::ClaudeKeychain => "claude-keychain".hash(&mut h),
+        AccountKind::CodexLocal { path } => ("codex", path).hash(&mut h),
+        AccountKind::GrokLocal { path } => ("grok", path).hash(&mut h),
+        AccountKind::Devin { cookie, org_id } => ("devin", cookie, org_id).hash(&mut h),
+        AccountKind::DevinCli { token, org_id } => ("devin-cli", token, org_id).hash(&mut h),
+        AccountKind::AntigravityLocal {
+            path,
+            from_keychain,
+        } => ("antigravity", path, from_keychain).hash(&mut h),
+    }
+    h.finish()
+}
+
+fn account_entry(key: &str, fingerprint: u64) -> std::sync::Arc<AccountEntry> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<AccountEntry>>>> = OnceLock::new();
+    let mut registry = REGISTRY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = registry.get(key) {
+        if entry.fingerprint == fingerprint {
+            return entry.clone();
+        }
+    }
+    let entry = Arc::new(AccountEntry {
+        fingerprint,
+        fetch_lock: Mutex::new(()),
+        state: Mutex::new(AccountState::default()),
+    });
+    registry.insert(key.to_string(), entry.clone());
+    entry
+}
+
+fn cached_fetch(
+    entry: &AccountEntry,
+    force: bool,
+    fetch: impl FnOnce() -> Result<QuotaResult, QuotaError>,
+) -> Result<QuotaResult, QuotaError> {
+    use std::sync::PoisonError;
+    let started = std::time::Instant::now();
+    let _in_flight = entry
+        .fetch_lock
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    {
+        let state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // 等锁期间别的线程刚查完 → 直接用它的结果，哪怕是 force（避免同一时刻重复请求）
+        if let Some((at, result)) = &state.last_ok {
+            if *at > started && state.cooldown_until.is_none() {
+                return Ok(result.clone());
+            }
+        }
+        if let Decision::Done(result) = decide(&state, std::time::Instant::now(), force) {
+            return result;
+        }
+    }
+    let result = fetch();
+    let mut state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+    record(&mut state, std::time::Instant::now(), result)
 }
 
 // ---------------------------------------------------------------------------
@@ -844,7 +1100,7 @@ fn decode_json_with_hex_fallback(text: &str) -> Result<Value, String> {
     match serde_json::from_str::<Value>(text) {
         Ok(v) => Ok(v),
         Err(e) => {
-            let hex_like = text.len() % 2 == 0
+            let hex_like = (text.len() & 1) == 0
                 && !text.is_empty()
                 && text.bytes().all(|b| b.is_ascii_hexdigit());
             if hex_like {
@@ -1283,6 +1539,7 @@ pub fn parse_claude_usage(usage: &Value, plan: Option<String>) -> QuotaResult {
         plan,
         windows,
         extra,
+        stale: None,
     }
 }
 
@@ -1471,6 +1728,7 @@ pub fn parse_codex_usage(usage: &Value, plan: Option<String>) -> QuotaResult {
         plan,
         windows,
         extra: None,
+        stale: None,
     }
 }
 
@@ -1744,6 +2002,7 @@ pub fn parse_grok_billing(weekly: &Value, monthly: Option<&Value>) -> QuotaResul
         plan,
         windows,
         extra: None,
+        stale: None,
     }
 }
 
@@ -1851,6 +2110,7 @@ pub fn parse_devin_quota(quota: &Value, plan: Option<String>) -> QuotaResult {
         plan,
         windows,
         extra,
+        stale: None,
     }
 }
 
@@ -2159,6 +2419,7 @@ fn fetch_devin_cli(token: &str, _org_id: &str) -> Result<QuotaResult, QuotaError
         plan,
         windows,
         extra,
+        stale: None,
     })
 }
 
@@ -2782,6 +3043,7 @@ pub fn parse_antigravity_quota(response: &Value) -> QuotaResult {
         plan: None,
         windows,
         extra: None,
+        stale: None,
     }
 }
 
@@ -2812,6 +3074,11 @@ pub fn fmt_countdown(resets_at: i64) -> String {
     if diff <= 0 {
         return String::new();
     }
+    fmt_duration(diff)
+}
+
+/// 时长文案（同 `fmt_countdown` 的格式）。
+pub fn fmt_duration(diff: i64) -> String {
     let days = diff / 86400;
     let hours = (diff % 86400) / 3600;
     let minutes = (diff % 3600) / 60;
@@ -3488,5 +3755,247 @@ devin_webapp_host = "app.devin.ai"
         assert_eq!(parse_keychain_account(out), Some("alice".into()));
         assert_eq!(parse_keychain_account("    \"acct\"<blob>=<NULL>\n"), None);
         assert_eq!(parse_keychain_account("nothing here"), None);
+    }
+
+    fn sample_result(tag: &str) -> QuotaResult {
+        QuotaResult {
+            plan: Some(tag.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn http_err_with(status: u16, retry_after: Option<u64>) -> QuotaError {
+        QuotaError::http(status, retry_after, None)
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn cache_ttl_serves_fresh_result_until_expiry_unless_forced() {
+        let t0 = std::time::Instant::now();
+        let mut state = AccountState::default();
+        assert!(matches!(decide(&state, t0, false), Decision::Fetch));
+        record(&mut state, t0, Ok(sample_result("a"))).unwrap();
+
+        // TTL 内：直接返回缓存，且没有 stale 标记
+        match decide(&state, t0 + CACHE_TTL - secs(1), false) {
+            Decision::Done(Ok(r)) => {
+                assert_eq!(r.plan.as_deref(), Some("a"));
+                assert!(r.stale.is_none());
+            }
+            _ => panic!("expected cache hit"),
+        }
+        // 手动刷新绕过缓存
+        assert!(matches!(
+            decide(&state, t0 + secs(1), true),
+            Decision::Fetch
+        ));
+        // TTL 过后重新查询
+        assert!(matches!(
+            decide(&state, t0 + CACHE_TTL, false),
+            Decision::Fetch
+        ));
+    }
+
+    #[test]
+    fn rate_limit_sets_cooldown_from_retry_after_and_serves_last_result() {
+        let t0 = std::time::Instant::now();
+        let mut state = AccountState::default();
+        record(&mut state, t0, Ok(sample_result("good"))).unwrap();
+
+        let t1 = t0 + CACHE_TTL + secs(10);
+        let r = record(&mut state, t1, Err(http_err_with(429, Some(120)))).unwrap();
+        assert_eq!(r.plan.as_deref(), Some("good"));
+        let stale = r.stale.expect("stale marker");
+        assert_eq!(
+            stale.reason,
+            StaleReason::RateLimited { retry_in_secs: 120 }
+        );
+        assert_eq!(stale.age_secs, (CACHE_TTL + secs(10)).as_secs());
+
+        // 冷却中：普通刷新和手动刷新都不发请求，返回上次结果
+        for force in [false, true] {
+            match decide(&state, t1 + secs(30), force) {
+                Decision::Done(Ok(r)) => {
+                    assert_eq!(r.plan.as_deref(), Some("good"));
+                    assert_eq!(
+                        r.stale.unwrap().reason,
+                        StaleReason::RateLimited { retry_in_secs: 90 }
+                    );
+                }
+                _ => panic!("cooldown must short-circuit (force={force})"),
+            }
+        }
+        // 冷却结束后恢复请求
+        assert!(matches!(
+            decide(&state, t1 + secs(120), true),
+            Decision::Fetch
+        ));
+    }
+
+    #[test]
+    fn rate_limit_defaults_to_five_minutes_and_is_clamped() {
+        let t0 = std::time::Instant::now();
+        let mut state = AccountState::default();
+        // 没有 Retry-After → 5 分钟；没有上次结果 → 返回 429 错误
+        let err = record(&mut state, t0, Err(http_err_with(429, None))).unwrap_err();
+        assert!(err.is_status(429));
+        assert_eq!(state.cooldown_until, Some(t0 + RATE_LIMIT_DEFAULT_COOLDOWN));
+        match decide(&state, t0 + secs(10), false) {
+            Decision::Done(Err(e)) => {
+                assert!(e.is_status(429));
+                assert_eq!(e.to_string(), "HTTP 429 (retry in 5m)");
+            }
+            _ => panic!("expected 429 error during cooldown"),
+        }
+
+        // Retry-After: 0 不会变成「立刻重试」；过大的值被限制在上限
+        let mut s2 = AccountState::default();
+        let _ = record(&mut s2, t0, Err(http_err_with(429, Some(0))));
+        assert_eq!(s2.cooldown_until, Some(t0 + FAILURE_BACKOFF));
+        let mut s3 = AccountState::default();
+        let _ = record(&mut s3, t0, Err(http_err_with(429, Some(999_999))));
+        assert_eq!(s3.cooldown_until, Some(t0 + RATE_LIMIT_MAX_COOLDOWN));
+    }
+
+    #[test]
+    fn failure_backs_off_for_60s_but_manual_refresh_bypasses() {
+        let t0 = std::time::Instant::now();
+        let mut state = AccountState::default();
+        record(&mut state, t0, Ok(sample_result("good"))).unwrap();
+
+        let t1 = t0 + CACHE_TTL + secs(1);
+        let r = record(&mut state, t1, Err("HTTP 500".into())).unwrap();
+        assert_eq!(
+            r.stale.unwrap().reason,
+            StaleReason::Error("HTTP 500".into())
+        );
+
+        // 退避期内：自动刷新直接回上次结果；手动刷新放行；60 秒后放行
+        match decide(&state, t1 + secs(59), false) {
+            Decision::Done(Ok(r)) => assert!(r.stale.is_some()),
+            _ => panic!("expected backoff"),
+        }
+        assert!(matches!(
+            decide(&state, t1 + secs(5), true),
+            Decision::Fetch
+        ));
+        assert!(matches!(
+            decide(&state, t1 + secs(60), false),
+            Decision::Fetch
+        ));
+
+        // 没有上次结果时，退避期内返回同一个错误
+        let mut empty = AccountState::default();
+        let _ = record(&mut empty, t0, Err("boom".into()));
+        match decide(&empty, t0 + secs(5), false) {
+            Decision::Done(Err(e)) => assert_eq!(e.to_string(), "boom"),
+            _ => panic!("expected cached error"),
+        }
+        // 成功后清除退避/冷却
+        record(&mut empty, t0 + secs(70), Ok(sample_result("ok"))).unwrap();
+        assert!(empty.backoff.is_none() && empty.cooldown_until.is_none());
+    }
+
+    #[test]
+    fn stale_results_expire_after_max_age() {
+        let t0 = std::time::Instant::now();
+        let mut state = AccountState::default();
+        record(&mut state, t0, Ok(sample_result("old"))).unwrap();
+        let late = t0 + MAX_STALE_AGE + secs(1);
+        let err = record(&mut state, late, Err("HTTP 503".into())).unwrap_err();
+        assert_eq!(err.to_string(), "HTTP 503");
+    }
+
+    #[test]
+    fn cached_fetch_dedupes_and_respects_force_and_cooldown() {
+        let entry = AccountEntry {
+            fingerprint: 1,
+            fetch_lock: std::sync::Mutex::new(()),
+            state: std::sync::Mutex::new(AccountState::default()),
+        };
+        let calls = std::cell::Cell::new(0);
+        let ok = |tag: &'static str| {
+            let calls = &calls;
+            move || {
+                calls.set(calls.get() + 1);
+                Ok(sample_result(tag))
+            }
+        };
+        assert_eq!(
+            cached_fetch(&entry, false, ok("a"))
+                .unwrap()
+                .plan
+                .as_deref(),
+            Some("a")
+        );
+        // 第二次命中缓存，闭包不会被调用
+        assert_eq!(
+            cached_fetch(&entry, false, ok("b"))
+                .unwrap()
+                .plan
+                .as_deref(),
+            Some("a")
+        );
+        assert_eq!(calls.get(), 1);
+        // force 绕过缓存
+        assert_eq!(
+            cached_fetch(&entry, true, ok("c")).unwrap().plan.as_deref(),
+            Some("c")
+        );
+        assert_eq!(calls.get(), 2);
+        // 429 → 进入冷却，之后 force 也不发请求，返回上次结果并标记 stale
+        let limited = cached_fetch(&entry, true, || Err(http_err_with(429, Some(300)))).unwrap();
+        assert!(limited.stale.is_some());
+        let again = cached_fetch(&entry, true, ok("d")).unwrap();
+        assert_eq!(again.plan.as_deref(), Some("c"));
+        assert!(again.stale.is_some());
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn account_entry_resets_when_credentials_change() {
+        let a = account_entry("test-key-fp", 10);
+        a.state.lock().unwrap().cooldown_until = Some(std::time::Instant::now() + secs(100));
+        assert!(std::sync::Arc::ptr_eq(
+            &a,
+            &account_entry("test-key-fp", 10)
+        ));
+        let b = account_entry("test-key-fp", 11);
+        assert!(!std::sync::Arc::ptr_eq(&a, &b));
+        assert!(b.state.lock().unwrap().cooldown_until.is_none());
+
+        let k1 = AccountKind::Devin {
+            cookie: "c1".into(),
+            org_id: None,
+        };
+        let k2 = AccountKind::Devin {
+            cookie: "c2".into(),
+            org_id: None,
+        };
+        assert_ne!(account_fingerprint(&k1), account_fingerprint(&k2));
+        assert_eq!(account_fingerprint(&k1), account_fingerprint(&k1));
+    }
+
+    #[test]
+    fn parallel_map_runs_concurrently_and_keeps_order() {
+        // 每个任务睡 200ms；串行需要 ≥1s，并发应远小于
+        let items: Vec<u64> = (0..5).collect();
+        let started = std::time::Instant::now();
+        let out = parallel_map(&items, |n| {
+            std::thread::sleep(Duration::from_millis(200));
+            n * 10
+        });
+        assert!(started.elapsed() < Duration::from_millis(800));
+        assert_eq!(out, vec![Some(0), Some(10), Some(20), Some(30), Some(40)]);
+    }
+
+    #[test]
+    fn retry_in_formatting() {
+        assert_eq!(fmt_retry_in(30), "30s");
+        assert_eq!(fmt_retry_in(61), "2m");
+        assert_eq!(fmt_retry_in(300), "5m");
     }
 }

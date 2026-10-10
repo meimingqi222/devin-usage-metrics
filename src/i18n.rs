@@ -353,6 +353,8 @@ pub enum Key {
     QuotaResetsIn,
     QuotaExtra,
     QuotaError,
+    QuotaStaleRateLimited,
+    QuotaStaleError,
     QuotaKeychainNotice,
     QuotaKeychainAllow,
     QuotaKeychainDismiss,
@@ -548,6 +550,8 @@ impl Key {
         Key::QuotaResetsIn,
         Key::QuotaExtra,
         Key::QuotaError,
+        Key::QuotaStaleRateLimited,
+        Key::QuotaStaleError,
         Key::QuotaKeychainNotice,
         Key::QuotaKeychainAllow,
         Key::QuotaKeychainDismiss,
@@ -746,6 +750,8 @@ fn zh(key: Key) -> &'static str {
         Key::QuotaResetsIn => "{0} 后重置",
         Key::QuotaExtra => "附加：{0}",
         Key::QuotaError => "查询失败：{0}",
+        Key::QuotaStaleRateLimited => "缓存数据（{0}前），被限流，{1}后重试",
+        Key::QuotaStaleError => "缓存数据（{0}前），本次查询失败：{1}",
         Key::QuotaKeychainNotice => {
             "检测到本机可能有 Claude Code / Antigravity 登录信息存在「钥匙串」中。读取它们才能查询订阅配额；凭证仅在本机使用，不会上传。首次读取时系统可能会弹出授权框。"
         }
@@ -948,6 +954,8 @@ fn en(key: Key) -> &'static str {
         Key::QuotaResetsIn => "resets in {0}",
         Key::QuotaExtra => "Extra: {0}",
         Key::QuotaError => "Query failed: {0}",
+        Key::QuotaStaleRateLimited => "Cached data ({0} ago) - rate limited, retry in {1}",
+        Key::QuotaStaleError => "Cached data ({0} ago) - refresh failed: {1}",
         Key::QuotaKeychainNotice => {
             "Claude Code / Antigravity logins may be stored in the macOS Keychain. Reading them is required to query subscription quotas. Credentials stay on this machine. The system may show an authorization prompt on first access."
         }

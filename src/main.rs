@@ -261,7 +261,7 @@ impl Root {
         }
         self.view_mode = ViewMode::LiveQuota;
         if !self.quota_loading && self.quota_updated_at.is_empty() {
-            self.start_quota_load(cx);
+            self.start_quota_load(false, cx);
         }
         cx.notify();
     }
@@ -801,8 +801,9 @@ impl Root {
         }
     }
 
-    /// 后台发现账号并逐个查询配额（含必要的 token 刷新），完成后整体替换卡片。
-    fn start_quota_load(&mut self, cx: &mut Context<Self>) {
+    /// 后台发现账号并并发查询配额（含必要的 token 刷新），完成后整体替换卡片。
+    /// `force=true`（手动刷新）绕过 5 分钟结果缓存，但仍尊重 429 冷却。
+    fn start_quota_load(&mut self, force: bool, cx: &mut Context<Self>) {
         self.quota_load_id += 1;
         let load_id = self.quota_load_id;
         self.quota_loading = true;
@@ -812,13 +813,16 @@ impl Root {
 
         let load = cx.background_executor().spawn(async move {
             let accounts = quota::discover_accounts(allow_keychain);
+            // 各账号并发查询；返回顺序与 accounts 一致，卡片顺序不变
+            let results = quota::fetch_accounts(&accounts, force);
             accounts
                 .iter()
-                .map(|account| QuotaCard {
+                .zip(results)
+                .map(|(account, result)| QuotaCard {
                     key: account.key.clone(),
                     provider: account.provider,
                     label: account.label.clone(),
-                    result: quota::fetch_account(account),
+                    result,
                 })
                 .collect::<Vec<_>>()
         });
@@ -845,7 +849,7 @@ impl Root {
         quota::set_keychain_allowed(true);
         self.quota_keychain_allowed = true;
         self.quota_keychain_dismissed = false;
-        self.start_quota_load(cx);
+        self.start_quota_load(false, cx);
     }
 
     /// 本次会话内隐藏钥匙串提示，不写入持久化偏好。
@@ -883,7 +887,7 @@ impl Root {
         {
             quota::remove_devin_account(idx);
         }
-        self.start_quota_load(cx);
+        self.start_quota_load(false, cx);
     }
 
     /// 按当前 Agent + 设备筛选预计算会话列表（排序、截断、费用、模型展示名）。
@@ -2021,7 +2025,7 @@ impl Root {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, _, cx| {
                 if !this.quota_loading {
-                    this.start_quota_load(cx);
+                    this.start_quota_load(true, cx);
                 }
             }));
 
@@ -3296,6 +3300,20 @@ impl Root {
                             .text_color(rgb(MUTED))
                             .child(i18n::tf(i18n::Key::QuotaExtra, &[extra])),
                     );
+                }
+                if let Some(stale) = &result.stale {
+                    // 缓存/过期数据：限流冷却中，或本次查询失败后回退到上次结果
+                    let age = quota::fmt_duration(stale.age_secs.max(60) as i64);
+                    let text = match &stale.reason {
+                        quota::StaleReason::RateLimited { retry_in_secs } => i18n::tf(
+                            i18n::Key::QuotaStaleRateLimited,
+                            &[&age, &quota::fmt_duration((*retry_in_secs).max(60) as i64)],
+                        ),
+                        quota::StaleReason::Error(err) => {
+                            i18n::tf(i18n::Key::QuotaStaleError, &[&age, err])
+                        }
+                    };
+                    d = d.child(div().text_xs().text_color(rgb(0xfbbf24)).child(text));
                 }
             }
         }
