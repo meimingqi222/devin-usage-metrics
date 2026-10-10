@@ -1424,11 +1424,9 @@ fn fetch_claude(kind: &AccountKind) -> Result<QuotaResult, QuotaError> {
     if claude_needs_refresh(loaded.cred.expires_at, now_sec())
         && !loaded.cred.refresh_token.is_empty()
     {
+        refreshed = true; // 只尝试一次：失败后 401 路径不再重复刷新
         match refresh_claude_loaded(&agent, kind, &loaded) {
-            Ok(l) => {
-                loaded = l;
-                refreshed = true;
-            }
+            Ok(l) => loaded = l,
             // 还没真正过期时，刷新失败不致命：继续用现有 token 试一次查询
             Err(_) if loaded.cred.expires_at.is_some_and(|exp| exp > now_sec()) => {}
             Err(e) => return Err(e),
@@ -3997,5 +3995,65 @@ devin_webapp_host = "app.devin.ai"
         assert_eq!(fmt_retry_in(30), "30s");
         assert_eq!(fmt_retry_in(61), "2m");
         assert_eq!(fmt_retry_in(300), "5m");
+    }
+
+    /// 本地起一个只应答 `responses.len()` 次的 HTTP 服务，返回 base url。
+    fn serve_canned(responses: Vec<String>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for resp in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn canned(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn http_error_keeps_status_retry_after_and_body() {
+        let base = serve_canned(vec![
+            canned("429 Too Many Requests", "Retry-After: 42\r\n", "{\"e\":1}"),
+            canned(
+                "400 Bad Request",
+                "",
+                r#"{"error":"invalid_grant","error_description":"Refresh token not found or invalid"}"#,
+            ),
+            canned("200 OK", "", r#"{"ok":true}"#),
+        ]);
+        let agent = http_agent();
+
+        let e = get_json(&agent, &format!("{base}/usage"), &[]).unwrap_err();
+        assert_eq!(e.to_string(), "HTTP 429");
+        assert_eq!(e.status, Some(429));
+        assert_eq!(e.retry_after_secs, Some(42));
+        assert_eq!(e.body.as_deref(), Some("{\"e\":1}"));
+
+        // refresh 端点的 400：body 里是 invalid_grant → 报会话过期；message 区分于普通 "HTTP 400"
+        let e = post_json(
+            &agent,
+            &format!("{base}/token"),
+            serde_json::json!({}),
+            &[],
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap_err();
+        assert_eq!(e.status, Some(400));
+        assert!(is_invalid_grant(e.body.as_deref()));
+
+        let ok = get_json(&agent, &format!("{base}/ok"), &[]).unwrap();
+        assert_eq!(ok["ok"], true);
     }
 }
