@@ -16,9 +16,9 @@ use chrono::TimeZone;
 use data::{AgentKind, LoadedData};
 use devin_usage_metrics::{agg, cli, data, i18n, pricing, quota, sync};
 use gpui::{
-    actions, div, point, prelude::*, px, relative, rgb, size, Animation, AnimationExt as _, AnyElement, App,
-    Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyBinding, KeyDownEvent,
-    MouseButton, Render, SharedString, Task, TitlebarOptions, Window, WindowBounds,
+    actions, div, point, prelude::*, px, relative, rgb, size, Animation, AnimationExt as _,
+    AnyElement, App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyBinding,
+    KeyDownEvent, MouseButton, Render, SharedString, Task, TitlebarOptions, Window, WindowBounds,
     WindowControlArea, WindowOptions,
 };
 use rayon::prelude::*;
@@ -983,61 +983,64 @@ impl Root {
     /// 左侧边栏：应用名 + 可滚动/可折叠的分区（agents、设备、同步设置）。
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_history_mode = self.view_mode == ViewMode::AgentHistory;
-        let render_agent_item = |kind: AgentKind, this_agent: AgentKind, loaded_agents: &HashMap<AgentKind, Arc<LoadedData>>| {
-            let is_selected = is_history_mode && kind == this_agent;
-            let installed = kind.is_installed();
-            let count = loaded_agents
-                .get(&kind)
-                .map(|d| d.sessions.iter().filter(|s| s.agent == kind).count());
+        let render_agent_item =
+            |kind: AgentKind,
+             this_agent: AgentKind,
+             loaded_agents: &HashMap<AgentKind, Arc<LoadedData>>| {
+                let is_selected = is_history_mode && kind == this_agent;
+                let installed = kind.is_installed();
+                let count = loaded_agents
+                    .get(&kind)
+                    .map(|d| d.sessions.iter().filter(|s| s.agent == kind).count());
 
-            div()
-                .id(SharedString::from(format!("agent-{}", kind.label())))
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_2()
-                .rounded_md()
-                .cursor_pointer()
-                .when(is_selected, |d| d.bg(rgba(ACCENT, 0.18)))
-                .when(!is_selected, |d| d.hover(|h| h.bg(rgb(PANEL2))))
-                .when(!installed, |d| d.opacity(0.45))
-                .child(
-                    div()
-                        .w(px(7.))
-                        .h(px(7.))
-                        .rounded_full()
-                        .bg(rgb(if installed {
-                            model_color(kind.label())
-                        } else {
-                            MUTED
-                        })),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_sm()
-                        .font_weight(if is_selected {
-                            gpui::FontWeight::BOLD
-                        } else {
-                            gpui::FontWeight::MEDIUM
-                        })
-                        .text_color(if is_selected {
-                            rgb(ACCENT)
-                        } else if installed {
-                            rgb(TEXT)
-                        } else {
-                            rgb(MUTED)
-                        })
-                        .child(kind.label()),
-                )
-                .children(
-                    count.map(|c| div().text_xs().text_color(rgb(MUTED)).child(c.to_string())),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.switch_agent(kind, cx);
-                }))
-        };
+                div()
+                    .id(SharedString::from(format!("agent-{}", kind.label())))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(is_selected, |d| d.bg(rgba(ACCENT, 0.18)))
+                    .when(!is_selected, |d| d.hover(|h| h.bg(rgb(PANEL2))))
+                    .when(!installed, |d| d.opacity(0.45))
+                    .child(
+                        div()
+                            .w(px(7.))
+                            .h(px(7.))
+                            .rounded_full()
+                            .bg(rgb(if installed {
+                                model_color(kind.label())
+                            } else {
+                                MUTED
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .font_weight(if is_selected {
+                                gpui::FontWeight::BOLD
+                            } else {
+                                gpui::FontWeight::MEDIUM
+                            })
+                            .text_color(if is_selected {
+                                rgb(ACCENT)
+                            } else if installed {
+                                rgb(TEXT)
+                            } else {
+                                rgb(MUTED)
+                            })
+                            .child(kind.label()),
+                    )
+                    .children(
+                        count.map(|c| div().text_xs().text_color(rgb(MUTED)).child(c.to_string())),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.switch_agent(kind, cx);
+                    }))
+            };
 
         let mut active_kinds = Vec::new();
         let mut other_kinds = Vec::new();
@@ -1059,7 +1062,11 @@ impl Root {
             .map(|kind| render_agent_item(kind, self.agent, &self.loaded_agents));
 
         let other_count = other_kinds.len();
-        let other_arrow = if self.section_other_agents_open { "▾" } else { "▸" };
+        let other_arrow = if self.section_other_agents_open {
+            "▾"
+        } else {
+            "▸"
+        };
         let other_toggle_btn = if other_count > 0 {
             Some(
                 div()
@@ -1071,7 +1078,10 @@ impl Root {
                     .text_color(rgb(MUTED))
                     .cursor_pointer()
                     .hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
-                    .child(format!("{other_arrow} {}", i18n::tf(i18n::Key::MoreAgents, &[&other_count.to_string()])))
+                    .child(format!(
+                        "{other_arrow} {}",
+                        i18n::tf(i18n::Key::MoreAgents, &[&other_count.to_string()])
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.section_other_agents_open = !this.section_other_agents_open;
                         cx.notify();
@@ -1342,12 +1352,8 @@ impl Root {
             .flex()
             .items_center()
             .justify_between()
-            .when(quota_active, |d| {
-                d.bg(rgba(ACCENT, 0.18))
-            })
-            .when(!quota_active, |d| {
-                d.hover(|h| h.bg(rgb(PANEL2)))
-            })
+            .when(quota_active, |d| d.bg(rgba(ACCENT, 0.18)))
+            .when(!quota_active, |d| d.hover(|h| h.bg(rgb(PANEL2))))
             .child(
                 div()
                     .flex()
@@ -1435,13 +1441,7 @@ impl Root {
                 )
             })
             .child(quota_nav_btn)
-            .child(
-                div()
-                    .mx_3()
-                    .mb_1()
-                    .border_b_1()
-                    .border_color(rgb(BORDER)),
-            )
+            .child(div().mx_3().mb_1().border_b_1().border_color(rgb(BORDER)))
             .child(content)
             .child(sync_toggle)
             .child(footer_row)
@@ -1544,7 +1544,10 @@ impl Root {
             .border_b_1()
             .border_color(rgb(BORDER))
             .child(tab_btn(SettingsTab::Sync, i18n::t(i18n::Key::SettingsSync)))
-            .child(tab_btn(SettingsTab::General, i18n::t(i18n::Key::SettingsGeneral)));
+            .child(tab_btn(
+                SettingsTab::General,
+                i18n::t(i18n::Key::SettingsGeneral),
+            ));
 
         let content_body: AnyElement = match self.settings_tab {
             SettingsTab::Sync => {
@@ -1607,7 +1610,9 @@ impl Root {
                                 button
                                     .cursor_pointer()
                                     .hover(|h| h.bg(rgb(0x6ad4ff)))
-                                    .on_click(cx.listener(|this, _, _, cx| this.start_github_login(cx)))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.start_github_login(cx)),
+                                    )
                             })
                             .child(login_label),
                     );
@@ -1668,7 +1673,10 @@ impl Root {
                 let lang_btn = |lang: i18n::Lang, label: &'static str| {
                     let active = cur_lang == lang;
                     div()
-                        .id(SharedString::from(format!("settings-lang-{}", lang.short_label())))
+                        .id(SharedString::from(format!(
+                            "settings-lang-{}",
+                            lang.short_label()
+                        )))
                         .px_3()
                         .py_1()
                         .rounded_sm()
@@ -1680,7 +1688,8 @@ impl Root {
                                 .font_weight(gpui::FontWeight::BOLD)
                         })
                         .when(!active, |d| {
-                            d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
+                            d.text_color(rgb(MUTED))
+                                .hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
                         })
                         .child(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1724,12 +1733,7 @@ impl Root {
                             .pt_2()
                             .border_t_1()
                             .border_color(rgb(BORDER))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child("关于本应用"),
-                            )
+                            .child(div().text_xs().text_color(rgb(MUTED)).child("关于本应用"))
                             .child(
                                 div()
                                     .text_xs()
@@ -2714,9 +2718,14 @@ impl Root {
                         d.text_color(rgb(ACCENT)).bg(rgba(ACCENT, 0.15))
                     })
                     .when(!self.hide_empty_buckets, |d| {
-                        d.text_color(rgb(MUTED)).hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
+                        d.text_color(rgb(MUTED))
+                            .hover(|h| h.bg(rgb(PANEL2)).text_color(rgb(TEXT)))
                     })
-                    .child(if self.hide_empty_buckets { "☑" } else { "☐" })
+                    .child(if self.hide_empty_buckets {
+                        "☑"
+                    } else {
+                        "☐"
+                    })
                     .child(i18n::t(i18n::Key::HideEmptyDays))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.hide_empty_buckets = !this.hide_empty_buckets;
