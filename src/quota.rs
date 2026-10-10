@@ -220,9 +220,14 @@ fn write_store(path: &Path, store: &StoreFile) {
 }
 
 /// 先写临时文件再替换，避免半截文件（Windows 上 rename 不覆盖，需先删旧文件）。
+///
+/// Unix 上保留原文件权限（新文件默认 0600）：这些文件存放 OAuth token / cookie，
+/// 临时文件若沿用 umask 默认的 0644，替换后会把 `~/.claude/.credentials.json`
+/// 之类的凭据文件变成同机其他用户可读。
 fn atomic_write(path: &Path, data: &[u8]) {
     let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    if std::fs::write(&temp, data).is_err() {
+    if write_private_file(&temp, data, path).is_err() {
+        let _ = std::fs::remove_file(&temp);
         return;
     }
     if std::fs::rename(&temp, path).is_err() {
@@ -230,6 +235,32 @@ fn atomic_write(path: &Path, data: &[u8]) {
         if std::fs::rename(&temp, path).is_err() {
             let _ = std::fs::remove_file(&temp);
         }
+    }
+}
+
+/// 写 `temp`，权限取 `original` 现有权限，不存在则 0600（非 Unix 平台忽略）。
+fn write_private_file(temp: &Path, data: &[u8], original: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mode = std::fs::metadata(original)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0o600);
+        let _ = std::fs::remove_file(temp);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(temp)?;
+        file.write_all(data)?;
+        // open(2) 的 mode 受 umask 影响，这里显式设成与原文件一致
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = original;
+        std::fs::write(temp, data)
     }
 }
 
@@ -520,19 +551,130 @@ fn grok_entry(v: &Value) -> Option<&Value> {
 // HTTP
 // ---------------------------------------------------------------------------
 
-fn http_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(20)))
-        .build()
-        .new_agent()
+/// 查询类请求的全局超时（含读 body）。
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// OAuth refresh 请求的全局超时（服务端偶尔较慢，且失败代价高）。
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+/// 错误响应 body 最多保留的字节数（只用于识别 `invalid_grant` 等错误码）。
+const ERROR_BODY_LIMIT: u64 = 4096;
+
+/// 带结构化信息的查询错误：保留 HTTP 状态码、`Retry-After` 和（截断的）响应 body，
+/// 让上层能区分 401 / 429 / `invalid_grant`，而不是只拿到一个 "HTTP 429" 字符串。
+/// `Display` 与旧的字符串错误保持一致（"HTTP 429"），UI 展示不变。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuotaError {
+    pub message: String,
+    /// HTTP 状态码；非 HTTP 错误（网络、解析、凭据读取）为 None
+    pub status: Option<u16>,
+    /// `Retry-After` 解析出的秒数
+    pub retry_after_secs: Option<u64>,
+    /// 错误响应 body（截断）
+    pub body: Option<String>,
 }
 
-fn get_json(agent: &ureq::Agent, url: &str, headers: &[(&str, &str)]) -> Result<Value, String> {
+impl QuotaError {
+    fn http(status: u16, retry_after_secs: Option<u64>, body: Option<String>) -> Self {
+        QuotaError {
+            message: format!("HTTP {status}"),
+            status: Some(status),
+            retry_after_secs,
+            body,
+        }
+    }
+
+    fn is_status(&self, code: u16) -> bool {
+        self.status == Some(code)
+    }
+}
+
+impl std::fmt::Display for QuotaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for QuotaError {
+    fn from(message: String) -> Self {
+        QuotaError {
+            message,
+            status: None,
+            retry_after_secs: None,
+            body: None,
+        }
+    }
+}
+
+impl From<&str> for QuotaError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+impl From<QuotaError> for String {
+    fn from(e: QuotaError) -> Self {
+        e.message
+    }
+}
+
+/// 全进程共享的 HTTP agent：复用连接池 / TLS 会话，避免每次查询都重新握手。
+/// `http_status_as_error(false)`：4xx/5xx 也返回响应，这样才能读到 `Retry-After` 和 body。
+fn http_agent() -> ureq::Agent {
+    use std::sync::OnceLock;
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            ureq::Agent::config_builder()
+                .timeout_global(Some(HTTP_TIMEOUT))
+                .http_status_as_error(false)
+                .build()
+                .new_agent()
+        })
+        .clone()
+}
+
+/// 解析 `Retry-After`：整数秒或 HTTP-date（RFC 2822/1123）。无法解析返回 None。
+fn parse_retry_after(raw: &str, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(secs);
+    }
+    let when = DateTime::parse_from_rfc2822(raw).ok()?;
+    Some((when.timestamp() - now.timestamp()).max(0) as u64)
+}
+
+/// 4xx/5xx → 结构化错误（读取 `Retry-After` 与截断的 body）；其余原样放行。
+fn check_status(
+    resp: ureq::http::Response<ureq::Body>,
+) -> Result<ureq::http::Response<ureq::Body>, QuotaError> {
+    let status = resp.status().as_u16();
+    if status < 400 {
+        return Ok(resp);
+    }
+    let retry_after_secs = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| parse_retry_after(v, chrono::Utc::now()));
+    let body = resp
+        .into_body()
+        .with_config()
+        .limit(ERROR_BODY_LIMIT)
+        .lossy_utf8(true)
+        .read_to_string()
+        .ok()
+        .filter(|b| !b.is_empty());
+    Err(QuotaError::http(status, retry_after_secs, body))
+}
+
+fn get_json(agent: &ureq::Agent, url: &str, headers: &[(&str, &str)]) -> Result<Value, QuotaError> {
     let mut req = agent.get(url);
     for &(k, v) in headers {
         req = req.header(k, v);
     }
-    let resp = req.call().map_err(http_err)?;
+    let resp = check_status(req.call().map_err(http_err)?)?;
     read_json(resp)
 }
 
@@ -541,44 +683,54 @@ fn post_form(
     url: &str,
     form: &str,
     headers: &[(&str, &str)],
-) -> Result<Value, String> {
+) -> Result<Value, QuotaError> {
     let mut req = agent
         .post(url)
+        .config()
+        .timeout_global(Some(REFRESH_TIMEOUT))
+        .build()
         .header("content-type", "application/x-www-form-urlencoded")
         .header("accept", "application/json");
     for &(k, v) in headers {
         req = req.header(k, v);
     }
-    let resp = req.send(form.as_bytes()).map_err(http_err)?;
+    let resp = check_status(req.send(form.as_bytes()).map_err(http_err)?)?;
     read_json(resp)
 }
 
+/// POST JSON。`timeout` 为 None 时用 agent 默认超时；OAuth refresh 传 `REFRESH_TIMEOUT`。
 fn post_json(
     agent: &ureq::Agent,
     url: &str,
     payload: Value,
     headers: &[(&str, &str)],
-) -> Result<Value, String> {
-    let mut req = agent.post(url).header("accept", "application/json");
+    timeout: Option<Duration>,
+) -> Result<Value, QuotaError> {
+    let mut req = agent
+        .post(url)
+        .config()
+        .timeout_global(Some(timeout.unwrap_or(HTTP_TIMEOUT)))
+        .build()
+        .header("accept", "application/json");
     for &(k, v) in headers {
         req = req.header(k, v);
     }
-    let resp = req.send_json(payload).map_err(http_err)?;
+    let resp = check_status(req.send_json(payload).map_err(http_err)?)?;
     read_json(resp)
 }
 
-fn read_json(resp: ureq::http::Response<ureq::Body>) -> Result<Value, String> {
+fn read_json(resp: ureq::http::Response<ureq::Body>) -> Result<Value, QuotaError> {
     let mut body = resp.into_body();
     let text = body
         .read_to_string()
-        .map_err(|e: ureq::Error| e.to_string())?;
-    serde_json::from_str(&text).map_err(|e| format!("JSON: {e}"))
+        .map_err(|e: ureq::Error| QuotaError::from(e.to_string()))?;
+    serde_json::from_str(&text).map_err(|e| QuotaError::from(format!("JSON: {e}")))
 }
 
-fn http_err(e: ureq::Error) -> String {
+fn http_err(e: ureq::Error) -> QuotaError {
     match e {
-        ureq::Error::StatusCode(code) => format!("HTTP {code}"),
-        other => other.to_string(),
+        ureq::Error::StatusCode(code) => QuotaError::http(code, None, None),
+        other => other.to_string().into(),
     }
 }
 
@@ -606,6 +758,10 @@ fn parse_when(v: &Value) -> Option<i64> {
 // ---------------------------------------------------------------------------
 
 pub fn fetch_account(account: &Account) -> Result<QuotaResult, String> {
+    fetch_account_uncached(account).map_err(String::from)
+}
+
+fn fetch_account_uncached(account: &Account) -> Result<QuotaResult, QuotaError> {
     match &account.kind {
         AccountKind::ClaudeLocal { path } => fetch_claude(path),
         AccountKind::ClaudeKeychain => fetch_claude_keychain(),
@@ -685,7 +841,7 @@ fn write_back_claude(path: &Path, cred: &ClaudeCred) {
     atomic_write(path, out.as_bytes());
 }
 
-fn refresh_claude(cred: &mut ClaudeCred) -> Result<(), String> {
+fn refresh_claude(cred: &mut ClaudeCred) -> Result<(), QuotaError> {
     let agent = http_agent();
     let resp = post_json(
         &agent,
@@ -697,6 +853,7 @@ fn refresh_claude(cred: &mut ClaudeCred) -> Result<(), String> {
             "scope": CLAUDE_SCOPES,
         }),
         &[("user-agent", "axios/1.15.2")],
+        Some(REFRESH_TIMEOUT),
     )?;
     let access = json_field(&resp, &["access_token"])
         .and_then(Value::as_str)
@@ -711,7 +868,7 @@ fn refresh_claude(cred: &mut ClaudeCred) -> Result<(), String> {
     Ok(())
 }
 
-fn fetch_claude(path: &Path) -> Result<QuotaResult, String> {
+fn fetch_claude(path: &Path) -> Result<QuotaResult, QuotaError> {
     let mut cred = read_claude_cred(path)?;
     let agent = http_agent();
     let headers = |token: &str| -> [(&'static str, String); 3] {
@@ -725,14 +882,14 @@ fn fetch_claude(path: &Path) -> Result<QuotaResult, String> {
         ]
     };
 
-    let mut usage: Result<Value, String>;
+    let mut usage: Result<Value, QuotaError>;
     let mut refreshed = false;
     loop {
         let h = headers(&cred.access_token);
         let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
         usage = get_json(&agent, "https://api.anthropic.com/api/oauth/usage", &refs);
         match &usage {
-            Err(e) if e == "HTTP 401" && !refreshed && !cred.refresh_token.is_empty() => {
+            Err(e) if e.is_status(401) && !refreshed && !cred.refresh_token.is_empty() => {
                 refresh_claude(&mut cred)?;
                 write_back_claude(path, &cred);
                 refreshed = true;
@@ -757,7 +914,7 @@ fn fetch_claude(path: &Path) -> Result<QuotaResult, String> {
 
 /// macOS Keychain 版 Claude Code 查询：从 `Claude Code-credentials` 读取 JSON，
 /// 刷新后写回 Keychain。
-fn fetch_claude_keychain() -> Result<QuotaResult, String> {
+fn fetch_claude_keychain() -> Result<QuotaResult, QuotaError> {
     #[cfg(target_os = "macos")]
     {
         let raw = keychain_read("Claude Code-credentials")
@@ -790,14 +947,14 @@ fn fetch_claude_keychain() -> Result<QuotaResult, String> {
             ]
         };
 
-        let mut usage: Result<Value, String>;
+        let mut usage: Result<Value, QuotaError>;
         let mut refreshed = false;
         loop {
             let h = headers(&cred.access_token);
             let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
             usage = get_json(&agent, "https://api.anthropic.com/api/oauth/usage", &refs);
             match &usage {
-                Err(e) if e == "HTTP 401" && !refreshed && !cred.refresh_token.is_empty() => {
+                Err(e) if e.is_status(401) && !refreshed && !cred.refresh_token.is_empty() => {
                     refresh_claude(&mut cred)?;
                     // 写回 Keychain
                     if let Some(oauth) = v.pointer("/claudeAiOauth").and_then(|o| o.as_object()) {
@@ -942,13 +1099,20 @@ struct CodexCred {
     expires_at: Option<i64>,
 }
 
-fn read_codex_cred(path: &Path) -> Result<CodexCred, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+/// `ApiKeyMode`：auth.json 里没有 ChatGPT access_token（不是错误）；
+/// `Other`：读文件 / 解析失败（是错误）。
+enum CodexCredError {
+    ApiKeyMode,
+    Other(String),
+}
+
+fn read_codex_cred(path: &Path) -> Result<CodexCred, CodexCredError> {
+    let text = std::fs::read_to_string(path).map_err(|e| CodexCredError::Other(e.to_string()))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| CodexCredError::Other(e.to_string()))?;
     let access = v
         .get("access_token")
         .and_then(Value::as_str)
-        .ok_or_else(|| "API-key mode; run `codex login` to use a ChatGPT subscription".to_string())?
+        .ok_or(CodexCredError::ApiKeyMode)?
         .to_string();
     let refresh_token = v
         .get("refresh_token")
@@ -1006,7 +1170,7 @@ fn write_back_codex(path: &Path, cred: &CodexCred) {
     atomic_write(path, out.as_bytes());
 }
 
-fn refresh_codex(cred: &mut CodexCred) -> Result<(), String> {
+fn refresh_codex(cred: &mut CodexCred) -> Result<(), QuotaError> {
     let agent = http_agent();
     let form = format!(
         "client_id={CODEX_CLIENT_ID}&grant_type=refresh_token&refresh_token={}&scope=openid+profile+email",
@@ -1028,22 +1192,23 @@ fn refresh_codex(cred: &mut CodexCred) -> Result<(), String> {
     Ok(())
 }
 
-fn fetch_codex(path: &Path) -> Result<QuotaResult, String> {
+fn fetch_codex(path: &Path) -> Result<QuotaResult, QuotaError> {
     // API-key mode：auth.json 没有 access_token，无法查询订阅配额。
-    // 直接返回一个标识性的结果，不当作错误。
+    // 直接返回一个标识性的结果，不当作错误。文件读不到 / 解析失败则是真错误，
+    // 不能伪装成 API MODE。
     let mut cred = match read_codex_cred(path) {
         Ok(c) => c,
-        Err(_) => {
+        Err(CodexCredError::ApiKeyMode) => {
             return Ok(QuotaResult {
                 plan: Some("API MODE".into()),
-                windows: Vec::new(),
-                extra: None,
+                ..Default::default()
             });
         }
+        Err(CodexCredError::Other(e)) => return Err(e.into()),
     };
     let agent = http_agent();
 
-    let mut usage: Result<Value, String>;
+    let mut usage: Result<Value, QuotaError>;
     let mut refreshed = false;
     loop {
         let headers: [(&str, &str); 2] = [
@@ -1056,7 +1221,7 @@ fn fetch_codex(path: &Path) -> Result<QuotaResult, String> {
             &headers,
         );
         match &usage {
-            Err(e) if e == "HTTP 401" && !refreshed && !cred.refresh_token.is_empty() => {
+            Err(e) if e.is_status(401) && !refreshed && !cred.refresh_token.is_empty() => {
                 refresh_codex(&mut cred)?;
                 write_back_codex(path, &cred);
                 refreshed = true;
@@ -1224,7 +1389,7 @@ fn write_back_grok(path: &Path, cred: &GrokCred) {
     atomic_write(path, out.as_bytes());
 }
 
-fn refresh_grok(cred: &mut GrokCred) -> Result<(), String> {
+fn refresh_grok(cred: &mut GrokCred) -> Result<(), QuotaError> {
     let agent = http_agent();
     // OIDC discovery 取 token_endpoint；失败则退回默认路径
     let token_endpoint = get_json(
@@ -1259,11 +1424,11 @@ fn refresh_grok(cred: &mut GrokCred) -> Result<(), String> {
     Ok(())
 }
 
-fn fetch_grok(path: &Path) -> Result<QuotaResult, String> {
+fn fetch_grok(path: &Path) -> Result<QuotaResult, QuotaError> {
     let mut cred = read_grok_cred(path)?;
     let agent = http_agent();
 
-    let mut body: Result<Value, String>;
+    let mut body: Result<Value, QuotaError>;
     let mut refreshed = false;
     loop {
         let bearer = format!("Bearer {}", cred.access_token);
@@ -1275,7 +1440,7 @@ fn fetch_grok(path: &Path) -> Result<QuotaResult, String> {
             &headers,
         );
         match &body {
-            Err(e) if e == "HTTP 401" && !refreshed && !cred.refresh_token.is_empty() => {
+            Err(e) if e.is_status(401) && !refreshed && !cred.refresh_token.is_empty() => {
                 refresh_grok(&mut cred)?;
                 write_back_grok(path, &cred);
                 refreshed = true;
@@ -1284,20 +1449,22 @@ fn fetch_grok(path: &Path) -> Result<QuotaResult, String> {
             _ => break,
         }
     }
-    // Grok 未使用过时 billing API 可能返回错误，视为 100% 剩余（0% 已用）
+    // Grok 未使用过时 billing API 可能返回 4xx（如 404），视为 100% 剩余（0% 已用）。
+    // 但网络错误、401/403（凭据问题）、429（限流）、5xx 是真错误，必须向上传，
+    // 否则限流/掉线会被显示成「用量 0%」。
     let weekly = match body {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) if grok_billing_error_means_unused(&e) => {
             return Ok(QuotaResult {
-                plan: None,
                 windows: vec![QuotaWindow {
                     label: WindowLabel::Weekly,
                     used_percent: 0.0,
                     resets_at: None,
                 }],
-                extra: None,
+                ..Default::default()
             });
         }
+        Err(e) => return Err(e),
     };
 
     let bearer = format!("Bearer {}", cred.access_token);
@@ -1311,6 +1478,11 @@ fn fetch_grok(path: &Path) -> Result<QuotaResult, String> {
     .ok();
 
     Ok(parse_grok_billing(&weekly, monthly.as_ref()))
+}
+
+/// billing 接口对「从未用过」的账号返回的客户端错误（非鉴权、非限流）。
+fn grok_billing_error_means_unused(e: &QuotaError) -> bool {
+    matches!(e.status, Some(s) if (400..500).contains(&s) && !matches!(s, 401 | 403 | 408 | 429))
 }
 
 pub fn parse_grok_billing(weekly: &Value, monthly: Option<&Value>) -> QuotaResult {
@@ -1387,7 +1559,7 @@ fn cents_value(v: Option<&Value>) -> Option<f64> {
 // Devin（浏览器 session cookie）
 // ---------------------------------------------------------------------------
 
-fn fetch_devin(cookie: &str, org_id: Option<&str>) -> Result<QuotaResult, String> {
+fn fetch_devin(cookie: &str, org_id: Option<&str>) -> Result<QuotaResult, QuotaError> {
     let agent = http_agent();
     let org = match org_id {
         Some(id) => id.to_string(),
@@ -1706,7 +1878,7 @@ mod pb {
 ///     F17 (varint): daily_reset_at (unix 秒)
 ///     F18 (varint): weekly_reset_at (unix 秒)
 /// ```
-fn fetch_devin_cli(token: &str, _org_id: &str) -> Result<QuotaResult, String> {
+fn fetch_devin_cli(token: &str, _org_id: &str) -> Result<QuotaResult, QuotaError> {
     // 构造 protobuf 请求体
     let mut meta = Vec::new();
     pb::write_string_field(&mut meta, 1, "chisel");
@@ -1729,11 +1901,13 @@ fn fetch_devin_cli(token: &str, _org_id: &str) -> Result<QuotaResult, String> {
         .header("accept", "*/*")
         .send(&body)
         .map_err(http_err)?;
+    let resp = check_status(resp)?;
 
     // 读取二进制响应体
     let resp_bytes: Vec<u8> = {
         let mut r = resp.into_body();
-        r.read_to_vec().map_err(|e: ureq::Error| e.to_string())?
+        r.read_to_vec()
+            .map_err(|e: ureq::Error| QuotaError::from(e.to_string()))?
     };
 
     // 解析响应：F1 (UserStatus) -> F13 (QuotaInfo)
@@ -2242,7 +2416,7 @@ fn read_antigravity_cred(path: &Path, from_keychain: bool) -> Result<Antigravity
 }
 
 /// 刷新 Google OAuth access_token。
-fn refresh_antigravity(cred: &mut AntigravityCred) -> Result<(), String> {
+fn refresh_antigravity(cred: &mut AntigravityCred) -> Result<(), QuotaError> {
     let (client_id, client_secret) = antigravity_oauth_client()
         .ok_or_else(|| "Antigravity OAuth client not found".to_string())?;
     let agent = http_agent();
@@ -2296,7 +2470,7 @@ fn write_back_antigravity(path: &Path, cred: &AntigravityCred) {
 /// API 端点：`https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`
 /// 认证：Google OAuth Bearer token
 /// 必须带 `User-Agent: antigravity/<version>` 和 `X-Goog-Api-Client` 头，否则返回 403。
-fn fetch_antigravity(path: &Path, from_keychain: bool) -> Result<QuotaResult, String> {
+fn fetch_antigravity(path: &Path, from_keychain: bool) -> Result<QuotaResult, QuotaError> {
     let mut cred = read_antigravity_cred(path, from_keychain)?;
     if cred.access_token.is_empty() {
         return Err("Antigravity: no access token".into());
@@ -2312,14 +2486,20 @@ fn fetch_antigravity(path: &Path, from_keychain: bool) -> Result<QuotaResult, St
         ]
     };
 
-    let mut body: Result<Value, String>;
+    let mut body: Result<Value, QuotaError>;
     let mut refreshed = false;
     loop {
         let h = headers(&cred.access_token);
         let refs: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        body = post_json(&agent, ANTIGRAVITY_QUOTA_URL, serde_json::json!({}), &refs);
+        body = post_json(
+            &agent,
+            ANTIGRAVITY_QUOTA_URL,
+            serde_json::json!({}),
+            &refs,
+            None,
+        );
         match &body {
-            Err(e) if e.contains("401") && !refreshed && !cred.refresh_token.is_empty() => {
+            Err(e) if e.is_status(401) && !refreshed && !cred.refresh_token.is_empty() => {
                 refresh_antigravity(&mut cred)?;
                 write_back_antigravity(path, &cred);
                 refreshed = true;
@@ -2891,5 +3071,87 @@ devin_webapp_host = "app.devin.ai"
         let r = parse_antigravity_quota(&response);
         assert_eq!(r.windows.len(), 0);
         assert_eq!(r.extra, None);
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_and_http_date() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 10, 12, 0, 0)
+            .unwrap();
+        assert_eq!(parse_retry_after("120", now), Some(120));
+        assert_eq!(parse_retry_after(" 0 ", now), Some(0));
+        assert_eq!(
+            parse_retry_after("Sat, 10 Oct 2026 12:05:00 GMT", now),
+            Some(300)
+        );
+        // 过去的日期 → 0，而不是负数/下溢
+        assert_eq!(
+            parse_retry_after("Sat, 10 Oct 2026 11:00:00 GMT", now),
+            Some(0)
+        );
+        assert_eq!(parse_retry_after("", now), None);
+        assert_eq!(parse_retry_after("soon", now), None);
+        assert_eq!(parse_retry_after("-5", now), None);
+    }
+
+    #[test]
+    fn quota_error_display_matches_legacy_string() {
+        let e = QuotaError::http(429, Some(30), None);
+        assert_eq!(e.to_string(), "HTTP 429");
+        assert!(e.is_status(429) && !e.is_status(401));
+        assert_eq!(String::from(e), "HTTP 429");
+        let plain: QuotaError = "boom".into();
+        assert_eq!(plain.status, None);
+    }
+
+    #[test]
+    fn grok_unused_account_only_for_plain_client_errors() {
+        let err = |s| QuotaError::http(s, None, None);
+        assert!(grok_billing_error_means_unused(&err(404)));
+        assert!(grok_billing_error_means_unused(&err(400)));
+        for s in [401, 403, 429, 500, 503] {
+            assert!(!grok_billing_error_means_unused(&err(s)), "{s}");
+        }
+        // 网络错误（无状态码）不能被当成 0%
+        assert!(!grok_billing_error_means_unused(&"timeout".into()));
+    }
+
+    #[test]
+    fn codex_unreadable_file_is_error_not_api_mode() {
+        let dir = std::env::temp_dir().join(format!("quota-codex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("nope.json");
+        assert!(matches!(
+            read_codex_cred(&missing),
+            Err(CodexCredError::Other(_))
+        ));
+        let api = dir.join("api.json");
+        std::fs::write(&api, r#"{"OPENAI_API_KEY":"sk-x"}"#).unwrap();
+        assert!(matches!(
+            read_codex_cred(&api),
+            Err(CodexCredError::ApiKeyMode)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_permissions_and_defaults_to_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("quota-aw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("cred.json");
+        std::fs::write(&existing, "old").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640)).unwrap();
+        atomic_write(&existing, b"new");
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "new");
+        let mode = std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+
+        let fresh = dir.join("fresh.json");
+        atomic_write(&fresh, b"x");
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
