@@ -1265,6 +1265,8 @@ struct CodexPayload {
     #[serde(rename = "type")]
     payload_type: Option<String>,
     message: Option<String>,
+    role: Option<String>,
+    content: Option<Value>,
     info: Option<CodexInfo>,
 }
 
@@ -1328,11 +1330,42 @@ fn parse_codex_file(path: &Path) -> (HashMap<String, SessionBuilder>, Vec<CodexE
                 if let Some(cwd) = payload.and_then(|p| p.cwd.as_deref()) {
                     session.cwd = cwd.to_owned();
                 }
-                if let Some(source) = payload
-                    .and_then(|p| p.source.as_ref())
-                    .and_then(Value::as_str)
-                {
-                    session.source = source.to_owned();
+                if let Some(source) = payload.and_then(|p| p.source.as_ref()) {
+                    let src_str = if let Some(s) = source.as_str() {
+                        s.to_owned()
+                    } else if source.to_string().contains("guardian") {
+                        "guardian".to_owned()
+                    } else {
+                        "subagent".to_owned()
+                    };
+                    session.source = src_str;
+                }
+            }
+            "response_item" => {
+                if session.title.is_empty() {
+                    let is_user = payload
+                        .and_then(|p| p.role.as_deref())
+                        .map(|r| r == "user")
+                        .unwrap_or(false);
+                    if is_user {
+                        if let Some(content) = payload.and_then(|p| p.content.as_ref()) {
+                            if let Some(arr) = content.as_array() {
+                                for item in arr {
+                                    if let Some(txt) = item.get("text").and_then(Value::as_str) {
+                                        let txt = txt.trim();
+                                        if !txt.starts_with('<')
+                                            && !txt.starts_with("# AGENTS.md")
+                                            && !txt.starts_with("# Files mentioned")
+                                            && !txt.starts_with(">>> RETAINED")
+                                        {
+                                            session.title = compact_title(txt);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             "turn_context" => {
@@ -1528,6 +1561,37 @@ pub(crate) fn load_codex(start: i64, end: i64, previous: Option<&LoadedData>) ->
                 dedup_key,
                 ..Default::default()
             });
+        }
+    }
+
+    fn load_codex_titles(base: &Path) -> HashMap<String, String> {
+        let mut titles = HashMap::new();
+        let index_file = base.join("session_index.jsonl");
+        let Ok(file) = File::open(index_file) else {
+            return titles;
+        };
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            #[derive(serde::Deserialize)]
+            struct IndexRow {
+                id: Option<String>,
+                thread_name: Option<String>,
+            }
+            if let Ok(row) = serde_json::from_str::<IndexRow>(&line) {
+                if let (Some(id), Some(name)) = (row.id, row.thread_name) {
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        titles.insert(id, name.to_string());
+                    }
+                }
+            }
+        }
+        titles
+    }
+
+    let codex_titles = load_codex_titles(&base);
+    for (id, session) in metas.iter_mut() {
+        if let Some(t) = codex_titles.get(id) {
+            session.title = t.clone();
         }
     }
 
@@ -3368,6 +3432,46 @@ mod tests {
         assert_eq!(events[1].model, "gpt-5.1");
         assert_eq!(events[0].input_tokens + events[0].cached_tokens, 12000.0);
         assert!(events[1].context_order > events[0].context_order);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_extracts_title_from_response_item_filtering_noise() {
+        let dir = std::env::temp_dir().join(format!("codex-title-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let codex = dir.join("session.jsonl");
+        let lines = vec![
+            json!({"type": "session_meta", "payload": {"id": "codex-test-1", "cwd": "D:/code/test"}}),
+            json!({"type": "response_item", "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "<environment_context>noise</environment_context>"}]
+            }}),
+            json!({"type": "response_item", "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "# AGENTS.md instructions\nrule"}]
+            }}),
+            json!({"type": "response_item", "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "修复搜索框回车跑路行为\n具体细节描述..."}]
+            }}),
+        ];
+        std::fs::write(
+            &codex,
+            lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let (metas, _, _) = parse_codex_file(&codex);
+        assert_eq!(
+            metas["codex-test-1"].title,
+            "修复搜索框回车跑路行为 具体细节描述..."
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

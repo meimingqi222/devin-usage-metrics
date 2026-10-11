@@ -66,3 +66,7 @@ tmp/
 
 # ZCode 本地会话目录
 .zcode/
+
+# Agent 临时工作目录
+.agent-notes/
+.agent-notes-evidence/

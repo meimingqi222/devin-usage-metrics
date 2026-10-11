@@ -8,6 +8,42 @@ use toml_edit::DocumentMut;
 
 type Result<T> = std::result::Result<T, String>;
 
+/// Claude Code keeps its output's room free under the window it is set to,
+/// so it compacts at the window less this much. Codex compacts at the limit
+/// itself.
+pub const COMPACT_RESERVE: u64 = 33_000;
+
+/// The thresholds the local machine's groups run with now, keyed by
+/// (device, group label): Codex's one global setting, Claude Code's per
+/// model. Advice is measured against these when they are set. Only the
+/// local device is filled in — another machine's config is not ours to read.
+pub fn current_thresholds(
+    agent: AgentKind,
+    models: impl Iterator<Item = String>,
+) -> BTreeMap<(String, String), u64> {
+    let mut out = BTreeMap::new();
+    let device = crate::data::device_id();
+    if agent == AgentKind::Codex {
+        if let Ok(target) = Target::local(agent, "") {
+            if let Some(trigger) = target.effective_trigger() {
+                out.insert(
+                    (device, crate::compaction::CODEX_GROUP.to_string()),
+                    trigger,
+                );
+            }
+        }
+        return out;
+    }
+    for model in models {
+        if let Ok(target) = Target::local(agent, &model) {
+            if let Some(trigger) = target.effective_trigger() {
+                out.insert((device.clone(), model.trim().to_ascii_lowercase()), trigger);
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 pub struct Target {
     pub path: PathBuf,
@@ -122,7 +158,7 @@ impl Target {
     pub fn proposed(&self, trigger: u64) -> Result<Value> {
         let value = if self.model.is_some() {
             trigger
-                .checked_add(33_000)
+                .checked_add(COMPACT_RESERVE)
                 .ok_or("Threshold out of supported range")?
         } else {
             trigger
@@ -136,6 +172,23 @@ impl Target {
             return Err("Threshold out of supported range".into());
         }
         Ok(json!(value))
+    }
+
+    /// The threshold this agent actually compacts at now, as a trigger rather
+    /// than as the setting: Claude Code keeps its output's room under the
+    /// window. None when nothing sets one, a variable takes precedence over
+    /// the setting, or the value is not a whole number.
+    pub fn effective_trigger(&self) -> Option<u64> {
+        let setting = self.read().ok()?;
+        if setting.locked {
+            return None;
+        }
+        let value = setting.effective?.as_u64()?;
+        Some(if self.model.is_some() {
+            value.saturating_sub(COMPACT_RESERVE)
+        } else {
+            value
+        })
     }
 
     fn id(&self) -> String {

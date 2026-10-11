@@ -2,42 +2,143 @@ use super::*;
 use devin_usage_metrics::compaction_config::Target;
 use i18n::{t, Key};
 
-pub fn curve(r: &compaction::Recommendation) -> impl IntoElement {
-    let values = r.curve.clone();
-    let first = values.first().map(|p| p.0).unwrap_or(0);
-    let last = values.last().map(|p| p.0).unwrap_or(0);
-    let lo = values.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-    let hi = values.iter().map(|p| p.1).fold(0.0, f64::max);
-    let recommended = r.recommended;
+/// 规范化指标卡片，对齐主界面 stat_card 风格
+pub fn metric_card(
+    label: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    sub: Option<impl Into<SharedString>>,
+    color: u32,
+) -> gpui::Div {
     div()
-        .w_full()
-        .p_3()
-        .rounded_md()
-        .bg(rgb(BG))
+        .flex_1()
+        .min_w(px(130.))
         .flex()
         .flex_col()
-        .gap_1()
+        .justify_between()
+        .p_3()
+        .rounded_md()
+        .bg(rgb(PANEL2))
+        .border_1()
+        .border_color(rgb(BORDER))
+        .child(div().text_xs().text_color(rgb(MUTED)).child(label.into()))
+        .child(
+            div()
+                .py_1()
+                .text_xl()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(color))
+                .child(value.into()),
+        )
         .child(
             div()
                 .text_xs()
                 .text_color(rgb(MUTED))
-                .child(t(Key::CompactCurve)),
+                .child(sub.map(|s| s.into()).unwrap_or_else(|| "".into())),
+        )
+}
+
+pub fn curve(r: &compaction::Recommendation) -> impl IntoElement {
+    let values: Vec<_> = r
+        .curve
+        .iter()
+        .map(|(threshold, cost)| (*threshold, (cost / r.baseline_cost.max(1e-9) - 1.0) * 100.0))
+        .collect();
+    let first = values.first().map(|p| p.0).unwrap_or(0);
+    let last = values.last().map(|p| p.0).unwrap_or(0);
+    let lo = values.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let hi = values.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+    let recommended = r.recommended;
+    let candidate = r.candidate;
+    let label = if r.status == compaction::Status::Keep {
+        Key::CompactKeepTitle
+    } else {
+        Key::CompactionRecommended
+    };
+
+    div()
+        .w_full()
+        .p_3()
+        .rounded_md()
+        .bg(rgb(PANEL2))
+        .border_1()
+        .border_color(rgb(BORDER))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(rgb(TEXT))
+                                .child("费用敏感度曲线"),
+                        )
+                        .child(div().text_xs().text_color(rgb(MUTED)).child("越低越节省")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .text_xs()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(div().w(px(8.)).h(px(3.)).rounded_sm().bg(rgb(C_OUT)))
+                                .child(div().text_color(rgb(MUTED)).child("建议/保持点")),
+                        )
+                        .when(candidate != recommended, |d| {
+                            d.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(div().w(px(8.)).h(px(3.)).rounded_sm().bg(rgb(MUTED)))
+                                    .child(div().text_color(rgb(MUTED)).child("对比候选")),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(div().w(px(8.)).h(px(3.)).rounded_sm().bg(rgb(ACCENT)))
+                                .child(div().text_color(rgb(MUTED)).child("模拟费用")),
+                        ),
+                ),
         )
         .child(
             div()
+                .w_full()
+                .p_2()
+                .rounded_md()
+                .bg(rgb(BG))
+                .border_1()
+                .border_color(rgb(BORDER))
                 .flex()
                 .gap_3()
                 .child(
                     div()
-                        .w(px(70.))
+                        .w(px(60.))
                         .h(px(90.))
                         .flex()
                         .flex_col()
                         .justify_between()
                         .text_xs()
                         .text_color(rgb(MUTED))
-                        .child(pricing::fmt_cost(hi))
-                        .child(pricing::fmt_cost(lo)),
+                        .child(format!("{hi:+.1}%"))
+                        .child(format!("{lo:+.1}%")),
                 )
                 .child(
                     gpui::canvas(
@@ -64,6 +165,13 @@ pub fn curve(r: &compaction::Recommendation) -> impl IntoElement {
                             if let Ok(path) = grid.build() {
                                 window.paint_path(path, rgb(BORDER));
                             }
+                            let y = coord(first, 0.0).y;
+                            let mut baseline = gpui::PathBuilder::stroke(px(1.));
+                            baseline.move_to(point(bounds.left(), y));
+                            baseline.line_to(point(bounds.right(), y));
+                            if let Ok(path) = baseline.build() {
+                                window.paint_path(path, rgb(MUTED));
+                            }
                             let mut line = gpui::PathBuilder::stroke(px(2.));
                             for (i, (threshold, cost)) in values.iter().enumerate() {
                                 if i == 0 {
@@ -74,6 +182,15 @@ pub fn curve(r: &compaction::Recommendation) -> impl IntoElement {
                             }
                             if let Ok(path) = line.build() {
                                 window.paint_path(path, rgb(ACCENT));
+                            }
+                            if candidate != recommended {
+                                let x = coord(candidate, lo).x;
+                                let mut alt = gpui::PathBuilder::stroke(px(1.));
+                                alt.move_to(point(x, bounds.top()));
+                                alt.line_to(point(x, bounds.bottom()));
+                                if let Ok(path) = alt.build() {
+                                    window.paint_path(path, rgb(MUTED));
+                                }
                             }
                             let x = coord(recommended, lo).x;
                             let mut marker = gpui::PathBuilder::stroke(px(2.));
@@ -90,17 +207,30 @@ pub fn curve(r: &compaction::Recommendation) -> impl IntoElement {
         )
         .child(
             div()
-                .pl(px(82.))
+                .pl(px(72.))
                 .flex()
                 .justify_between()
                 .text_xs()
                 .text_color(rgb(MUTED))
                 .child(fmt_tokens(first as f64))
-                .child(div().text_color(rgb(C_OUT)).child(format!(
-                    "{} {}",
-                    t(Key::CompactionRecommended),
-                    fmt_tokens(recommended as f64)
-                )))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_color(rgb(C_OUT)).child(format!(
+                            "{} {}",
+                            t(label),
+                            fmt_tokens(recommended as f64)
+                        )))
+                        .when(candidate != recommended, |d| {
+                            d.child(div().text_color(rgb(MUTED)).child(format!(
+                                "{} {}",
+                                t(Key::CompactCandidate),
+                                fmt_tokens(candidate as f64)
+                            )))
+                        }),
+                )
                 .child(fmt_tokens(last as f64)),
         )
 }
@@ -113,12 +243,13 @@ impl Root {
         trigger: Option<u64>,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let mut panel = div()
+        let panel = div()
             .w_full()
             .min_w(px(0.))
-            .pt_3()
-            .mt_1()
-            .border_t_1()
+            .p_3()
+            .rounded_md()
+            .bg(rgb(PANEL2))
+            .border_1()
             .border_color(rgb(BORDER))
             .flex()
             .flex_col()
@@ -145,55 +276,13 @@ impl Root {
             .as_ref()
             .map(|v| v.to_string())
             .unwrap_or_else(|| t(Key::CompactDefault).into());
-        panel = panel
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(t(Key::CompactConfig)),
-                    )
-                    .when(setting.ours, |d| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(C_OUT))
-                                .child(format!("✓ {}", t(Key::CompactApplied))),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .whitespace_normal()
-                    .child(target.path.display().to_string()),
-            )
-            .child(
-                div()
-                    .p_2()
-                    .rounded_md()
-                    .bg(rgb(BG))
-                    .text_sm()
-                    .whitespace_normal()
-                    .child(format!(
-                        "{}: {}{}",
-                        target.key,
-                        current,
-                        proposal
-                            .as_ref()
-                            .filter(|v| setting.value.as_ref() != Some(*v))
-                            .map(|v| format!("  →  {v}"))
-                            .unwrap_or_default()
-                    )),
-            );
+
         let busy = self.compaction_config_task.is_some();
         let mut actions = div().flex().items_center().gap_2();
-        if proposal.is_some_and(|p| setting.value.as_ref() != Some(&p)) {
+        if proposal
+            .as_ref()
+            .is_some_and(|p| setting.value.as_ref() != Some(p))
+        {
             let apply_target = target.clone();
             let expected = setting.value.clone();
             let threshold = trigger.unwrap();
@@ -202,14 +291,16 @@ impl Root {
                 div()
                     .id(SharedString::from(format!("compact-apply-{model}")))
                     .px_3()
-                    .py_2()
+                    .py_1()
                     .rounded_md()
-                    .bg(rgb(if enabled { ACCENT } else { PANEL2 }))
-                    .text_sm()
-                    .text_color(rgb(if enabled { BG } else { MUTED }))
+                    .bg(rgb(if enabled { ACCENT } else { PANEL }))
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(if enabled { 0x0a0a0c } else { MUTED }))
                     .child(t(Key::CompactApply))
                     .when(enabled, |d| {
                         d.cursor_pointer()
+                            .hover(|h| h.bg(rgb(0x6ad4ff)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.change_compaction(
                                     apply_target.clone(),
@@ -222,26 +313,103 @@ impl Root {
             );
         }
         if setting.has_undo {
+            let undo_target = target.clone();
             let expected = setting.value.clone();
             actions = actions.child(
                 div()
                     .id(SharedString::from(format!("compact-undo-{model}")))
                     .px_3()
-                    .py_2()
+                    .py_1()
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(BORDER))
-                    .text_sm()
+                    .text_xs()
+                    .text_color(rgb(TEXT))
                     .child(t(Key::CompactUndo))
                     .when(!busy, |d| {
                         d.cursor_pointer()
+                            .hover(|h| h.bg(rgb(PANEL)))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.change_compaction(target.clone(), expected.clone(), None, cx);
+                                this.change_compaction(
+                                    undo_target.clone(),
+                                    expected.clone(),
+                                    None,
+                                    cx,
+                                );
                             }))
                     }),
             );
         }
-        panel.child(actions).child(
+
+        let row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(TEXT))
+                                    .child(format!("⚙ {}", t(Key::CompactConfig))),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(target.path.display().to_string()),
+                            )
+                            .when(setting.ours, |d| {
+                                d.child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(rgb(C_OUT))
+                                        .child(format!("✓ {}", t(Key::CompactApplied))),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_xs()
+                            .child(
+                                div()
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("{}: ", target.key)),
+                            )
+                            .child(div().text_color(rgb(TEXT)).child(current))
+                            .when_some(
+                                proposal
+                                    .as_ref()
+                                    .filter(|v| setting.value.as_ref() != Some(*v)),
+                                |d, p| {
+                                    d.child(div().text_color(rgb(MUTED)).child("→")).child(
+                                        div()
+                                            .text_color(rgb(ACCENT))
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .child(p.to_string()),
+                                    )
+                                },
+                            ),
+                    ),
+            )
+            .child(actions);
+
+        panel.child(row).child(
             div()
                 .text_xs()
                 .text_color(rgb(MUTED))

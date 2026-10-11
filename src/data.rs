@@ -149,6 +149,11 @@ impl AgentKind {
         }
     }
 
+    /// 该 agent 是否支持压缩建议（目前仅支持 Claude Code 和 Codex）。
+    pub fn supports_compaction(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex)
+    }
+
     /// 检查该 agent 是否在本地安装过（数据目录存在）。
     pub fn is_installed(self) -> bool {
         let home = || dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -707,6 +712,37 @@ impl SessionRec {
                 }
             })
             .unwrap_or_else(|| "unknown".into())
+    }
+
+    /// 获取所属项目或文件夹名称（基于 working_directory）
+    pub fn project_name(&self) -> String {
+        let trimmed = self.working_directory.trim_end_matches(['/', '\\']);
+        if trimmed.is_empty() {
+            return "未指定项目".to_string();
+        }
+        std::path::Path::new(trimmed)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(trimmed)
+            .to_string()
+    }
+
+    /// 判断是否为后台审核任务或内部派生任务（如 Codex 的 Guardian review）
+    pub fn is_subagent_or_review(&self) -> bool {
+        self.source == "guardian"
+            || self.source == "subagent"
+            || self.title == "Guardian review"
+            || self.title.starts_with("Guardian review")
+    }
+
+    /// 获取终端续读（Resume）命令
+    pub fn resume_command(&self) -> Option<String> {
+        match self.agent {
+            AgentKind::Claude => Some(format!("claude resume {}", self.id)),
+            AgentKind::Codex => Some(format!("codex resume {}", self.id)),
+            _ => None,
+        }
     }
 }
 

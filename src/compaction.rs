@@ -7,6 +7,25 @@ use std::collections::BTreeMap;
 const STEP: u64 = 10_000;
 const MIN_CALLS: usize = 50;
 const MIN_COMPACTIONS: usize = 3;
+/// Codex's threshold is one global setting, so every model's segments are
+/// pooled under this label rather than competing for their own advice.
+pub const CODEX_GROUP: &str = "Codex · all models";
+/// Where the agents' own models start: Claude Code's 200K (1M when asked for
+/// the long context), Codex's 272K. A prompt past it means the model holds
+/// more, which is what raises the search above what was observed.
+const BASE_WINDOW_CLAUDE: u64 = 200_000;
+const BASE_WINDOW_CODEX: u64 = 272_000;
+
+/// What replaying the history at one threshold came to.
+#[derive(Debug, Clone, Copy, Default)]
+struct Replay {
+    /// Weighted cost in dollars.
+    cost: f64,
+    /// Compactions the replay had to make.
+    compactions: usize,
+    /// Calls whose context would have passed the threshold.
+    over: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -30,11 +49,36 @@ pub struct Recommendation {
     pub rework: u64,
     /// Median observed pre-compaction prompt, not the current config setting.
     pub observed: u64,
+    /// The threshold the advice is measured against: the configured one when
+    /// there is one, else `observed`.
+    pub current: u64,
+    /// The most the narrowest model in the pool can hold, which caps both
+    /// the baseline and the search.
+    pub window: u64,
     /// Actual prompt threshold, NOT Claude's autoCompactWindow setting.
     pub recommended: u64,
+    /// The threshold the replay liked best, before any "keep" override.
+    pub candidate: u64,
     pub baseline_cost: f64,
     pub recommended_cost: f64,
+    /// Compactions the replay makes at `observed`.
+    pub baseline_compactions: usize,
+    /// Compactions the replay makes at `candidate`.
+    pub candidate_compactions: usize,
+    /// Share of replayed calls whose context would pass `candidate`.
+    pub over_share: f64,
+    /// What `candidate` would have saved, before any "keep" override.
+    pub candidate_saving: f64,
+    pub candidate_cost: f64,
+    /// Candidate saving when estimated rework is doubled (at least +10K).
+    pub cautious_saving: f64,
+    pub sensitivity_failed: bool,
+    pub baseline_inferred: bool,
+    pub priced_calls: usize,
     pub curve: Vec<(u64, f64)>,
+    /// Streams dropped from the replay because their model has no usable
+    /// price. They still count towards the sample statistics.
+    pub unpriced: usize,
     pub status: Status,
 }
 
@@ -73,12 +117,17 @@ fn median(mut values: Vec<u64>) -> u64 {
 
 /// Uses the selected window, device and agent. Streams are isolated BEFORE
 /// grouping by model: switching A → B → A must not join the two A fragments.
+/// `current` maps a group's (device, label) to the threshold it runs with
+/// now, as a trigger rather than as the setting; advice is measured against
+/// it when one is set, and against the observed compaction point when it is
+/// not. Only the local machine fills it in — another's config is not ours.
 pub fn analyze(
     data: &LoadedData,
     agent: AgentKind,
     device: Option<&str>,
     start: i64,
     end: i64,
+    current: &BTreeMap<(String, String), u64>,
 ) -> Report {
     let mut report = Report::default();
     if !matches!(agent, AgentKind::Claude | AgentKind::Codex) {
@@ -117,7 +166,7 @@ pub fn analyze(
     let mut groups: BTreeMap<(String, String), Vec<Vec<&TurnRec>>> = BTreeMap::new();
     let group_model = |t: &TurnRec| {
         if agent == AgentKind::Codex {
-            "Codex · all models".to_string()
+            CODEX_GROUP.to_string()
         } else {
             t.model.trim().to_ascii_lowercase()
         }
@@ -153,9 +202,10 @@ pub fn analyze(
         }
     }
     for ((device_id, model), streams) in groups {
+        let trigger = current.get(&(device_id.clone(), model.clone())).copied();
         report
             .recommendations
-            .push(recommend(agent, device_id, model, &streams));
+            .push(recommend(agent, device_id, model, &streams, trigger));
     }
     report.recommendations.sort_by_key(|r| {
         (
@@ -175,7 +225,23 @@ fn recommend(
     device_id: String,
     model: String,
     streams: &[Vec<&TurnRec>],
+    current: Option<u64>,
 ) -> Recommendation {
+    let calls = streams.iter().map(Vec::len).sum();
+    let stream_count = streams.len();
+    let device_name = streams[0][0].device_name.clone();
+    let (priced_streams, prices): (Vec<_>, Vec<_>) = streams
+        .iter()
+        .filter_map(|s| {
+            PricingTable::instance()
+                .find(&s[0].model)
+                .filter(|p| p.i > 0.0)
+                .map(|price| (s.clone(), price))
+        })
+        .unzip();
+    let unpriced = stream_count - priced_streams.len();
+    // Coverage includes unknown models; simulation calibration excludes them.
+    let streams = priced_streams.as_slice();
     let mut peaks = Vec::new();
     let mut afters = Vec::new();
     let mut growths = Vec::new();
@@ -210,42 +276,45 @@ fn recommend(
     let has_rework_samples = !reworks.is_empty();
     let mut r = Recommendation {
         device_id,
-        device_name: streams[0][0].device_name.clone(),
+        device_name,
         model,
-        calls: streams.iter().map(Vec::len).sum(),
-        streams: streams.len(),
+        calls,
+        streams: stream_count,
         compactions: peaks.len(),
         growth: median(growths),
         after: median(afters),
         rework: median(reworks),
         observed: median(peaks),
+        current: 0,
+        window: 0,
         recommended: 0,
+        candidate: 0,
         baseline_cost: 0.0,
         recommended_cost: 0.0,
+        baseline_compactions: 0,
+        candidate_compactions: 0,
+        over_share: 0.0,
+        candidate_saving: 0.0,
+        candidate_cost: 0.0,
+        cautious_saving: 0.0,
+        sensitivity_failed: false,
+        baseline_inferred: current.is_none(),
+        priced_calls: streams.iter().map(Vec::len).sum(),
         curve: Vec::new(),
+        unpriced,
         status: Status::NotEnoughCalls,
     };
-    if r.calls < MIN_CALLS {
+    if streams.is_empty() {
+        r.status = Status::UnknownPricing;
+        return r;
+    }
+    if r.priced_calls < MIN_CALLS {
         return r;
     }
     if r.compactions < MIN_COMPACTIONS {
         r.status = Status::NotEnoughCompactions;
         return r;
     }
-    // Codex has a global setting: pool isolated model segments, retaining
-    // each segment's own pricing instead of offering competing settings.
-    let prices: Option<Vec<_>> = streams
-        .iter()
-        .map(|s| {
-            PricingTable::instance()
-                .find(&s[0].model)
-                .filter(|p| p.i > 0.0)
-        })
-        .collect();
-    let Some(prices) = prices else {
-        r.status = Status::UnknownPricing;
-        return r;
-    };
     let base = median(streams.iter().map(|s| prompt(s[0])).collect());
     if r.compactions < 5 || !has_rework_samples {
         r.rework = r.rework.max(10_000);
@@ -260,13 +329,42 @@ fn recommend(
         .max(min)
         .div_ceil(STEP)
         * STEP;
-    // Never advise expanding beyond a historical prompt we actually observed.
-    let top = r.observed.min(if agent == AgentKind::Claude {
+    // The setting is global, so the narrowest model in the pool binds: a
+    // threshold it cannot hold would be ignored by it. A prompt only ever
+    // came from a model that served it, so a stream that reached past its
+    // catalog window proves the catalog is stale for that model, and what
+    // the stream actually reached is the better bound for it.
+    let base_window = if agent == AgentKind::Claude {
+        BASE_WINDOW_CLAUDE
+    } else {
+        BASE_WINDOW_CODEX
+    };
+    let hard_cap = if agent == AgentKind::Claude {
         967_000
     } else {
         1_000_000
-    });
-    let run = |threshold| {
+    };
+    let window = streams
+        .iter()
+        .map(|s| {
+            let reached = s.iter().map(|t| prompt(t)).max().unwrap_or_default();
+            PricingTable::instance()
+                .context_window(&s[0].model)
+                .unwrap_or(base_window)
+                .max(reached)
+        })
+        .min()
+        .unwrap_or(base_window)
+        .min(hard_cap);
+    r.window = window;
+    // Measure against what is set when something sets it, and against where
+    // compactions happened to land when nothing does. The agent compacts at
+    // the smaller of the setting and the model's window either way.
+    r.current = current.unwrap_or(r.observed).min(window);
+    // Search up to the window, not only as far as compactions were seen: a
+    // model that compacts at 200K by default says nothing about 250K.
+    let top = window;
+    let run_with_rework = |threshold, rework| {
         streams
             .iter()
             .zip(&prices)
@@ -276,19 +374,26 @@ fn recommend(
                     threshold,
                     r.after,
                     base,
-                    r.rework,
+                    rework,
                     agent,
                     price,
                 )
             })
-            .sum()
+            .fold(Replay::default(), |sum, part| Replay {
+                cost: sum.cost + part.cost,
+                compactions: sum.compactions + part.compactions,
+                over: sum.over + part.over,
+            })
     };
-    r.baseline_cost = run(r.observed);
+    let run = |threshold| run_with_rework(threshold, r.rework);
+    let baseline = run(r.current);
+    r.baseline_cost = baseline.cost;
+    r.baseline_compactions = baseline.compactions;
     let mut curve = Vec::new();
     for threshold in (floor..=top).step_by(STEP as usize) {
-        curve.push((threshold, run(threshold)));
+        curve.push((threshold, run(threshold).cost));
     }
-    curve.push((r.observed, r.baseline_cost));
+    curve.push((r.current, baseline.cost));
     let low = curve
         .iter()
         .map(|(_, cost)| *cost)
@@ -298,11 +403,37 @@ fn recommend(
         .filter(|(_, cost)| *cost <= low * 1.01)
         .max_by_key(|(threshold, _)| *threshold)
         .unwrap();
+    r.candidate = best.0;
+    r.candidate_cost = best.1;
     r.recommended = best.0;
     r.recommended_cost = best.1;
+    let advised = run(best.0);
+    r.candidate_compactions = advised.compactions;
+    r.over_share = advised.over as f64 / r.priced_calls.max(1) as f64;
+    r.candidate_saving = if r.baseline_cost > 0.0 {
+        ((r.baseline_cost - best.1) / r.baseline_cost).max(0.0)
+    } else {
+        0.0
+    };
     r.status = Status::Recommend;
-    if r.savings_fraction() < 0.03 {
-        r.recommended = r.observed;
+    // Compacting more often throws away context the cost model does not
+    // price, so a smaller threshold has to clear a higher bar than a larger
+    // one, which only ever compacts less.
+    let bar = if r.candidate < r.current { 0.05 } else { 0.03 };
+    let cautious_rework = r
+        .rework
+        .saturating_mul(2)
+        .max(r.rework.saturating_add(10_000));
+    let cautious_baseline = run_with_rework(r.current, cautious_rework).cost;
+    let cautious_candidate = run_with_rework(r.candidate, cautious_rework).cost;
+    r.cautious_saving = if cautious_baseline > 0.0 {
+        ((cautious_baseline - cautious_candidate) / cautious_baseline).max(0.0)
+    } else {
+        0.0
+    };
+    r.sensitivity_failed = r.candidate_saving >= bar && r.cautious_saving < bar;
+    if r.savings_fraction() < bar || r.sensitivity_failed {
+        r.recommended = r.current;
         r.recommended_cost = r.baseline_cost;
         r.status = Status::Keep;
     }
@@ -320,9 +451,11 @@ fn replay(
     rework: u64,
     agent: AgentKind,
     price: &Pricing,
-) -> f64 {
+) -> Replay {
     let summary = after.saturating_sub(base) as f64;
     let mut cost = 0.0;
+    let mut compactions = 0usize;
+    let mut over = 0usize;
     for s in streams {
         let write_rate = |t: &TurnRec| {
             if agent != AgentKind::Claude {
@@ -345,10 +478,17 @@ fn replay(
                 prompt(t).saturating_sub(prompt(prev))
             };
             let write = write_rate(t);
-            if ctx + growth > threshold && ctx > after {
+            // Read the threshold before compacting: the compaction resets
+            // ctx, which would hide the call that triggered it.
+            let past = ctx + growth > threshold;
+            if past && ctx > after {
                 cost +=
                     ctx as f64 * price.cr + summary * price.o + (summary + rework as f64) * write;
                 ctx = after + rework;
+                compactions += 1;
+            }
+            if past {
+                over += 1;
             }
             // Unlike an always-hit replay, account for observed Claude pauses.
             let ttl = if t.cache_creation_1h_tokens > t.cache_creation_5m_tokens {
@@ -365,12 +505,54 @@ fn replay(
             ctx += growth;
         }
     }
-    cost / 1_000_000.0
+    Replay {
+        cost: cost / 1_000_000.0,
+        compactions,
+        over,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpriced_streams_do_not_change_replay_calibration() {
+        let mut data = history(AgentKind::Codex, 320_000, 1000);
+        let before = analyze(&data, AgentKind::Codex, None, 0, i64::MAX, &BTreeMap::new());
+        let mut unknown = history(AgentKind::Codex, 150_000, 2000);
+        for t in &mut unknown.turns {
+            t.session_key = "unpriced".into();
+            t.model = "unpriced-model-xyz".into();
+        }
+        data.turns.extend(unknown.turns);
+        let after = analyze(&data, AgentKind::Codex, None, 0, i64::MAX, &BTreeMap::new());
+        let (a, b) = (&before.recommendations[0], &after.recommendations[0]);
+        assert_eq!(a.observed, b.observed);
+        assert_eq!(a.after, b.after);
+        assert_eq!(a.candidate, b.candidate);
+        assert_eq!(a.baseline_cost, b.baseline_cost);
+        assert_eq!(b.unpriced, 1);
+        assert_eq!(b.calls, 3000);
+    }
+
+    #[test]
+    fn a_wide_model_cannot_raise_another_models_cap() {
+        let mut data = history(AgentKind::Codex, 960_000, 1000);
+        let mut narrow = history(AgentKind::Codex, 150_000, 200);
+        for t in &mut narrow.turns {
+            t.session_key = "narrow".into();
+            t.model = "gpt-5.1".into();
+        }
+        data.turns.extend(narrow.turns);
+        let r = &analyze(&data, AgentKind::Codex, None, 0, i64::MAX, &BTreeMap::new())
+            .recommendations[0];
+        assert_eq!(
+            r.window,
+            PricingTable::instance().context_window("gpt-5.1").unwrap()
+        );
+        assert!(r.curve.iter().all(|p| p.0 <= r.window));
+    }
 
     fn history(agent: AgentKind, compact_at: u64, count: usize) -> LoadedData {
         let mut data = LoadedData::default();
@@ -405,10 +587,100 @@ mod tests {
     }
 
     #[test]
+    fn one_unpriced_stream_does_not_sink_the_whole_pooled_codex_group() {
+        // Codex pools every model into one group, so a single stream whose
+        // model carries no usable price (e.g. the all-zero placeholder
+        // "codex-auto-review" in models.dev) must not turn the entire
+        // recommendation into "missing pricing".
+        let mut priced = history(AgentKind::Codex, 960_000, 1000);
+        for t in &mut priced.turns {
+            t.session_key = "priced".into();
+        }
+        let mut review = history(AgentKind::Codex, 200_000, 120);
+        for t in &mut review.turns {
+            t.session_key = "review".into();
+            t.model = "codex-auto-review".into();
+        }
+        priced.turns.extend(review.turns);
+        let report = analyze(
+            &priced,
+            AgentKind::Codex,
+            None,
+            0,
+            i64::MAX,
+            &BTreeMap::new(),
+        );
+        let r = &report.recommendations[0];
+        assert_ne!(r.status, Status::UnknownPricing);
+        assert_eq!(r.status, Status::Recommend);
+        assert_eq!(r.observed, 955_000);
+        assert_eq!(r.unpriced, 1);
+        assert!(r.recommended < r.observed);
+        assert!(r.baseline_cost > 0.0);
+    }
+
+    #[test]
+    fn a_small_saving_that_would_compact_more_often_is_not_advised() {
+        // Compacting more often throws away context the cost model does not
+        // price, so a threshold below the historical one has to clear a
+        // higher bar than a larger one. A few percent is not enough.
+        let kept = &analyze(
+            &history(AgentKind::Codex, 320_000, 1000),
+            AgentKind::Codex,
+            None,
+            0,
+            i64::MAX,
+            &BTreeMap::new(),
+        )
+        .recommendations[0];
+        // 4.6% would have cleared the old flat 3% bar, but it costs five
+        // more compactions, so it now reads as "keep".
+        assert!(kept.candidate < kept.observed);
+        assert!(kept.candidate_saving >= 0.03 && kept.candidate_saving < 0.05);
+        assert_eq!(kept.status, Status::Keep);
+        assert_eq!(kept.recommended, kept.observed);
+        assert_eq!(kept.recommended_cost, kept.baseline_cost);
+        // The rejected candidate stays visible so the trade-off is shown.
+        assert_eq!(kept.candidate_compactions, kept.baseline_compactions + 5);
+        assert!(kept.over_share > 0.0);
+
+        // Clearing the nominal bar alone is insufficient when plausible
+        // extra rework reverses that advantage.
+        let advised = &analyze(
+            &history(AgentKind::Codex, 340_000, 1000),
+            AgentKind::Codex,
+            None,
+            0,
+            i64::MAX,
+            &BTreeMap::new(),
+        )
+        .recommendations[0];
+        assert!(advised.candidate < advised.observed);
+        assert!(advised.candidate_saving >= 0.05);
+        assert!(advised.cautious_saving < 0.05);
+        assert!(advised.sensitivity_failed);
+        assert_eq!(advised.status, Status::Keep);
+        assert_eq!(advised.recommended, advised.current);
+    }
+
+    #[test]
+    fn the_trade_off_counts_compactions_and_calls_past_the_threshold() {
+        let data = history(AgentKind::Codex, 960_000, 1000);
+        let report = analyze(&data, AgentKind::Codex, None, 0, i64::MAX, &BTreeMap::new());
+        let r = &report.recommendations[0];
+        assert_eq!(r.status, Status::Recommend);
+        // Compacting earlier means more compactions, and the share of calls
+        // that would still reach the threshold is a real fraction.
+        assert!(r.candidate_compactions > r.baseline_compactions);
+        assert!(r.over_share > 0.0 && r.over_share <= 1.0);
+        assert_eq!(r.candidate, r.recommended);
+    }
+
+    #[test]
     fn long_history_recommends_smaller_but_short_history_does_not_guess() {
         for agent in [AgentKind::Claude, AgentKind::Codex] {
             let data = history(agent, 960_000, 1000);
-            let report = analyze(&data, agent, None, 0, i64::MAX);
+            let report = analyze(&data, agent, None, 0, i64::MAX, &BTreeMap::new());
             let r = &report.recommendations[0];
             assert_eq!(r.status, Status::Recommend);
             assert_eq!(r.observed, 955_000);
@@ -416,9 +688,16 @@ mod tests {
             assert_eq!(r.after, 60_000);
             assert!(r.recommended >= 160_000 && r.recommended < r.observed);
             assert!(r.savings_fraction() >= 0.2);
-            let short = analyze(&data, agent, None, 0, 1_000 + 20 * 30);
+            let short = analyze(&data, agent, None, 0, 1_000 + 20 * 30, &BTreeMap::new());
             assert_eq!(short.recommendations[0].status, Status::NotEnoughCalls);
-            let no_cuts = analyze(&history(agent, 960_000, 100), agent, None, 0, i64::MAX);
+            let no_cuts = analyze(
+                &history(agent, 960_000, 100),
+                agent,
+                None,
+                0,
+                i64::MAX,
+                &BTreeMap::new(),
+            );
             assert_eq!(
                 no_cuts.recommendations[0].status,
                 Status::NotEnoughCompactions
@@ -442,16 +721,30 @@ mod tests {
             t.device_id = "laptop".into();
         }
         data.turns.extend(remote);
-        let all = analyze(&data, AgentKind::Claude, None, 0, i64::MAX);
+        let all = analyze(
+            &data,
+            AgentKind::Claude,
+            None,
+            0,
+            i64::MAX,
+            &BTreeMap::new(),
+        );
         assert_eq!(all.recommendations.len(), 2);
         assert!(all
             .recommendations
             .iter()
             .all(|r| r.compactions == 0 && r.streams == 2));
         assert_eq!(
-            analyze(&data, AgentKind::Claude, Some("laptop"), 0, i64::MAX)
-                .recommendations
-                .len(),
+            analyze(
+                &data,
+                AgentKind::Claude,
+                Some("laptop"),
+                0,
+                i64::MAX,
+                &BTreeMap::new()
+            )
+            .recommendations
+            .len(),
             1
         );
         // Same model on both sides of a model change must remain separate.
@@ -464,10 +757,17 @@ mod tests {
                 t.cache_read_tokens = 10_000.0;
             }
         }
-        assert!(analyze(&switched, AgentKind::Claude, None, 0, i64::MAX)
-            .recommendations
-            .iter()
-            .all(|r| r.compactions == 0));
+        assert!(analyze(
+            &switched,
+            AgentKind::Claude,
+            None,
+            0,
+            i64::MAX,
+            &BTreeMap::new()
+        )
+        .recommendations
+        .iter()
+        .all(|r| r.compactions == 0));
     }
 
     #[test]
@@ -477,18 +777,22 @@ mod tests {
             t.model = "unpriced-model-xyz".into();
         }
         assert_eq!(
-            analyze(&data, AgentKind::Codex, None, 0, i64::MAX).recommendations[0].status,
+            analyze(&data, AgentKind::Codex, None, 0, i64::MAX, &BTreeMap::new()).recommendations
+                [0]
+            .status,
             Status::UnknownPricing
         );
         for t in &mut data.turns {
             t.context_stream.clear();
         }
-        let report = analyze(&data, AgentKind::Codex, None, 0, i64::MAX);
+        let report = analyze(&data, AgentKind::Codex, None, 0, i64::MAX, &BTreeMap::new());
         assert!(report.recommendations.is_empty());
         assert_eq!(report.skipped, 200);
-        assert!(analyze(&data, AgentKind::Devin, None, 0, i64::MAX)
-            .recommendations
-            .is_empty());
+        assert!(
+            analyze(&data, AgentKind::Devin, None, 0, i64::MAX, &BTreeMap::new())
+                .recommendations
+                .is_empty()
+        );
     }
 
     #[test]
@@ -503,7 +807,7 @@ mod tests {
             };
             t.cache_read_tokens = (tokens - 5_000) as f64;
         }
-        let report = analyze(&data, AgentKind::Codex, None, 0, i64::MAX);
+        let report = analyze(&data, AgentKind::Codex, None, 0, i64::MAX, &BTreeMap::new());
         let r = &report.recommendations[0];
         assert_eq!(r.compactions, 16);
         assert_eq!(r.observed, 200_000);
@@ -525,7 +829,7 @@ mod tests {
             t.model = "gpt-5.1".into();
         }
         data.turns.extend(second);
-        let pooled = analyze(&data, AgentKind::Codex, None, 0, i64::MAX);
+        let pooled = analyze(&data, AgentKind::Codex, None, 0, i64::MAX, &BTreeMap::new());
         assert_eq!(pooled.recommendations.len(), 1);
         assert_eq!(pooled.recommendations[0].calls, 100);
         assert_eq!(pooled.recommendations[0].streams, 2);
@@ -538,20 +842,80 @@ mod tests {
     #[test]
     fn keeps_a_threshold_with_no_safe_smaller_candidate_and_preserves_transcript_order() {
         let mut data = history(AgentKind::Codex, 150_000, 200);
-        let original = analyze(&data, AgentKind::Codex, None, 0, i64::MAX);
+        let original = analyze(&data, AgentKind::Codex, None, 0, i64::MAX, &BTreeMap::new());
         let r = &original.recommendations[0];
-        assert_eq!(r.status, Status::Keep);
+        // The search now runs up to the model's window, so a threshold above
+        // where compactions happened to land is reachable: compacting less
+        // often saves the summary and the rework it costs.
         assert_eq!(r.observed, 145_000);
-        assert_eq!(r.recommended, r.observed);
-        assert_eq!(r.baseline_cost, r.recommended_cost);
+        assert_eq!(r.window, 400_000);
+        assert_eq!(r.status, Status::Recommend);
+        assert!(r.candidate > r.observed);
+        assert_eq!(r.recommended, r.candidate);
+        assert!(r.candidate_compactions < r.baseline_compactions);
+        assert!(r.candidate_saving >= 0.03);
         // Hash maps / synced records need not arrive in transcript order.
         for (i, t) in data.turns.iter_mut().enumerate() {
             t.created_at = 1_000;
             t.context_order = i as u64;
         }
         data.turns.reverse();
-        let reordered = analyze(&data, AgentKind::Codex, None, 0, i64::MAX);
+        let reordered = analyze(&data, AgentKind::Codex, None, 0, i64::MAX, &BTreeMap::new());
         assert_eq!(reordered.recommendations[0].compactions, r.compactions);
         assert_eq!(reordered.recommendations[0].observed, 145_000);
+        assert_eq!(reordered.recommendations[0].candidate, r.candidate);
+    }
+
+    #[test]
+    fn the_narrowest_model_in_the_pool_caps_the_advice() {
+        // A global setting applies to every model pooled with it, so the
+        // smallest window binds: Claude Haiku's 200K, not Opus's 1M.
+        let mut data = history(AgentKind::Claude, 150_000, 200);
+        for t in &mut data.turns {
+            t.model = "claude-haiku-4-5".into();
+        }
+        let r = &analyze(
+            &data,
+            AgentKind::Claude,
+            None,
+            0,
+            i64::MAX,
+            &BTreeMap::new(),
+        )
+        .recommendations[0];
+        assert_eq!(r.window, 200_000);
+        assert!(r.candidate <= r.window);
+        assert!(r.current <= r.window);
+        // Nothing on the curve may sit above the window either.
+        assert!(r.curve.iter().all(|(threshold, _)| *threshold <= r.window));
+    }
+
+    #[test]
+    fn the_configured_threshold_is_what_the_advice_is_measured_against() {
+        let data = history(AgentKind::Codex, 390_000, 1000);
+        let key = ("desktop".to_string(), CODEX_GROUP.to_string());
+        // Nothing set: the observed compaction point stands in for it.
+        let inferred = &analyze(&data, AgentKind::Codex, None, 0, i64::MAX, &BTreeMap::new())
+            .recommendations[0];
+        assert_eq!(inferred.current, inferred.observed);
+        // Something set: that is the baseline, and the window still caps it.
+        let set = BTreeMap::from([(key.clone(), 300_000)]);
+        let measured =
+            &analyze(&data, AgentKind::Codex, None, 0, i64::MAX, &set).recommendations[0];
+        assert_eq!(measured.current, 300_000);
+        assert_eq!(measured.window, 400_000);
+        // A setting past the window is clamped to it, as the agent runs at
+        // the smaller of the two.
+        let beyond = BTreeMap::from([(key, 900_000)]);
+        let clamped =
+            &analyze(&data, AgentKind::Codex, None, 0, i64::MAX, &beyond).recommendations[0];
+        assert_eq!(clamped.current, 400_000);
+        // Another device's config is not ours to read, so its groups keep
+        // the inferred baseline.
+        let other = BTreeMap::from([(("laptop".to_string(), CODEX_GROUP.to_string()), 300_000)]);
+        assert!(analyze(&data, AgentKind::Codex, None, 0, i64::MAX, &other)
+            .recommendations
+            .iter()
+            .all(|r| r.current == r.observed));
     }
 }

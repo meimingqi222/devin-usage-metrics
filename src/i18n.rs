@@ -106,6 +106,12 @@ struct ConfigFile {
     skipped_update_version: Option<String>,
     #[serde(default)]
     last_update_check_at: Option<i64>,
+    #[serde(default = "default_true")]
+    sessions_group_by_project: bool,
+    #[serde(default = "default_true")]
+    sessions_hide_subagents: bool,
+    #[serde(default)]
+    hidden_session_keys: std::collections::HashSet<String>,
 }
 
 impl Default for ConfigFile {
@@ -115,6 +121,27 @@ impl Default for ConfigFile {
             auto_check_updates: true,
             skipped_update_version: None,
             last_update_check_at: None,
+            sessions_group_by_project: true,
+            sessions_hide_subagents: true,
+            hidden_session_keys: std::collections::HashSet::new(),
+        }
+    }
+}
+
+/// 会话管理偏好，与语言一起存在 `config.json`。
+#[derive(Clone, Debug)]
+pub struct SessionPrefs {
+    pub group_by_project: bool,
+    pub hide_subagents: bool,
+    pub hidden_session_keys: std::collections::HashSet<String>,
+}
+
+impl Default for SessionPrefs {
+    fn default() -> Self {
+        Self {
+            group_by_project: true,
+            hide_subagents: true,
+            hidden_session_keys: std::collections::HashSet::new(),
         }
     }
 }
@@ -195,6 +222,23 @@ pub fn save_update_prefs(prefs: &UpdatePrefs) {
     write_config_file(&config);
 }
 
+pub fn load_session_prefs() -> SessionPrefs {
+    let config = load_config_file();
+    SessionPrefs {
+        group_by_project: config.sessions_group_by_project,
+        hide_subagents: config.sessions_hide_subagents,
+        hidden_session_keys: config.hidden_session_keys,
+    }
+}
+
+pub fn save_session_prefs(prefs: &SessionPrefs) {
+    let mut config = load_config_file();
+    config.sessions_group_by_project = prefs.group_by_project;
+    config.sessions_hide_subagents = prefs.hide_subagents;
+    config.hidden_session_keys = prefs.hidden_session_keys.clone();
+    write_config_file(&config);
+}
+
 #[cfg(not(target_os = "windows"))]
 fn replace_config_file(temp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
     std::fs::rename(temp, path)
@@ -245,7 +289,19 @@ pub enum Key {
     CompactionFewCalls,
     CompactionFewCuts,
     CompactionNoPrice,
+    CompactionUnpriced,
+    CompactionTradeoff,
     CompactionKeep,
+    CompactionKeepMarginal,
+    CompactKeepTitle,
+    CompactChangeTitle,
+    CompactBaselineInferred,
+    CompactBaselineConfigured,
+    CompactCandidateSaving,
+    CompactSensitivity,
+    CompactEvidence,
+    CompactCandidateComparison,
+    CompactInferredNote,
     CompactionCaveat,
     CompactApply,
     CompactUndo,
@@ -253,11 +309,16 @@ pub enum Key {
     CompactDefault,
     CompactConfig,
     CompactCurve,
+    CompactCandidate,
     CompactRemote,
     CompactLocked,
     CompactSaved,
     CompactRestored,
     CompactScope,
+    CompactDetails,
+    CompactOptimal,
+    CompactRecommendBadge,
+    CompactImpactTitle,
     PeriodDay,
     PeriodWeek,
     PeriodMonth,
@@ -327,6 +388,22 @@ pub enum Key {
     ThTokens,
     ThWindowCost,
     SessionsNotFound,
+    SessionsGroupByProject,
+    SessionsFlatView,
+    SessionsHideSubagents,
+    SessionsShowSubagents,
+    SessionsRecycleBin,
+    SessionsActive,
+    SessionsSearchPlaceholder,
+    SessionsCollapseAll,
+    SessionsExpandAll,
+    SessionsResume,
+    SessionsCopyId,
+    SessionsOpenFolder,
+    SessionsHide,
+    SessionsRestore,
+    SessionsCopied,
+    SessionsUnspecifiedProject,
 
     // 会话详情
     AdaptiveRouted,
@@ -485,7 +562,19 @@ impl Key {
         Key::CompactionFewCalls,
         Key::CompactionFewCuts,
         Key::CompactionNoPrice,
+        Key::CompactionUnpriced,
+        Key::CompactionTradeoff,
         Key::CompactionKeep,
+        Key::CompactionKeepMarginal,
+        Key::CompactKeepTitle,
+        Key::CompactChangeTitle,
+        Key::CompactBaselineInferred,
+        Key::CompactBaselineConfigured,
+        Key::CompactCandidateSaving,
+        Key::CompactSensitivity,
+        Key::CompactEvidence,
+        Key::CompactCandidateComparison,
+        Key::CompactInferredNote,
         Key::CompactionCaveat,
         Key::CompactApply,
         Key::CompactUndo,
@@ -493,11 +582,16 @@ impl Key {
         Key::CompactDefault,
         Key::CompactConfig,
         Key::CompactCurve,
+        Key::CompactCandidate,
         Key::CompactRemote,
         Key::CompactLocked,
         Key::CompactSaved,
         Key::CompactRestored,
         Key::CompactScope,
+        Key::CompactDetails,
+        Key::CompactOptimal,
+        Key::CompactRecommendBadge,
+        Key::CompactImpactTitle,
         Key::PeriodDay,
         Key::PeriodWeek,
         Key::PeriodMonth,
@@ -557,6 +651,22 @@ impl Key {
         Key::ThTokens,
         Key::ThWindowCost,
         Key::SessionsNotFound,
+        Key::SessionsGroupByProject,
+        Key::SessionsFlatView,
+        Key::SessionsHideSubagents,
+        Key::SessionsShowSubagents,
+        Key::SessionsRecycleBin,
+        Key::SessionsActive,
+        Key::SessionsSearchPlaceholder,
+        Key::SessionsCollapseAll,
+        Key::SessionsExpandAll,
+        Key::SessionsResume,
+        Key::SessionsCopyId,
+        Key::SessionsOpenFolder,
+        Key::SessionsHide,
+        Key::SessionsRestore,
+        Key::SessionsCopied,
+        Key::SessionsUnspecifiedProject,
         Key::AdaptiveRouted,
         Key::AdaptiveShort,
         Key::ConfigValue,
@@ -704,12 +814,17 @@ fn zh(key: Key) -> &'static str {
         Key::CompactApplied => "已应用",
         Key::CompactDefault => "Agent 默认 / 继承",
         Key::CompactConfig => "本机配置变更预览",
-        Key::CompactCurve => "阈值 → 模拟费用 · 越低越省 · 绿线为建议值",
+        Key::CompactCurve => "阈值 → 相对基准的费用变化 · 负值更省 · 绿线为保留 / 建议值，灰线为候选",
+        Key::CompactCandidate => "仅供比较的候选",
         Key::CompactRemote => "远程设备：仅展示分析，请在来源设备应用配置。",
         Key::CompactLocked => "环境变量覆盖了压缩设置。请先移除覆盖，再应用建议。",
         Key::CompactSaved => "配置已保存；请开启新的 agent 会话。可撤销恢复原字段。",
         Key::CompactRestored => "已恢复修改前的字段，其他设置保持不变。",
         Key::CompactScope => "仅修改此字段；Claude 写入触发点 + 33K 预留，Codex 对所有模型生效。项目 / profile 配置或终端环境可能覆盖它；请在新会话确认。",
+        Key::CompactDetails => "计算依据与算法参数",
+        Key::CompactOptimal => "无需修改",
+        Key::CompactRecommendBadge => "建议调优",
+        Key::CompactImpactTitle => "压缩频次变动",
         Key::CompactionUnsupported => "目前支持 Claude Code 和 Codex。请在左侧选择对应 agent；Devin 等来源尚未验证压缩语义。",
         Key::CompactionEmpty => "此时间范围内没有可分析的调用。请选择其他时间范围或重新加载本机数据。",
         Key::CompactionSkipped => "跳过 {0} 条缺少上下文标识、模型或有效用量的记录。旧版同步数据需在来源设备升级并重新加载。",
@@ -719,11 +834,23 @@ fn zh(key: Key) -> &'static str {
         Key::CompactionRecommended => "建议触发阈值",
         Key::CompactionSaving => "预计费用节省",
         Key::CompactionCosts => "窗口内模拟费用：{0} → {1}（不是实际账单）",
-        Key::CompactionFewCalls => "样本不足：至少需要 50 次有效调用。",
+        Key::CompactionFewCalls => "样本不足：至少需要 50 次可定价的有效调用。",
         Key::CompactionFewCuts => "压缩样本不足：至少需要 3 次疑似压缩，不猜测默认阈值。",
         Key::CompactionNoPrice => "缺少模型定价，暂不推荐阈值。",
-        Key::CompactionKeep => "保持历史阈值：预计收益不足 3%，或没有安全的更小候选值。",
-        Key::CompactionCaveat => "上下文从至少 20K 降至不足 60% 时视为疑似压缩；返工由后续 10 次调用估算，样本不足时保守按至少 10K 计算。每 10K 搜索，选择距最低成本 1% 内最大的阈值。建议值是完整输入长度，不含输出，并非 Claude 的 autoCompactWindow。未评估摘要质量；订阅配额不等于 API 费用。",
+        Key::CompactionUnpriced => "已排除 {0} 个缺少模型定价的上下文片段，未计入费用估算。",
+        Key::CompactionTradeoff => "按 {0} 压缩约 {1} 次（当前 {2} 次）；{3} 的调用会触及该阈值。",
+        Key::CompactionKeep => "保持现状：预计收益不足以抵偿更频繁压缩丢失的上下文，或没有安全的更小候选值。",
+        Key::CompactionKeepMarginal => "保持现状：更低阈值约可省 {0}%，但要多压缩约 {1} 次，丢失更多上下文。",
+        Key::CompactKeepTitle => "保持现状",
+        Key::CompactChangeTitle => "建议调整压缩阈值",
+        Key::CompactBaselineInferred => "历史估计基准",
+        Key::CompactBaselineConfigured => "当前配置基准",
+        Key::CompactCandidateSaving => "候选节省",
+        Key::CompactSensitivity => "返工成本提高后约省 {0}%；此候选未通过稳健性检查。",
+        Key::CompactEvidence => "费用回放覆盖 {0} 次调用；历史观察到 {1} 次疑似压缩，基准回放模拟 {2} 次。",
+        Key::CompactCandidateComparison => "候选 {0}：模拟费用 {1} → {2}，约省 {3}%（{4}）；压缩 {5} → {6} 次。",
+        Key::CompactInferredNote => "未读取到显式阈值；基准来自历史观察，不代表 Agent 当前默认值。保持现状不会写入这个估计值。",
+        Key::CompactionCaveat => "上下文从至少 20K 降至不足 60% 时视为疑似压缩；返工由后续 10 次调用估算，样本不足时保守按至少 10K 计算。每 10K 搜索，选择距最低成本 1% 内最大的阈值。调低须节省至少 5%，调高须至少 3%，并通过更高返工成本检查。建议值是完整输入长度，不含输出，并非 Claude 的 autoCompactWindow。未评估摘要质量；订阅配额不等于 API 费用。",
         Key::PeriodDay => "日",
         Key::PeriodWeek => "周",
         Key::PeriodMonth => "月",
@@ -783,6 +910,22 @@ fn zh(key: Key) -> &'static str {
         Key::ThTokens => "Tokens",
         Key::ThWindowCost => "窗口费用",
         Key::SessionsNotFound => "未找到 {0} 本地会话数据",
+        Key::SessionsGroupByProject => "按项目分组",
+        Key::SessionsFlatView => "时间平铺",
+        Key::SessionsHideSubagents => "隐藏审查任务",
+        Key::SessionsShowSubagents => "包含审查任务",
+        Key::SessionsRecycleBin => "回收站 ({0})",
+        Key::SessionsActive => "活跃会话",
+        Key::SessionsSearchPlaceholder => "搜索标题、ID、路径、模型...",
+        Key::SessionsCollapseAll => "全部折叠",
+        Key::SessionsExpandAll => "全部展开",
+        Key::SessionsResume => "续读",
+        Key::SessionsCopyId => "复制 ID",
+        Key::SessionsOpenFolder => "打开目录",
+        Key::SessionsHide => "隐藏",
+        Key::SessionsRestore => "恢复",
+        Key::SessionsCopied => "已复制！",
+        Key::SessionsUnspecifiedProject => "未指定项目",
         Key::AdaptiveRouted => "adaptive → {0}（服务端路由）",
         Key::AdaptiveShort => "adaptive → {0}",
         Key::ConfigValue => "{0}（配置值：{1}）",
@@ -932,12 +1075,17 @@ fn en(key: Key) -> &'static str {
         Key::CompactApplied => "Applied",
         Key::CompactDefault => "Agent default / inherited",
         Key::CompactConfig => "Local configuration preview",
-        Key::CompactCurve => "Threshold → simulated cost · lower is cheaper · green marks suggestion",
+        Key::CompactCurve => "Threshold → cost change from baseline · negative is cheaper · green: kept / advised, grey: candidate",
+        Key::CompactCandidate => "comparison candidate",
         Key::CompactRemote => "Remote device: analysis only. Apply on the source device.",
         Key::CompactLocked => "An environment variable overrides compaction. Remove it before applying.",
         Key::CompactSaved => "Configuration saved. Start a new agent session; Undo restores the original field.",
         Key::CompactRestored => "Original field restored; other settings preserved.",
         Key::CompactScope => "Only this field changes. Claude writes trigger + 33K reserve; Codex affects all models. Project/profile config or terminal environment may override it; verify in a new session.",
+        Key::CompactDetails => "Technical details & parameters",
+        Key::CompactOptimal => "Optimal",
+        Key::CompactRecommendBadge => "Recommended",
+        Key::CompactImpactTitle => "Compaction change",
         Key::CompactionUnsupported => "Currently supports Claude Code and Codex. Select either agent in the sidebar; compaction semantics for Devin and other sources are not yet verified.",
         Key::CompactionEmpty => "No analyzable calls in this range. Choose another time range or reload local data.",
         Key::CompactionSkipped => "Skipped {0} records without context identity, model or valid usage. For older sync data, upgrade and reload on the source device.",
@@ -947,11 +1095,23 @@ fn en(key: Key) -> &'static str {
         Key::CompactionRecommended => "Suggested trigger",
         Key::CompactionSaving => "Estimated cost saving",
         Key::CompactionCosts => "Simulated cost over range: {0} → {1} (not an actual bill)",
-        Key::CompactionFewCalls => "Too little data: at least 50 valid calls are required.",
+        Key::CompactionFewCalls => "Too little data: at least 50 priced valid calls are required.",
         Key::CompactionFewCuts => "Too few compactions: at least 3 suspected compactions are required. No default threshold is guessed.",
         Key::CompactionNoPrice => "No model pricing available; no threshold recommendation.",
-        Key::CompactionKeep => "Keep the historical threshold: estimated saving is below 3%, or no safe smaller candidate exists.",
-        Key::CompactionCaveat => "A prompt of at least 20K dropping below 60% is treated as a suspected compaction. Rework is estimated over the next 10 calls, with a conservative 10K minimum when samples are scarce. Search every 10K; choose the largest threshold within 1% of the cheapest. Thresholds mean total input, excluding output, not Claude's autoCompactWindow. Summary quality is not evaluated; subscription quota is not API cost.",
+        Key::CompactionUnpriced => "Excluded {0} context segments without model pricing from the cost estimate.",
+        Key::CompactionTradeoff => "At {0} about {1} compactions (now {2}); {3} of calls would reach that threshold.",
+        Key::CompactionKeep => "Keep the current setting: the saving does not pay for the context a more frequent compaction loses, or there is no safe smaller candidate.",
+        Key::CompactionKeepMarginal => "Keep the current setting: a lower one would save about {0}% but compact about {1} more times, losing more context.",
+        Key::CompactKeepTitle => "Keep current setting",
+        Key::CompactChangeTitle => "Change compaction threshold",
+        Key::CompactBaselineInferred => "Historical baseline (inferred)",
+        Key::CompactBaselineConfigured => "Configured baseline",
+        Key::CompactCandidateSaving => "Candidate saving",
+        Key::CompactSensitivity => "With higher rework cost, saving is about {0}%; this candidate fails the sensitivity check.",
+        Key::CompactEvidence => "Cost replay covers {0} calls; {1} suspected compactions observed, {2} simulated at baseline.",
+        Key::CompactCandidateComparison => "Candidate {0}: simulated cost {1} → {2}, saving {3}% ({4}); compactions {5} → {6}.",
+        Key::CompactInferredNote => "No explicit threshold was read; the baseline is inferred from history, not the current agent default. Keeping the setting does not write this estimate.",
+        Key::CompactionCaveat => "A prompt of at least 20K dropping below 60% is treated as a suspected compaction. Rework is estimated over the next 10 calls, with a conservative 10K minimum when samples are scarce. Search every 10K; choose the largest threshold within 1% of the cheapest. Lowering requires at least 5% saving, raising at least 3%, including a higher-rework sensitivity check. Thresholds mean total input, excluding output, not Claude's autoCompactWindow. Summary quality is not evaluated; subscription quota is not API cost.",
         Key::PeriodDay => "Day",
         Key::PeriodWeek => "Week",
         Key::PeriodMonth => "Month",
@@ -1014,6 +1174,22 @@ fn en(key: Key) -> &'static str {
         Key::ThTokens => "Tokens",
         Key::ThWindowCost => "Cost",
         Key::SessionsNotFound => "No local session data found for {0}",
+        Key::SessionsGroupByProject => "Group by Project",
+        Key::SessionsFlatView => "Flat List",
+        Key::SessionsHideSubagents => "Hide Reviews",
+        Key::SessionsShowSubagents => "Show Reviews",
+        Key::SessionsRecycleBin => "Recycle Bin ({0})",
+        Key::SessionsActive => "Active",
+        Key::SessionsSearchPlaceholder => "Search title, ID, path, model...",
+        Key::SessionsCollapseAll => "Collapse All",
+        Key::SessionsExpandAll => "Expand All",
+        Key::SessionsResume => "Resume",
+        Key::SessionsCopyId => "Copy ID",
+        Key::SessionsOpenFolder => "Open Folder",
+        Key::SessionsHide => "Hide",
+        Key::SessionsRestore => "Restore",
+        Key::SessionsCopied => "Copied!",
+        Key::SessionsUnspecifiedProject => "Unspecified Project",
         Key::AdaptiveRouted => "adaptive → {0} (server-routed)",
         Key::AdaptiveShort => "adaptive → {0}",
         Key::ConfigValue => "{0} (configured: {1})",
@@ -1213,11 +1389,16 @@ mod tests {
     #[test]
     fn config_roundtrip() {
         // 直接测内部序列化格式，避免写用户配置目录
+        let mut hidden = std::collections::HashSet::new();
+        hidden.insert("cli/s1".to_string());
         let config = ConfigFile {
             lang: Lang::En.code().to_string(),
             auto_check_updates: false,
             skipped_update_version: Some("0.2.0".into()),
             last_update_check_at: Some(1_700_000_000),
+            sessions_group_by_project: false,
+            sessions_hide_subagents: false,
+            hidden_session_keys: hidden,
         };
         let text = serde_json::to_string(&config).unwrap();
         let parsed: ConfigFile = serde_json::from_str(&text).unwrap();
@@ -1225,6 +1406,9 @@ mod tests {
         assert!(!parsed.auto_check_updates);
         assert_eq!(parsed.skipped_update_version.as_deref(), Some("0.2.0"));
         assert_eq!(parsed.last_update_check_at, Some(1_700_000_000));
+        assert!(!parsed.sessions_group_by_project);
+        assert!(!parsed.sessions_hide_subagents);
+        assert!(parsed.hidden_session_keys.contains("cli/s1"));
     }
 
     #[test]
@@ -1234,6 +1418,9 @@ mod tests {
         assert!(parsed.auto_check_updates);
         assert!(parsed.skipped_update_version.is_none());
         assert!(parsed.last_update_check_at.is_none());
+        assert!(parsed.sessions_group_by_project);
+        assert!(parsed.sessions_hide_subagents);
+        assert!(parsed.hidden_session_keys.is_empty());
     }
 
     #[test]

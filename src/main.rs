@@ -15,6 +15,7 @@ mod usage_table;
 use agg::{build_buckets_for_device, format_window_range, window_for, Bucket, PeriodKind};
 use chrono::TimeZone;
 use data::{AgentKind, LoadedData};
+use devin_usage_metrics::compaction_config::current_thresholds;
 use devin_usage_metrics::{agg, cli, compaction, data, i18n, pricing, quota, sync};
 use gpui::{
     actions, div, point, prelude::*, px, relative, rgb, size, Animation, AnimationExt as _,
@@ -44,6 +45,8 @@ const C_CACHED: u32 = 0x8b7cf6;
 /// 缓存写入：与缓存读取同色系但更浅，让堆叠图里两者可区分
 const C_CACHE_WRITE: u32 = 0xc4b5fd;
 const C_COST: u32 = 0xfbbf24;
+const RED: u32 = 0xf87171;
+const GREEN: u32 = 0x3ddc97;
 /// 同步采集涵盖 CLI、SQLite 与大量 JSONL 文件。限制外层并行度以重叠 I/O，
 /// 同时让各数据源内部的 Rayon 任务共享同一个池，避免过度抢占磁盘和 CPU。
 const SYNC_COLLECTION_CONCURRENCY: usize = 4;
@@ -133,6 +136,7 @@ struct SessionRow {
     title_short: String,
     model_text: String,
     cost_str: String,
+    cost_val: Option<f64>,
     total: f64,
 }
 
@@ -179,6 +183,7 @@ struct Root {
     compaction_task: Option<Task<()>>,
     compaction_config_task: Option<Task<()>>,
     compaction_notice: Option<(bool, String)>,
+    compaction_details_open: bool,
     selected: Option<String>,
     loaded_at: String,
     loading: bool,
@@ -246,6 +251,12 @@ struct Root {
     /// 应用自动更新
     update: updater_ui::UpdateState,
     update_prefs: i18n::UpdatePrefs,
+    // 会话管理
+    session_search_input: Entity<TextInput>,
+    session_prefs: i18n::SessionPrefs,
+    sessions_collapsed_projects: std::collections::HashSet<String>,
+    sessions_show_hidden: bool,
+    session_feedback: Option<(String, std::time::Instant)>,
 }
 
 fn open_external_url(url: &str) -> Result<(), String> {
@@ -260,7 +271,53 @@ fn open_external_url(url: &str) -> Result<(), String> {
         .map_err(|e| format!("无法打开浏览器: {e}"))
 }
 
+fn open_folder(path: &str) {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
 impl Root {
+    fn set_session_feedback(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.session_feedback = Some((text.into(), Instant::now()));
+        cx.notify();
+    }
+
+    fn copy_to_clipboard(&mut self, text: String, feedback: &'static str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.set_session_feedback(feedback, cx);
+    }
+
+    fn toggle_project_collapsed(&mut self, project: &str, cx: &mut Context<Self>) {
+        if self.sessions_collapsed_projects.contains(project) {
+            self.sessions_collapsed_projects.remove(project);
+        } else {
+            self.sessions_collapsed_projects.insert(project.to_string());
+        }
+        cx.notify();
+    }
+
+    fn hide_session(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.session_prefs
+            .hidden_session_keys
+            .insert(key.to_string());
+        i18n::save_session_prefs(&self.session_prefs);
+        self.set_session_feedback(i18n::t(i18n::Key::SessionsHide), cx);
+    }
+
+    fn restore_session(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.session_prefs.hidden_session_keys.remove(key);
+        i18n::save_session_prefs(&self.session_prefs);
+        self.set_session_feedback(i18n::t(i18n::Key::SessionsRestore), cx);
+    }
+
     fn switch_to_quota(&mut self, cx: &mut Context<Self>) {
         if self.view_mode == ViewMode::LiveQuota {
             cx.notify();
@@ -282,6 +339,9 @@ impl Root {
         }
 
         self.agent = target_agent;
+        if !self.agent.supports_compaction() && self.tab == Tab::Compaction {
+            self.tab = Tab::Usage;
+        }
         self.selected = None;
         self.page = 0;
 
@@ -949,10 +1009,11 @@ impl Root {
                 };
                 SessionRow {
                     time_str: fmt_ts(s.last_activity_at),
-                    id_short: truncate(&s.id, 18),
-                    title_short: truncate(&s.title, 48),
+                    id_short: truncate(&s.id, 16),
+                    title_short: truncate(&s.title, 80),
                     model_text: truncate(&model_text, 30),
                     cost_str,
+                    cost_val: cost_summary.cost,
                     total,
                     session: s.clone(),
                 }
@@ -2099,7 +2160,9 @@ impl Root {
                 .overflow_hidden()
                 .child(tab_btn(Tab::Usage, i18n::t(i18n::Key::Usage)))
                 .child(tab_btn(Tab::Sessions, i18n::t(i18n::Key::Sessions)))
-                .child(tab_btn(Tab::Compaction, i18n::t(i18n::Key::Compaction)))
+                .when(self.agent.supports_compaction(), |d| {
+                    d.child(tab_btn(Tab::Compaction, i18n::t(i18n::Key::Compaction)))
+                })
                 .when(show_period, |d| {
                     d.child(
                         div()
@@ -2786,9 +2849,19 @@ impl Root {
         let agent = self.agent;
         let device = self.device_filter.clone();
         let (start, end) = window_for(self.period, self.page);
-        let work = cx
-            .background_executor()
-            .spawn(async move { compaction::analyze(&data, agent, device.as_deref(), start, end) });
+        // Measure the advice against the thresholds set now, not only against
+        // where compactions happened to land.
+        let models = data
+            .turns
+            .iter()
+            .filter(|t| t.agent == agent)
+            .map(|t| t.model.trim().to_ascii_lowercase())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter();
+        let work = cx.background_executor().spawn(async move {
+            let current = current_thresholds(agent, models);
+            compaction::analyze(&data, agent, device.as_deref(), start, end, &current)
+        });
         self.compaction_task = Some(cx.spawn(async move |this, cx| {
             let report = work.await;
             this.update(cx, |this, cx| {
@@ -2922,244 +2995,1282 @@ impl Root {
                 .border_color(rgb(BORDER))
                 .flex()
                 .flex_col()
-                .gap_2()
+                .gap_3();
+
+            // 头部标题与样本统计
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(TEXT))
+                                    .child(r.model.clone()),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(1.))
+                                    .rounded_sm()
+                                    .bg(rgb(PANEL2))
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(device.to_string()),
+                            ),
+                    )
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(tf(
+                        Key::CompactionSample,
+                        &[
+                            &r.calls.to_string(),
+                            &r.streams.to_string(),
+                            &r.compactions.to_string(),
+                        ],
+                    ))),
+            );
+
+            // 核心结论 Hero 横幅 (结论先行，清晰明确)
+            let keeping = r.status == Status::Keep;
+
+            let (
+                hero_icon,
+                hero_icon_bg,
+                hero_icon_color,
+                hero_title,
+                hero_badge,
+                hero_badge_bg,
+                hero_badge_color,
+                hero_desc,
+            ) = match r.status {
+                Status::Keep => {
+                    let desc = if r.sensitivity_failed {
+                        tf(
+                            Key::CompactSensitivity,
+                            &[&format!("{:.1}", r.cautious_saving * 100.)],
+                        )
+                    } else if r.candidate < r.current {
+                        tf(
+                            Key::CompactionKeepMarginal,
+                            &[
+                                &format!("{:.1}", r.candidate_saving * 100.),
+                                &r.candidate_compactions
+                                    .saturating_sub(r.baseline_compactions)
+                                    .to_string(),
+                            ],
+                        )
+                    } else {
+                        t(Key::CompactionKeep).into()
+                    };
+                    (
+                        "✓",
+                        rgba(C_OUT, 0.12),
+                        C_OUT,
+                        format!(
+                            "{} ({})",
+                            t(Key::CompactKeepTitle),
+                            fmt_tokens(r.current as f64)
+                        ),
+                        t(Key::CompactOptimal),
+                        rgba(C_OUT, 0.15),
+                        C_OUT,
+                        desc,
+                    )
+                }
+                Status::Recommend => (
+                    "⚡",
+                    rgba(ACCENT, 0.12),
+                    ACCENT,
+                    format!(
+                        "{} ({})",
+                        t(Key::CompactChangeTitle),
+                        fmt_tokens(r.recommended as f64)
+                    ),
+                    t(Key::CompactRecommendBadge),
+                    rgba(ACCENT, 0.15),
+                    ACCENT,
+                    format!(
+                        "检测到调优至 {} 预计可节省 {:.1}% 费用，且返工增量在安全范围内。",
+                        fmt_tokens(r.recommended as f64),
+                        r.candidate_saving * 100.,
+                    ),
+                ),
+                Status::NotEnoughCalls => (
+                    "ℹ",
+                    rgba(MUTED, 0.12),
+                    MUTED,
+                    t(Key::CompactionFewCalls).into(),
+                    "样本不足",
+                    rgba(MUTED, 0.15),
+                    MUTED,
+                    t(Key::CompactionFewCalls).into(),
+                ),
+                Status::NotEnoughCompactions => (
+                    "ℹ",
+                    rgba(MUTED, 0.12),
+                    MUTED,
+                    t(Key::CompactionFewCuts).into(),
+                    "样本不足",
+                    rgba(MUTED, 0.15),
+                    MUTED,
+                    t(Key::CompactionFewCuts).into(),
+                ),
+                Status::UnknownPricing => (
+                    "!",
+                    rgba(C_COST, 0.12),
+                    C_COST,
+                    t(Key::CompactionNoPrice).into(),
+                    "缺少定价",
+                    rgba(C_COST, 0.15),
+                    C_COST,
+                    t(Key::CompactionNoPrice).into(),
+                ),
+            };
+
+            let hero_card = div()
+                .p_3()
+                .rounded_md()
+                .bg(rgb(PANEL2))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .flex()
+                .items_start()
+                .gap_3()
                 .child(
                     div()
-                        .text_sm()
+                        .w(px(32.))
+                        .h(px(32.))
+                        .rounded_md()
+                        .bg(hero_icon_bg)
+                        .text_color(rgb(hero_icon_color))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .font_weight(gpui::FontWeight::BOLD)
-                        .whitespace_normal()
-                        .child(format!("{} · {}", r.model, device)),
+                        .child(hero_icon),
                 )
                 .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(MUTED))
-                        .whitespace_normal()
-                        .child(tf(
-                            Key::CompactionSample,
-                            &[
-                                &r.calls.to_string(),
-                                &r.streams.to_string(),
-                                &r.compactions.to_string(),
-                            ],
-                        )),
-                );
-            if matches!(r.status, Status::Recommend | Status::Keep) {
-                let metric = |label, value, color| {
                     div()
                         .flex_1()
                         .min_w(px(0.))
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(div().text_xs().text_color(rgb(MUTED)).child(label))
                         .child(
                             div()
-                                .text_2xl()
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .text_color(rgb(color))
-                                .child(value),
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(rgb(TEXT))
+                                        .child(hero_title),
+                                )
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py(px(1.))
+                                        .rounded_sm()
+                                        .bg(hero_badge_bg)
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(rgb(hero_badge_color))
+                                        .child(hero_badge),
+                                ),
                         )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .whitespace_normal()
+                                .child(hero_desc),
+                        ),
+                );
+
+            card = card.child(hero_card);
+
+            if matches!(r.status, Status::Recommend | Status::Keep) {
+                let baseline_label = if r.baseline_inferred {
+                    Key::CompactBaselineInferred
+                } else {
+                    Key::CompactBaselineConfigured
                 };
-                card = card
-                    .child(
-                        div()
-                            .flex()
-                            .gap_4()
-                            .py_2()
-                            .child(metric(
-                                t(Key::CompactionRecommended),
-                                fmt_tokens(r.recommended as f64),
-                                ACCENT,
-                            ))
-                            .child(metric(
-                                t(Key::CompactionObserved),
-                                fmt_tokens(r.observed as f64),
-                                TEXT,
-                            ))
-                            .child(metric(
-                                t(Key::CompactionSaving),
-                                format!("{:.1}%", r.savings_fraction() * 100.),
-                                C_OUT,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .whitespace_normal()
-                            .child(tf(
-                                Key::CompactionCosts,
-                                &[
-                                    &pricing::fmt_cost(r.baseline_cost),
-                                    &pricing::fmt_cost(r.recommended_cost),
-                                ],
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .whitespace_normal()
-                            .child(tf(
-                                Key::CompactionFacts,
-                                &[
-                                    &fmt_tokens(r.growth as f64),
-                                    &fmt_tokens(r.after as f64),
-                                    &fmt_tokens(r.rework as f64),
-                                ],
-                            )),
-                    );
+                let diff_cuts = r
+                    .candidate_compactions
+                    .saturating_sub(r.baseline_compactions);
+                let stat_matrix = div()
+                    .flex()
+                    .flex_wrap()
+                    .w_full()
+                    .gap_2()
+                    .child(compaction_ui::metric_card(
+                        t(baseline_label),
+                        fmt_tokens(r.current as f64),
+                        Some(pricing::fmt_cost(r.baseline_cost)),
+                        TEXT,
+                    ))
+                    .child(compaction_ui::metric_card(
+                        t(if keeping {
+                            Key::CompactCandidate
+                        } else {
+                            Key::CompactionRecommended
+                        }),
+                        fmt_tokens(if keeping { r.candidate } else { r.recommended } as f64),
+                        Some(pricing::fmt_cost(if keeping {
+                            r.candidate_cost
+                        } else {
+                            r.recommended_cost
+                        })),
+                        if keeping { MUTED } else { ACCENT },
+                    ))
+                    .child(compaction_ui::metric_card(
+                        t(if keeping {
+                            Key::CompactCandidateSaving
+                        } else {
+                            Key::CompactionSaving
+                        }),
+                        format!("{:.1}%", r.candidate_saving * 100.),
+                        Some(format!(
+                            "~{}",
+                            pricing::fmt_cost(r.baseline_cost * r.candidate_saving.max(0.0))
+                        )),
+                        if r.candidate_saving >= 0.03 {
+                            C_OUT
+                        } else {
+                            MUTED
+                        },
+                    ))
+                    .child(compaction_ui::metric_card(
+                        t(Key::CompactImpactTitle),
+                        format!("+{} 次", diff_cuts),
+                        Some(format!(
+                            "{} → {} 次",
+                            r.baseline_compactions, r.candidate_compactions
+                        )),
+                        if diff_cuts > 100 { C_COST } else { MUTED },
+                    ));
+                card = card.child(stat_matrix);
+
+                // 本机配置设置卡片 (精致单行)
+                card = card.child(self.compaction_config_panel(
+                    &r.device_id,
+                    &r.model,
+                    (r.status == Status::Recommend).then_some(r.recommended),
+                    cx,
+                ));
+
+                // 成本曲线
                 if r.curve.len() > 1 {
                     card = card.child(compaction_ui::curve(r));
                 }
-            }
-            let note = match r.status {
-                Status::NotEnoughCalls => Some(Key::CompactionFewCalls),
-                Status::NotEnoughCompactions => Some(Key::CompactionFewCuts),
-                Status::UnknownPricing => Some(Key::CompactionNoPrice),
-                Status::Keep => Some(Key::CompactionKeep),
-                Status::Recommend => None,
-            };
-            if let Some(note) = note {
-                card = card.child(
+
+                // 渐进式披露：折叠面板收纳算法依据与样本明细
+                let details_open = self.compaction_details_open;
+                let mut drawer = div()
+                    .w_full()
+                    .rounded_md()
+                    .bg(rgb(PANEL2))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .flex()
+                    .flex_col();
+
+                drawer = drawer.child(
                     div()
-                        .text_sm()
-                        .text_color(rgb(MUTED))
-                        .whitespace_normal()
-                        .child(t(note)),
+                        .id("compaction-details-toggle")
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .cursor_pointer()
+                        .hover(|h| h.bg(rgb(PANEL)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.compaction_details_open = !this.compaction_details_open;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(if details_open { "▼" } else { "▶" })
+                                .child(format!(
+                                    "{} ({} 次调用样本)",
+                                    t(Key::CompactDetails),
+                                    r.calls
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(if details_open {
+                                    "收起"
+                                } else {
+                                    "展开明细"
+                                }),
+                        ),
                 );
+
+                if details_open {
+                    let mut details_body = div()
+                        .px_3()
+                        .py_3()
+                        .border_t_1()
+                        .border_color(rgb(BORDER))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(rgb(MUTED));
+
+                    let params_grid = div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(100.))
+                                .p_2()
+                                .rounded_sm()
+                                .bg(rgb(BG))
+                                .child(div().text_xs().text_color(rgb(MUTED)).child("单次调用增长"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(rgb(TEXT))
+                                        .child(fmt_tokens(r.growth as f64)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(100.))
+                                .p_2()
+                                .rounded_sm()
+                                .bg(rgb(BG))
+                                .child(div().text_xs().text_color(rgb(MUTED)).child("压缩后保留"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(rgb(TEXT))
+                                        .child(fmt_tokens(r.after as f64)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(100.))
+                                .p_2()
+                                .rounded_sm()
+                                .bg(rgb(BG))
+                                .child(div().text_xs().text_color(rgb(MUTED)).child("平均估计返工"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(rgb(TEXT))
+                                        .child(fmt_tokens(r.rework as f64)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(100.))
+                                .p_2()
+                                .rounded_sm()
+                                .bg(rgb(BG))
+                                .child(div().text_xs().text_color(rgb(MUTED)).child("疑似压缩事件"))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(rgb(TEXT))
+                                        .child(format!("{} 次", r.compactions)),
+                                ),
+                        );
+
+                    details_body = details_body.child(params_grid);
+
+                    details_body = details_body.child(div().whitespace_normal().child(tf(
+                        Key::CompactEvidence,
+                        &[
+                            &r.priced_calls.to_string(),
+                            &r.compactions.to_string(),
+                            &r.baseline_compactions.to_string(),
+                        ],
+                    )));
+
+                    if r.unpriced > 0 {
+                        details_body = details_body.child(
+                            div()
+                                .text_color(rgb(C_COST))
+                                .whitespace_normal()
+                                .child(tf(Key::CompactionUnpriced, &[&r.unpriced.to_string()])),
+                        );
+                    }
+
+                    if r.baseline_inferred {
+                        details_body = details_body
+                            .child(div().whitespace_normal().child(t(Key::CompactInferredNote)));
+                    }
+
+                    details_body = details_body
+                        .child(div().whitespace_normal().child(t(Key::CompactionCaveat)));
+
+                    drawer = drawer.child(details_body);
+                }
+
+                card = card.child(drawer);
+            } else {
+                card = card.child(self.compaction_config_panel(&r.device_id, &r.model, None, cx));
             }
-            card = card.child(self.compaction_config_panel(
-                &r.device_id,
-                &r.model,
-                (r.status == Status::Recommend).then_some(r.recommended),
-                cx,
-            ));
+
             body = body.child(card);
         }
-        body.child(
-            div()
-                .text_xs()
-                .text_color(rgb(MUTED))
-                .whitespace_normal()
-                .child(t(Key::CompactionCaveat)),
-        )
+        body
     }
 
-    fn sessions_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let detail = self
-            .selected
-            .as_ref()
-            .map(|key| self.session_detail(key, cx));
-        let header = div()
+    fn render_session_header(has_modes: bool) -> gpui::Div {
+        let mut header = div()
+            .w_full()
+            .min_w(px(0.))
+            .flex_none()
+            .h(px(26.))
             .flex()
             .gap_2()
             .px_2()
-            .py_1()
+            .items_center()
             .text_xs()
             .text_color(rgb(MUTED))
             .border_b_1()
             .border_color(rgb(BORDER))
-            .child(cell(i18n::t(i18n::Key::ThLastActive), 84.))
-            .child(cell(i18n::t(i18n::Key::ThSession), 130.))
-            .child(div().flex_1().child(i18n::t(i18n::Key::ThTitle)))
-            .child(cell(i18n::t(i18n::Key::ThMode), 70.))
-            .child(cell(i18n::t(i18n::Key::ThModel), 190.))
-            .child(cell_r(i18n::t(i18n::Key::ThMsgs), 48.))
-            .child(cell_r(i18n::t(i18n::Key::ThTokens), 72.))
-            .child(cell_r(i18n::t(i18n::Key::ThWindowCost), 64.));
-        let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        for r in &self.sessions_rows {
-            let s = &r.session;
-            let key = s.key.clone();
-            let is_sel = self.selected.as_deref() == Some(key.as_str());
-            let adaptive = s.selected_model == "adaptive";
-            let mut row = div()
-                .id(SharedString::from(format!("srow-{}", key)))
-                .flex()
-                .gap_2()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .cursor_pointer()
-                .items_center()
-                .hover(|h| h.bg(rgb(PANEL2)))
-                .when(is_sel, |d| d.bg(rgb(PANEL2)))
-                .border_b_1()
-                .border_color(rgba(BORDER, 0.4))
-                .child(cell(&r.time_str, 84.))
-                .child(
-                    div()
-                        .w(px(130.))
-                        .flex()
-                        .gap_1()
-                        .items_center()
-                        .child(
-                            div()
-                                .w(px(6.))
-                                .h(px(6.))
-                                .rounded_full()
-                                .bg(rgb(model_color(&s.display_model()))),
-                        )
-                        .child(r.id_short.clone()),
-                )
-                .child(div().flex_1().child(r.title_short.clone()))
-                .child(cell(&s.agent_mode, 70.))
-                .child(
-                    div()
-                        .w(px(190.))
-                        .text_color(if adaptive { rgb(ACCENT) } else { rgb(TEXT) })
-                        .child(r.model_text.clone()),
-                )
-                .child(cell_r(&format!("{:.0}", s.agent_messages), 48.))
-                .child(cell_r(&fmt_tokens(r.total), 72.))
-                .child(cell_r(&r.cost_str, 64.))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.selected = Some(key.clone());
-                    cx.notify();
-                }));
-            if self.agent == AgentKind::Devin && s.source == "cli-next" {
-                row = row.child(div().text_xs().text_color(rgba(MUTED, 0.7)).child("next"));
-            }
-            rows.push(row.into_any_element());
+            .child(cell(i18n::t(i18n::Key::ThLastActive), 80.))
+            .child(
+                div()
+                    .w(px(110.))
+                    .flex_none()
+                    .min_w(px(0.))
+                    .truncate()
+                    .child(i18n::t(i18n::Key::ThSession)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .truncate()
+                    .child(i18n::t(i18n::Key::ThTitle)),
+            );
+        if has_modes {
+            header = header.child(cell(i18n::t(i18n::Key::ThMode), 60.));
         }
-        let mut body = div()
-            .id("sessions-scroll")
-            .size_full()
+        header
+            .child(cell(i18n::t(i18n::Key::ThModel), 140.))
+            .child(cell_r(i18n::t(i18n::Key::ThMsgs), 42.))
+            .child(cell_r(i18n::t(i18n::Key::ThTokens), 65.))
+            .child(cell_r(i18n::t(i18n::Key::ThWindowCost), 55.))
+            .child(div().w(px(105.)).flex_none())
+    }
+
+    fn render_session_row(
+        &self,
+        r: &SessionRow,
+        is_hidden: bool,
+        has_modes: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let s = &r.session;
+        let key = s.key.clone();
+        let is_sel = self.selected.as_deref() == Some(key.as_str());
+        let adaptive = s.selected_model == "adaptive";
+        let resume_cmd = s.resume_command();
+
+        let mut row = div()
+            .id(SharedString::from(format!("srow-{}", key)))
+            .w_full()
             .min_w(px(0.))
-            .overflow_scroll()
-            .p_4()
+            .flex_none()
+            .h(px(28.))
             .flex()
-            .flex_col()
-            .gap_3();
-        if let Some(d) = detail {
-            body = body.child(d);
+            .gap_2()
+            .px_2()
+            .text_xs()
+            .cursor_pointer()
+            .items_center()
+            .hover(|h| h.bg(rgb(PANEL2)))
+            .when(is_sel, |d| d.bg(rgb(PANEL2)))
+            .border_b_1()
+            .border_color(rgba(BORDER, 0.4))
+            .child(cell(&r.time_str, 80.))
+            .child(
+                div()
+                    .w(px(110.))
+                    .flex_none()
+                    .flex()
+                    .gap_1()
+                    .items_center()
+                    .min_w(px(0.))
+                    .child(
+                        div()
+                            .w(px(6.))
+                            .h(px(6.))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(rgb(model_color(&s.display_model()))),
+                    )
+                    .child(div().min_w(px(0.)).truncate().child(r.id_short.clone()))
+                    .when(
+                        self.agent == AgentKind::Devin && s.source == "cli-next",
+                        |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(rgba(MUTED, 0.7))
+                                    .child("next"),
+                            )
+                        },
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .truncate()
+                    .child(r.title_short.clone()),
+            );
+
+        if has_modes {
+            row = row.child(cell(&s.agent_mode, 60.));
         }
-        let empty = rows.is_empty();
-        body.child(
+
+        let mut row = row
+            .child(
+                div()
+                    .w(px(140.))
+                    .flex_none()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_color(if adaptive { rgb(ACCENT) } else { rgb(TEXT) })
+                    .child(r.model_text.clone()),
+            )
+            .child(cell_r(&format!("{:.0}", s.agent_messages), 42.))
+            .child(cell_r(&fmt_tokens(r.total), 65.))
+            .child(cell_r(&r.cost_str, 55.));
+
+        // 操作按钮列
+        let key_copy = key.clone();
+        let sid = s.id.clone();
+        let key_toggle = key.clone();
+        let mut actions = div()
+            .w(px(105.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap_1();
+
+        // 1. 复制 ID 按钮
+        actions = actions.child(
             div()
-                .w_full()
-                .min_w(px(0.))
-                .p_3()
-                .rounded_md()
+                .id(SharedString::from(format!("btn-copy-id-{}", key)))
+                .px(px(4.))
+                .py(px(1.))
+                .rounded_sm()
                 .bg(rgb(PANEL))
                 .border_1()
                 .border_color(rgb(BORDER))
-                .flex()
-                .flex_col()
-                .child(header)
-                .when(empty, |panel| {
-                    panel.child(
-                        div()
-                            .p_4()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .child(i18n::tf(i18n::Key::SessionsNotFound, &[self.agent.label()])),
-                    )
+                .text_color(rgb(MUTED))
+                .cursor_pointer()
+                .hover(|h| h.text_color(rgb(TEXT)).border_color(rgb(ACCENT)))
+                .child("ID")
+                .on_click(cx.listener({
+                    let sid = sid.clone();
+                    move |this, _, _, cx| {
+                        this.copy_to_clipboard(sid.clone(), i18n::t(i18n::Key::SessionsCopied), cx);
+                        cx.stop_propagation();
+                    }
+                })),
+        );
+
+        // 2. 续读命令
+        if let Some(cmd) = resume_cmd {
+            actions = actions.child(
+                div()
+                    .id(SharedString::from(format!("btn-resume-{}", key)))
+                    .px(px(4.))
+                    .py(px(1.))
+                    .rounded_sm()
+                    .bg(rgb(PANEL))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .text_color(rgb(ACCENT))
+                    .cursor_pointer()
+                    .hover(|h| h.bg(rgba(ACCENT, 0.15)).border_color(rgb(ACCENT)))
+                    .child(i18n::t(i18n::Key::SessionsResume))
+                    .on_click(cx.listener({
+                        let cmd = cmd.clone();
+                        move |this, _, _, cx| {
+                            this.copy_to_clipboard(
+                                cmd.clone(),
+                                i18n::t(i18n::Key::SessionsCopied),
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }
+                    })),
+            );
+        }
+
+        // 3. 移入回收站 / 恢复
+        actions = actions.child(
+            div()
+                .id(SharedString::from(format!("btn-hide-toggle-{}", key)))
+                .px(px(4.))
+                .py(px(1.))
+                .rounded_sm()
+                .bg(rgb(PANEL))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .text_color(if is_hidden { rgb(GREEN) } else { rgb(MUTED) })
+                .cursor_pointer()
+                .hover(|h| {
+                    if is_hidden {
+                        h.text_color(rgb(GREEN)).border_color(rgb(GREEN))
+                    } else {
+                        h.text_color(rgb(RED)).border_color(rgb(RED))
+                    }
                 })
-                .children(rows),
-        )
+                .child(if is_hidden {
+                    i18n::t(i18n::Key::SessionsRestore)
+                } else {
+                    i18n::t(i18n::Key::SessionsHide)
+                })
+                .on_click(cx.listener({
+                    let key_toggle = key_toggle.clone();
+                    move |this, _, _, cx| {
+                        if is_hidden {
+                            this.restore_session(&key_toggle, cx);
+                        } else {
+                            this.hide_session(&key_toggle, cx);
+                        }
+                        cx.stop_propagation();
+                    }
+                })),
+        );
+
+        row = row.child(actions);
+
+        row.on_click(cx.listener(move |this, _, _, cx| {
+            this.selected = Some(key_copy.clone());
+            cx.notify();
+        }))
+        .into_any_element()
+    }
+
+    fn session_search_box(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let input = self.session_search_input.clone();
+        let focused = input.read(cx).is_focused(window);
+        let focus_input = input.clone();
+        let has_text = !input.read(cx).text().is_empty();
+        let clear_input = input.clone();
+
+        div()
+            .w(px(240.))
+            .h(px(28.))
+            .px_2()
+            .rounded_md()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .cursor_text()
+            .when(focused, |d| {
+                d.bg(rgb(PANEL2)).border_1().border_color(rgb(ACCENT))
+            })
+            .when(!focused, |d| {
+                d.bg(rgb(0x101014))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .hover(|h| h.bg(rgb(PANEL2)))
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_, _, window, cx| {
+                    focus_input.read(cx).focus(window);
+                    cx.stop_propagation();
+                }),
+            )
+            .child(div().flex_1().min_w(px(0.)).child(input))
+            .when(has_text, |d| {
+                d.child(
+                    div()
+                        .id("clear-search-query")
+                        .flex_none()
+                        .px_1()
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .hover(|h| h.text_color(rgb(TEXT)))
+                        .child("✕")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            clear_input.update(cx, |input, cx| {
+                                input.set_text("", cx);
+                            });
+                        })),
+                )
+            })
+    }
+
+    fn sessions_view(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let detail = self
+            .selected
+            .as_ref()
+            .map(|key| self.session_detail(key, cx));
+        let has_modes = self
+            .sessions_rows
+            .iter()
+            .any(|r| !r.session.agent_mode.trim().is_empty());
+
+        let search_query = self
+            .session_search_input
+            .read(cx)
+            .text()
+            .trim()
+            .to_lowercase();
+
+        let hidden_subagent_count = self
+            .sessions_rows
+            .iter()
+            .filter(|r| {
+                !self
+                    .session_prefs
+                    .hidden_session_keys
+                    .contains(&r.session.key)
+                    && r.session.is_subagent_or_review()
+            })
+            .count();
+
+        let hidden_total_count = self.session_prefs.hidden_session_keys.len();
+
+        // 过滤会话行
+        let mut filtered_rows: Vec<&SessionRow> = Vec::new();
+        for r in &self.sessions_rows {
+            let s = &r.session;
+            let is_hidden = self.session_prefs.hidden_session_keys.contains(&s.key);
+            if self.sessions_show_hidden != is_hidden {
+                continue;
+            }
+            if !self.sessions_show_hidden
+                && self.session_prefs.hide_subagents
+                && s.is_subagent_or_review()
+            {
+                continue;
+            }
+            if !search_query.is_empty() {
+                let matches = s.title.to_lowercase().contains(&search_query)
+                    || s.id.to_lowercase().contains(&search_query)
+                    || s.working_directory.to_lowercase().contains(&search_query)
+                    || s.display_model().to_lowercase().contains(&search_query);
+                if !matches {
+                    continue;
+                }
+            }
+            filtered_rows.push(r);
+        }
+
+        // 收集项目中所有不重复的项目名
+        let mut all_project_names: Vec<String> = Vec::new();
+        for r in &filtered_rows {
+            let p_name = r.session.project_name();
+            let p_name = if p_name.is_empty() {
+                i18n::t(i18n::Key::SessionsUnspecifiedProject).to_string()
+            } else {
+                p_name
+            };
+            if !all_project_names.contains(&p_name) {
+                all_project_names.push(p_name);
+            }
+        }
+
+        // Toolbar 控制栏
+        let group_by_project = self.session_prefs.group_by_project;
+        let hide_subagents = self.session_prefs.hide_subagents;
+        let show_hidden = self.sessions_show_hidden;
+
+        let toggle_group_btn = div()
+            .id("toggle-session-grouping")
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .text_xs()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap_1()
+            .when(group_by_project, |d| {
+                d.bg(rgb(PANEL2))
+                    .text_color(rgb(ACCENT))
+                    .border_1()
+                    .border_color(rgb(ACCENT))
+            })
+            .when(!group_by_project, |d| {
+                d.bg(rgb(PANEL))
+                    .text_color(rgb(MUTED))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .hover(|h| h.text_color(rgb(TEXT)).bg(rgb(PANEL2)))
+            })
+            .child(if group_by_project {
+                i18n::t(i18n::Key::SessionsGroupByProject).to_string()
+            } else {
+                i18n::t(i18n::Key::SessionsFlatView).to_string()
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.session_prefs.group_by_project = !this.session_prefs.group_by_project;
+                i18n::save_session_prefs(&this.session_prefs);
+                cx.notify();
+            }));
+
+        let collapse_all_btn = if group_by_project && !all_project_names.is_empty() {
+            Some(
+                div()
+                    .id("collapse-all-projects")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .bg(rgb(PANEL))
+                    .text_color(rgb(MUTED))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .hover(|h| h.text_color(rgb(TEXT)).bg(rgb(PANEL2)))
+                    .child(i18n::t(i18n::Key::SessionsCollapseAll))
+                    .on_click(cx.listener({
+                        let all_projects = all_project_names.clone();
+                        move |this, _, _, cx| {
+                            for p in &all_projects {
+                                this.sessions_collapsed_projects.insert(p.clone());
+                            }
+                            cx.notify();
+                        }
+                    })),
+            )
+        } else {
+            None
+        };
+
+        let expand_all_btn = if group_by_project && !all_project_names.is_empty() {
+            Some(
+                div()
+                    .id("expand-all-projects")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .bg(rgb(PANEL))
+                    .text_color(rgb(MUTED))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .hover(|h| h.text_color(rgb(TEXT)).bg(rgb(PANEL2)))
+                    .child(i18n::t(i18n::Key::SessionsExpandAll))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sessions_collapsed_projects.clear();
+                        cx.notify();
+                    })),
+            )
+        } else {
+            None
+        };
+
+        let toggle_subagents_btn = div()
+            .id("toggle-hide-subagents")
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .text_xs()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap_1()
+            .when(hide_subagents, |d| {
+                d.bg(rgb(PANEL2))
+                    .text_color(rgb(ACCENT))
+                    .border_1()
+                    .border_color(rgb(ACCENT))
+            })
+            .when(!hide_subagents, |d| {
+                d.bg(rgb(PANEL))
+                    .text_color(rgb(MUTED))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .hover(|h| h.text_color(rgb(TEXT)).bg(rgb(PANEL2)))
+            })
+            .child(if hide_subagents && hidden_subagent_count > 0 {
+                format!(
+                    "{} ({})",
+                    i18n::t(i18n::Key::SessionsHideSubagents),
+                    hidden_subagent_count
+                )
+            } else if hide_subagents {
+                i18n::t(i18n::Key::SessionsHideSubagents).to_string()
+            } else {
+                i18n::t(i18n::Key::SessionsShowSubagents).to_string()
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.session_prefs.hide_subagents = !this.session_prefs.hide_subagents;
+                i18n::save_session_prefs(&this.session_prefs);
+                cx.notify();
+            }));
+
+        let toggle_recycle_btn = div()
+            .id("toggle-recycle-bin")
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .text_xs()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap_1()
+            .when(show_hidden, |d| {
+                d.bg(rgba(RED, 0.15))
+                    .text_color(rgb(RED))
+                    .border_1()
+                    .border_color(rgba(RED, 0.4))
+            })
+            .when(!show_hidden, |d| {
+                d.bg(rgb(PANEL))
+                    .text_color(rgb(MUTED))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .hover(|h| h.text_color(rgb(TEXT)).bg(rgb(PANEL2)))
+            })
+            .child(if show_hidden {
+                i18n::t(i18n::Key::SessionsActive).to_string()
+            } else {
+                i18n::tf(
+                    i18n::Key::SessionsRecycleBin,
+                    &[&hidden_total_count.to_string()],
+                )
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.sessions_show_hidden = !this.sessions_show_hidden;
+                cx.notify();
+            }));
+
+        let feedback_el = if let Some((ref text, at)) = self.session_feedback {
+            if at.elapsed().as_secs() < 3 {
+                Some(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgba(GREEN, 0.15))
+                        .text_color(rgb(GREEN))
+                        .border_1()
+                        .border_color(rgba(GREEN, 0.3))
+                        .text_xs()
+                        .child(format!("✓ {}", text)),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut toolbar = div()
+            .w_full()
+            .min_w(px(0.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(self.session_search_box(window, cx))
+            .child(toggle_group_btn);
+
+        if let Some(btn) = collapse_all_btn {
+            toolbar = toolbar.child(btn);
+        }
+        if let Some(btn) = expand_all_btn {
+            toolbar = toolbar.child(btn);
+        }
+
+        toolbar = toolbar
+            .child(toggle_subagents_btn)
+            .child(toggle_recycle_btn);
+
+        if let Some(fb) = feedback_el {
+            toolbar = toolbar.child(fb);
+        }
+
+        let mut body = div()
+            .id("sessions-scroll")
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(toolbar);
+
+        if let Some(d) = detail {
+            body = body.child(d);
+        }
+
+        if filtered_rows.is_empty() {
+            let msg = if show_hidden {
+                i18n::t(i18n::Key::SessionsRecycleBin).to_string()
+            } else if !search_query.is_empty() {
+                format!("没有找到与 \"{}\" 匹配的会话", search_query)
+            } else {
+                i18n::tf(i18n::Key::SessionsNotFound, &[self.agent.label()])
+            };
+            return body.child(
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .flex_none()
+                    .p_8()
+                    .rounded_md()
+                    .bg(rgb(PANEL))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child(msg),
+            );
+        }
+
+        if group_by_project {
+            struct Group<'a> {
+                name: String,
+                working_dir: String,
+                rows: Vec<&'a SessionRow>,
+                total_tokens: f64,
+                total_cost: Option<f64>,
+            }
+            let mut groups: Vec<Group> = Vec::new();
+            for r in filtered_rows {
+                let p_name = r.session.project_name();
+                let p_name = if p_name.is_empty() {
+                    i18n::t(i18n::Key::SessionsUnspecifiedProject).to_string()
+                } else {
+                    p_name
+                };
+                if let Some(g) = groups.iter_mut().find(|g| g.name == p_name) {
+                    g.rows.push(r);
+                    g.total_tokens += r.total;
+                    if let Some(c) = r.cost_val {
+                        *g.total_cost.get_or_insert(0.0) += c;
+                    }
+                    if g.working_dir.is_empty() && !r.session.working_directory.is_empty() {
+                        g.working_dir = r.session.working_directory.clone();
+                    }
+                } else {
+                    groups.push(Group {
+                        name: p_name,
+                        working_dir: r.session.working_directory.clone(),
+                        rows: vec![r],
+                        total_tokens: r.total,
+                        total_cost: r.cost_val,
+                    });
+                }
+            }
+
+            for group in groups {
+                let is_collapsed = self.sessions_collapsed_projects.contains(&group.name);
+                let p_name_clone = group.name.clone();
+                let working_dir_clone = group.working_dir.clone();
+                let arrow = if is_collapsed { "▸" } else { "▾" };
+
+                let mut card = div()
+                    .id(SharedString::from(format!("project-card-{}", group.name)))
+                    .w_full()
+                    .min_w(px(0.))
+                    .flex_none()
+                    .rounded_md()
+                    .bg(rgb(PANEL))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .flex()
+                    .flex_col();
+
+                let mut card_header = div()
+                    .id(SharedString::from(format!("project-header-{}", group.name)))
+                    .w_full()
+                    .min_w(px(0.))
+                    .flex_none()
+                    .h(px(36.))
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(PANEL2))
+                    .border_b_1()
+                    .border_color(if is_collapsed {
+                        rgba(0, 0.0)
+                    } else {
+                        rgba(BORDER, 1.0)
+                    })
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .hover(|h| h.bg(rgb(0x2a2a35)))
+                    .on_click(cx.listener({
+                        let p_name = p_name_clone.clone();
+                        move |this, _, _, cx| {
+                            this.toggle_project_collapsed(&p_name, cx);
+                        }
+                    }))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(arrow))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(TEXT))
+                            .child(group.name.clone()),
+                    );
+
+                if !group.working_dir.is_empty() {
+                    card_header = card_header.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .truncate()
+                            .max_w(px(320.))
+                            .child(group.working_dir.clone()),
+                    );
+                }
+
+                card_header = card_header
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .px_2()
+                            .py(px(1.))
+                            .rounded_sm()
+                            .bg(rgb(PANEL))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format!("{} 会话", group.rows.len())),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py(px(1.))
+                            .rounded_sm()
+                            .bg(rgb(PANEL))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format!("{} Tokens", fmt_tokens(group.total_tokens))),
+                    );
+
+                if let Some(cost) = group.total_cost {
+                    card_header = card_header.child(
+                        div()
+                            .px_2()
+                            .py(px(1.))
+                            .rounded_sm()
+                            .bg(rgb(PANEL))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_xs()
+                            .text_color(rgb(ACCENT))
+                            .child(pricing::fmt_cost(cost)),
+                    );
+                }
+
+                if !working_dir_clone.is_empty() {
+                    card_header = card_header.child(
+                        div()
+                            .id(SharedString::from(format!("open-dir-{}", group.name)))
+                            .px_2()
+                            .py(px(1.))
+                            .rounded_sm()
+                            .bg(rgb(PANEL))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .cursor_pointer()
+                            .hover(|h| h.text_color(rgb(TEXT)).border_color(rgb(ACCENT)))
+                            .child(i18n::t(i18n::Key::SessionsOpenFolder))
+                            .on_click(cx.listener({
+                                let wdir = working_dir_clone.clone();
+                                move |_, _, _, cx| {
+                                    open_folder(&wdir);
+                                    cx.stop_propagation();
+                                }
+                            })),
+                    );
+                }
+
+                card = card.child(card_header);
+
+                if !is_collapsed {
+                    let mut rows_elements: Vec<gpui::AnyElement> = Vec::new();
+                    for r in group.rows {
+                        rows_elements.push(self.render_session_row(r, show_hidden, has_modes, cx));
+                    }
+                    card = card
+                        .child(Self::render_session_header(has_modes))
+                        .children(rows_elements);
+                }
+
+                body = body.child(card);
+            }
+        } else {
+            // 平铺视图
+            let mut rows_elements: Vec<gpui::AnyElement> = Vec::new();
+            for r in filtered_rows {
+                rows_elements.push(self.render_session_row(r, show_hidden, has_modes, cx));
+            }
+            body = body.child(
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .flex_none()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(PANEL))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .flex()
+                    .flex_col()
+                    .child(Self::render_session_header(has_modes))
+                    .children(rows_elements),
+            );
+        }
+
+        body
     }
 
     fn session_detail(&self, key: &str, cx: &mut Context<Self>) -> gpui::Div {
@@ -3179,7 +4290,6 @@ impl Root {
             .collect();
         ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let ttft_med = ttfts.get(ttfts.len() / 2).copied().unwrap_or(0.0);
-        // 会话详情与列表用同一套口径，避免同一会话在两个视图里显示不同用量。
         let token_total = session_token_total(s, &turns);
         let meta_total =
             s.input_tokens + s.output_tokens + s.cached_tokens + s.cache_creation_tokens;
@@ -3220,7 +4330,133 @@ impl Root {
                 .child(div().flex_1().text_color(rgb(TEXT)).child(v))
         };
 
+        let is_hidden = self.session_prefs.hidden_session_keys.contains(key);
+        let resume_cmd = s.resume_command();
+        let s_id = s.id.clone();
+        let s_key = key.to_string();
+        let workdir = s.working_directory.clone();
+
+        let mut actions_bar = div()
+            .mt_2()
+            .pt_2()
+            .border_t_1()
+            .border_color(rgba(BORDER, 0.4))
+            .flex()
+            .items_center()
+            .gap_2();
+
+        // 复制 ID 按钮
+        actions_bar = actions_bar.child(
+            div()
+                .id(SharedString::from(format!("detail-copy-id-{}", s_key)))
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(PANEL2))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .text_xs()
+                .cursor_pointer()
+                .hover(|h| h.bg(rgb(0x2a2a35)).border_color(rgb(ACCENT)))
+                .child(i18n::t(i18n::Key::SessionsCopyId))
+                .on_click(cx.listener({
+                    let s_id = s_id.clone();
+                    move |this, _, _, cx| {
+                        this.copy_to_clipboard(
+                            s_id.clone(),
+                            i18n::t(i18n::Key::SessionsCopied),
+                            cx,
+                        );
+                    }
+                })),
+        );
+
+        // 续读命令
+        if let Some(cmd) = resume_cmd {
+            actions_bar = actions_bar.child(
+                div()
+                    .id(SharedString::from(format!("detail-resume-{}", s_key)))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(PANEL2))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .text_xs()
+                    .cursor_pointer()
+                    .hover(|h| h.bg(rgb(0x2a2a35)).border_color(rgb(ACCENT)))
+                    .child(i18n::t(i18n::Key::SessionsResume))
+                    .on_click(cx.listener({
+                        let cmd = cmd.clone();
+                        move |this, _, _, cx| {
+                            this.copy_to_clipboard(
+                                cmd.clone(),
+                                i18n::t(i18n::Key::SessionsCopied),
+                                cx,
+                            );
+                        }
+                    })),
+            );
+        }
+
+        // 打开目录
+        if !workdir.is_empty() {
+            actions_bar = actions_bar.child(
+                div()
+                    .id(SharedString::from(format!("detail-open-dir-{}", s_key)))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(PANEL2))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .text_xs()
+                    .cursor_pointer()
+                    .hover(|h| h.bg(rgb(0x2a2a35)).border_color(rgb(ACCENT)))
+                    .child(i18n::t(i18n::Key::SessionsOpenFolder))
+                    .on_click(cx.listener({
+                        let workdir = workdir.clone();
+                        move |_, _, _, _| {
+                            open_folder(&workdir);
+                        }
+                    })),
+            );
+        }
+
+        // 移入回收站 / 恢复
+        actions_bar = actions_bar.child(
+            div()
+                .id(SharedString::from(format!("detail-toggle-hide-{}", s_key)))
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(PANEL2))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .text_xs()
+                .cursor_pointer()
+                .hover(|h| h.bg(rgb(0x2a2a35)).border_color(rgb(ACCENT)))
+                .child(if is_hidden {
+                    i18n::t(i18n::Key::SessionsRestore)
+                } else {
+                    i18n::t(i18n::Key::SessionsHide)
+                })
+                .on_click(cx.listener({
+                    let s_key = s_key.clone();
+                    move |this, _, _, cx| {
+                        if is_hidden {
+                            this.restore_session(&s_key, cx);
+                        } else {
+                            this.hide_session(&s_key, cx);
+                        }
+                    }
+                })),
+        );
+
         div()
+            .w_full()
+            .min_w(px(0.))
+            .flex_none()
             .p_3()
             .rounded_md()
             .bg(rgb(PANEL))
@@ -3328,6 +4564,7 @@ impl Root {
                     )
                 },
             ))
+            .child(actions_bar)
     }
 
     /// 订阅用量视图：每个账号一张卡片，展示各配额窗口的用量进度条与重置倒计时。
@@ -3744,11 +4981,22 @@ fn legend(name: &'static str, color: u32) -> impl IntoElement {
 }
 
 fn cell(text: &str, w: f32) -> gpui::Div {
-    div().w(px(w)).child(text.to_string())
+    div()
+        .w(px(w))
+        .flex_none()
+        .min_w(px(0.))
+        .truncate()
+        .child(text.to_string())
 }
 
 fn cell_r(text: &str, w: f32) -> gpui::Div {
-    div().w(px(w)).text_right().child(text.to_string())
+    div()
+        .w(px(w))
+        .flex_none()
+        .text_right()
+        .min_w(px(0.))
+        .truncate()
+        .child(text.to_string())
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -3789,7 +5037,10 @@ impl Render for Root {
         if self.loading && !self.has_loaded {
             return self.loading_view().into_any_element();
         }
-        if self.view_mode == ViewMode::AgentHistory && self.tab == Tab::Compaction {
+        if self.view_mode == ViewMode::AgentHistory
+            && self.tab == Tab::Compaction
+            && self.agent.supports_compaction()
+        {
             self.update_compaction(cx);
         }
 
@@ -3797,8 +5048,11 @@ impl Render for Root {
             ViewMode::LiveQuota => self.quota_view(cx).into_any_element(),
             ViewMode::AgentHistory => match self.tab {
                 Tab::Usage => self.usage_view(cx).into_any_element(),
-                Tab::Sessions => self.sessions_view(cx).into_any_element(),
-                Tab::Compaction => self.compaction_view(cx).into_any_element(),
+                Tab::Sessions => self.sessions_view(window, cx).into_any_element(),
+                Tab::Compaction if self.agent.supports_compaction() => {
+                    self.compaction_view(cx).into_any_element()
+                }
+                Tab::Compaction => self.usage_view(cx).into_any_element(),
             },
         };
         let errors: Vec<String> = self
@@ -3943,6 +5197,7 @@ fn main() {
                         compaction_task: None,
                         compaction_config_task: None,
                         compaction_notice: None,
+                        compaction_details_open: false,
                         selected: None,
                         loaded_at: i18n::t(i18n::Key::Loading).into(),
                         loading: false,
@@ -3987,11 +5242,28 @@ fn main() {
                         sync_task: None,
                         update: updater_ui::UpdateState::default(),
                         update_prefs: i18n::load_update_prefs(),
+                        session_search_input: cx.new(|cx| {
+                            TextInput::new(
+                                cx,
+                                "",
+                                i18n::t(i18n::Key::SessionsSearchPlaceholder),
+                                false,
+                            )
+                        }),
+                        session_prefs: i18n::load_session_prefs(),
+                        sessions_collapsed_projects: std::collections::HashSet::new(),
+                        sessions_show_hidden: false,
+                        session_feedback: None,
                     };
                     root.rebuild_buckets();
                     root.rebuild_sessions();
                     root.start_load(false, cx);
                     root.start_update_scheduler(cx);
+                    let search_input = root.session_search_input.clone();
+                    cx.observe(&search_input, |_, _, cx| {
+                        cx.notify();
+                    })
+                    .detach();
                     root
                 })
             },

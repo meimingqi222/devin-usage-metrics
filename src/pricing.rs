@@ -57,6 +57,11 @@ pub struct Pricing {
     /// 人类可读的模型标签（仅 Devin 表有）
     #[serde(default)]
     pub l: Option<String>,
+    /// 模型的上下文窗口（token），来自 models.dev 的 `limit.context`。
+    /// 压缩建议用它做上界：一个全局设置对池内所有模型生效，不能超过
+    /// 窗口最小的那个，否则建议出模型装不下的阈值。
+    #[serde(default)]
+    pub ctx: Option<u64>,
 }
 
 impl Pricing {
@@ -139,6 +144,7 @@ fn gpt_5_6_long_context_pricing(model: &str) -> Option<Pricing> {
         cr: rates.2,
         cw: rates.3,
         l: None,
+        ctx: None,
     })
 }
 
@@ -209,6 +215,12 @@ impl PricingTable {
     pub fn find(&self, model: &str) -> Option<Pricing> {
         let normalized = model.trim().to_ascii_lowercase();
         self.find_normalized(&normalized)
+    }
+
+    /// 模型的上下文窗口（token）。压缩建议用它做上界，避免建议出模型
+    /// 装不下的阈值。Devin 表不带窗口信息，返回 None。
+    pub fn context_window(&self, model: &str) -> Option<u64> {
+        self.find(model).and_then(|p| p.ctx)
     }
 
     /// Devin Self-serve/Pro prices; missing entries never use enterprise prices.
@@ -487,6 +499,7 @@ fn extract_devin_pro_pricing(text: &str) -> Result<HashMap<String, Pricing>, Str
             cw: row.cache_write_cost_per_million_usd,
             cr: row.cache_read_cost_per_million_usd,
             l: Some(row.label),
+            ctx: None,
         };
         if row.model_uid.trim().is_empty()
             || [price.i, price.o, price.cw, price.cr]
@@ -608,6 +621,11 @@ pub fn extract_models_dev_pricing(value: &serde_json::Value) -> HashMap<String, 
                 cw: num("cache_write"),
                 cr: num("cache_read"),
                 l: None,
+                ctx: model
+                    .get("limit")
+                    .and_then(|l| l.get("context"))
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|n| *n > 0),
             };
             // 全零条目多为按 plan 计价的占位（如 token-plan），跳过以免污染。
             if p.i == 0.0 && p.o == 0.0 && p.cw == 0.0 && p.cr == 0.0 {
@@ -990,6 +1008,7 @@ mod tests {
             cr: 0.1,
             cw: 0.0,
             l: None,
+            ctx: None,
         };
         // 1M input ($1) + 2M output ($10) + 10M cached ($1) = $12
         let cost = p.cost(1_000_000.0, 2_000_000.0, 10_000_000.0);
@@ -1004,6 +1023,7 @@ mod tests {
             cr: 0.5,
             cw: 6.25,
             l: None,
+            ctx: None,
         };
         // claude-opus-5: 530 input + 216178 output + 32217103 cache_read + 662052 cache_creation(1h)
         // ccusage 算法：1h cache 按 input×2=10 计费
