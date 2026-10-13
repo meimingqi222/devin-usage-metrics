@@ -1,5 +1,4 @@
 use crate::data::{AgentKind, LoadedData};
-use crate::pricing::PricingTable;
 use chrono::{Datelike, Local, TimeDelta, TimeZone};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -169,22 +168,23 @@ pub fn build_buckets_for_device(
 
 /// 使用与图表聚合完全相同的口径计算单轮费用。
 pub fn cost_for_turn(turn: &crate::data::TurnRec, model: &str) -> Option<f64> {
-    if let Some(cost) = turn.recorded_cost {
+    if let Some(cost) = turn
+        .recorded_cost
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+    {
         return Some(cost);
     }
-    let pricing = PricingTable::instance();
     if turn.agent == AgentKind::Claude
         && (turn.cache_creation_5m_tokens > 0.0 || turn.cache_creation_1h_tokens > 0.0)
     {
-        return pricing.find(model).map(|p| {
-            p.cost_claude_cache(
-                turn.input_tokens,
-                turn.output_tokens,
-                turn.cache_read_tokens,
-                turn.cache_creation_5m_tokens,
-                turn.cache_creation_1h_tokens,
-            )
-        });
+        return crate::pricing::turn_cost_claude(
+            model,
+            turn.input_tokens,
+            turn.output_tokens,
+            turn.cache_read_tokens,
+            turn.cache_creation_5m_tokens,
+            turn.cache_creation_1h_tokens,
+        );
     }
     if turn.agent == AgentKind::Devin {
         crate::pricing::devin_pro_turn_cost(
@@ -670,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn long_context_tier_is_devin_only() {
+    fn api_and_devin_apply_their_own_long_context_tiers() {
         let make_turn = |agent| crate::data::TurnRec {
             agent,
             model: "gpt-5-6-sol-high".into(),
@@ -680,7 +680,7 @@ mod tests {
         let devin = cost_for_turn(&make_turn(AgentKind::Devin), "gpt-5-6-sol-high").unwrap();
         let codex = cost_for_turn(&make_turn(AgentKind::Codex), "gpt-5-6-sol-high").unwrap();
         assert!((devin - 2.4).abs() < 1e-12);
-        assert!((codex - 1.2).abs() < 1e-12);
+        assert!((codex - 2.4).abs() < 1e-12);
     }
 
     #[test]

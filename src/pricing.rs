@@ -6,9 +6,8 @@
 //! - `devin-model-pricing.json` — Devin 官方发布的模型价格表
 //!   (https://docs.devinenterprise.com/desktop/models)，`model_uid` 与
 //!   sessions.db 中的 `model` 字段完全一致，覆盖所有思考等级变体。
-//! - `models-dev-pricing.json` — 从 models.dev 提取的非 Devin 模型价格子集，
-//!   覆盖 Claude / GPT / Gemini 等家族的裸 model id，供 Amp、Claude Code、
-//!   Codex、Antigravity 使用。
+//! - `models-dev-pricing.json` — models.dev 的供应商完整报价与可确认的裸模型别名，
+//!   保留来源、完整模型 ID、缓存单价缺失标记与上下文阶梯。
 //!
 //! `models-dev` 部分会自动更新（对标 OpenCode 的 models-dev.ts）：
 //! 启动时先加载内嵌快照，再用本地缓存覆盖；缓存缺失或超过 24h 时从
@@ -24,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const DEVIN_PRICING_JSON: &str = include_str!("devin-model-pricing.json");
 const DEVIN_PRO_PRICING_JSON: &str = include_str!("devin-pro-pricing.json");
@@ -42,7 +41,7 @@ const MODELS_DEV_CACHE_TTL_SECS: u64 = 24 * 3600;
 const MODELS_DEV_RETRY_BACKOFF_SECS: u64 = 3600;
 
 /// 单个模型的定价信息，所有字段均为"美元 / 百万 token"。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Pricing {
     /// 输入 token 单价
     pub i: f64,
@@ -62,9 +61,56 @@ pub struct Pricing {
     /// 窗口最小的那个，否则建议出模型装不下的阈值。
     #[serde(default)]
     pub ctx: Option<u64>,
+    /// The actual catalog provider, retained even for a bare default alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tiers: Vec<ContextTier>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missing_cache_read: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missing_cache_write: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ContextTier {
+    pub above: u64,
+    pub i: f64,
+    pub o: f64,
+    pub cw: f64,
+    pub cr: f64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missing_cache_read: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missing_cache_write: bool,
 }
 
 impl Pricing {
+    /// Thresholds are per request, including cache reads and writes, never daily totals.
+    pub fn for_prompt(&self, prompt: f64) -> Self {
+        let mut price = self.clone();
+        if let Some(tier) = self
+            .tiers
+            .iter()
+            .filter(|t| prompt > t.above as f64)
+            .max_by_key(|t| t.above)
+        {
+            price.i = tier.i;
+            price.o = tier.o;
+            price.cw = tier.cw;
+            price.cr = tier.cr;
+            price.missing_cache_read = tier.missing_cache_read;
+            price.missing_cache_write = tier.missing_cache_write;
+        }
+        price
+    }
+
+    pub fn supports_cache_usage(&self, read: f64, write: f64) -> bool {
+        (read <= 0.0 || !self.missing_cache_read) && (write <= 0.0 || !self.missing_cache_write)
+    }
+
     /// 根据各类 token 数量计算美元费用。
     /// - `input` 是不含 cache_creation 的纯输入 token
     /// - `cached` 对应缓存读取（cache_read）
@@ -74,9 +120,8 @@ impl Pricing {
     /// 不区分 5m/1h（Devin/Amp/Codex 均无此区分），这里统一用 `cw` 费率。
     /// Claude 的 1h vs 5m 差异在 `cost_with_cache_breakdown` 中处理。
     pub fn cost(&self, input: f64, output: f64, cached: f64) -> f64 {
-        (input / 1_000_000.0) * self.i
-            + (output / 1_000_000.0) * self.o
-            + (cached / 1_000_000.0) * self.cr
+        let p = self.for_prompt(input + cached);
+        (input * p.i + output * p.o + cached * p.cr) / 1_000_000.0
     }
 
     /// 带缓存写入的完整费用计算。
@@ -88,7 +133,8 @@ impl Pricing {
         cached: f64,
         cache_creation: f64,
     ) -> f64 {
-        self.cost(input, output, cached) + (cache_creation / 1_000_000.0) * self.cw
+        let p = self.for_prompt(input + cached + cache_creation);
+        (input * p.i + output * p.o + cached * p.cr + cache_creation * p.cw) / 1_000_000.0
     }
 
     /// Claude 专用：区分 5m 和 1h cache creation 的费用计算。
@@ -102,11 +148,12 @@ impl Pricing {
         cc_5m: f64,
         cc_1h: f64,
     ) -> f64 {
-        let cw_1h = self.i * 2.0; // 1h cache = input × 2
-        (input / 1_000_000.0) * self.i
-            + (output / 1_000_000.0) * self.o
-            + (cached / 1_000_000.0) * self.cr
-            + (cc_5m / 1_000_000.0) * self.cw
+        let p = self.for_prompt(input + cached + cc_5m + cc_1h);
+        let cw_1h = p.i * 2.0; // 1h cache = input × 2
+        (input / 1_000_000.0) * p.i
+            + (output / 1_000_000.0) * p.o
+            + (cached / 1_000_000.0) * p.cr
+            + (cc_5m / 1_000_000.0) * p.cw
             + (cc_1h / 1_000_000.0) * cw_1h
     }
 }
@@ -145,6 +192,7 @@ fn gpt_5_6_long_context_pricing(model: &str) -> Option<Pricing> {
         cw: rates.3,
         l: None,
         ctx: None,
+        ..Default::default()
     })
 }
 
@@ -190,7 +238,7 @@ impl PricingTable {
             if !models_fetch_disabled() {
                 if let Some(path) = models_dev_cache_path() {
                     if let Some(cached) = load_cached_models_dev(&path) {
-                        models_dev.extend(cached);
+                        models_dev = cached;
                     }
                 }
             }
@@ -204,17 +252,18 @@ impl PricingTable {
     }
 
     /// 按模型名查找定价，返回 owned 副本（内部用锁支持后台热更新）。
-    /// 查找顺序：
-    /// 1. Devin 表精确匹配（model_uid 完全一致）
-    /// 2. models.dev 表精确匹配
-    /// 3. Devin label 精确匹配（如 "GPT-5.6 Luna XHigh Thinking"）
-    /// 4. 去掉 provider 前缀后重试（如 "accounts/fireworks/models/kimi-k2p5" → "kimi-k2p5"）
-    /// 5. 去掉日期后缀后重试（如 "claude-haiku-4-5-20251001" → "claude-haiku-4-5"）
-    /// 6. models.dev 表前缀匹配（如 "gpt-5.1-max" → "gpt-5.1"）
-    /// 7. 反向前缀匹配
+    /// Legacy table inspection, including Devin enterprise model UIDs and labels.
+    /// Usage billing must choose `find_api` or `find_devin_pro` explicitly.
     pub fn find(&self, model: &str) -> Option<Pricing> {
         let normalized = model.trim().to_ascii_lowercase();
         self.find_normalized(&normalized)
+    }
+
+    /// API-equivalent prices must never fall back to the Devin enterprise table.
+    pub fn find_api(&self, model: &str) -> Option<Pricing> {
+        let model = model.trim().to_ascii_lowercase();
+        let prices = self.models_dev.read().ok()?;
+        lookup_api_price(&prices, &model)
     }
 
     /// 模型的上下文窗口（token）。压缩建议用它做上界，避免建议出模型
@@ -238,15 +287,11 @@ impl PricingTable {
             .values()
             .filter_map(|price| {
                 let label = price.l.as_ref()?.to_ascii_lowercase();
-                (model == label || model.starts_with(&format!("{label} ")))
+                (model == label || model.strip_prefix(&label).is_some_and(is_effort_suffix))
                     .then_some((label.len(), price))
             })
             .max_by_key(|(len, _)| *len)
             .map(|(_, price)| price.clone())
-    }
-
-    fn models_dev_exact(&self, key: &str) -> Option<Pricing> {
-        self.models_dev.read().ok()?.get(key).cloned()
     }
 
     fn find_normalized(&self, model: &str) -> Option<Pricing> {
@@ -259,8 +304,7 @@ impl PricingTable {
             return Some(p.clone());
         }
 
-        // 2. models.dev 表精确匹配
-        if let Some(p) = self.models_dev_exact(model) {
+        if let Some(p) = self.find_api(model) {
             return Some(p);
         }
 
@@ -269,57 +313,14 @@ impl PricingTable {
             return Some(p.clone());
         }
 
-        // 4. 去掉 provider 前缀后重试
-        let stripped_prefix = strip_provider_prefix(model);
-        if stripped_prefix != model {
-            if let Some(p) = self.find_normalized(stripped_prefix) {
-                return Some(p);
-            }
-            // 同时尝试 Fireworks p→. 归一化
-            let normalized = normalize_fireworks_p(stripped_prefix);
-            if normalized != stripped_prefix {
-                if let Some(p) = self.find_normalized(&normalized) {
-                    return Some(p);
-                }
-            }
-        }
-
-        // 4b. 尝试 Fireworks p→. 归一化（即使没有 provider 前缀）
-        let normalized = normalize_fireworks_p(model);
-        if normalized != model {
-            if let Some(p) = self.find_normalized(&normalized) {
-                return Some(p);
-            }
-        }
-
         // 5. 去掉日期后缀后重试
         let stripped_date = strip_date_suffix(model);
         if stripped_date != model {
             if let Some(p) = self.devin.get(stripped_date) {
                 return Some(p.clone());
             }
-            if let Some(p) = self.models_dev_exact(stripped_date) {
-                return Some(p);
-            }
             if let Some(p) = self.devin_labels.get(stripped_date) {
                 return Some(p.clone());
-            }
-        }
-
-        // Flash 没有已确认的独立价格，不能通过前缀静默套用 glm-5.3。
-        if stripped_date == "glm-5.3-flash" {
-            return None;
-        }
-
-        // 6. models.dev 表前缀匹配 — 找最长的键作为前缀
-        if let Ok(guard) = self.models_dev.read() {
-            if let Some(p) = guard
-                .iter()
-                .filter(|(key, _)| model.starts_with(key.as_str()))
-                .max_by_key(|(key, _)| key.len())
-                .map(|(_, v)| v.clone())
-            {
-                return Some(p);
             }
         }
 
@@ -327,21 +328,102 @@ impl PricingTable {
         if let Some((_, p)) = self
             .devin_labels
             .iter()
-            .filter(|(label, _)| model.starts_with(label.as_str()))
+            .filter(|(label, _)| {
+                model
+                    .strip_prefix(label.as_str())
+                    .is_some_and(is_effort_suffix)
+            })
             .max_by_key(|(label, _)| label.len())
         {
             return Some(p.clone());
         }
 
-        // 7. 反向前缀匹配 — 键以模型名开头
-        self.models_dev.read().ok().and_then(|guard| {
-            guard
-                .iter()
-                .filter(|(key, _)| key.starts_with(stripped_date))
-                .max_by_key(|(key, _)| key.len())
-                .map(|(_, v)| v.clone())
-        })
+        None
     }
+}
+
+fn is_effort_suffix(suffix: &str) -> bool {
+    matches!(
+        suffix,
+        "-low"
+            | "-medium"
+            | "-high"
+            | "-xhigh"
+            | "-max"
+            | "-thinking"
+            | "-think"
+            | " low"
+            | " medium"
+            | " high"
+            | " xhigh"
+            | " max"
+            | " low thinking"
+            | " medium thinking"
+            | " high thinking"
+            | " xhigh thinking"
+            | " max thinking"
+    ) || suffix
+        .strip_prefix("-thinking:")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn normalize_provider_model(model: &str) -> String {
+    // Fireworks log names use an API resource path rather than a provider/model id.
+    if let Some(id) = model.strip_prefix("accounts/fireworks/models/") {
+        return format!("fireworks-ai/{}", normalize_fireworks_p(id));
+    }
+    if let Some(id) = model.strip_prefix("fireworks/") {
+        return format!("fireworks-ai/{}", normalize_fireworks_p(id));
+    }
+    if let Some(id) = model.strip_prefix("fireworks-ai/") {
+        return format!("fireworks-ai/{}", normalize_fireworks_p(id));
+    }
+    let (prefix, id) = model
+        .rsplit_once('/')
+        .map(|(prefix, id)| (format!("{prefix}/"), id))
+        .unwrap_or_else(|| (String::new(), model));
+    if let Some(id) = id.strip_prefix("gk-") {
+        return format!("{prefix}grok-{id}");
+    }
+    if let Some(version) = id.strip_prefix("gpt-") {
+        let mut parts = version.splitn(3, '-');
+        let major = parts.next().unwrap_or("");
+        let minor = parts.next().unwrap_or("");
+        if !major.is_empty()
+            && !minor.is_empty()
+            && major.bytes().all(|b| b.is_ascii_digit())
+            && minor.bytes().all(|b| b.is_ascii_digit())
+        {
+            let suffix = parts.next().map(|s| format!("-{s}")).unwrap_or_default();
+            return format!("{prefix}gpt-{major}.{minor}{suffix}");
+        }
+    }
+    model.to_owned()
+}
+
+fn lookup_api_price(prices: &HashMap<String, Pricing>, model: &str) -> Option<Pricing> {
+    if let Some(price) = prices.get(model) {
+        return Some(price.clone());
+    }
+    let model = normalize_provider_model(model);
+    if let Some(price) = prices.get(&model) {
+        return Some(price.clone());
+    }
+    let dated = strip_date_suffix(&model);
+    if let Some(price) = prices.get(dated) {
+        return Some(price.clone());
+    }
+    prices
+        .iter()
+        .filter(|(key, _)| {
+            dated.strip_prefix(key.as_str()).is_some_and(|suffix| {
+                let base = strip_provider_prefix(key);
+                (base.starts_with("gpt-") || base.starts_with("claude-"))
+                    && is_effort_suffix(suffix)
+            })
+        })
+        .max_by_key(|(key, _)| key.len())
+        .map(|(_, price)| price.clone())
 }
 
 fn parse_pricing_json(json: &str) -> HashMap<String, Pricing> {
@@ -500,6 +582,7 @@ fn extract_devin_pro_pricing(text: &str) -> Result<HashMap<String, Pricing>, Str
             cr: row.cache_read_cost_per_million_usd,
             l: Some(row.label),
             ctx: None,
+            ..Default::default()
         };
         if row.model_uid.trim().is_empty()
             || [price.i, price.o, price.cw, price.cr]
@@ -593,65 +676,231 @@ fn mark_fetch_failed(marker: &std::path::Path) {
     std::fs::write(marker, now.to_string()).ok();
 }
 
-/// 把 models.dev/api.json（provider → models → cost 嵌套结构）拍平成
-/// `{model_id: Pricing}`。`provider/model` 形式的 id 会额外登记去前缀别名，
-/// 与 `find()` 的去 provider 前缀逻辑配合。
-/// 阶梯价（`tiers` / `context_over_200k`）暂按平价处理，与旧快照口径一致。
+struct CatalogQuote {
+    provider: String,
+    model: String,
+    owner: Option<String>,
+    price: Pricing,
+}
+
+/// Preserve billing providers. Bare aliases require an origin quote or agreement
+/// between all candidates; conflicting reseller quotes never overwrite an origin.
 pub fn extract_models_dev_pricing(value: &serde_json::Value) -> HashMap<String, Pricing> {
     let mut out = HashMap::new();
+    let mut aliases: std::collections::BTreeMap<String, Vec<CatalogQuote>> =
+        std::collections::BTreeMap::new();
     let Some(providers) = value.as_object() else {
         return out;
     };
-    for provider in providers.values() {
+    for (provider_id, provider) in providers {
         let Some(models) = provider.get("models").and_then(|m| m.as_object()) else {
             continue;
         };
         for (id, model) in models {
-            let Some(cost) = model.get("cost") else {
+            let Some(mut p) = parse_api_price(model) else {
                 continue;
             };
-            let num = |k: &str| {
-                cost.get(k)
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(0.0)
-            };
-            let p = Pricing {
-                i: num("input"),
-                o: num("output"),
-                cw: num("cache_write"),
-                cr: num("cache_read"),
-                l: None,
-                ctx: model
-                    .get("limit")
-                    .and_then(|l| l.get("context"))
-                    .and_then(serde_json::Value::as_u64)
-                    .filter(|n| *n > 0),
-            };
-            // 全零条目多为按 plan 计价的占位（如 token-plan），跳过以免污染。
-            if p.i == 0.0 && p.o == 0.0 && p.cw == 0.0 && p.cr == 0.0 {
-                continue;
-            }
+            let provider_id = provider_id.to_ascii_lowercase();
+            p.source = Some(provider_id.clone());
             let key = id.to_ascii_lowercase();
-            if let Some(suffix) = key.rsplit('/').next() {
-                if !suffix.is_empty() && suffix != key.as_str() {
-                    // 别名不覆盖裸 id（裸 id 的 provider 定价更可信）。
-                    out.entry(suffix.to_owned()).or_insert_with(|| p.clone());
-                }
+            p.source_model = Some(key.clone());
+            out.insert(format!("{provider_id}/{key}"), p.clone());
+            if provider_id == "fireworks-ai" && key.starts_with("accounts/fireworks/models/") {
+                out.insert(normalize_provider_model(&key), p.clone());
             }
-            out.insert(key, p);
+            let owner = model
+                .get("canonical_model_id")
+                .and_then(|v| v.as_str())
+                .and_then(|id| id.split_once('/'))
+                .map(|(owner, _)| owner.to_ascii_lowercase());
+            let alias = strip_provider_prefix(&key);
+            if !alias.is_empty() {
+                aliases
+                    .entry(alias.to_owned())
+                    .or_default()
+                    .push(CatalogQuote {
+                        provider: provider_id,
+                        model: key,
+                        owner,
+                        price: p,
+                    });
+            }
+        }
+    }
+    for (alias, mut candidates) in aliases {
+        if out.contains_key(&alias) {
+            continue;
+        }
+        candidates.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
+        let origin = origin_provider(strip_provider_prefix(&alias));
+        let mut authoritative: Vec<_> = candidates
+            .iter()
+            .filter(|quote| Some(quote.provider.as_str()) == origin)
+            .collect();
+        if authoritative.is_empty() {
+            authoritative = candidates
+                .iter()
+                .filter(|quote| {
+                    candidates
+                        .iter()
+                        .any(|candidate| candidate.owner.as_ref() == Some(&quote.provider))
+                })
+                .collect();
+        }
+        let has_origin = !authoritative.is_empty();
+        let choices: Vec<_> = if has_origin {
+            authoritative
+        } else {
+            candidates.iter().collect()
+        };
+        let first = &choices[0].price;
+        if choices.iter().all(|quote| same_rates(first, &quote.price))
+            && (first.i != 0.0
+                || first.o != 0.0
+                || first.cw != 0.0
+                || first.cr != 0.0
+                || has_origin)
+        {
+            out.insert(alias, first.clone());
         }
     }
     out
 }
 
-/// 读取本地价格缓存，兼容两种形态：自动更新存的原始 api.json（嵌套），
-/// 以及拍平后的快照格式。不可用时返回 None（调用方退回内嵌快照）。
+/// Defaults for families whose origin provider is absent from canonical metadata,
+/// or has distinct global/regional APIs. This is identity policy, never a rate table.
+fn origin_provider(model: &str) -> Option<&'static str> {
+    let prefixes: &[(&str, &[&str])] = &[
+        ("anthropic", &["claude-"]),
+        (
+            "openai",
+            &["gpt-", "chatgpt-", "o1", "o3", "o4", "text-embedding-"],
+        ),
+        ("google", &["gemini-", "gemma-"]),
+        ("xai", &["grok-", "gk-"]),
+        ("deepseek", &["deepseek-"]),
+        ("moonshotai", &["kimi-", "moonshot-"]),
+        ("minimax", &["minimax-"]),
+        ("zai", &["glm-"]),
+        ("alibaba", &["qwen"]),
+        (
+            "mistral",
+            &[
+                "mistral-",
+                "open-mistral-",
+                "magistral-",
+                "codestral-",
+                "devstral-",
+                "ministral-",
+                "pixtral-",
+            ],
+        ),
+        ("cohere", &["command-", "embed-"]),
+        ("xiaomi", &["mimo-"]),
+    ];
+    prefixes
+        .iter()
+        .find(|(_, prefixes)| prefixes.iter().any(|p| model.starts_with(p)))
+        .map(|(provider, _)| *provider)
+}
+
+fn same_rates(a: &Pricing, b: &Pricing) -> bool {
+    (
+        a.i,
+        a.o,
+        a.cr,
+        a.cw,
+        a.missing_cache_read,
+        a.missing_cache_write,
+    ) == (
+        b.i,
+        b.o,
+        b.cr,
+        b.cw,
+        b.missing_cache_read,
+        b.missing_cache_write,
+    ) && a.tiers == b.tiers
+}
+
+fn parse_api_price(model: &serde_json::Value) -> Option<Pricing> {
+    let cost = model.get("cost")?.as_object()?;
+    let rate = |key: &str| {
+        cost.get(key)
+            .and_then(|v| v.as_f64())
+            .filter(|n| n.is_finite() && *n >= 0.0)
+    };
+    let optional_rate = |key: &str| {
+        if cost.contains_key(key) {
+            rate(key)
+        } else {
+            Some(0.0)
+        }
+    };
+    let mut p = Pricing {
+        i: rate("input")?,
+        o: rate("output")?,
+        cw: optional_rate("cache_write")?,
+        cr: optional_rate("cache_read")?,
+        ctx: model
+            .pointer("/limit/context")
+            .and_then(|v| v.as_u64())
+            .filter(|n| *n > 0),
+        missing_cache_read: !cost.contains_key("cache_read"),
+        missing_cache_write: !cost.contains_key("cache_write"),
+        ..Default::default()
+    };
+    if let Some(tiers) = cost.get("tiers") {
+        for tier in tiers.as_array()? {
+            if tier.pointer("/tier/type")?.as_str()? != "context" {
+                return None;
+            }
+            let above = tier.pointer("/tier/size")?.as_u64()?;
+            if above == 0 {
+                return None;
+            }
+            let tier_rate = |key: &str, base| match tier.get(key) {
+                None => Some(base),
+                Some(v) => v.as_f64().filter(|n| n.is_finite() && *n >= 0.0),
+            };
+            p.tiers.push(ContextTier {
+                above,
+                i: tier_rate("input", p.i)?,
+                o: tier_rate("output", p.o)?,
+                cw: tier_rate("cache_write", p.cw)?,
+                cr: tier_rate("cache_read", p.cr)?,
+                missing_cache_read: p.missing_cache_read && tier.get("cache_read").is_none(),
+                missing_cache_write: p.missing_cache_write && tier.get("cache_write").is_none(),
+            });
+        }
+        p.tiers.sort_by_key(|t| t.above);
+        if p.tiers.windows(2).any(|w| w[0].above == w[1].above) {
+            return None;
+        }
+    } else if cost.contains_key("context_over_200k") {
+        // The legacy name is also used for 272K models; without an explicit
+        // threshold it cannot safely tell us when to apply the higher rate.
+        return None;
+    }
+    Some(p)
+}
+
+/// Legacy flattened caches discarded provider identity and cannot be trusted.
+/// Raw catalogs and flattened snapshots with complete provenance remain supported.
 fn load_cached_models_dev(path: &std::path::Path) -> Option<HashMap<String, Pricing>> {
     let text = std::fs::read_to_string(path).ok()?;
     // 先试拍平快照；嵌套结构按 Pricing 解析必然失败（字段缺失），再走提取。
     let flat = try_parse_flat_pricing(&text);
     if !flat.is_empty() {
-        return Some(flat);
+        return flat
+            .values()
+            .all(|p| {
+                p.source.as_deref().is_some_and(|s| !s.is_empty())
+                    && p.source_model.as_deref().is_some_and(|s| !s.is_empty())
+                    && [p.i, p.o, p.cr, p.cw]
+                        .iter()
+                        .all(|r| r.is_finite() && *r >= 0.0)
+            })
+            .then_some(flat);
     }
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let extracted = extract_models_dev_pricing(&value);
@@ -724,7 +973,7 @@ pub fn refresh_models_dev(force: bool) -> bool {
     let Some(path) = models_dev_cache_path() else {
         return false;
     };
-    if !force && cache_is_fresh(&path) {
+    if !force && cache_is_fresh(&path) && load_cached_models_dev(&path).is_some() {
         return false;
     }
     let marker = retry_marker_path(&path);
@@ -759,7 +1008,7 @@ pub fn refresh_models_dev(force: bool) -> bool {
     std::fs::remove_file(&marker).ok();
     let count = fetched.len();
     if let Ok(mut guard) = PricingTable::instance().models_dev.write() {
-        guard.extend(fetched);
+        *guard = fetched;
     }
     eprintln!("INFO 价格表已更新（{count} 个模型）");
     true
@@ -788,7 +1037,11 @@ pub fn turn_cost(
     cache_creation: f64,
 ) -> Option<f64> {
     PricingTable::instance()
-        .find(model)
+        .find_api(model)
+        .filter(|p| {
+            p.for_prompt(input + cached + cache_creation)
+                .supports_cache_usage(cached, cache_creation)
+        })
         .map(|p| p.cost_with_cache_write(input, output, cached, cache_creation))
 }
 
@@ -855,7 +1108,11 @@ pub fn turn_cost_claude(
     cc_1h: f64,
 ) -> Option<f64> {
     PricingTable::instance()
-        .find(model)
+        .find_api(model)
+        .filter(|p| {
+            p.for_prompt(input + cached + cc_5m + cc_1h)
+                .supports_cache_usage(cached, cc_5m)
+        })
         .map(|p| p.cost_claude_cache(input, output, cached, cc_5m, cc_1h))
 }
 
@@ -1009,6 +1266,7 @@ mod tests {
             cw: 0.0,
             l: None,
             ctx: None,
+            ..Default::default()
         };
         // 1M input ($1) + 2M output ($10) + 10M cached ($1) = $12
         let cost = p.cost(1_000_000.0, 2_000_000.0, 10_000_000.0);
@@ -1024,6 +1282,7 @@ mod tests {
             cw: 6.25,
             l: None,
             ctx: None,
+            ..Default::default()
         };
         // claude-opus-5: 530 input + 216178 output + 32217103 cache_read + 662052 cache_creation(1h)
         // ccusage 算法：1h cache 按 input×2=10 计费
@@ -1079,12 +1338,14 @@ mod tests {
     }
 
     #[test]
-    fn lookup_is_case_insensitive_but_glm_flash_does_not_fall_back() {
+    fn lookup_is_case_insensitive_and_flash_requires_its_own_quote() {
         let table = PricingTable::instance();
         assert!(table.find("CLAUDE-OPUS-5").is_some());
         assert!(table.find("GLM-5.2 High").is_some());
-        assert!(table.find("GLM-5.3-Flash").is_none());
-        assert!(table.find("glm-5.3-flash").is_none());
+        // This catalog now contains a real Flash quote; it must use that exact quote.
+        let flash = table.find_api("GLM-5.3-Flash").unwrap();
+        assert_eq!(flash.source.as_deref(), Some("zai"));
+        assert!(table.find_api("glm-5.3-unknown-flash").is_none());
     }
 
     #[test]
@@ -1137,13 +1398,17 @@ mod tests {
     }
 
     #[test]
-    fn provider_prefix_is_stripped() {
+    fn fireworks_resource_names_keep_the_billing_provider() {
         let table = PricingTable::instance();
         // Amp 使用带 provider 前缀的模型名，且 Fireworks 用 p 代替点号
         let p = table
-            .find("accounts/fireworks/models/kimi-k2p5")
-            .expect("应通过去 provider 前缀 + p→. 归一化匹配 kimi-k2.5");
-        assert_eq!(p.i, 0.6);
+            .find_api("accounts/fireworks/models/kimi-k3")
+            .expect("Fireworks resource names must retain the provider");
+        assert_eq!(p.source.as_deref(), Some("fireworks-ai"));
+        assert_eq!(
+            normalize_provider_model("accounts/fireworks/models/kimi-k2p5"),
+            "fireworks-ai/kimi-k2.5"
+        );
     }
 
     #[test]
@@ -1152,10 +1417,11 @@ mod tests {
         assert!(table.find("deepseek-v4-flash").is_some());
         assert!(table.find("deepseek-v4-pro").is_some());
         assert!(table.find("glm-5.2").is_some());
-        assert!(table.find("kimi-k2.7").is_some());
+        // A shortened version id is not evidence for the price of a longer id.
+        assert!(table.find_api("kimi-k2.7").is_none());
         assert!(table.find("kimi-k3").is_some());
         assert!(table.find("grok-4.6").is_some());
-        assert!(table.find("gk-4.6").is_some());
+        assert!(table.find_api("gk-4.6").is_some());
     }
 
     #[test]
@@ -1166,6 +1432,183 @@ mod tests {
             "kimi-k2p5"
         );
         assert_eq!(strip_provider_prefix("gpt-5.1"), "gpt-5.1");
+    }
+
+    #[test]
+    fn exact_provider_ids_win_before_normalization_and_max_is_not_universal() {
+        let prices = extract_models_dev_pricing(&serde_json::json!({"proxy": {"models": {
+            "gpt-5-1": {"cost": {"input": 9, "output": 90}},
+            "gpt-5.1": {"cost": {"input": 2, "output": 20}},
+            "qwen3": {"cost": {"input": 1, "output": 10}}
+        }}}));
+        assert_eq!(lookup_api_price(&prices, "proxy/gpt-5-1").unwrap().i, 9.0);
+        assert_eq!(lookup_api_price(&prices, "proxy/gpt-5.1").unwrap().i, 2.0);
+        assert!(lookup_api_price(&prices, "proxy/qwen3-max").is_none());
+        let snapshot = parse_pricing_json(MODELS_DEV_PRICING_JSON);
+        for (id, quote) in snapshot.iter().filter(|(id, _)| id.contains('/')) {
+            let resolved = lookup_api_price(&snapshot, id).unwrap();
+            assert!(same_rates(quote, &resolved), "wrong rates for {id}");
+            assert_eq!(quote.source, resolved.source, "wrong channel for {id}");
+            assert_eq!(
+                quote.source_model, resolved.source_model,
+                "wrong deployment for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_tiers_use_full_prompt_and_keep_unspecified_rates() {
+        let p = parse_api_price(&serde_json::json!({"cost": {
+            "input": 2, "output": 10, "cache_read": 0.1, "cache_write": 2.5,
+            "tiers": [
+                {"tier": {"type": "context", "size": 100}, "input": 4, "output": 15},
+                {"tier": {"type": "context", "size": 200}, "input": 8, "output": 30, "cache_read": 0.2, "cache_write": 10}
+            ], "context_over_200k": {"input": 999}
+        }})).unwrap();
+        assert_eq!(p.for_prompt(100.0).i, 2.0);
+        assert_eq!(p.for_prompt(101.0).i, 4.0);
+        assert_eq!(p.for_prompt(200.0).i, 4.0);
+        assert_eq!(p.for_prompt(201.0).i, 8.0);
+        assert!(
+            (p.cost_with_cache_write(1.0, 2.0, 90.0, 10.0) - (4.0 + 30.0 + 9.0 + 25.0) / 1e6).abs()
+                < 1e-12
+        );
+        assert!(
+            (p.cost_claude_cache(1.0, 2.0, 90.0, 5.0, 5.0)
+                - (4.0 + 30.0 + 9.0 + 12.5 + 40.0) / 1e6)
+                .abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn malformed_or_unspecified_rates_are_not_assumed_free() {
+        for cost in [
+            serde_json::json!({"input": -1, "output": 2}),
+            serde_json::json!({"input": 1}),
+            serde_json::json!({"input": 1, "output": 2, "cache_read": "bad"}),
+            serde_json::json!({"input": 1, "output": 2, "context_over_200k": {"input": 3}}),
+            serde_json::json!({"input": 1, "output": 2, "tiers": [{"tier": {"type": "unknown", "size": 1}}]}),
+        ] {
+            assert!(parse_api_price(&serde_json::json!({"cost": cost})).is_none());
+        }
+        let p = parse_api_price(&serde_json::json!({"cost": {"input": 1, "output": 2}})).unwrap();
+        assert!(p.supports_cache_usage(0.0, 0.0));
+        assert!(!p.supports_cache_usage(1.0, 0.0));
+        assert!(!p.supports_cache_usage(0.0, 1.0));
+        let zero = parse_api_price(&serde_json::json!({"cost": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}})).unwrap();
+        assert!(zero.supports_cache_usage(1.0, 1.0));
+        assert_eq!(zero.cost_with_cache_write(1.0, 1.0, 1.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn api_lookup_preserves_channels_and_never_uses_devin_or_unknown_variants() {
+        let table = PricingTable::instance();
+        assert_eq!(
+            table.find_api("anthropic/claude-sonnet-5-5").unwrap().cr,
+            0.1
+        );
+        assert_eq!(table.find_api("vivgrid/claude-sonnet-5-5").unwrap().cr, 0.2);
+        for model in [
+            "unknown-provider/claude-sonnet-5-5",
+            "adaptive",
+            "swe-1-7-high",
+            "claude-opus",
+            "gpt-5.1-fast",
+            "gpt-5.1-free",
+        ] {
+            assert!(
+                table.find_api(model).is_none(),
+                "wrong price inferred for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_ids_distinguish_deployments_within_one_provider() {
+        let prices = extract_models_dev_pricing(&serde_json::json!({"reseller": {"models": {
+            "vendor/novel-1": {"cost": {"input": 1, "output": 2}},
+            "TEE/novel-1": {"cost": {"input": 3, "output": 6}}
+        }}}));
+        assert_eq!(prices["reseller/vendor/novel-1"].i, 1.0);
+        assert_eq!(prices["reseller/tee/novel-1"].i, 3.0);
+        assert!(!prices.contains_key("novel-1"));
+        assert!(!prices.contains_key("vendor/novel-1"));
+        assert!(!prices.contains_key("tee/novel-1"));
+    }
+
+    #[test]
+    fn canonical_identity_finds_an_origin_without_using_a_reseller_quote() {
+        let prices = extract_models_dev_pricing(&serde_json::json!({
+            "lab": {"models": {"novel-1": {"cost": {"input": 1, "output": 2}}}},
+            "reseller": {"models": {"novel-1": {"canonical_model_id": "lab/novel-1", "cost": {"input": 9, "output": 18}}}}
+        }));
+        assert_eq!(prices["novel-1"].source.as_deref(), Some("lab"));
+        assert_eq!(prices["reseller/novel-1"].i, 9.0);
+    }
+
+    #[test]
+    fn catalog_keeps_provider_prices_and_rejects_ambiguous_defaults() {
+        let v = serde_json::json!({
+            "openai": {"models": {"gpt-test": {"cost": {"input": 2, "output": 10}}}},
+            "google": {"models": {"gemini-test": {"cost": {"input": 1, "output": 5}}}},
+            "reseller": {"models": {
+                "gpt-test": {"cost": {"input": 9, "output": 90}},
+                "google/gemini-test": {"cost": {"input": 7, "output": 70}},
+                "mystery": {"cost": {"input": 2, "output": 4}},
+                "free-model": {"cost": {"input": 0, "output": 0}}
+            }},
+            "other": {"models": {"mystery": {"cost": {"input": 3, "output": 6}}}}
+        });
+        let prices = extract_models_dev_pricing(&v);
+        assert_eq!(prices["gpt-test"].i, 2.0);
+        assert_eq!(prices["reseller/gpt-test"].i, 9.0);
+        assert_eq!(prices["reseller/google/gemini-test"].i, 7.0);
+        assert_eq!(prices["google/gemini-test"].i, 1.0);
+        assert!(!prices.contains_key("mystery"));
+        assert_eq!(prices["reseller/free-model"].i, 0.0);
+    }
+
+    #[test]
+    fn unknown_model_variants_do_not_inherit_a_different_price() {
+        let table = PricingTable::instance();
+        for model in [
+            "claude-opus",
+            "gpt-5.1-fast",
+            "gpt-5.1-new-version",
+            "gpt-5.1-free",
+        ] {
+            assert!(
+                table.find(model).is_none(),
+                "unexpected fallback for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_prices_win_over_resellers_for_claude() {
+        let v = serde_json::json!({
+            "anthropic": {"models": {
+                "claude-sonnet-5-5": {"cost": {"input": 2, "output": 10, "cache_read": 0.1, "cache_write": 2.5}},
+                "claude-opus-5-5": {"cost": {"input": 4, "output": 20, "cache_read": 0.2, "cache_write": 5}}
+            }},
+            "vivgrid": {"models": {
+                "claude-sonnet-5-5": {"cost": {"input": 2, "output": 10, "cache_read": 0.2, "cache_write": 2.5}}
+            }},
+            "venice": {"models": {
+                "claude-opus-5-5": {"cost": {"input": 4.8, "output": 24, "cache_read": 0.24, "cache_write": 6}}
+            }}
+        });
+        let prices = extract_models_dev_pricing(&v);
+        let sonnet = &prices["claude-sonnet-5-5"];
+        assert_eq!(
+            (sonnet.i, sonnet.o, sonnet.cr, sonnet.cw),
+            (2.0, 10.0, 0.1, 2.5)
+        );
+        let opus = &prices["claude-opus-5-5"];
+        assert_eq!((opus.i, opus.o, opus.cr, opus.cw), (4.0, 20.0, 0.2, 5.0));
+        // The reported excess is exactly Sonnet's 45,338,785 cache reads at +$0.10/M.
+        assert!((sonnet.cost(0.0, 0.0, 45_338_785.0) - 4.5338785).abs() < 1e-9);
     }
 
     #[test]
@@ -1210,11 +1653,16 @@ mod tests {
         let flat = dir.join("flat.json");
         std::fs::write(
             &flat,
-            r#"{"gemini-3.8-flash":{"i":0.75,"o":3.75,"cw":0.08,"cr":0.07}}"#,
+            r#"{"gemini-3.8-flash":{"i":0.75,"o":3.75,"cw":0.08,"cr":0.07,"source":"google","source_model":"gemini-3.8-flash"}}"#,
         )
         .unwrap();
         let m = load_cached_models_dev(&flat).expect("拍平缓存应可加载");
         assert_eq!(m.get("gemini-3.8-flash").map(|p| p.o), Some(3.75));
+        std::fs::write(&flat, r#"{"gemini-3.8-flash":{"i":0.8,"o":4}}"#).unwrap();
+        assert!(
+            load_cached_models_dev(&flat).is_none(),
+            "legacy reseller prices must not override the corrected snapshot"
+        );
         // 缺失/损坏的缓存不影响启动（退回内嵌快照）
         assert!(load_cached_models_dev(&dir.join("missing.json")).is_none());
         assert!(!cache_is_fresh(&dir.join("missing.json")));

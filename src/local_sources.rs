@@ -1018,7 +1018,7 @@ fn parse_claude_file(
                     .or(value.request_id.as_deref())
                     .unwrap_or("");
                 // cache_creation: 优先用 5m/1h 拆分，否则用合并值（旧格式归入 5m）
-                let (cc_5m, cc_1h) = if let Some(cc) = usage.cache_creation.as_ref() {
+                let (mut cc_5m, cc_1h) = if let Some(cc) = usage.cache_creation.as_ref() {
                     (
                         cc.ephemeral_5m.unwrap_or(0.0),
                         cc.ephemeral_1h.unwrap_or(0.0),
@@ -1027,6 +1027,9 @@ fn parse_claude_file(
                     // 旧格式没有 cache_creation 拆分，cache_creation_input_tokens 归入 5m
                     (usage.cache_creation_input_tokens.unwrap_or(0.0), 0.0)
                 };
+                // A present but empty/partial breakdown must not erase the total.
+                let total_writes = usage.cache_creation_input_tokens.unwrap_or(cc_5m + cc_1h);
+                cc_5m += (total_writes - cc_5m - cc_1h).max(0.0);
                 let cache_creation = cc_5m + cc_1h;
                 // input 不再包含 cache_creation，保持与 ccusage 一致
                 let input = usage.input_tokens.unwrap_or(0.0);
@@ -2617,8 +2620,6 @@ pub(crate) fn load_zcode(start: i64, end: i64) -> LoadedData {
 /// 已迁移进 opencode.db，opencode2 又把 session/message 迁到了 session_v2/
 /// session_message 表。读这一个库即可覆盖两个版本的用量（优先 v2 表）。
 pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
-    use rusqlite::{Connection, OpenFlags};
-
     let agent = AgentKind::OpenCode;
     let mut candidates = Vec::new();
     if let Some(data_dir) = dirs::data_dir() {
@@ -2646,6 +2647,17 @@ pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
         }
     };
 
+    parse_opencode_db(&db_path, start, end)
+}
+
+fn parse_opencode_db(db_path: &Path, start: i64, end: i64) -> LoadedData {
+    use rusqlite::{Connection, OpenFlags};
+    let agent = AgentKind::OpenCode;
+    let mut data = LoadedData {
+        turns_start: start,
+        turns_end: end,
+        ..Default::default()
+    };
     let conn = match Connection::open_with_flags(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -2812,6 +2824,11 @@ pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
                     .and_then(Value::as_f64)
                     .unwrap_or(0.0)
                     .max(0.0);
+                // OpenCode's zero is also used as an unpriced placeholder.
+                let recorded_cost = v
+                    .get("cost")
+                    .and_then(Value::as_f64)
+                    .filter(|cost| cost.is_finite() && *cost > 0.0);
 
                 let start_sec = timestamp_ms_to_sec(time_created);
                 let duration_ms = match (
@@ -2842,6 +2859,9 @@ pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
                 builder.cached_tokens += cache_rd;
                 builder.cache_creation_tokens += cache_wr;
                 builder.agent_messages += 1.0;
+                if let Some(cost) = recorded_cost {
+                    builder.recorded_cost = Some(builder.recorded_cost.unwrap_or(0.0) + cost);
+                }
                 if builder.model.is_empty() {
                     builder.model = model.clone();
                 }
@@ -2861,7 +2881,7 @@ pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
                         cache_creation_1h_tokens: 0.0,
                         ttft_ms: 0.0,
                         total_time_ms: duration_ms,
-                        recorded_cost: None,
+                        recorded_cost,
                         ..Default::default()
                     });
                 }
@@ -2879,22 +2899,9 @@ pub(crate) fn load_opencode(start: i64, end: i64) -> LoadedData {
     data
 }
 
-/// 拼出 "provider/model" 形式的模型名（pricing 查表时会自动去掉 provider 前缀），
+/// Preserve the billing provider separately from any author namespace in modelID,
 /// 并去掉 opencode 变体后缀（如 "gemini-3-pro-preview(high)" → "gemini-3-pro-preview"）。
 fn opencode_model_name(provider: &str, model_id: &str) -> String {
-    let base = match model_id.find('(') {
-        Some(idx) => &model_id[..idx],
-        None => model_id,
-    };
-    let base = base.trim();
-    if provider.is_empty() {
-        base.to_string()
-    } else {
-        format!("{provider}/{base}")
-    }
-}
-
-fn mimocode_model_name(provider: &str, model_id: &str) -> String {
     let base = match model_id.find('(') {
         Some(idx) => &model_id[..idx],
         None => model_id,
@@ -2903,16 +2910,15 @@ fn mimocode_model_name(provider: &str, model_id: &str) -> String {
     if base.is_empty() {
         return "unknown".into();
     }
-    // modelID 自带 provider 前缀时（如 "xiaomi/mimo-v2.5"）直接沿用，
-    // 避免拼出 "openrouter/xiaomi/mimo-v2.5" 这种双前缀。
-    if base.contains('/') {
-        return base.to_owned();
-    }
-    if provider.is_empty() {
-        base.to_owned()
+    if provider.is_empty() || base.starts_with(&format!("{provider}/")) {
+        base.to_string()
     } else {
         format!("{provider}/{base}")
     }
+}
+
+fn mimocode_model_name(provider: &str, model_id: &str) -> String {
+    opencode_model_name(provider, model_id)
 }
 
 // ==================== MimoCode ====================
@@ -3207,19 +3213,26 @@ fn parse_pi_file(path: &Path, start: i64, end: i64) -> Option<(SessionRec, Vec<T
                             .get("cost")
                             .and_then(|cost| cost.get("total"))
                             .and_then(Value::as_f64)
-                            .unwrap_or(0.0);
+                            .filter(|cost| cost.is_finite() && *cost >= 0.0);
                         let raw_model = message
                             .get("model")
                             .and_then(Value::as_str)
                             .unwrap_or("unknown");
-                        let model = format!("[pi] {raw_model}");
+                        let provider = message
+                            .get("provider")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let model = opencode_model_name(provider, raw_model);
                         session.model = model.clone();
                         session.input_tokens += input;
                         session.output_tokens += output;
                         session.cached_tokens += cache_read;
                         session.cache_creation_tokens += cache_write;
                         session.agent_messages += 1.0;
-                        session.recorded_cost = Some(session.recorded_cost.unwrap_or(0.0) + cost);
+                        if let Some(cost) = cost {
+                            session.recorded_cost =
+                                Some(session.recorded_cost.unwrap_or(0.0) + cost);
+                        }
 
                         if at >= start && at < end {
                             turns.push(TurnRec {
@@ -3231,7 +3244,7 @@ fn parse_pi_file(path: &Path, start: i64, end: i64) -> Option<(SessionRec, Vec<T
                                 cache_read_tokens: cache_read,
                                 cache_creation_tokens: cache_write,
                                 model,
-                                recorded_cost: Some(cost),
+                                recorded_cost: cost,
                                 ..Default::default()
                             });
                         }
@@ -3562,7 +3575,7 @@ mod tests {
 
         assert_eq!(session.id, "pi-session-1");
         assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].model, "[pi] openrouter/free");
+        assert_eq!(turns[0].model, "openrouter/free");
         assert_eq!(turns[0].input_tokens, 2039.0);
         assert_eq!(turns[0].output_tokens, 156.0);
         assert_eq!(turns[0].cache_read_tokens, 320.0);
@@ -3572,11 +3585,119 @@ mod tests {
     }
 
     #[test]
+    fn opencode_database_keeps_recorded_cost_in_both_schemas() {
+        for v2 in [false, true] {
+            let folder = tempfile::tempdir().unwrap();
+            let path = folder.path().join("usage.db");
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let session_table = if v2 { "session_v2" } else { "session" };
+            let message_table = if v2 { "session_message" } else { "message" };
+            conn.execute_batch(&format!(
+                "CREATE TABLE {session_table} (id TEXT, parent_id TEXT, directory TEXT, title TEXT, agent TEXT, model TEXT, time_created INTEGER, time_updated INTEGER);
+                 CREATE TABLE {message_table} (session_id TEXT, time_created INTEGER, data TEXT, type TEXT);"
+            )).unwrap();
+            for (session, cost) in [("charged", 0.125), ("placeholder", 0.0)] {
+                let mut message = json!({
+                    "role": "assistant", "cost": cost,
+                    "tokens": {"input": 100, "output": 2, "cache": {"read": 0, "write": 0}}
+                });
+                if v2 {
+                    message["model"] = json!({"id": "vendor/novel-1", "providerID": "reseller"});
+                } else {
+                    message["modelID"] = json!("vendor/novel-1");
+                    message["providerID"] = json!("reseller");
+                }
+                conn.execute(
+                    &format!("INSERT INTO {message_table} VALUES (?1, 1, ?2, 'assistant')"),
+                    rusqlite::params![session, message.to_string()],
+                )
+                .unwrap();
+            }
+            drop(conn);
+            let data = super::parse_opencode_db(&path, 0, i64::MAX);
+            assert!(data.errors.is_empty());
+            assert_eq!(data.turns.len(), 2);
+            let charged = data
+                .turns
+                .iter()
+                .find(|t| t.session_key == "opencode/charged")
+                .unwrap();
+            assert_eq!(charged.model, "reseller/vendor/novel-1");
+            assert_eq!(charged.recorded_cost, Some(0.125));
+            assert_eq!(
+                crate::agg::cost_for_turn(charged, &charged.model),
+                Some(0.125)
+            );
+            let placeholder = data
+                .turns
+                .iter()
+                .find(|t| t.session_key == "opencode/placeholder")
+                .unwrap();
+            assert_eq!(placeholder.recorded_cost, None);
+        }
+    }
+
+    #[test]
+    fn claude_empty_cache_breakdown_preserves_total_writes() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            json!({
+                "type": "assistant", "sessionId": "session", "timestamp": "2026-10-11T12:00:00Z",
+                "message": {"id": "cache-message", "model": "claude-sonnet-5-5", "usage": {
+                    "input_tokens": 1, "output_tokens": 2,
+                    "cache_creation_input_tokens": 100, "cache_creation": {}
+                }}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (_, turns, _) = parse_claude_file(file.path(), 0, i64::MAX);
+        assert_eq!(turns[0].cache_creation_tokens, 100.0);
+        assert_eq!(turns[0].cache_creation_5m_tokens, 100.0);
+    }
+
+    #[test]
+    fn provider_names_keep_the_route_even_with_author_qualified_models() {
+        assert_eq!(
+            mimocode_model_name("openrouter", "xiaomi/mimo-v2.5"),
+            "openrouter/xiaomi/mimo-v2.5"
+        );
+        assert_eq!(
+            mimocode_model_name("anthropic", "anthropic/claude-sonnet-5-5"),
+            "anthropic/claude-sonnet-5-5"
+        );
+    }
+
+    #[test]
+    fn pi_missing_cost_is_unknown_and_explicit_zero_is_preserved() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let make = |usage| {
+            json!({"type": "message", "timestamp": "2026-10-11T12:00:00Z", "message": {
+            "role": "assistant", "provider": "anthropic", "model": "claude-sonnet-5-5", "usage": usage
+        }}).to_string()
+        };
+        std::fs::write(
+            file.path(),
+            format!(
+                "{}\n{}\n",
+                make(json!({"input": 100, "output": 2})),
+                make(json!({"input": 100, "output": 2, "cost": {"total": 0}}))
+            ),
+        )
+        .unwrap();
+        let (_, turns) = parse_pi_file(file.path(), 0, i64::MAX).unwrap();
+        assert_eq!(turns[0].recorded_cost, None);
+        assert_eq!(turns[1].recorded_cost, Some(0.0));
+        assert_eq!(turns[0].model, "anthropic/claude-sonnet-5-5");
+    }
+
+    #[test]
     fn mimocode_model_name_keeps_qualified_ids() {
         assert_eq!(mimocode_model_name("mimo", "mimo-auto"), "mimo/mimo-auto");
         assert_eq!(
             mimocode_model_name("openrouter", "xiaomi/mimo-v2.5"),
-            "xiaomi/mimo-v2.5"
+            "openrouter/xiaomi/mimo-v2.5"
         );
         assert_eq!(
             mimocode_model_name("anthropic", "claude-opus-4-7"),

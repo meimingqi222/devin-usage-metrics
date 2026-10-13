@@ -234,8 +234,14 @@ fn recommend(
         .iter()
         .filter_map(|s| {
             PricingTable::instance()
-                .find(&s[0].model)
+                .find_api(&s[0].model)
                 .filter(|p| p.i > 0.0)
+                .filter(|p| {
+                    s.iter().all(|t| {
+                        p.for_prompt(prompt(t) as f64)
+                            .supports_cache_usage(t.cache_read_tokens, t.cache_creation_5m_tokens)
+                    })
+                })
                 .map(|price| (s.clone(), price))
         })
         .unzip();
@@ -349,7 +355,8 @@ fn recommend(
         .map(|s| {
             let reached = s.iter().map(|t| prompt(t)).max().unwrap_or_default();
             PricingTable::instance()
-                .context_window(&s[0].model)
+                .find_api(&s[0].model)
+                .and_then(|p| p.ctx)
                 .unwrap_or(base_window)
                 .max(reached)
         })
@@ -457,7 +464,7 @@ fn replay(
     let mut compactions = 0usize;
     let mut over = 0usize;
     for s in streams {
-        let write_rate = |t: &TurnRec| {
+        let write_rate = |t: &TurnRec, price: &Pricing| {
             if agent != AgentKind::Claude {
                 return price.i;
             }
@@ -469,7 +476,8 @@ fn replay(
             price.cw * (1.0 - hour_share) + price.i * 2.0 * hour_share
         };
         let mut ctx = prompt(s[0]);
-        cost += ctx as f64 * write_rate(s[0]) + s[0].output_tokens * price.o;
+        let first_price = price.for_prompt(ctx as f64);
+        cost += ctx as f64 * write_rate(s[0], &first_price) + s[0].output_tokens * first_price.o;
         for p in s.windows(2) {
             let (prev, t) = (p[0], p[1]);
             let growth = if compacted(prompt(prev), prompt(t)) {
@@ -477,13 +485,15 @@ fn replay(
             } else {
                 prompt(t).saturating_sub(prompt(prev))
             };
-            let write = write_rate(t);
             // Read the threshold before compacting: the compaction resets
             // ctx, which would hide the call that triggered it.
             let past = ctx + growth > threshold;
             if past && ctx > after {
-                cost +=
-                    ctx as f64 * price.cr + summary * price.o + (summary + rework as f64) * write;
+                let summary_price = price.for_prompt(ctx as f64);
+                let write = write_rate(t, &summary_price);
+                cost += ctx as f64 * summary_price.cr
+                    + summary * summary_price.o
+                    + (summary + rework as f64) * write;
                 ctx = after + rework;
                 compactions += 1;
             }
@@ -496,12 +506,14 @@ fn replay(
             } else {
                 300
             };
+            let call_price = price.for_prompt((ctx + growth) as f64);
+            let write = write_rate(t, &call_price);
             let read = if agent == AgentKind::Claude && t.created_at - prev.created_at > ttl {
                 write
             } else {
-                price.cr
+                call_price.cr
             };
-            cost += ctx as f64 * read + growth as f64 * write + t.output_tokens * price.o;
+            cost += ctx as f64 * read + growth as f64 * write + t.output_tokens * call_price.o;
             ctx += growth;
         }
     }
@@ -515,6 +527,32 @@ fn replay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_uses_each_simulated_calls_context_tier() {
+        let price: Pricing = serde_json::from_value(serde_json::json!({
+            "i": 1, "o": 2, "cr": 0.01,
+            "tiers": [{"above": 100, "i": 10, "o": 30, "cw": 0, "cr": 0.2}]
+        }))
+        .unwrap();
+        let turns = [
+            TurnRec {
+                input_tokens: 100.0,
+                output_tokens: 3.0,
+                ..Default::default()
+            },
+            TurnRec {
+                input_tokens: 5.0,
+                cache_read_tokens: 100.0,
+                output_tokens: 3.0,
+                ..Default::default()
+            },
+        ];
+        let streams = [turns.iter().collect()];
+        let result = replay(&streams, 1_000, 20, 10, 0, AgentKind::Codex, &price);
+        // First call at the boundary: $106/M; next call above it: $160/M.
+        assert!((result.cost - 266.0 / 1e6).abs() < 1e-12);
+    }
 
     #[test]
     fn unpriced_streams_do_not_change_replay_calibration() {
@@ -571,10 +609,23 @@ mod tests {
                     "gpt-5.2"
                 }
                 .into(),
-                input_tokens: 500.0,
+                // Codex logs ordinary input plus cache reads, without Claude TTL writes.
+                input_tokens: if agent == AgentKind::Claude {
+                    500.0
+                } else {
+                    5_000.0
+                },
                 cache_read_tokens: (ctx - 5_000) as f64,
-                cache_creation_tokens: 4_500.0,
-                cache_creation_5m_tokens: 4_500.0,
+                cache_creation_tokens: if agent == AgentKind::Claude {
+                    4_500.0
+                } else {
+                    0.0
+                },
+                cache_creation_5m_tokens: if agent == AgentKind::Claude {
+                    4_500.0
+                } else {
+                    0.0
+                },
                 output_tokens: 800.0,
                 ..Default::default()
             });
