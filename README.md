@@ -13,6 +13,7 @@ A native desktop app that reads local sessions from Devin, Claude Code, Codex, A
   - Stat cards for Total Tokens, Input (new), Output, Cached read, and Turns/Sessions
   - Stacked bar chart of token trends (input / output / cached layers)
   - Per-period detail table with session count, turns, token breakdown, and per-model usage
+  - Antigravity `gemini-3.8-flash-*` internal variants fall back to the base Flash API quote only when no exact quote exists; original model names are retained and separate Lite/TTS/Cyber families are excluded. If the Google base quote lacks a cache-write rate, first processing is estimated at the input rate. These estimates exclude cache storage-duration charges and are not actual bills.
 - **Sessions view**
   - Lists the 500 most recent sessions, sorted by last activity
   - Shows title, working directory, agent mode, selected model, message count, total tokens

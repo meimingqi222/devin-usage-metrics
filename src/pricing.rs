@@ -1045,6 +1045,48 @@ pub fn turn_cost(
         .map(|p| p.cost_with_cache_write(input, output, cached, cache_creation))
 }
 
+/// Antigravity API-equivalent estimate, preserving exact provider quotes first.
+/// Internal Flash suffixes use the base quote. Missing Google Flash cache-write
+/// prices estimate first processing at the input rate, not zero; storage-duration
+/// charges cannot be inferred from local token records and are not included.
+pub fn turn_cost_antigravity(
+    model: &str,
+    input: f64,
+    output: f64,
+    cached: f64,
+    cache_creation: f64,
+) -> Option<f64> {
+    let model = model.trim().to_ascii_lowercase();
+    let table = PricingTable::instance();
+    let price = table.find_api(&model).or_else(|| {
+        let suffix = model.strip_prefix("gemini-3.8-flash-")?;
+        // These are separate product families, not internal routing suffixes.
+        if suffix.is_empty()
+            || ["lite", "tts", "cyber"].iter().any(|family| {
+                suffix == *family
+                    || suffix
+                        .strip_prefix(family)
+                        .is_some_and(|rest| rest.starts_with('-'))
+            })
+        {
+            return None;
+        }
+        table.find_api("gemini-3.8-flash")
+    })?;
+    let price = price.for_prompt(input + cached + cache_creation);
+    if price.missing_cache_write
+        && price.source.as_deref() == Some("google")
+        && price.source_model.as_deref() == Some("gemini-3.8-flash")
+    {
+        return price
+            .supports_cache_usage(cached, 0.0)
+            .then(|| price.cost(input + cache_creation, output, cached));
+    }
+    price
+        .supports_cache_usage(cached, cache_creation)
+        .then(|| price.cost_with_cache_write(input, output, cached, cache_creation))
+}
+
 /// 计算单次请求费用。与聚合用量不同，这里会按该请求的 prompt 总量应用
 /// GPT-5.6 的 272K 长上下文阶梯价。
 pub fn single_turn_cost(

@@ -186,6 +186,15 @@ pub fn cost_for_turn(turn: &crate::data::TurnRec, model: &str) -> Option<f64> {
             turn.cache_creation_1h_tokens,
         );
     }
+    if turn.agent == AgentKind::Antigravity {
+        return crate::pricing::turn_cost_antigravity(
+            model,
+            turn.input_tokens,
+            turn.output_tokens,
+            turn.cache_read_tokens,
+            turn.cache_creation_tokens,
+        );
+    }
     if turn.agent == AgentKind::Devin {
         crate::pricing::devin_pro_turn_cost(
             model,
@@ -681,6 +690,80 @@ mod tests {
         let codex = cost_for_turn(&make_turn(AgentKind::Codex), "gpt-5-6-sol-high").unwrap();
         assert!((devin - 2.4).abs() < 1e-12);
         assert!((codex - 2.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn antigravity_flash_suffixes_use_base_estimates_without_rewriting_models() {
+        let models = [
+            "gemini-3.8-flash",
+            "gemini-3.8-flash-exp-a",
+            "gemini-3.8-flash-n",
+            "gemini-3.8-flash-tiered",
+            "gemini-3.8-flash-future-internal-variant",
+        ];
+        let turn = crate::data::TurnRec {
+            agent: AgentKind::Antigravity,
+            created_at: Local::now().timestamp(),
+            input_tokens: 1_000_000.0,
+            output_tokens: 2_000_000.0,
+            cache_read_tokens: 3_000_000.0,
+            cache_creation_tokens: 4_000_000.0,
+            ..Default::default()
+        };
+        // Ordinary input + first processing of cache writes, output, cached reads.
+        // (1 + 4) * $0.75 + 2 * $3.75 + 3 * $0.075 = $11.475.
+        let expected = 11.475;
+        let mut data = LoadedData::default();
+        for model in models {
+            let session = crate::data::SessionRec {
+                agent: AgentKind::Antigravity,
+                key: model.into(),
+                selected_model: model.into(),
+                ..Default::default()
+            };
+            let record = crate::data::TurnRec {
+                session_key: session.key.clone(),
+                ..turn.clone()
+            };
+            // Antigravity records use the session model when the turn has no model.
+            assert!((cost_for_turn(&record, model).unwrap() - expected).abs() < 1e-9);
+            data.sessions.push(session);
+            data.turns.push(record);
+        }
+        for period in [PeriodKind::Day, PeriodKind::Week, PeriodKind::Month] {
+            let buckets = build_buckets_for(&data, period, AgentKind::Antigravity, 0);
+            let bucket = buckets.iter().find(|b| b.turns > 0).unwrap();
+            assert!((bucket.cost - 5.0 * expected).abs() < 1e-9);
+            for model in models {
+                assert!(bucket.by_model[model].priced);
+                assert!((bucket.by_model[model].cost - expected).abs() < 1e-9);
+            }
+        }
+        for session in &data.sessions {
+            assert!((cost_for_session_turns(&data, session).unwrap() - expected).abs() < 1e-9);
+        }
+        let codex = crate::data::TurnRec {
+            agent: AgentKind::Codex,
+            ..turn.clone()
+        };
+        assert!(cost_for_turn(&codex, "gemini-3.8-flash-n").is_none());
+        assert!(cost_for_turn(&codex, "gemini-3.8-flash").is_none());
+        for model in [
+            "gemini-3.8-pro-n",
+            "gemini-3.8-flash-lite-new",
+            "gemini-3.8-flash-tts-new",
+            "gemini-3.8-flash-cyber-new",
+            "gemini-3.8-flash-",
+            "gemini-3.8-flashback",
+            "reseller/gemini-3.8-flash-n",
+        ] {
+            assert!(cost_for_turn(&turn, model).is_none(), "{model}");
+        }
+        let recorded = crate::data::TurnRec {
+            recorded_cost: Some(7.0),
+            ..turn
+        };
+        assert_eq!(cost_for_turn(&recorded, "gemini-3.8-flash-n"), Some(7.0));
     }
 
     #[test]
