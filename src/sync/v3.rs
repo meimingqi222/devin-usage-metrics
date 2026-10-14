@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const PROTOCOL: u32 = 3;
 const DATA_SCHEMA: u32 = 1;
@@ -26,6 +27,161 @@ const LOCAL_MANIFEST_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
 /// 对象成功写入后才通过 CAS 发布，因此其他设备不会观察到半成品。
 const UPLOAD_CONCURRENCY: usize = 8;
 const DOWNLOAD_CONCURRENCY: usize = 8;
+const PARSED_CACHE_BYTES: usize = 128 * 1024 * 1024;
+// 默认每小时同步，缓存必须跨越该间隔；仍每天重新验证一次磁盘对象。
+const PARSED_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+struct CachedDevice {
+    manifest_hash: String,
+    retained_day: String,
+    package: Arc<DevicePackage>,
+    bytes: usize,
+    verified_at: Instant,
+    used_at: Instant,
+}
+
+#[derive(Default)]
+struct ParsedCache {
+    scope: Option<String>,
+    devices: BTreeMap<String, CachedDevice>,
+    bytes: usize,
+}
+
+impl ParsedCache {
+    fn set_scope(&mut self, scope: Option<String>) {
+        if self.scope != scope {
+            *self = Self {
+                scope,
+                ..Default::default()
+            };
+        }
+    }
+
+    fn remove(&mut self, id: &str) {
+        if let Some(entry) = self.devices.remove(id) {
+            self.bytes -= entry.bytes;
+        }
+    }
+
+    fn get(
+        &mut self,
+        scope: &str,
+        id: &str,
+        hash: &str,
+        retained_day: &str,
+    ) -> Option<Arc<DevicePackage>> {
+        if self.scope.as_deref() != Some(scope) {
+            return None;
+        }
+        let entry = self.devices.get_mut(id)?;
+        if entry.manifest_hash != hash
+            || entry.retained_day != retained_day
+            || entry.verified_at.elapsed() >= PARSED_CACHE_TTL
+        {
+            self.remove(id);
+            return None;
+        }
+        entry.used_at = Instant::now();
+        Some(Arc::clone(&entry.package))
+    }
+
+    fn insert(
+        &mut self,
+        scope: &str,
+        hash: &str,
+        retained_day: String,
+        package: Arc<DevicePackage>,
+    ) {
+        // 注销/切换目的地期间完成的旧下载不能重新填充缓存。
+        if self.scope.as_deref() != Some(scope) {
+            return;
+        }
+        self.remove(&package.device_id);
+        let bytes = package_memory(&package);
+        if bytes > PARSED_CACHE_BYTES {
+            return;
+        }
+        while self.bytes + bytes > PARSED_CACHE_BYTES {
+            let oldest = self
+                .devices
+                .iter()
+                .min_by_key(|(_, entry)| entry.used_at)
+                .map(|(id, _)| id.clone())
+                .unwrap();
+            self.remove(&oldest);
+        }
+        self.bytes += bytes;
+        self.devices.insert(
+            package.device_id.clone(),
+            CachedDevice {
+                manifest_hash: hash.to_owned(),
+                retained_day,
+                package,
+                bytes,
+                verified_at: Instant::now(),
+                used_at: Instant::now(),
+            },
+        );
+    }
+}
+
+fn package_memory(package: &DevicePackage) -> usize {
+    // 预算包含 Vec 的容量和所有记录字符串的堆分配，不包含查看端的结果副本。
+    std::mem::size_of::<DevicePackage>()
+        + package.device_id.capacity()
+        + package.device_name.capacity()
+        + package.turns.capacity() * std::mem::size_of::<TurnRec>()
+        + package.sessions.capacity() * std::mem::size_of::<SessionRec>()
+        + package
+            .turns
+            .iter()
+            .map(|t| {
+                [
+                    &t.session_key,
+                    &t.model,
+                    &t.context_stream,
+                    &t.device_id,
+                    &t.device_name,
+                    &t.dedup_key,
+                ]
+                .iter()
+                .map(|s| s.capacity())
+                .sum::<usize>()
+            })
+            .sum::<usize>()
+        + package
+            .sessions
+            .iter()
+            .map(|s| {
+                [
+                    &s.key,
+                    &s.source,
+                    &s.id,
+                    &s.title,
+                    &s.working_directory,
+                    &s.selected_model,
+                    &s.agent_mode,
+                    &s.device_id,
+                    &s.device_name,
+                ]
+                .iter()
+                .map(|s| s.capacity())
+                .sum::<usize>()
+                    + s.real_model.as_ref().map_or(0, String::capacity)
+            })
+            .sum::<usize>()
+}
+
+fn parsed_cache() -> &'static Mutex<ParsedCache> {
+    static CACHE: OnceLock<Mutex<ParsedCache>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+pub(super) fn clear_import_cache() {
+    if let Ok(mut cache) = parsed_cache().lock() {
+        *cache = ParsedCache::default();
+    }
+}
 
 type EncodedBlock = (BlockRef, Vec<u8>);
 type EncodedSession = (SessionRef, Vec<u8>);
@@ -1051,8 +1207,26 @@ pub(super) fn export_local_v3_with_transport(
 fn load_remote(
     transport: &dyn SyncTransport,
     manifest: &Manifest,
-) -> Result<DevicePackage, String> {
-    load_remote_cached(transport, manifest, &cache_dir())
+    manifest_hash: &str,
+    scope: Option<&str>,
+) -> Result<Arc<DevicePackage>, String> {
+    let retained_day = day(now() - RETAIN_DAYS * 86_400);
+    if let Some(scope) = scope {
+        if let Ok(mut cache) = parsed_cache().lock() {
+            if let Some(package) =
+                cache.get(scope, &manifest.device_id, manifest_hash, &retained_day)
+            {
+                return Ok(package);
+            }
+        }
+    }
+    let package = Arc::new(load_remote_cached(transport, manifest, &cache_dir())?);
+    if let Some(scope) = scope {
+        if let Ok(mut cache) = parsed_cache().lock() {
+            cache.insert(scope, manifest_hash, retained_day, Arc::clone(&package));
+        }
+    }
+    Ok(package)
 }
 
 fn load_remote_cached(
@@ -1160,6 +1334,10 @@ pub(super) fn import_remote_v3_with_transport(
 ) -> (LoadedData, Vec<RemoteDevice>, Option<String>) {
     let started = Instant::now();
     let local_id = data::device_id();
+    let scope = transport.cache_scope();
+    if let Ok(mut cache) = parsed_cache().lock() {
+        cache.set_scope(scope.clone());
+    }
     let names = match transport.list_sync_files() {
         Ok(value) => value,
         Err(error) => return (LoadedData::default(), Vec::new(), Some(error)),
@@ -1169,6 +1347,22 @@ pub(super) fn import_remote_v3_with_transport(
         .filter(|name| name.starts_with("v3-head-") && name.ends_with(".json"))
         .cloned()
         .collect();
+    if let Ok(mut cache) = parsed_cache().lock() {
+        let removed: Vec<_> = cache
+            .devices
+            .keys()
+            .filter(|id| {
+                cache.scope == scope
+                    && !heads
+                        .iter()
+                        .any(|name| name == &format!("v3-head-{id}.json"))
+            })
+            .cloned()
+            .collect();
+        for id in removed {
+            cache.remove(&id);
+        }
+    }
     // 双读迁移：按设备选协议。任何一台设备升级都不能让其他 v2 设备的
     // 数据从 UI 消失。
     if heads.is_empty() {
@@ -1202,7 +1396,7 @@ pub(super) fn import_remote_v3_with_transport(
                     .trim_end_matches(".json")
                     .to_string();
                 let result = if id == local_id {
-                    read_cached_local_manifest(&id).map(Ok)
+                    read_cached_local_manifest(&id).map(|manifest| Ok((manifest, String::new())))
                 } else {
                     None
                 }
@@ -1223,7 +1417,7 @@ pub(super) fn import_remote_v3_with_transport(
                             if manifest.device_id != id {
                                 return Err("v3 head 与 manifest 设备不一致".into());
                             }
-                            Ok(manifest)
+                            Ok((manifest, head.manifest))
                         })
                 });
                 (id, result)
@@ -1232,7 +1426,7 @@ pub(super) fn import_remote_v3_with_transport(
     });
     for (id, result) in manifests {
         match result {
-            Ok(manifest) => {
+            Ok((manifest, manifest_hash)) => {
                 devices.push(RemoteDevice {
                     device_id: manifest.device_id.clone(),
                     device_name: manifest.device_name.clone(),
@@ -1241,8 +1435,9 @@ pub(super) fn import_remote_v3_with_transport(
                     is_local: manifest.device_id == local_id,
                 });
                 if manifest.device_id != local_id {
-                    match load_remote(transport, &manifest) {
+                    match load_remote(transport, &manifest, &manifest_hash, scope.as_deref()) {
                         Ok(package) => {
+                            let package = Arc::unwrap_or_clone(package);
                             v3_devices.insert(manifest.device_id.clone());
                             merged.sessions.extend(package.sessions);
                             merged.turns.extend(package.turns);
@@ -1475,6 +1670,86 @@ mod tests {
         fs::remove_dir_all(&cache).unwrap();
         transport.put(&manifest.blocks[0].file, b"corrupt").unwrap();
         assert!(load_remote_cached(&transport, &manifest, &cache).is_err());
+    }
+
+    #[test]
+    fn repeated_import_reuses_verified_records_but_observes_revision_and_destination_changes() {
+        let folder = tempfile::tempdir().unwrap();
+        let transport = LocalTransport::new(folder.path().join("account-a"));
+        let other = LocalTransport::new(folder.path().join("account-b"));
+        let publish = |transport: &LocalTransport, package: &DevicePackage| {
+            let manifest = publish_fixture(transport, package);
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            let hash = sha256_hex(&bytes);
+            transport
+                .put(&format!("v3-manifest-{hash}.json"), &bytes)
+                .unwrap();
+            transport
+                .put(
+                    "v3-head-device-a.json",
+                    &serde_json::to_vec(&Head {
+                        protocol: PROTOCOL,
+                        sequence: 1,
+                        manifest: hash,
+                        previous_manifest: None,
+                        updated_at: now(),
+                        device_id: "device-a".into(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            manifest
+        };
+        let mut package = package_fixture();
+        package.turns[0].model = format!("unique-{}", unique_suffix());
+        let manifest = publish(&transport, &package);
+        let (first, _, error) = import_remote_v3_with_transport(&transport);
+        assert!(error.is_none());
+        assert_eq!(first.turns.len(), package.turns.len());
+        let block = &manifest
+            .blocks
+            .iter()
+            .find(|b| b.utc_day == day(package.turns[0].created_at))
+            .unwrap();
+        fs::remove_file(cache_dir().join(format!("{}.zst", block.hash))).unwrap();
+        fs::remove_file(transport.dir.join(&block.file)).unwrap();
+        let (unchanged, _, error) = import_remote_v3_with_transport(&transport);
+        assert!(error.is_none());
+        assert_eq!(unchanged.turns, first.turns);
+        package.turns[0].input_tokens = 777.0;
+        package.sessions[0].title = "historical metadata corrected".into();
+        publish(&transport, &package);
+        let (corrected, _, error) = import_remote_v3_with_transport(&transport);
+        assert!(error.is_none());
+        assert_eq!(corrected.turns.len(), package.turns.len());
+        assert!(corrected.turns.contains(&package.turns[0]));
+        assert_eq!(corrected.sessions, package.sessions);
+
+        let manifest = publish(&other, &package);
+        let block = &manifest.blocks[0];
+        fs::remove_file(cache_dir().join(format!("{}.zst", block.hash))).unwrap();
+        other.put(&block.file, b"corrupt").unwrap();
+        let (_, _, error) = import_remote_v3_with_transport(&other);
+        assert!(
+            error.is_some(),
+            "another destination must not reuse parsed records"
+        );
+        publish(&other, &package);
+        let (recovered, _, error) = import_remote_v3_with_transport(&other);
+        assert!(error.is_none());
+        assert_eq!(recovered.turns, corrected.turns);
+        fs::remove_file(other.dir.join("v3-head-device-a.json")).unwrap();
+        let (removed, _, error) = import_remote_v3_with_transport(&other);
+        assert!(error.is_none());
+        assert!(removed.turns.is_empty());
+        publish(&other, &package);
+        fs::remove_file(cache_dir().join(format!("{}.zst", block.hash))).unwrap();
+        other.put(&block.file, b"corrupt").unwrap();
+        let (_, _, error) = import_remote_v3_with_transport(&other);
+        assert!(
+            error.is_some(),
+            "removed devices must not retain parsed records"
+        );
     }
 
     #[test]

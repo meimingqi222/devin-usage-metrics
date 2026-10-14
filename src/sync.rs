@@ -116,6 +116,7 @@ fn cooldown_path() -> Option<PathBuf> {
 }
 
 /// 503/502/504 后持久化冷却，防止用户反复点击或重启应用继续打满服务端。
+/// 自动同步先完成短延迟重试，仅在重试耗尽后调用。
 pub fn record_transient_failure(error: &str) {
     if !["HTTP 502", "HTTP 503", "HTTP 504"]
         .iter()
@@ -123,11 +124,22 @@ pub fn record_transient_failure(error: &str) {
     {
         return;
     }
+    record_cooldown(Duration::from_secs(TRANSIENT_FAILURE_COOLDOWN_SECS));
+}
+
+fn record_cooldown(delay: Duration) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let Ok(_lock) = LOCK.lock() else { return };
     let Some(path) = cooldown_path() else { return };
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let until = now_secs().saturating_add(TRANSIENT_FAILURE_COOLDOWN_SECS);
+    let until = now_secs().saturating_add(delay.as_secs()).max(
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0),
+    );
     let _ = atomic_replace(&path, until.to_string().as_bytes());
 }
 
@@ -429,7 +441,13 @@ pub fn delete_github_sync_session() {
     if let Ok(mut cache) = session_cache().lock() {
         *cache = None;
     }
+    clear_import_cache();
     delete_session_meta();
+}
+
+/// 释放已解析的远程记录；关闭同步或退出登录时调用。
+pub fn clear_import_cache() {
+    v3::clear_import_cache();
 }
 
 /// GitHub Device Flow 的一次待完成授权。客户端只展示验证码并轮询自建 API，
@@ -562,6 +580,10 @@ pub fn wait_for_github_login(
 pub type HeadRead = Option<(Vec<u8>, Option<String>)>;
 
 pub trait SyncTransport: Sync {
+    /// 已认证目的地的缓存作用域。不提供时不复用跨轮次的解析结果。
+    fn cache_scope(&self) -> Option<String> {
+        None
+    }
     /// 写入（或覆盖）一个数据包。name 是文件名如 `device-xxx.json`。
     fn put(&self, name: &str, data: &[u8]) -> Result<(), String>;
     /// 读取一个数据包。不存在时返回 Err。
@@ -594,6 +616,10 @@ impl LocalTransport {
 
 #[cfg(test)]
 impl SyncTransport for LocalTransport {
+    fn cache_scope(&self) -> Option<String> {
+        Some(self.dir.to_string_lossy().into_owned())
+    }
+
     fn put(&self, name: &str, data: &[u8]) -> Result<(), String> {
         fs::create_dir_all(&self.dir).map_err(|e| format!("创建同步目录失败: {e}"))?;
         let path = self.dir.join(name);
@@ -1005,28 +1031,85 @@ impl SyncServerTransport {
             for (key, value) in extra {
                 request = request.header(*key, *value);
             }
-            let response = self
-                .agent
-                .run(request.body(body.to_vec()).map_err(|e| e.to_string())?)
-                .map_err(|e| format!("自建同步服务 {method} 失败: {e}"))?;
-            let status = response.status().as_u16();
-            let etag = response
-                .headers()
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            let payload = WebDavTransport::read_body(response)?;
-            if matches!(status, 502..=504) {
-                if let Some(delay) = delay {
-                    data::log_event(format!(
-                        "sync self-hosted {method} got HTTP {status}; retry in {}s",
-                        delay.as_secs()
-                    ));
-                    std::thread::sleep(delay);
-                    continue;
+            let request = request.body(body.to_vec()).map_err(|e| e.to_string())?;
+            let response = (|| {
+                let response = self.agent.run(request)?;
+                let status = response.status().as_u16();
+                let etag = response
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| {
+                        s.parse::<u64>().ok().or_else(|| {
+                            chrono::DateTime::parse_from_rfc2822(s).ok().map(|at| {
+                                at.timestamp()
+                                    .saturating_sub(chrono::Utc::now().timestamp())
+                                    .max(1) as u64
+                            })
+                        })
+                    })
+                    .map(|seconds| Duration::from_secs(seconds.max(1)));
+                let payload = response
+                    .into_body()
+                    .into_with_config()
+                    .limit(MAX_WEBDAV_RESPONSE_BYTES)
+                    .read_to_vec()?;
+                Ok::<_, ureq::Error>((status, etag, payload, retry_after))
+            })();
+            match response {
+                Ok((status, etag, payload, retry_after)) => {
+                    if matches!(status, 408 | 425 | 429 | 500 | 502..=504) {
+                        // 长时间限流交给同步调度器，避免占住每个上传线程等待。
+                        if let Some(wait) =
+                            retry_after.filter(|wait| *wait > Duration::from_secs(30))
+                        {
+                            record_cooldown(wait);
+                            return Ok((status, etag, payload));
+                        }
+                        if let Some(wait) = delay.map(|delay| retry_after.unwrap_or(delay)) {
+                            data::log_event(format!(
+                                "sync self-hosted {method} got HTTP {status}; retry in {}s",
+                                wait.as_secs()
+                            ));
+                            std::thread::sleep(wait);
+                            continue;
+                        }
+                        if let Some(wait) = retry_after {
+                            record_cooldown(wait);
+                        }
+                    }
+                    return Ok((status, etag, payload));
+                }
+                Err(error) => {
+                    let retryable = matches!(
+                        error,
+                        ureq::Error::Timeout(_)
+                            | ureq::Error::Io(_)
+                            | ureq::Error::HostNotFound
+                            | ureq::Error::ConnectionFailed
+                    );
+                    if retryable {
+                        if let Some(wait) = delay {
+                            data::log_event(format!(
+                                "sync self-hosted {method} transport failed: {error}; retry in {}s",
+                                wait.as_secs()
+                            ));
+                            std::thread::sleep(wait);
+                            continue;
+                        }
+                    }
+                    return Err(if retryable {
+                        format!("自建同步服务 {method} transport failed: {error}")
+                    } else {
+                        format!("自建同步服务 {method} 失败: {error}")
+                    });
                 }
             }
-            return Ok((status, etag, payload));
         }
         unreachable!()
     }
@@ -1043,6 +1126,13 @@ impl SyncServerTransport {
 }
 
 impl SyncTransport for SyncServerTransport {
+    fn cache_scope(&self) -> Option<String> {
+        // 只缓存指纹，不在缓存元数据中保存会话令牌。换账号/令牌会安全失效。
+        Some(sha256_hex(
+            format!("{}\0{}", self.base_url, self.token).as_bytes(),
+        ))
+    }
+
     fn put(&self, name: &str, data: &[u8]) -> Result<(), String> {
         let (status, _, _) = self.run(
             "PUT",
@@ -1822,5 +1912,27 @@ mod tests {
             .body(ureq::Body::builder().data(bytes.clone()))
             .unwrap();
         assert_eq!(WebDavTransport::read_body(response).unwrap(), bytes);
+    }
+
+    #[test]
+    fn self_hosted_get_recovers_from_disconnect_and_truncated_response() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for response in [
+                "",
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nda",
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                stream.read(&mut request).unwrap();
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let transport = SyncServerTransport::new(&url, "synthetic-test-session");
+        assert_eq!(transport.get("object").unwrap(), b"data");
+        server.join().unwrap();
     }
 }

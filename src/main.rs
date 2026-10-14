@@ -492,6 +492,7 @@ impl Root {
             self.sync_tick_task = None;
             self.sync_task = None;
             self.sync_busy = false;
+            sync::clear_import_cache();
             self.remote_data = Arc::new(LoadedData::default());
             self.known_devices = Vec::new();
             self.sync_message = None;
@@ -779,6 +780,9 @@ impl Root {
 
             this.update(cx, |this, cx| {
                 if this.sync_id != sync_id {
+                    if !this.sync_enabled {
+                        sync::clear_import_cache();
+                    }
                     return;
                 }
                 this.sync_busy = false;
@@ -798,7 +802,9 @@ impl Root {
                     .as_deref()
                     .is_some_and(sync::is_retryable_error);
                 if let Some(error) = this.sync_message.as_deref() {
-                    sync::record_transient_failure(error);
+                    if this.sync_retry_attempt >= 3 {
+                        sync::record_transient_failure(error);
+                    }
                 } else {
                     sync::clear_transient_failure();
                     this.sync_retry_attempt = 0;
