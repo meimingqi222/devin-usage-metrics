@@ -1926,8 +1926,12 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0; 4096];
-                stream.read(&mut request).unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
                 stream.write_all(response.as_bytes()).unwrap();
             }
         });
