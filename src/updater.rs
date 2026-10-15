@@ -2,12 +2,14 @@
 //!
 //! 更新源是 GitHub Releases（`meimingqi222/devin-usage-metrics`），没有独立
 //! 更新服务器。正式通道只认 `releases/latest` 里非 draft / 非 prerelease 的那一条。
-//! 「替换正在运行的二进制并重启」走本文件底部的平台 helper。
+//! 版本比较、资产选择、sidecar 校验与解压来自 `gpui-app-update-core`；
+//! 「替换正在运行的二进制并重启」由 `gpui-app-update-installer` 的 helper 执行，
+//! 本文件保留资产名、HTTP（ureq 3）、缓存路径、安装预检与文案。
 
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
+#[cfg(target_os = "macos")]
+use gpui_app_update_installer::enclosing_app_bundle;
 use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const GITHUB_OWNER: &str = "meimingqi222";
@@ -143,61 +145,10 @@ impl UpdateStatus {
     }
 }
 
-/// 轻量 semver：去掉可选 `v` 前缀，比较三段数字，缺省按 0。
-pub fn is_version_newer(candidate: &str, current: &str) -> bool {
-    let next = version_parts(candidate);
-    let base = version_parts(current);
-    let (Some(next), Some(base)) = (next, base) else {
-        return normalize_version(candidate) != normalize_version(current);
-    };
-    for i in 0..next.len().max(base.len()) {
-        let l = next.get(i).copied().unwrap_or(0);
-        let r = base.get(i).copied().unwrap_or(0);
-        if l > r {
-            return true;
-        }
-        if l < r {
-            return false;
-        }
-    }
-    false
-}
-
-pub fn normalize_version(version: &str) -> String {
-    version.trim().trim_start_matches(['v', 'V']).to_string()
-}
-
-fn version_parts(version: &str) -> Option<[u64; 3]> {
-    let norm = normalize_version(version);
-    let mut it = norm.split('.');
-    let major = it.next()?.parse().ok()?;
-    let minor = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let patch = it
-        .next()
-        .map(|s| s.split(|c: char| !c.is_ascii_digit()).next().unwrap_or("0"))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    Some([major, minor, patch])
-}
-
-/// GitHub Releases API 的 `releases/latest` 子集。
-#[derive(Debug, Deserialize)]
-pub struct GithubRelease {
-    pub tag_name: String,
-    pub html_url: String,
-    pub name: Option<String>,
-    pub body: Option<String>,
-    pub prerelease: bool,
-    pub draft: bool,
-    pub assets: Vec<GithubAsset>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct GithubAsset {
-    pub name: String,
-    pub browser_download_url: String,
-    pub size: u64,
-}
+pub use gpui_app_update_core::{
+    is_skipped, is_version_newer, looks_like_dev_build, normalize_version, parse_checksum_sidecar,
+    select_asset_by_candidates, sha256_file, GithubAsset, GithubRelease,
+};
 
 /// 当前构建应订阅的发行包目标。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,165 +189,48 @@ pub fn candidate_asset_names(target: UpdateTarget) -> &'static [&'static str] {
     }
 }
 
-pub fn select_asset_by_candidates<'a>(
-    release: &'a GithubRelease,
-    candidates: &[&str],
-) -> Option<&'a GithubAsset> {
-    if release.draft || release.prerelease {
-        return None;
-    }
-    for name in candidates {
-        if let Some(asset) = release.assets.iter().find(|a| a.name == *name) {
-            return Some(asset);
-        }
-    }
-    None
-}
-
-/// 解析 `<hex>  <filename>` 形式的 sidecar，返回十六进制摘要（小写）。
+/// 校验下载包与 sidecar；消息沿用原有英文文案。
 ///
-/// 容忍 UTF-8 BOM：Windows PowerShell 5 的 `Out-File -Encoding utf8` 会写 BOM。
-pub fn parse_checksum_sidecar(text: &str) -> Option<String> {
-    let text = text.trim_start_matches('\u{feff}');
-    let line = text.lines().find(|l| !l.trim().is_empty())?;
-    let hex = line.split_whitespace().next()?;
-    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    Some(hex.to_ascii_lowercase())
+/// SHA-256 sidecar 与安装包来自同一发布源，只能发现损坏或截断，不是发布者认证。
+pub fn verify_checksum(zip_path: &Path, sidecar: &str) -> Result<(), String> {
+    gpui_app_update_core::verify_sha256_sidecar(zip_path, sidecar).map_err(|e| e.to_string())
 }
 
-/// 计算文件 SHA-256（小写 hex）。
-pub fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
+/// 在 `cache_dir` 下新建独占 staging 目录并解压，返回待安装载荷路径。
+///
+/// 整个归档先校验（逃逸、绝对路径、重复项、符号链接、数量和体积上限）再写入；
+/// 只会清理本产品缓存里旧的 staging 与旧版固定的 `extracted` 目录。
+pub fn extract_update_zip(zip_path: &Path, cache_dir: &Path) -> Result<PathBuf, String> {
+    let _ = std::fs::remove_dir_all(cache_dir.join("extracted"));
+    let staging = gpui_app_update_core::create_staging_dir(cache_dir)
+        .map_err(|e| format!("create extract dir: {e}"))?;
+    gpui_app_update_core::extract_zip(
+        zip_path,
+        &staging,
+        gpui_app_update_core::ExtractLimits::default(),
+    )
+    .map_err(|e| e.to_string())?;
+    match payload_spec() {
+        Some(spec) => gpui_app_update_core::find_payload(&staging, spec).map_err(|e| e.to_string()),
+        None => Err("unsupported platform for app update".into()),
     }
-    Ok(hex_encode(&hasher.finalize()))
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// 解压 zip 到 `dest_dir`，拒绝 zip-slip（任一条目逃出目标根）。
-pub fn extract_update_zip(zip_path: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
-    if dest_dir.exists() {
-        let _ = std::fs::remove_dir_all(dest_dir);
-    }
-    std::fs::create_dir_all(dest_dir).map_err(|e| format!("create extract dir: {e}"))?;
-
-    let file = std::fs::File::open(zip_path).map_err(|e| format!("open zip: {e}"))?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("read zip: {e}"))?;
-
-    let dest_real = dest_dir
-        .canonicalize()
-        .unwrap_or_else(|_| dest_dir.to_path_buf());
-
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| format!("zip entry: {e}"))?;
-        let Some(rel) = entry.enclosed_name() else {
-            return Err(format!("zip entry escapes destination: {:?}", entry.name()));
-        };
-        if rel.is_absolute()
-            || rel
-                .components()
-                .any(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
-        {
-            return Err(format!("zip entry has absolute path: {:?}", entry.name()));
-        }
-        let out = dest_dir.join(&rel);
-        if let Ok(out_real) = out.canonicalize() {
-            if !out_real.starts_with(&dest_real) {
-                return Err(format!("zip entry escapes destination: {:?}", entry.name()));
-            }
-        }
-
-        if entry.is_dir() || entry.name().ends_with('/') {
-            std::fs::create_dir_all(&out).map_err(|e| format!("mkdir {}: {e}", out.display()))?;
-            continue;
-        }
-        if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-        }
-        let mut outfile =
-            std::fs::File::create(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
-        std::io::copy(&mut entry, &mut outfile)
-            .map_err(|e| format!("write {}: {e}", out.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Some(mode) = entry.unix_mode() {
-                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode));
-            }
-        }
-    }
-
-    find_payload(dest_dir)
-}
-
-fn find_payload(root: &Path) -> Result<PathBuf, String> {
+fn payload_spec() -> Option<gpui_app_update_core::PayloadSpec<'static>> {
     #[cfg(windows)]
     {
-        let exe = root.join(WINDOWS_EXE_NAME);
-        if exe.is_file() {
-            return Ok(exe);
-        }
-        if let Ok(rd) = std::fs::read_dir(root) {
-            for ent in rd.flatten() {
-                let p = ent.path().join(WINDOWS_EXE_NAME);
-                if p.is_file() {
-                    return Ok(p);
-                }
-            }
-        }
-        Err(format!("extracted zip does not contain {WINDOWS_EXE_NAME}"))
+        Some(gpui_app_update_core::PayloadSpec::WindowsExe(
+            WINDOWS_EXE_NAME,
+        ))
     }
     #[cfg(target_os = "macos")]
     {
-        let app = root.join(MACOS_APP_NAME);
-        if app.is_dir() {
-            return Ok(app);
-        }
-        if let Ok(rd) = std::fs::read_dir(root) {
-            for ent in rd.flatten() {
-                let p = ent.path();
-                if p.is_dir()
-                    && p.extension().and_then(|e| e.to_str()) == Some("app")
-                    && p.file_name().and_then(|n| n.to_str()) == Some(MACOS_APP_NAME)
-                {
-                    return Ok(p);
-                }
-            }
-        }
-        Err(format!("extracted zip does not contain {MACOS_APP_NAME}"))
+        Some(gpui_app_update_core::PayloadSpec::MacApp(MACOS_APP_NAME))
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = root;
-        Err("unsupported platform for app update".into())
+        None
     }
-}
-
-/// 是否运行在 cargo 构建目录里（开发态，不检查更新）。
-pub fn looks_like_dev_build(exe: &Path) -> bool {
-    let s = exe.to_string_lossy().to_ascii_lowercase();
-    s.contains("target\\debug")
-        || s.contains("target/debug")
-        || s.contains("target\\release")
-        || s.contains("target/release")
-}
-
-/// 用户跳过了这个版本则不提示。
-pub fn is_skipped(latest: &str, skipped: Option<&str>) -> bool {
-    skipped.is_some_and(|s| normalize_version(s) == normalize_version(latest))
 }
 
 fn http_agent(timeout: Duration) -> ureq::Agent {
@@ -475,32 +309,33 @@ pub fn fetch_text(url: &str, timeout_ms: u64) -> Result<String, String> {
 }
 
 /// 完整的「检查 → 有新版本则产出 Available」纯逻辑；网络由调用方注入。
+///
+/// sidecar 按「资产 URL + `.sha256`」拼接，检查阶段不要求它出现在资产列表里。
 pub fn evaluate_release(
     current_version: &str,
     release: &GithubRelease,
     candidates: &[&str],
 ) -> Result<UpdateStatus, String> {
-    if release.draft || release.prerelease {
-        return Ok(UpdateStatus::NotAvailable {
+    let candidate = gpui_app_update_core::evaluate_release(
+        current_version,
+        release,
+        candidates,
+        gpui_app_update_core::ChecksumSource::UrlSuffix,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(match candidate {
+        None => UpdateStatus::NotAvailable {
             current_version: current_version.to_string(),
-        });
-    }
-    let latest = normalize_version(&release.tag_name);
-    if !is_version_newer(&latest, current_version) {
-        return Ok(UpdateStatus::NotAvailable {
+        },
+        Some(c) => UpdateStatus::Available {
             current_version: current_version.to_string(),
-        });
-    }
-    let asset = select_asset_by_candidates(release, candidates)
-        .ok_or_else(|| format!("no matching asset for this platform among {candidates:?}"))?;
-    Ok(UpdateStatus::Available {
-        current_version: current_version.to_string(),
-        latest_version: latest,
-        release_url: release.html_url.clone(),
-        notes: release.body.clone().unwrap_or_default(),
-        asset_name: asset.name.clone(),
-        asset_url: asset.browser_download_url.clone(),
-        checksum_url: format!("{}.sha256", asset.browser_download_url),
+            latest_version: c.latest_version,
+            release_url: c.release_url,
+            notes: c.notes,
+            asset_name: c.asset_name,
+            asset_url: c.asset_url,
+            checksum_url: c.checksum_url,
+        },
     })
 }
 
@@ -539,16 +374,6 @@ pub fn is_packaged_install() -> bool {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn enclosing_app_bundle(exe: &Path) -> Option<PathBuf> {
-    for ancestor in exe.ancestors() {
-        if ancestor.extension().and_then(|e| e.to_str()) == Some("app") {
-            return Some(ancestor.to_path_buf());
-        }
-    }
-    None
-}
-
 /// 启动时清理上次更新留下的 `.old` 备份。
 pub fn cleanup_previous_update_leftovers() {
     let Ok(exe) = std::env::current_exe() else {
@@ -556,21 +381,12 @@ pub fn cleanup_previous_update_leftovers() {
     };
     #[cfg(windows)]
     {
-        let mut name = exe.as_os_str().to_owned();
-        name.push(".old");
-        let old = PathBuf::from(name);
-        if old.exists() {
-            let _ = std::fs::remove_file(&old);
-        }
+        gpui_app_update_installer::remove_exe_backup(&exe);
     }
     #[cfg(target_os = "macos")]
     {
-        let Some(bundle) = enclosing_app_bundle(&exe) else {
-            return;
-        };
-        let old = bundle.with_extension("app.old");
-        if old.exists() {
-            let _ = std::fs::remove_dir_all(&old);
+        if let Some(bundle) = enclosing_app_bundle(&exe) {
+            gpui_app_update_installer::remove_bundle_backup(&bundle);
         }
     }
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -579,10 +395,10 @@ pub fn cleanup_previous_update_leftovers() {
     }
 }
 
-/// 写 helper 脚本 → spawn → 调用方随后退出进程。
+/// 预检通过后拉起 helper，调用方随后退出进程。
 ///
-/// rename-first：任一时刻磁盘上至少有一份完整二进制。copy 失败时 helper
-/// 必须把 `.old` 挪回原名。
+/// helper（共享安装器）rename-first：任一时刻磁盘上至少有一份完整程序，
+/// copy 失败时把 `.old` 挪回原名再启动。
 pub fn apply_update_and_restart(payload: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -599,6 +415,28 @@ pub fn apply_update_and_restart(payload: &Path) -> Result<(), String> {
     }
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+fn probe_install_dir(parent: &Path) -> Result<(), String> {
+    let probe = parent.join(format!(".aum-update-write-probe-{}", std::process::id()));
+    match std::fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "install directory is not writable ({}): {e}",
+            parent.display()
+        )),
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn helper_dir() -> Result<PathBuf, String> {
+    let cache = update_cache_dir().ok_or_else(|| "user data dir unavailable".to_string())?;
+    std::fs::create_dir_all(&cache).map_err(|e| format!("create cache: {e}"))?;
+    Ok(cache)
+}
+
 #[cfg(windows)]
 fn apply_update_windows(payload: &Path) -> Result<(), String> {
     if !payload.is_file() {
@@ -608,101 +446,13 @@ fn apply_update_windows(payload: &Path) -> Result<(), String> {
     if current == payload {
         return Err("payload is the running executable".into());
     }
-
     let Some(parent) = current.parent() else {
         return Err("current exe has no parent directory".into());
     };
-    let probe = parent.join(format!(".aum-update-write-probe-{}", std::process::id()));
-    match std::fs::write(&probe, b"ok") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-        }
-        Err(e) => {
-            return Err(format!(
-                "install directory is not writable ({}): {e}",
-                parent.display()
-            ));
-        }
-    }
-
-    let cache = update_cache_dir().ok_or_else(|| "user data dir unavailable".to_string())?;
-    std::fs::create_dir_all(&cache).map_err(|e| format!("create cache: {e}"))?;
-    let script_path = cache.join("apply-update.ps1");
-    let log_path = cache.join("apply-update.log");
-
-    let q = |p: &Path| -> String {
-        let s = p.to_string_lossy().replace('\'', "''");
-        format!("'{s}'")
-    };
-    let parent_pid = std::process::id();
-    let script = format!(
-        r#"$ErrorActionPreference = 'Stop'
-$exe = {exe}
-$new = {new}
-$old = "$exe.old"
-$log = {log}
-function Log($m) {{ Add-Content -Path $log -Value ("$(Get-Date -Format o) " + $m) }}
-try {{
-  Log "waiting for pid {pid}"
-  Wait-Process -Id {pid} -ErrorAction SilentlyContinue
-  Start-Sleep -Milliseconds 400
-  if (Test-Path -LiteralPath $old) {{ Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue }}
-  Move-Item -LiteralPath $exe -Destination $old -Force
-  try {{
-    Copy-Item -LiteralPath $new -Destination $exe -Force
-    Log "copied new binary"
-    Start-Process -FilePath $exe
-    Log "relaunched"
-  }} catch {{
-    Log ("COPY FAILED, restoring: " + $_.Exception.Message)
-    if (Test-Path -LiteralPath $exe) {{ Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue }}
-    if (Test-Path -LiteralPath $old) {{
-      Move-Item -LiteralPath $old -Destination $exe -Force
-      Start-Process -FilePath $exe
-      Log "restored previous binary and relaunched"
-    }} else {{
-      Log "CRITICAL: no .old to restore"
-    }}
-    exit 1
-  }}
-}} catch {{
-  Log ("FAILED: " + $_.Exception.Message)
-  exit 1
-}}
-"#,
-        exe = q(&current),
-        new = q(payload),
-        log = q(&log_path),
-        pid = parent_pid,
-    );
-    let mut f = std::fs::File::create(&script_path).map_err(|e| format!("write helper: {e}"))?;
-    f.write_all(script.as_bytes())
-        .map_err(|e| format!("write helper: {e}"))?;
-    drop(f);
-
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(&script_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
-        if cmd.spawn().is_ok() {
-            return Ok(());
-        }
-        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-        cmd.spawn()
-            .map_err(|e| format!("spawn update helper: {e}"))?;
-    }
-    Ok(())
+    probe_install_dir(parent)?;
+    let cache = helper_dir()?;
+    gpui_app_update_installer::spawn_windows_exe_replacement(&current, payload, &cache)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -713,95 +463,13 @@ fn apply_update_macos(payload: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
     let current_bundle =
         enclosing_app_bundle(&exe).ok_or_else(|| "not running from a .app bundle".to_string())?;
-
     let Some(parent) = current_bundle.parent() else {
         return Err("app bundle has no parent directory".into());
     };
-    let probe = parent.join(format!(".aum-update-write-probe-{}", std::process::id()));
-    match std::fs::write(&probe, b"ok") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-        }
-        Err(e) => {
-            return Err(format!(
-                "install directory is not writable ({}): {e}",
-                parent.display()
-            ));
-        }
-    }
-
-    let cache = update_cache_dir().ok_or_else(|| "user data dir unavailable".to_string())?;
-    std::fs::create_dir_all(&cache).map_err(|e| format!("create cache: {e}"))?;
-    let script_path = cache.join("apply-update.sh");
-    let log_path = cache.join("apply-update.log");
-
-    let shell_quote = |p: &Path| -> String {
-        let s = p.to_string_lossy().replace('\'', "'\\''");
-        format!("'{s}'")
-    };
-    let parent_pid = std::process::id();
-    let script = format!(
-        r#"#!/bin/bash
-set -euo pipefail
-trap '' HUP
-CUR={cur}
-NEW={new}
-OLD="${{CUR}}.old"
-LOG={log}
-log() {{ echo "$(date -Iseconds) $*" >> "$LOG"; }}
-log "waiting for pid {pid}"
-while kill -0 {pid} 2>/dev/null; do sleep 0.2; done
-sleep 0.3
-rm -rf "$OLD"
-mv "$CUR" "$OLD"
-if cp -R "$NEW" "$CUR"; then
-  log "replaced app bundle"
-  open "$CUR"
-  log "relaunched"
-else
-  log "COPY FAILED, restoring previous bundle"
-  rm -rf "$CUR"
-  mv "$OLD" "$CUR"
-  open "$CUR"
-  log "restored and relaunched previous bundle"
-  exit 1
-fi
-"#,
-        cur = shell_quote(&current_bundle),
-        new = shell_quote(payload),
-        log = shell_quote(&log_path),
-        pid = parent_pid,
-    );
-    let mut f = std::fs::File::create(&script_path).map_err(|e| format!("write helper: {e}"))?;
-    f.write_all(script.as_bytes())
-        .map_err(|e| format!("write helper: {e}"))?;
-    drop(f);
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755));
-    }
-
-    let mut cmd = std::process::Command::new("/bin/bash");
-    cmd.arg(&script_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: 子进程里只 setsid，让 helper 离开父进程会话，避免 quit 时
-        // SIGHUP 把替换脚本带走。
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-    cmd.spawn()
-        .map_err(|e| format!("spawn update helper: {e}"))?;
-    Ok(())
+    probe_install_dir(parent)?;
+    let cache = helper_dir()?;
+    gpui_app_update_installer::spawn_macos_bundle_replacement(&current_bundle, payload, &cache)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -973,37 +641,89 @@ mod tests {
             zip.write_all(b"nope").unwrap();
             zip.finish().unwrap();
         }
-        let dest = dir.join("out");
-        let err = extract_update_zip(&zip_path, &dest).unwrap_err();
+        let cache = dir.join("cache");
+        let err = extract_update_zip(&zip_path, &cache).unwrap_err();
         assert!(err.contains("escape") || err.contains("absolute"), "{err}");
+        assert!(!dir.join("escape.txt").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn write_release_zip(path: &Path, files: &[&str]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        for name in files {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(b"binary").unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    /// 发行包布局与 `.github/workflows/release.yml` 一致：Windows 根目录 exe + assets，
+    /// macOS 为 `Agent Usage Metrics.app` bundle。
     #[test]
     fn extract_roundtrip_and_find_exe_or_app() {
         let dir = test_dir("extract-ok");
         let zip_path = dir.join("pack.zip");
-        {
-            let file = std::fs::File::create(&zip_path).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
-            let opts = zip::write::SimpleFileOptions::default();
-            #[cfg(windows)]
-            let payload_name = WINDOWS_EXE_NAME;
-            #[cfg(target_os = "macos")]
-            let payload_name = "Agent Usage Metrics.app/Contents/MacOS/devin-usage-metrics";
-            #[cfg(not(any(windows, target_os = "macos")))]
-            let payload_name = WINDOWS_EXE_NAME;
-            zip.start_file(payload_name, opts).unwrap();
-            zip.write_all(b"binary").unwrap();
-            zip.finish().unwrap();
-        }
-        let dest = dir.join("extracted");
-        let payload = extract_update_zip(&zip_path, &dest).unwrap();
-        assert!(payload.exists(), "payload at {}", payload.display());
+        write_release_zip(
+            &zip_path,
+            &[
+                WINDOWS_EXE_NAME,
+                "assets/icon.png",
+                "Agent Usage Metrics.app/Contents/Info.plist",
+                "Agent Usage Metrics.app/Contents/MacOS/devin-usage-metrics",
+            ],
+        );
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(cache.join("extracted")).unwrap();
+        std::fs::write(cache.join("pack.zip.sha256"), b"keep").unwrap();
+        let result = extract_update_zip(&zip_path, &cache);
         #[cfg(windows)]
-        assert!(payload.ends_with(WINDOWS_EXE_NAME));
+        assert!(result.unwrap().ends_with(WINDOWS_EXE_NAME));
         #[cfg(target_os = "macos")]
-        assert!(payload.ends_with(MACOS_APP_NAME));
+        assert!(result.unwrap().ends_with(MACOS_APP_NAME));
+        #[cfg(not(any(windows, target_os = "macos")))]
+        assert_eq!(result.unwrap_err(), "unsupported platform for app update");
+        assert!(
+            !cache.join("extracted").exists(),
+            "legacy fixed dir is retired"
+        );
+        assert!(
+            cache.join("pack.zip.sha256").exists(),
+            "other cache files stay"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bare_binary_fallback_zip_is_not_an_installable_payload() {
+        let dir = test_dir("bare-binary");
+        let zip_path = dir.join("pack.zip");
+        write_release_zip(&zip_path, &["devin-usage-metrics"]);
+        let err = extract_update_zip(&zip_path, &dir.join("cache")).unwrap_err();
+        assert!(
+            err.contains("does not contain") || err.contains("unsupported platform"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checksum_verification_keeps_messages() {
+        let dir = test_dir("checksum");
+        let file = dir.join("a.zip");
+        std::fs::write(&file, b"abc").unwrap();
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        verify_checksum(&file, &format!("{abc}  a.zip\n")).unwrap();
+        assert_eq!(
+            verify_checksum(&file, "junk").unwrap_err(),
+            "checksum sidecar is malformed"
+        );
+        let zero = "0".repeat(64);
+        assert_eq!(
+            verify_checksum(&file, &zero).unwrap_err(),
+            format!("checksum mismatch: expected {zero}, got {abc}")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4,9 +4,11 @@ version = "0.2.10"
 edition = "2021"
 
 [dependencies]
-gpui-app-host = { git = "https://github.com/meimingqi222/gpui-app-kit.git", rev = "3cf5e6cb3c171769e91674d3d5b0b3a7115b9c56" }
-gpui-app-widgets = { git = "https://github.com/meimingqi222/gpui-app-kit.git", rev = "3cf5e6cb3c171769e91674d3d5b0b3a7115b9c56" }
+gpui-app-host = { git = "https://github.com/meimingqi222/gpui-app-kit.git", rev = "ebb73e0e98701f405ef0bb85e95008a052013031" }
+gpui-app-widgets = { git = "https://github.com/meimingqi222/gpui-app-kit.git", rev = "ebb73e0e98701f405ef0bb85e95008a052013031" }
 gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "runtime_shaders"] }
+gpui-app-update-core = { git = "https://github.com/meimingqi222/gpui-app-kit.git", rev = "ebb73e0e98701f405ef0bb85e95008a052013031" }
+gpui-app-update-installer = { git = "https://github.com/meimingqi222/gpui-app-kit.git", rev = "ebb73e0e98701f405ef0bb85e95008a052013031" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -60,4 +62,4 @@ panic = "abort"
 strip = true
 
 [patch.crates-io]
-gpui = { git = "https://github.com/meimingqi222/gpui-app-kit.git", rev = "3cf5e6cb3c171769e91674d3d5b0b3a7115b9c56" }
+gpui = { git = "https://github.com/meimingqi222/gpui-app-kit.git", rev = "ebb73e0e98701f405ef0bb85e95008a052013031" }

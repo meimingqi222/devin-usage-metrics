@@ -37,7 +37,7 @@ jobs:
         run: cargo clippy --all-targets
 
       - name: Check content boundary
-        run: python ../gpui-app-kit/tools/check_content.py src/tray.rs
+        run: python ../gpui-app-kit/tools/check_content.py --forbid-call start_load --forbid-call start_tick --forbid-call switch_period src/tray.rs
 
       - name: Run tests
         run: cargo test

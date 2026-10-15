@@ -6,8 +6,8 @@
 use super::*;
 use devin_usage_metrics::updater::{
     self, candidate_asset_names, current_target, download_to_file, evaluate_release,
-    extract_update_zip, fetch_latest_release, fetch_text, is_skipped, parse_checksum_sidecar,
-    sha256_file, DownloadProgress, UpdateStatus, CHECK_INTERVAL_MS, FIRST_CHECK_DELAY_MS,
+    extract_update_zip, fetch_latest_release, fetch_text, is_skipped, verify_checksum,
+    DownloadProgress, UpdateStatus, CHECK_INTERVAL_MS, FIRST_CHECK_DELAY_MS,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -245,16 +245,8 @@ impl Root {
             }
             let sidecar = fetch_text(&checksum_url, 20_000)?;
             std::fs::write(&sidecar_path, &sidecar).map_err(|e| e.to_string())?;
-            let expected = parse_checksum_sidecar(&sidecar)
-                .ok_or_else(|| "checksum sidecar is malformed".to_string())?;
-            let actual = sha256_file(&zip_path).map_err(|e| e.to_string())?;
-            if actual != expected {
-                return Err(format!(
-                    "checksum mismatch: expected {expected}, got {actual}"
-                ));
-            }
-            let extracted = cache.join("extracted");
-            let payload = extract_update_zip(&zip_path, &extracted)?;
+            verify_checksum(&zip_path, &sidecar)?;
+            let payload = extract_update_zip(&zip_path, &cache)?;
             Ok::<PathBuf, String>(payload)
         });
 

@@ -5152,33 +5152,6 @@ impl Render for Root {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn set_macos_dock_icon() {
-    use objc::{class, msg_send, sel, sel_impl};
-    const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
-
-    unsafe {
-        let app: *mut objc::runtime::Object = msg_send![class!(NSApplication), sharedApplication];
-        if app.is_null() {
-            return;
-        }
-        let data: *mut objc::runtime::Object = msg_send![
-            class!(NSData),
-            dataWithBytes: ICON_PNG.as_ptr() as *const std::ffi::c_void
-            length: ICON_PNG.len()
-        ];
-        if data.is_null() {
-            return;
-        }
-        let image: *mut objc::runtime::Object = msg_send![class!(NSImage), alloc];
-        let image: *mut objc::runtime::Object = msg_send![image, initWithData: data];
-        if !image.is_null() {
-            let _: () = msg_send![app, setApplicationIconImage: image];
-            let _: () = msg_send![image, release];
-        }
-    }
-}
-
 fn main() {
     // 语言必须在任何文案生成前确定：配置文件 > 系统 locale。
     // 必须在 --cli 分支之前，否则 CLI 会停在 LANG 的静态默认值上。
@@ -5338,7 +5311,7 @@ fn main() {
         // 新价格在下次数据加载时生效；失败静默保留旧数据。
         pricing::ensure_fresh_async();
         #[cfg(target_os = "macos")]
-        set_macos_dock_icon();
+        gpui_app_host::desktop::set_dock_icon(include_bytes!("../assets/icon.png"), cx);
 
         gpui_app_host::desktop::bind_actions(
             cx,
