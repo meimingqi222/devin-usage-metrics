@@ -3291,6 +3291,386 @@ pub(crate) fn load_pi(start: i64, end: i64) -> LoadedData {
     data
 }
 
+// ==================== WorkBuddy ====================
+
+/// WorkBuddy（`~/.workbuddy`，桌面端）与同布局的 WorkBuddy AI
+///（`~/.workbuddy-ai`，workbuddy.ai）及 CodeBuddy CLI（`~/.codebuddy`）
+/// 共用同一套会话格式：`projects/<project-slug>/<sessionId>.jsonl`，
+/// 子会话在同名目录的 `subagents/` 下沿用同样的 JSONL 记录。
+/// 每行一条记录，`type` 包含 `message`（user/assistant）、`reasoning`、
+/// `function_call`、`function_call_result`、`file-history-snapshot`、
+/// `ai-title`、`custom-title` 等；携带 `providerData.usage`（新格式 camelCase，
+/// 附 `rawUsage`）或 `providerData.usage.input_tokens`（旧格式 snake_case，
+/// 无缓存拆分）的记录对应一次真实 LLM 调用。
+pub(crate) fn workbuddy_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for var in [
+        "WORKBUDDY_CONFIG_DIR",
+        "CODEBUDDY_CONFIG_DIR",
+        "WORKBUDDY_DIR",
+    ] {
+        if let Some(dir) = std::env::var_os(var) {
+            let dir = PathBuf::from(dir);
+            if !dir.as_os_str().is_empty() {
+                roots.push(dir.join("projects"));
+            }
+        }
+    }
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    roots.push(home.join(".workbuddy/projects"));
+    roots.push(home.join(".workbuddy-ai/projects"));
+    roots.push(home.join(".codebuddy/projects"));
+    let mut seen = HashSet::new();
+    roots.retain(|p| seen.insert(p.clone()));
+    roots
+}
+
+/// WorkBuddy 时间戳多为毫秒整数，旧记录也可能是秒或 RFC3339 字符串；
+/// 浮点毫秒（极少）按整数毫秒同样处理。
+fn workbuddy_ts(value: Option<&Value>) -> i64 {
+    if let Some(Value::Number(n)) = value {
+        if let Some(f) = n.as_f64() {
+            let i = f as i64;
+            return if i > 10_000_000_000 { i / 1000 } else { i };
+        }
+    }
+    timestamp(value)
+}
+
+fn workbuddy_number(value: Option<&Value>) -> f64 {
+    match value {
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+        Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// 在多个别名 key 中取第一个存在的字段值（即使为 0 也算存在）。
+fn workbuddy_pick(obj: &Value, keys: &[&str]) -> Option<f64> {
+    for key in keys {
+        if obj.get(key).is_some() {
+            return Some(workbuddy_number(obj.get(key)));
+        }
+    }
+    None
+}
+
+/// 缓存读取量：别名之间取最大值（它们是同一数量的不同写法，不是累加关系）。
+fn workbuddy_cached(usage: &Value, raw: Option<&Value>) -> f64 {
+    let mut best = 0.0f64;
+    // 新格式：inputTokensDetails: [{cached_tokens}]
+    for details_key in ["inputTokensDetails", "input_tokens_details"] {
+        if let Some(details) = usage.get(details_key).and_then(Value::as_array) {
+            let mut sum = 0.0;
+            for item in details {
+                sum += workbuddy_number(item.get("cached_tokens"))
+                    + workbuddy_number(item.get("cachedTokens"))
+                    + workbuddy_number(item.get("cache_read_input_tokens"))
+                    + workbuddy_number(item.get("cacheReadInputTokens"));
+            }
+            best = best.max(sum);
+        }
+    }
+    for key in [
+        "cached_tokens",
+        "cachedTokens",
+        "cache_read_input_tokens",
+        "cacheReadInputTokens",
+        "prompt_cache_hit_tokens",
+        "promptCacheHitTokens",
+    ] {
+        best = best.max(workbuddy_number(usage.get(key)));
+    }
+    if let Some(raw) = raw {
+        best = best.max(workbuddy_number(raw.get("prompt_cache_hit_tokens")));
+        best = best.max(workbuddy_number(raw.get("cache_read_input_tokens")));
+        best = best.max(workbuddy_number(raw.get("cached_tokens")));
+        if let Some(v) = raw
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .map(|v| workbuddy_number(Some(v)))
+        {
+            best = best.max(v);
+        }
+    }
+    best.max(0.0)
+}
+
+fn workbuddy_cache_write(usage: &Value, raw: Option<&Value>) -> f64 {
+    let mut best = 0.0f64;
+    for key in [
+        "cache_creation_input_tokens",
+        "cacheCreationInputTokens",
+        "prompt_cache_write_tokens",
+        "promptCacheWriteTokens",
+        "cache_write_input_tokens",
+        "cacheWriteInputTokens",
+    ] {
+        best = best.max(workbuddy_number(usage.get(key)));
+    }
+    if let Some(raw) = raw {
+        for key in [
+            "prompt_cache_write_tokens",
+            "cache_creation_input_tokens",
+            "cache_write_input_tokens",
+        ] {
+            best = best.max(workbuddy_number(raw.get(key)));
+        }
+    }
+    best.max(0.0)
+}
+
+/// 从 providerData 提取 (新增输入, 输出, 缓存读取, 缓存写入)。
+/// 输入口径与 Claude 一致：总量减去缓存读取，只保留新增部分。
+/// 无任何可计量用量时返回 None，调用方跳过该记录。
+fn workbuddy_usage_tokens(usage: &Value, raw: Option<&Value>) -> Option<(f64, f64, f64, f64)> {
+    let total_in = workbuddy_pick(usage, &["inputTokens", "input_tokens", "prompt_tokens"])
+        .or_else(|| {
+            raw.and_then(|r| workbuddy_pick(r, &["prompt_tokens", "inputTokens", "input_tokens"]))
+        })
+        .unwrap_or(0.0)
+        .max(0.0);
+    let output = workbuddy_pick(
+        usage,
+        &["outputTokens", "output_tokens", "completion_tokens"],
+    )
+    .or_else(|| {
+        raw.and_then(|r| workbuddy_pick(r, &["completion_tokens", "outputTokens", "output_tokens"]))
+    })
+    .unwrap_or(0.0)
+    .max(0.0);
+    let cached = workbuddy_cached(usage, raw);
+    let write = workbuddy_cache_write(usage, raw);
+    let input = (total_in - cached).max(0.0);
+    if input == 0.0 && output == 0.0 && cached == 0.0 && write == 0.0 {
+        return None;
+    }
+    Some((input, output, cached, write))
+}
+
+fn workbuddy_model(provider: &Value) -> String {
+    for key in ["model", "requestModelId", "requestModelName"] {
+        if let Some(name) = provider.get(key).and_then(Value::as_str) {
+            let name = name.trim();
+            if !name.is_empty() {
+                return name.to_owned();
+            }
+        }
+    }
+    "unknown".into()
+}
+
+/// 解析单个 WorkBuddy 会话文件。一个文件通常只对应一个会话（subagents 下的
+/// 文件是独立会话，用自己的 sessionId 区分），但为稳妥仍按 sessionId 分组，
+/// 由外层统一合并。返回 (会话构造器, 窗口内 turns, 无法读取标记)。
+fn parse_workbuddy_file(
+    path: &Path,
+    start: i64,
+    end: i64,
+) -> (HashMap<String, SessionBuilder>, Vec<TurnRec>, usize) {
+    let mut builders: HashMap<String, SessionBuilder> = HashMap::new();
+    let mut turns = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let fallback_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("")
+        .to_owned();
+    let Ok(file) = File::open(path) else {
+        return (builders, turns, 1);
+    };
+    let path_lossy = path.to_string_lossy().into_owned();
+    for (order, line) in BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .enumerate()
+    {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let sid = value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| fallback_id.clone());
+        if sid.is_empty() {
+            continue;
+        }
+        let builder = builders
+            .entry(sid.clone())
+            .or_insert_with(|| SessionBuilder {
+                id: sid.clone(),
+                source: "local".into(),
+                ..Default::default()
+            });
+        let at = workbuddy_ts(value.get("timestamp"));
+        builder.observe_time(at);
+        if builder.cwd.is_empty() {
+            if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
+                if !cwd.trim().is_empty() {
+                    builder.cwd = cwd.to_owned();
+                }
+            }
+        }
+        match value.get("type").and_then(Value::as_str).unwrap_or("") {
+            "ai-title" => {
+                if let Some(title) = value.get("aiTitle").and_then(Value::as_str) {
+                    if !title.trim().is_empty() {
+                        builder.title = compact_title(title);
+                    }
+                }
+            }
+            "custom-title" => {
+                if let Some(title) = value.get("customTitle").and_then(Value::as_str) {
+                    if !title.trim().is_empty() {
+                        builder.title = compact_title(title);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let provider = value.get("providerData");
+        // providerData.agent 标识调用方（cli / Explore / compact 等），记为模式
+        if builder.mode.is_empty() {
+            if let Some(agent) = provider
+                .and_then(|p| p.get("agent"))
+                .and_then(Value::as_str)
+            {
+                if !agent.trim().is_empty() {
+                    builder.mode = agent.to_owned();
+                }
+            }
+        }
+        let (Some(provider), Some(usage)) = (provider, provider.and_then(|p| p.get("usage")))
+        else {
+            continue;
+        };
+        // 同一 messageId 会在 reasoning / function_call / message 等多条记录里
+        // 重复出现，但只有一个携带 usage；按 messageId 去重后只计一次。
+        // 旧格式没有 messageId，回退到记录 id。
+        let mid = provider
+            .get("messageId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let rid = value.get("id").and_then(Value::as_str).unwrap_or("");
+        let dedup_raw = if !mid.is_empty() { mid } else { rid };
+        let dedup_key = if dedup_raw.is_empty() {
+            format!("anon:{path_lossy}:{order}")
+        } else {
+            dedup_raw.to_owned()
+        };
+        if !seen.insert(dedup_key.clone()) {
+            continue;
+        }
+        let raw = provider.get("rawUsage");
+        let Some((input, output, cached, write)) = workbuddy_usage_tokens(usage, raw) else {
+            continue;
+        };
+        let model = workbuddy_model(provider);
+        if !model.is_empty() && (builder.model.is_empty() || builder.model == "unknown") {
+            if model != "unknown" || builder.model.is_empty() {
+                builder.model = model.clone();
+            }
+        }
+        builder.input_tokens += input;
+        builder.output_tokens += output;
+        builder.cached_tokens += cached;
+        builder.cache_creation_tokens += write;
+        builder.agent_messages += 1.0;
+        if at >= start && at < end {
+            turns.push(TurnRec {
+                agent: AgentKind::WorkBuddy,
+                session_key: format!("workbuddy/{sid}"),
+                created_at: at,
+                input_tokens: input,
+                output_tokens: output,
+                cache_read_tokens: cached,
+                cache_creation_tokens: write,
+                cache_creation_5m_tokens: 0.0,
+                cache_creation_1h_tokens: 0.0,
+                model,
+                context_stream: "main".to_owned(),
+                context_order: order as u64,
+                ttft_ms: 0.0,
+                total_time_ms: 0.0,
+                recorded_cost: None,
+                dedup_key,
+                ..Default::default()
+            });
+        }
+    }
+    // 无标题时回退到会话 id，避免会话列表出现空标题
+    for builder in builders.values_mut() {
+        if builder.title.is_empty() {
+            builder.title = builder.id.clone();
+        }
+        if builder.model.is_empty() {
+            builder.model = "unknown".into();
+        }
+        if builder.mode.is_empty() {
+            builder.mode = "cli".into();
+        }
+    }
+    (builders, turns, 0)
+}
+
+pub(crate) fn load_workbuddy(start: i64, end: i64) -> LoadedData {
+    let agent = AgentKind::WorkBuddy;
+    let roots = workbuddy_roots();
+    let mut data = LoadedData {
+        turns_start: start,
+        turns_end: end,
+        ..Default::default()
+    };
+    if !roots.iter().any(|root| root.exists()) {
+        data.errors.push(error(
+            agent,
+            i18n::tf(i18n::Key::ErrNotFound, &[&roots[0].display().to_string()]),
+        ));
+        return data;
+    }
+
+    let files = recent_files(&roots, "jsonl");
+    let mut skipped = 0usize;
+    let results: Vec<(HashMap<String, SessionBuilder>, Vec<TurnRec>, usize)> = files
+        .par_iter()
+        .map(|path| parse_workbuddy_file(path, start, end))
+        .collect();
+    let mut merged: HashMap<String, SessionBuilder> = HashMap::new();
+    let mut seen_turns: HashSet<String> = HashSet::new();
+    for (partial, partial_turns, skip) in results {
+        skipped += skip;
+        for (id, builder) in partial {
+            match merged.get_mut(&id) {
+                Some(existing) => existing.merge(builder),
+                None => {
+                    merged.insert(id, builder);
+                }
+            }
+        }
+        // 同一会话极少数情况下会分布在多个文件（迁移/复制），按
+        // (session_key, dedup_key) 跨文件去重，避免重复计费
+        for turn in partial_turns {
+            let key = format!("{}\0{}", turn.session_key, turn.dedup_key);
+            if seen_turns.insert(key) {
+                data.turns.push(turn);
+            }
+        }
+    }
+    data.sessions = merged
+        .into_values()
+        .map(|builder| builder.finish(agent))
+        .collect();
+    data.turns.sort_by_key(|turn| turn.created_at);
+    if skipped > 0 {
+        data.errors.push(error(
+            agent,
+            i18n::tf(i18n::Key::ErrSessionsUnreadable, &[&skipped.to_string()]),
+        ));
+    }
+    data
+}
+
 fn timestamp_ms_to_sec(ts: Option<i64>) -> i64 {
     ts.map(|t| if t > 10_000_000_000 { t / 1000 } else { t })
         .unwrap_or(0)
@@ -3301,7 +3681,8 @@ mod tests {
     use super::{
         amp_cache_dir, amp_list_cache_path, content_text, load_amp_thread_export_cache,
         mimocode_model_name, parse_amp_value, parse_antigravity_db, parse_claude_file,
-        parse_codex_file, parse_pi_file, timestamp, AgParse, AmpListCache, AmpListEntry,
+        parse_codex_file, parse_pi_file, parse_workbuddy_file, timestamp, workbuddy_ts,
+        workbuddy_usage_tokens, AgParse, AmpListCache, AmpListEntry,
     };
     use serde_json::json;
     use std::fs::File;
@@ -3906,5 +4287,132 @@ mod tests {
         assert_eq!(turns[0].input_tokens, 777.0);
         assert_eq!(turns[0].output_tokens, 0.0);
         assert_eq!(session.input_tokens, 777.0);
+    }
+
+    fn workbuddy_test_file(name: &str, lines: &[serde_json::Value]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("workbuddy-{name}-{}", std::process::id()));
+        let file = File::create(&path).unwrap();
+        let mut writer = BufWriter::new(file);
+        for line in lines {
+            writeln!(writer, "{line}").unwrap();
+        }
+        writer.flush().unwrap();
+        path
+    }
+
+    #[test]
+    fn workbuddy_ms_timestamps_convert_to_seconds() {
+        assert_eq!(
+            workbuddy_ts(Some(&json!(1_781_668_474_107i64))),
+            1_781_668_474
+        );
+        assert_eq!(workbuddy_ts(Some(&json!(1_700_000_000i64))), 1_700_000_000);
+    }
+
+    #[test]
+    fn workbuddy_new_format_splits_cached_input() {
+        let usage = json!({
+            "inputTokens": 29526, "outputTokens": 311, "totalTokens": 29837,
+            "inputTokensDetails": [{"cached_tokens": 13376}],
+            "outputTokensDetails": [{"reasoning_tokens": 121}]
+        });
+        let raw = json!({
+            "prompt_tokens": 29526, "completion_tokens": 311,
+            "prompt_cache_hit_tokens": 13376, "prompt_cache_miss_tokens": 16150
+        });
+        let (input, output, cached, write) = workbuddy_usage_tokens(&usage, Some(&raw)).unwrap();
+        assert_eq!(input, 16150.0);
+        assert_eq!(output, 311.0);
+        assert_eq!(cached, 13376.0);
+        assert_eq!(write, 0.0);
+    }
+
+    #[test]
+    fn workbuddy_old_snake_format_has_no_cached_split() {
+        let usage = json!({"input_tokens": 234015, "output_tokens": 536, "total_tokens": 234551});
+        let (input, output, cached, write) = workbuddy_usage_tokens(&usage, None).unwrap();
+        assert_eq!(input, 234015.0);
+        assert_eq!(output, 536.0);
+        assert_eq!(cached, 0.0);
+        assert_eq!(write, 0.0);
+    }
+
+    #[test]
+    fn workbuddy_empty_usage_is_skipped() {
+        let usage = json!({"inputTokens": 0, "outputTokens": 0, "totalTokens": 0,
+            "inputTokensDetails": [{"cached_tokens": 0}]});
+        assert!(workbuddy_usage_tokens(&usage, None).is_none());
+    }
+
+    #[test]
+    fn workbuddy_file_dedups_by_message_id_and_reads_title() {
+        let sid = "workbuddy-fixture-session";
+        let path = workbuddy_test_file(
+            "dedup-title",
+            &[
+                json!({"type": "ai-title", "aiTitle": "示例会话",
+                    "sessionId": sid, "timestamp": 1_781_668_477_385i64,
+                    "cwd": "/tmp/demo"}),
+                // 同一 messageId 的 reasoning 记录不带 usage，不应计数
+                json!({"id": "r1", "type": "reasoning", "sessionId": sid,
+                    "timestamp": 1_781_668_482_316i64, "cwd": "/tmp/demo",
+                    "providerData": {"messageId": "msg-1", "model": "glm-5.2"}}),
+                json!({"id": "c1", "type": "function_call", "sessionId": sid,
+                    "timestamp": 1_781_668_482_337i64, "cwd": "/tmp/demo",
+                    "providerData": {"messageId": "msg-1", "model": "glm-5.2",
+                        "usage": {"inputTokens": 29526, "outputTokens": 311,
+                            "totalTokens": 29837,
+                            "inputTokensDetails": [{"cached_tokens": 13376}]},
+                        "rawUsage": {"prompt_tokens": 29526, "completion_tokens": 311,
+                            "prompt_cache_hit_tokens": 13376}}}),
+                // 同一 messageId 即使再带一份 usage 也只计一次
+                json!({"id": "c1-dup", "type": "function_call", "sessionId": sid,
+                    "timestamp": 1_781_668_482_337i64, "cwd": "/tmp/demo",
+                    "providerData": {"messageId": "msg-1", "model": "glm-5.2",
+                        "usage": {"inputTokens": 29526, "outputTokens": 311,
+                            "totalTokens": 29837,
+                            "inputTokensDetails": [{"cached_tokens": 13376}]}}}),
+                json!({"id": "m2", "type": "message", "role": "assistant",
+                    "sessionId": sid, "timestamp": 1_781_668_559_885i64,
+                    "cwd": "/tmp/demo",
+                    "providerData": {"messageId": "msg-2", "model": "auto",
+                        "usage": {"input_tokens": 100, "output_tokens": 5,
+                            "total_tokens": 105}}}),
+            ],
+        );
+        let (builders, turns, skipped) = parse_workbuddy_file(&path, 0, i64::MAX);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(skipped, 0);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(builders.len(), 1);
+        let builder = builders.get(sid).unwrap();
+        assert_eq!(builder.title, "示例会话");
+        assert_eq!(builder.cwd, "/tmp/demo");
+        // 同一 messageId 的两份 usage 只汇总一次
+        assert_eq!(builder.input_tokens, 16150.0 + 100.0);
+        assert_eq!(builder.output_tokens, 316.0);
+        assert_eq!(builder.cached_tokens, 13376.0);
+        let first = turns.iter().find(|t| t.dedup_key == "msg-1").unwrap();
+        assert_eq!(first.model, "glm-5.2");
+        assert_eq!(first.session_key, format!("workbuddy/{sid}"));
+    }
+
+    #[test]
+    fn workbuddy_missing_title_falls_back_to_session_id() {
+        let sid = "workbuddy-fixture-without-title";
+        let path = workbuddy_test_file(
+            "fallback-title",
+            &[json!({"id": "m1", "type": "message", "role": "assistant",
+                "sessionId": sid, "timestamp": 1_775_203_663_393i64,
+                "providerData": {"model": "kimi-k2.5",
+                    "usage": {"input_tokens": 100, "output_tokens": 2,
+                        "total_tokens": 102}}})],
+        );
+        let (builders, turns, _) = parse_workbuddy_file(&path, 0, i64::MAX);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(builders[sid].title, sid);
+        assert!(builders[sid].cwd.is_empty());
+        assert_eq!(turns[0].dedup_key, "m1");
     }
 }

@@ -34,6 +34,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - uses: ./.github/actions/gpui-kit
+        with:
+          token: ${{ secrets.GPUI_APP_KIT_TOKEN }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

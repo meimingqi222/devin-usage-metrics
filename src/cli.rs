@@ -229,6 +229,9 @@ fn parse_agent(value: &str) -> Result<Option<AgentKind>, String> {
         "opencode" | "open-code" => Ok(Some(AgentKind::OpenCode)),
         "pi" | "pi-agent" => Ok(Some(AgentKind::Pi)),
         "mimocode" | "mimo-code" | "mimo" => Ok(Some(AgentKind::MimoCode)),
+        "workbuddy" | "work-buddy" | "wb" | "codebuddy" | "code-buddy" => {
+            Ok(Some(AgentKind::WorkBuddy))
+        }
         _ => Err(i18n::tf(i18n::Key::CliUnsupportedAgent, &[value])),
     }
 }
@@ -496,6 +499,7 @@ fn agent_cli_name(agent: AgentKind) -> &'static str {
         AgentKind::OpenCode => "opencode",
         AgentKind::Pi => "pi",
         AgentKind::MimoCode => "mimocode",
+        AgentKind::WorkBuddy => "workbuddy",
     }
 }
 
@@ -575,6 +579,10 @@ mod tests {
         assert_eq!(parse_agent("claude-code").unwrap(), Some(AgentKind::Claude));
         assert_eq!(parse_agent("open_code").unwrap(), Some(AgentKind::OpenCode));
         assert_eq!(parse_agent("pi-agent").unwrap(), Some(AgentKind::Pi));
+        assert_eq!(
+            parse_agent("codebuddy").unwrap(),
+            Some(AgentKind::WorkBuddy)
+        );
         assert_eq!(parse_agent("all").unwrap(), None);
         assert!(parse_agent("amp").is_err());
     }

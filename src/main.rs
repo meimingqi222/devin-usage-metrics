@@ -9,6 +9,9 @@
 mod compaction_ui;
 mod model_distribution;
 mod text_input;
+mod tray;
+mod tray_controller;
+mod tray_model;
 mod updater_ui;
 mod usage_table;
 
@@ -18,10 +21,10 @@ use data::{AgentKind, LoadedData};
 use devin_usage_metrics::compaction_config::current_thresholds;
 use devin_usage_metrics::{agg, cli, compaction, data, i18n, pricing, quota, sync};
 use gpui::{
-    actions, div, point, prelude::*, px, relative, rgb, size, Animation, AnimationExt as _,
-    AnyElement, App, Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyBinding,
-    KeyDownEvent, MouseButton, Render, SharedString, Task, TitlebarOptions, Window, WindowBounds,
-    WindowControlArea, WindowOptions,
+    div, point, prelude::*, px, relative, rgb, size, Animation, AnimationExt as _, AnyElement, App,
+    Application, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyDownEvent, MouseButton,
+    Render, SharedString, Task, TitlebarOptions, Window, WindowBounds, WindowControlArea,
+    WindowHandle, WindowOptions,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -29,8 +32,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use text_input::TextInput;
-
-actions!(main, [Quit]);
 
 const BG: u32 = 0x101014;
 const PANEL: u32 = 0x1a1a21;
@@ -119,7 +120,8 @@ enum SettingsTab {
     General,
 }
 
-/// 订阅配额卡片：一个账号一条，结果在后台查询完成后整体替换。
+/// 订阅配额卡片：一个账号一条，后台查询完成后逐条更新。
+#[derive(Clone)]
 struct QuotaCard {
     key: String,
     provider: quota::Provider,
@@ -874,7 +876,7 @@ impl Root {
         }
     }
 
-    /// 后台发现账号并并发查询配额（含必要的 token 刷新），完成后整体替换卡片。
+    /// 后台发现账号并并发查询配额（含必要的 token 刷新），逐条更新卡片。
     /// `force=true`（手动刷新）绕过 5 分钟结果缓存，但仍尊重 429 冷却。
     fn start_quota_load(&mut self, force: bool, cx: &mut Context<Self>) {
         self.quota_load_id += 1;
@@ -884,10 +886,28 @@ impl Root {
         let allow_keychain = self.quota_keychain_allowed;
         cx.notify();
 
+        let (updates, progress) = smol::channel::unbounded();
         let load = cx.background_executor().spawn(async move {
+            let started = std::time::Instant::now();
             let accounts = quota::discover_accounts(allow_keychain);
+            data::log_event(format!(
+                "quota discovery elapsed_ms={} accounts={}",
+                started.elapsed().as_millis(),
+                accounts.len()
+            ));
             // 各账号并发查询；返回顺序与 accounts 一致，卡片顺序不变
-            let results = quota::fetch_accounts(&accounts, force);
+            let results =
+                quota::fetch_accounts_with_progress(&accounts, force, |index, account, result| {
+                    let _ = updates.try_send((
+                        index,
+                        QuotaCard {
+                            key: account.key.clone(),
+                            provider: account.provider,
+                            label: account.label.clone(),
+                            result: result.clone(),
+                        },
+                    ));
+                });
             accounts
                 .iter()
                 .zip(results)
@@ -900,6 +920,30 @@ impl Root {
                 .collect::<Vec<_>>()
         });
         self.quota_task = Some(cx.spawn(async move |this, cx| {
+            let mut completed = std::collections::BTreeMap::new();
+            while let Ok((index, card)) = progress.recv().await {
+                completed.insert(index, card);
+                if this
+                    .update(cx, |this, cx| {
+                        if this.quota_load_id != load_id {
+                            return;
+                        }
+                        // 已完成账号按发现顺序展示；刷新时其余账号保留上次结果。
+                        let mut cards: Vec<QuotaCard> = completed.values().cloned().collect();
+                        cards.extend(
+                            this.quota_cards
+                                .iter()
+                                .filter(|old| !completed.values().any(|new| new.key == old.key))
+                                .cloned(),
+                        );
+                        this.quota_cards = cards;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
             let cards = load.await;
             this.update(cx, |this, cx| {
                 if this.quota_load_id != load_id {
@@ -1768,6 +1812,7 @@ impl Root {
                         .child(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             i18n::set_lang(lang);
+                            tray_controller::TrayController::refresh_language(cx);
                             this.rebuild_buckets();
                             this.rebuild_sessions();
                             cx.notify();
@@ -2228,7 +2273,7 @@ impl Root {
 
     /// Windows 专用的窗口控制按钮。不要挂 on_click：这些区域会被系统
     /// 命中为 HTMINBUTTON/HTMAXBUTTON/HTCLOSE，松开鼠标时由 GPUI 执行
-    /// 最小化/最大化/WM_CLOSE（关闭已通过 on_window_should_close 退出）。
+    /// 最小化/最大化/WM_CLOSE（关闭通过 on_window_should_close 转为托盘驻留）。
     /// `.occlude()` 把按钮区域从父级的 Drag 命中测试中挖出来，否则整条
     /// 顶栏都会被当作标题栏拖拽区。
     fn windows_caption_buttons(&self, window: &mut Window) -> impl IntoElement {
@@ -5148,27 +5193,112 @@ fn main() {
         return;
     }
 
-    Application::new().run(move |cx: &mut App| {
-        // 价格表后台自动更新（对标 OpenCode）：启动后在后台检查一次，
-        // 新价格在下次数据加载时生效；失败静默保留旧数据。
-        pricing::ensure_fresh_async();
-        #[cfg(target_os = "macos")]
-        set_macos_dock_icon();
+    struct MainWindowState(pub Option<WindowHandle<Root>>);
+    impl gpui::Global for MainWindowState {}
 
-        // Bind platform-specific quit shortcut
-        #[cfg(target_os = "macos")]
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-        #[cfg(not(target_os = "macos"))]
-        cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
-        text_input::bind_keys(cx);
+    fn build_root(cx: &mut Context<Root>) -> Root {
+        let sync_cfg = sync::read_config();
+        let local_id = data::device_id();
+        let mut root = Root {
+            data: Arc::new(LoadedData::default()),
+            loaded_agents: HashMap::new(),
+            agent: AgentKind::Devin,
+            view_mode: ViewMode::AgentHistory,
+            tab: Tab::Usage,
+            period: PeriodKind::Day,
+            page: 0,
+            buckets: Vec::new(),
+            expanded_buckets: std::collections::HashSet::new(),
+            sessions_rows: Vec::new(),
+            compaction_report: None,
+            compaction_key: None,
+            compaction_task: None,
+            compaction_config_task: None,
+            compaction_notice: None,
+            compaction_details_open: false,
+            selected: None,
+            loaded_at: i18n::t(i18n::Key::Loading).into(),
+            loading: false,
+            has_loaded: false,
+            load_task: None,
+            load_id: 0,
+            quota_cards: Vec::new(),
+            quota_loading: false,
+            quota_load_id: 0,
+            quota_task: None,
+            quota_tick_task: None,
+            quota_updated_at: String::new(),
+            quota_message: None,
+            quota_keychain_allowed: quota::keychain_allowed(),
+            quota_keychain_dismissed: false,
+            device_filter: Some(local_id),
+            remote_data: Arc::new(LoadedData::default()),
+            known_devices: Vec::new(),
+            sync_busy: false,
+            sync_id: 0,
+            sync_last_at: String::new(),
+            sync_last_completed: None,
+            sync_message: None,
+            sync_retry_attempt: 0,
+            sync_enabled: sync_cfg.enabled && sync::github_sync_session_is_valid(),
+            sync_api_url: sync_cfg.api_url,
+            github_login_busy: false,
+            github_login_id: 0,
+            github_login_code: None,
+            github_login_code_copied: false,
+            github_login_task: None,
+            sync_config_open: false,
+            modal_url_input: cx.new(|cx| text_input::new(cx, "", "", false)),
+            modal_focus: cx.focus_handle(),
+            section_agents_open: true,
+            section_devices_open: true,
+            section_other_agents_open: false,
+            settings_tab: SettingsTab::Sync,
+            hide_empty_buckets: false,
+            sync_tick_task: None,
+            sync_task: None,
+            update: updater_ui::UpdateState::default(),
+            update_prefs: i18n::load_update_prefs(),
+            session_search_input: cx.new(|cx| {
+                text_input::new(cx, "", i18n::t(i18n::Key::SessionsSearchPlaceholder), false)
+            }),
+            session_prefs: i18n::load_session_prefs(),
+            sessions_collapsed_projects: std::collections::HashSet::new(),
+            sessions_show_hidden: false,
+            session_feedback: None,
+        };
+        root.rebuild_buckets();
+        root.rebuild_sessions();
+        root.start_load(false, cx);
+        root.start_update_scheduler(cx);
+        let search_input = root.session_search_input.clone();
+        cx.observe(&search_input, |_, _, cx| {
+            cx.notify();
+        })
+        .detach();
+        root
+    }
+
+    fn open_main_window(cx: &mut App) {
+        // 必须先激活应用再创建普通窗口。GPUI 0.2.2 在后台创建窗口时会同步
+        // resignKeyWindow，重入 window_did_change_key_status 并死锁。
+        tray_controller::TrayController::activate_dashboard(cx);
+        if cx.has_global::<MainWindowState>() {
+            if let Some(handle) = cx.global::<MainWindowState>().0 {
+                let res = handle.update(cx, |_, window, _| {
+                    window.activate_window();
+                    true
+                });
+                if res.is_ok() {
+                    return;
+                }
+            }
+        }
 
         let bounds = Bounds::centered(None, size(px(1240.), px(780.)), cx);
-        cx.open_window(
+        let handle = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                // 隐藏系统标题栏，内容延伸到窗口顶部（红绿灯悬浮在侧边栏上），
-                // 实现 macOS 一体化工具栏外观
                 titlebar: Some(TitlebarOptions {
                     title: Some("Agent Usage Metrics".into()),
                     appears_transparent: true,
@@ -5177,106 +5307,83 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                // Quit app when window is closed (clicking the red X button)
-                window.on_window_should_close(cx, |_, cx| {
-                    cx.quit();
-                    true // allow the window to close
+                gpui_app_host::desktop::install_close_handler(window, cx, |cx| {
+                    if cx.has_global::<MainWindowState>() {
+                        cx.global_mut::<MainWindowState>().0 = None;
+                    }
+                    tray_controller::TrayController::dashboard_closed(cx, |cx| {
+                        cx.global::<MainWindowState>().0.is_some()
+                    });
                 });
 
-                cx.new(|cx| {
-                    // 读取同步配置：决定启动时是否导入远程数据、是否启动定时任务
-                    let sync_cfg = sync::read_config();
-                    let local_id = data::device_id();
-                    let mut root = Root {
-                        data: Arc::new(LoadedData::default()),
-                        loaded_agents: HashMap::new(),
-                        agent: AgentKind::Devin,
-                        view_mode: ViewMode::AgentHistory,
-                        tab: Tab::Usage,
-                        period: PeriodKind::Day,
-                        page: 0,
-                        buckets: Vec::new(),
-                        expanded_buckets: std::collections::HashSet::new(),
-                        sessions_rows: Vec::new(),
-                        compaction_report: None,
-                        compaction_key: None,
-                        compaction_task: None,
-                        compaction_config_task: None,
-                        compaction_notice: None,
-                        compaction_details_open: false,
-                        selected: None,
-                        loaded_at: i18n::t(i18n::Key::Loading).into(),
-                        loading: false,
-                        has_loaded: false,
-                        load_task: None,
-                        load_id: 0,
-                        quota_cards: Vec::new(),
-                        quota_loading: false,
-                        quota_load_id: 0,
-                        quota_task: None,
-                        quota_tick_task: None,
-                        quota_updated_at: String::new(),
-                        quota_message: None,
-                        quota_keychain_allowed: quota::keychain_allowed(),
-                        quota_keychain_dismissed: false,
-                        device_filter: Some(local_id),
-                        remote_data: Arc::new(LoadedData::default()),
-                        known_devices: Vec::new(),
-                        sync_busy: false,
-                        sync_id: 0,
-                        sync_last_at: String::new(),
-                        sync_last_completed: None,
-                        sync_message: None,
-                        sync_retry_attempt: 0,
-                        // 只根据本地 meta 判断，不读钥匙串；真正同步时再取 token
-                        sync_enabled: sync_cfg.enabled && sync::github_sync_session_is_valid(),
-                        sync_api_url: sync_cfg.api_url,
-                        github_login_busy: false,
-                        github_login_id: 0,
-                        github_login_code: None,
-                        github_login_code_copied: false,
-                        github_login_task: None,
-                        sync_config_open: false,
-                        modal_url_input: cx.new(|cx| TextInput::new(cx, "", "", false)),
-                        modal_focus: cx.focus_handle(),
-                        section_agents_open: true,
-                        section_devices_open: true,
-                        section_other_agents_open: false,
-                        settings_tab: SettingsTab::Sync,
-                        hide_empty_buckets: false,
-                        sync_tick_task: None,
-                        sync_task: None,
-                        update: updater_ui::UpdateState::default(),
-                        update_prefs: i18n::load_update_prefs(),
-                        session_search_input: cx.new(|cx| {
-                            TextInput::new(
-                                cx,
-                                "",
-                                i18n::t(i18n::Key::SessionsSearchPlaceholder),
-                                false,
-                            )
-                        }),
-                        session_prefs: i18n::load_session_prefs(),
-                        sessions_collapsed_projects: std::collections::HashSet::new(),
-                        sessions_show_hidden: false,
-                        session_feedback: None,
-                    };
-                    root.rebuild_buckets();
-                    root.rebuild_sessions();
-                    root.start_load(false, cx);
-                    root.start_update_scheduler(cx);
-                    let search_input = root.session_search_input.clone();
-                    cx.observe(&search_input, |_, _, cx| {
-                        cx.notify();
-                    })
-                    .detach();
-                    root
-                })
+                cx.new(build_root)
             },
-        )
-        .unwrap();
+        );
 
-        cx.activate(true);
+        if let Ok(handle) = handle {
+            if cx.has_global::<MainWindowState>() {
+                cx.global_mut::<MainWindowState>().0 = Some(handle);
+            } else {
+                cx.set_global(MainWindowState(Some(handle)));
+            }
+        }
+    }
+
+    let application = Application::new().with_assets(tray::EmbeddedAssets);
+    application.on_reopen(|cx| {
+        tray_controller::TrayController::open_dashboard(cx, Arc::new(open_main_window));
+    });
+    application.run(move |cx: &mut App| {
+        // 价格表后台自动更新（对标 OpenCode）：启动后在后台检查一次，
+        // 新价格在下次数据加载时生效；失败静默保留旧数据。
+        pricing::ensure_fresh_async();
+        #[cfg(target_os = "macos")]
+        set_macos_dock_icon();
+
+        gpui_app_host::desktop::bind_actions(
+            cx,
+            gpui_app_host::desktop::DesktopLabels {
+                app: "Agent Usage Metrics",
+                hide: i18n::t(i18n::Key::DesktopHide),
+                hide_others: i18n::t(i18n::Key::DesktopHideOthers),
+                quit: i18n::t(i18n::Key::TrayQuit),
+                window: i18n::t(i18n::Key::DesktopWindow),
+                close: i18n::t(i18n::Key::DesktopClose),
+            },
+            |cx| {
+                let Some(active) = cx.active_window() else {
+                    return;
+                };
+                if tray_controller::TrayController::close_active(cx, active) {
+                    return;
+                }
+                if cx
+                    .try_global::<MainWindowState>()
+                    .and_then(|state| state.0)
+                    .is_some_and(|handle| gpui::AnyWindowHandle::from(handle) == active)
+                {
+                    gpui_app_host::desktop::close_window(active, cx, |cx| {
+                        cx.global_mut::<MainWindowState>().0 = None;
+                        tray_controller::TrayController::dashboard_closed(cx, |cx| {
+                            cx.global::<MainWindowState>().0.is_some()
+                        });
+                    });
+                }
+            },
+        );
+        text_input::bind_keys(cx);
+
+        cx.set_global(MainWindowState(None));
+
+        let open_main_cb = Arc::new(|cx: &mut App| {
+            open_main_window(cx);
+        });
+
+        if let Err(e) = tray_controller::TrayController::init(cx, open_main_cb) {
+            eprintln!("Failed to initialize system tray: {e}");
+        }
+
+        open_main_window(cx);
     });
 }
 

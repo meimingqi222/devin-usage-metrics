@@ -832,24 +832,67 @@ pub fn fetch_account_opts(account: &Account, force: bool) -> Result<QuotaResult,
 
 /// 并发查询所有账号，返回顺序与 `accounts` 一致（UI 卡片顺序不变）。
 pub fn fetch_accounts(accounts: &[Account], force: bool) -> Vec<Result<QuotaResult, String>> {
-    parallel_map(accounts, |a| fetch_account_opts(a, force))
-        .into_iter()
-        .map(|r| r.unwrap_or_else(|| Err("quota query thread panicked".to_string())))
-        .collect()
+    fetch_accounts_with_progress(accounts, force, |_, _, _| {})
+}
+
+/// 每个账号完成后立即通知调用方；最终结果仍按发现顺序返回。
+/// 快账号（包括缓存命中）无需等待慢接口，且不改变限流、缓存和刷新策略。
+pub fn fetch_accounts_with_progress(
+    accounts: &[Account],
+    force: bool,
+    on_result: impl Fn(usize, &Account, &Result<QuotaResult, String>) + Sync,
+) -> Vec<Result<QuotaResult, String>> {
+    parallel_map_with_progress(
+        accounts,
+        |account| {
+            let started = std::time::Instant::now();
+            let result = fetch_account_opts(account, force);
+            crate::data::log_event(format!(
+                "quota provider={} elapsed_ms={} success={}",
+                account.provider.label(),
+                started.elapsed().as_millis(),
+                result.is_ok()
+            ));
+            result
+        },
+        |index, result| on_result(index, &accounts[index], result),
+    )
+    .into_iter()
+    .map(|r| r.unwrap_or_else(|| Err("quota query thread panicked".to_string())))
+    .collect()
 }
 
 /// 每个元素一个线程（账号数很少），结果按输入顺序返回；线程 panic 对应位置为 None。
+#[cfg(test)]
 fn parallel_map<T, R, F>(items: &[T], f: F) -> Vec<Option<R>>
 where
     T: Sync,
     R: Send,
     F: Fn(&T) -> R + Sync,
 {
+    parallel_map_with_progress(items, f, |_, _| {})
+}
+
+fn parallel_map_with_progress<T, R, F, N>(items: &[T], f: F, notify: N) -> Vec<Option<R>>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+    N: Fn(usize, &R) + Sync,
+{
     std::thread::scope(|scope| {
         let f = &f;
+        let notify = &notify;
         let handles: Vec<_> = items
             .iter()
-            .map(|item| scope.spawn(move || f(item)))
+            .enumerate()
+            .map(|(index, item)| {
+                scope.spawn(move || {
+                    let result = f(item);
+                    notify(index, &result);
+                    result
+                })
+            })
             .collect();
         handles.into_iter().map(|h| h.join().ok()).collect()
     })
@@ -3958,6 +4001,54 @@ devin_webapp_host = "app.devin.ai"
         });
         assert!(started.elapsed() < Duration::from_millis(800));
         assert_eq!(out, vec![Some(0), Some(10), Some(20), Some(30), Some(40)]);
+    }
+
+    #[test]
+    fn progress_delivers_fast_account_before_slow_account_finishes() {
+        use std::sync::mpsc;
+        let (release, gate) = mpsc::channel();
+        let gate = std::sync::Mutex::new(gate);
+        let (events, received) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                parallel_map_with_progress(
+                    &[0, 1],
+                    |index| {
+                        if *index == 0 {
+                            gate.lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(5))
+                                .unwrap();
+                        }
+                        *index
+                    },
+                    |index, value| events.send((index, *value)).unwrap(),
+                )
+            });
+            let first = received.recv_timeout(Duration::from_secs(2));
+            // 无论测试是否通过，都释放慢请求，避免测试本身挂死。
+            release.send(()).unwrap();
+            assert_eq!(first.unwrap(), (1, 1));
+            assert_eq!(worker.join().unwrap(), vec![Some(0), Some(1)]);
+            assert_eq!(received.recv().unwrap(), (0, 0));
+        });
+        assert!(parallel_map_with_progress::<u8, u8, _, _>(
+            &[],
+            |n| *n,
+            |_, _| panic!("empty input notified")
+        )
+        .is_empty());
+        let results = parallel_map_with_progress(
+            &[0, 1],
+            |n| {
+                if *n == 0 {
+                    panic!("failed account");
+                }
+                *n
+            },
+            |_, _| {},
+        );
+        assert_eq!(results, vec![None, Some(1)]);
     }
 
     #[test]

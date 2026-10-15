@@ -123,6 +123,7 @@ fn agent_slug(agent: AgentKind) -> String {
         AgentKind::OpenCode => "opencode",
         AgentKind::Pi => "pi_agent",
         AgentKind::MimoCode => "mimocode",
+        AgentKind::WorkBuddy => "workbuddy",
     }
     .into()
 }

@@ -413,17 +413,21 @@ fn lookup_api_price(prices: &HashMap<String, Pricing>, model: &str) -> Option<Pr
     if let Some(price) = prices.get(dated) {
         return Some(price.clone());
     }
-    prices
-        .iter()
-        .filter(|(key, _)| {
-            dated.strip_prefix(key.as_str()).is_some_and(|suffix| {
-                let base = strip_provider_prefix(key);
-                (base.starts_with("gpt-") || base.starts_with("claude-"))
-                    && is_effort_suffix(suffix)
-            })
-        })
-        .max_by_key(|(key, _)| key.len())
-        .map(|(_, price)| price.clone())
+    // 仅合法的 effort 后缀能回退；从最长前缀开始查表，避免每轮扫描整张价格表。
+    // 不缓存查找结果，后台更新报价后下一次查询即可使用新价格。
+    for (index, _) in dated.char_indices().rev() {
+        if !is_effort_suffix(&dated[index..]) {
+            continue;
+        }
+        let key = &dated[..index];
+        let base = strip_provider_prefix(key);
+        if base.starts_with("gpt-") || base.starts_with("claude-") {
+            if let Some(price) = prices.get(key) {
+                return Some(price.clone());
+            }
+        }
+    }
+    None
 }
 
 fn parse_pricing_json(json: &str) -> HashMap<String, Pricing> {
@@ -1496,6 +1500,57 @@ mod tests {
                 "wrong deployment for {id}"
             );
         }
+    }
+
+    #[test]
+    fn effort_lookup_preserves_longest_match_and_provider_boundaries() {
+        let mut prices = HashMap::new();
+        for (key, rate) in [
+            ("proxy/claude-sonnet", 1.0),
+            ("proxy/claude-sonnet-high", 2.0),
+            ("claude-sonnet", 3.0),
+            ("proxy/gpt-5.1", 4.0),
+            ("proxy/gemini-3.8-flash", 5.0),
+        ] {
+            let mut price = PricingTable::instance().find_api("gpt-5.1").unwrap();
+            price.i = rate;
+            prices.insert(key.to_string(), price);
+        }
+        for (model, expected) in [
+            ("proxy/claude-sonnet-high", Some(2.0)),
+            ("proxy/claude-sonnet-high-thinking", Some(2.0)),
+            ("proxy/claude-sonnet high thinking", Some(1.0)),
+            ("proxy/claude-sonnet-thinking:8192", Some(1.0)),
+            ("proxy/claude-sonnet-20251001", Some(1.0)),
+            ("proxy/gpt-5-1-xhigh", Some(4.0)),
+            ("proxy/claude-sonnet-thinking:", None),
+            ("proxy/claude-sonnet-thinking:abc", None),
+            ("other/claude-sonnet-high", None),
+            ("proxy/gemini-3.8-flash-high", None),
+            ("proxy/claude-sonnet-未知", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                lookup_api_price(&prices, model).map(|p| p.i),
+                expected,
+                "{model}"
+            );
+        }
+        // 同一个别名在报价更新后必须立即使用新价格，不能缓存旧值或未命中结果。
+        prices.get_mut("proxy/claude-sonnet").unwrap().i = 9.0;
+        assert_eq!(
+            lookup_api_price(&prices, "proxy/claude-sonnet-max")
+                .unwrap()
+                .i,
+            9.0
+        );
+        assert!(lookup_api_price(&prices, "proxy/gpt-new-high").is_none());
+        let quote = prices["proxy/gpt-5.1"].clone();
+        prices.insert("proxy/gpt-new".into(), quote);
+        assert_eq!(
+            lookup_api_price(&prices, "proxy/gpt-new-high").unwrap().i,
+            4.0
+        );
     }
 
     #[test]

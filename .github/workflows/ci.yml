@@ -7,14 +7,20 @@ on:
   pull_request:
 
 # GPUI 的系统依赖在 Windows/macOS 上开箱即用，
-# Linux 需要额外的图形库，因此 CI 在 macOS 上运行。
+# Linux 需要额外图形库；桌面 CI 覆盖 macOS 与 Windows。
 jobs:
   check:
     name: fmt / clippy / test
-    runs-on: macos-latest
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - uses: ./.github/actions/gpui-kit
+        with:
+          token: ${{ secrets.GPUI_APP_KIT_TOKEN }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -29,6 +35,9 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets
+
+      - name: Check content boundary
+        run: python ../gpui-app-kit/tools/check_content.py src/tray.rs
 
       - name: Run tests
         run: cargo test

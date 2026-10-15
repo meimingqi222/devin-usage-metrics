@@ -15,7 +15,7 @@ use crate::local_sources;
 const CACHE_TTL_SECS: i64 = 300; // 5 minutes cache TTL
 /// 缓存结构版本。任何会影响 turn 集合/时间戳的解析改动都必须递增，否则旧的
 /// (且不带 dedup_key 的) 快照会被当作增量基线复用，修复无法生效。
-const CACHE_SCHEMA_VERSION: u32 = 13;
+const CACHE_SCHEMA_VERSION: u32 = 14;
 
 /// `message_nodes.created_at` 是节点**落盘**时间，不是真实生成时间：Devin 在
 /// 会话恢复/压缩时会把同一条消息以新的 created_at 重写一遍。实测比真实生成时间
@@ -115,6 +115,7 @@ pub enum AgentKind {
     OpenCode,
     Pi,
     MimoCode,
+    WorkBuddy,
 }
 
 impl AgentKind {
@@ -122,7 +123,7 @@ impl AgentKind {
     /// exports every thread from the remote service and makes routine loads
     /// and sync collection unacceptably slow. Keep `AgentKind::Amp` itself so
     /// existing caches and synchronized historical records still deserialize.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Devin,
         Self::Claude,
         Self::Codex,
@@ -132,6 +133,7 @@ impl AgentKind {
         Self::OpenCode,
         Self::Pi,
         Self::MimoCode,
+        Self::WorkBuddy,
     ];
 
     pub fn label(self) -> &'static str {
@@ -146,6 +148,7 @@ impl AgentKind {
             Self::OpenCode => "OpenCode",
             Self::Pi => "pi-agent",
             Self::MimoCode => "MimoCode",
+            Self::WorkBuddy => "WorkBuddy",
         }
     }
 
@@ -194,6 +197,9 @@ impl AgentKind {
                     .unwrap_or(false)
                     || home().join(".local/share/mimocode/mimocode.db").exists()
             }
+            Self::WorkBuddy => crate::local_sources::workbuddy_roots()
+                .iter()
+                .any(|p| p.exists()),
         }
     }
 }
@@ -1333,6 +1339,12 @@ fn load_uncached(start: i64, end: i64, previous: Option<Arc<LoadedData>>) -> Loa
             log_loaded_part("MimoCode", started, &data);
             parts.lock().unwrap().push(data);
         });
+        scope.spawn(|_| {
+            let started = Instant::now();
+            let data = local_sources::load_workbuddy(start, end);
+            log_loaded_part("WorkBuddy", started, &data);
+            parts.lock().unwrap().push(data);
+        });
     });
     let parts = parts.into_inner().unwrap();
 
@@ -1408,6 +1420,7 @@ fn load_selected_agent(
             AgentKind::OpenCode => local_sources::load_opencode(start, end),
             AgentKind::Pi => local_sources::load_pi(start, end),
             AgentKind::MimoCode => local_sources::load_mimocode(start, end),
+            AgentKind::WorkBuddy => local_sources::load_workbuddy(start, end),
             AgentKind::Devin => unreachable!(),
         };
         stamp_device(&mut data);
