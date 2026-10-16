@@ -1213,6 +1213,7 @@ dependencies = [
  "chrono",
  "cocoa",
  "dirs 5.0.1",
+ "embed-resource",
  "fs2",
  "gpui",
  "gpui-app-host",
