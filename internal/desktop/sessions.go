@@ -117,20 +117,37 @@ func sessionButton(c *ui.Context, label string, active bool) ui.Element {
 	return b
 }
 
+type sessionIdentity struct {
+	agent       model.Agent
+	device, key string
+}
+
+type sessionUsage struct {
+	cost          float64
+	priced, turns int
+}
+
 func (a *App) sessionCost(s model.Session) (float64, int, int) {
-	var cost float64
-	priced, turns := 0, 0
-	for _, turn := range a.allData().Turns {
-		if turn.Agent != s.Agent || turn.SessionKey != s.Key || turn.DeviceID != s.DeviceID {
-			continue
+	d := a.allData()
+	if a.sessionCosts == nil {
+		a.sessionCosts = map[sessionIdentity]sessionUsage{}
+		models := map[sessionIdentity]string{}
+		for _, session := range d.Sessions {
+			models[sessionIdentity{session.Agent, session.DeviceID, session.Key}] = session.DisplayModel()
 		}
-		turns++
-		if v, ok := pricing.Cost(turn, s.DisplayModel()); ok {
-			cost += v
-			priced++
+		for _, turn := range d.Turns {
+			key := sessionIdentity{turn.Agent, turn.DeviceID, turn.SessionKey}
+			usage := a.sessionCosts[key]
+			usage.turns++
+			if v, ok := pricing.Cost(turn, models[key]); ok {
+				usage.cost += v
+				usage.priced++
+			}
+			a.sessionCosts[key] = usage
 		}
 	}
-	return cost, priced, turns
+	usage := a.sessionCosts[sessionIdentity{s.Agent, s.DeviceID, s.Key}]
+	return usage.cost, usage.priced, usage.turns
 }
 
 func (a *App) sessionCostText(s model.Session) string {

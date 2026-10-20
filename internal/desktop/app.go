@@ -58,6 +58,16 @@ type App struct {
 	installed                                  map[model.Agent]bool
 	hideEmptyBuckets                           bool
 	syncLastAt, syncError                      string
+	cachedData                                 *model.Data
+	cachedAgent                                model.Agent
+	sessionCosts                               map[sessionIdentity]sessionUsage
+	usageCache                                 struct {
+		period  analytics.Period
+		page    int
+		device  string
+		start   int64
+		buckets []analytics.Bucket
+	}
 }
 
 func New(ctx context.Context) *App {
@@ -73,7 +83,7 @@ func (a *App) t(en, zh string) string {
 
 func (a *App) post(fn func()) {
 	select {
-	case a.events <- fn:
+	case a.events <- func() { fn(); a.cachedData = nil }:
 		if a.wake != nil {
 			a.wake()
 		}
@@ -154,9 +164,15 @@ func (a *App) refreshQuota(force bool) {
 }
 
 func (a *App) allData() model.Data {
+	if a.cachedData != nil && a.cachedAgent == a.agent {
+		return *a.cachedData
+	}
 	d := a.loaded[a.agent]
 	d.Sessions = append(append([]model.Session(nil), d.Sessions...), a.remote.Sessions...)
 	d.Turns = append(append([]model.Turn(nil), d.Turns...), a.remote.Turns...)
+	a.cachedData, a.cachedAgent = &d, a.agent
+	a.sessionCosts = nil
+	a.usageCache.buckets = nil
 	return d
 }
 

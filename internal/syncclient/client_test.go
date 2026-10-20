@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 	"io"
 	"net/http"
@@ -11,11 +12,12 @@ import (
 	"os"
 	"strings"
 	"sync"
+	stdatomic "sync/atomic"
 	"testing"
 	"time"
 )
 
-func setup(t *testing.T) {
+func setup(t testing.TB) {
 	t.Helper()
 	h := t.TempDir()
 	t.Setenv("HOME", h)
@@ -114,6 +116,7 @@ type objectServer struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	puts    int
+	gets    map[string]int
 }
 
 func (s *objectServer) serve(w http.ResponseWriter, r *http.Request) {
@@ -136,6 +139,10 @@ func (s *objectServer) serve(w http.ResponseWriter, r *http.Request) {
 	etag := `"` + hash(old) + `"`
 	switch r.Method {
 	case "GET":
+		if s.gets == nil {
+			s.gets = map[string]int{}
+		}
+		s.gets[name]++
 		if !exists {
 			w.WriteHeader(404)
 			return
@@ -174,7 +181,7 @@ func TestCycleV1MigrationReuseAndReadOnlyMerge(t *testing.T) {
 	s.objects["device-other.json"], _ = json.Marshal(pkg)
 	legacy := devicePackage{Schema: 1, DeviceID: "local", Start: now, End: now, Sessions: []model.Session{{Agent: model.Claude, DeviceID: "local", Key: "legacy", CreatedAt: now}}}
 	s.objects["device-local.json"], _ = json.Marshal(legacy)
-	local := model.Data{TurnsStart: now, TurnsEnd: now, Turns: []model.Turn{{Agent: model.Claude, SessionKey: "local-session", CreatedAt: now, InputTokens: 2}}}
+	local := model.Data{TurnsStart: 0, TurnsEnd: now + 3600, Turns: []model.Turn{{Agent: model.Claude, SessionKey: "local-session", CreatedAt: now, InputTokens: 2}}}
 	ctx := context.Background()
 	remote, e := Cycle(ctx, local)
 	if e != nil {
@@ -184,11 +191,31 @@ func TestCycleV1MigrationReuseAndReadOnlyMerge(t *testing.T) {
 		t.Fatal(remote)
 	}
 	count := s.puts
+	s.gets = map[string]int{}
+	start := time.Now()
+	if _, e = Cycle(ctx, local); e != nil {
+		t.Fatal(e)
+	}
+	blockGets, totalGets := 0, 0
+	for name, n := range s.gets {
+		totalGets += n
+		if strings.HasSuffix(name, ".zst") {
+			blockGets += n
+		}
+	}
+	t.Logf("unchanged own cycle: block GETs=%d object GETs=%d elapsed=%s", blockGets, totalGets, time.Since(start))
+	if blockGets != 0 {
+		t.Fatal("unchanged own cycle downloaded blocks")
+	}
+	if s.puts != count {
+		t.Fatalf("unchanged data wrote %d objects", s.puts-count)
+	}
+	local.TurnsEnd++
 	if _, e = Cycle(ctx, local); e != nil {
 		t.Fatal(e)
 	}
 	if s.puts != count {
-		t.Fatalf("unchanged data wrote %d objects", s.puts-count)
+		t.Fatal("moving future boundary republished unchanged history")
 	}
 	var h head
 	json.Unmarshal(s.objects["v3-head-local.json"], &h)
@@ -266,5 +293,225 @@ func TestLoginCancellationDoesNotPersistCredentials(t *testing.T) {
 	}
 	if _, e := os.Stat(path("github-sync-session.enc")); !os.IsNotExist(e) {
 		t.Fatal("cancelled login saved a session")
+	}
+}
+
+func TestCycleImmutableReuseAndScope(t *testing.T) {
+	setup(t)
+	s := &objectServer{objects: map[string][]byte{}}
+	server := httptest.NewServer(http.HandlerFunc(s.serve))
+	defer server.Close()
+	if err := SaveConfig(Config{true, server.URL}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSession(session{"token", "user", time.Now().Unix() + 3600}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	local := model.Data{TurnsStart: now, TurnsEnd: now, Turns: []model.Turn{{Agent: model.Claude, SessionKey: "s", CreatedAt: now, InputTokens: 1}}}
+	ctx := context.Background()
+	if _, err := Cycle(ctx, local); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise the public reader against a second device's real publication.
+	if err := atomic("device.json", []byte(`{"id":"reader"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSession(session{"token", "user", now + 3600}); err != nil {
+		t.Fatal(err)
+	}
+	measure := func() (model.Data, int, time.Duration) {
+		s.mu.Lock()
+		s.gets = map[string]int{}
+		s.mu.Unlock()
+		start := time.Now()
+		remote, err := Cycle(ctx, model.Data{})
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		n := 0
+		for name, count := range s.gets {
+			if strings.HasSuffix(name, ".zst") {
+				n += count
+			}
+		}
+		return remote, n, elapsed
+	}
+	remote, cold, coldTime := measure()
+	if len(remote.Turns) != 1 {
+		t.Fatal(remote)
+	}
+	remote.Turns[0].InputTokens = 999 // Caller ownership must not poison the cache.
+	remote, warm, warmTime := measure()
+	t.Logf("block GETs cold=%d warm=%d; cycle cold=%s warm=%s", cold, warm, coldTime, warmTime)
+	if warm != 0 || remote.Turns[0].InputTokens != 1 {
+		t.Fatalf("cache reuse: GETs=%d data=%+v", warm, remote)
+	}
+	// The same digest on a different server must not inherit cached blocks.
+	server2 := httptest.NewServer(http.HandlerFunc(s.serve))
+	defer server2.Close()
+	if err := SaveConfig(Config{true, server2.URL}); err != nil {
+		t.Fatal(err)
+	}
+	_, scoped, _ := measure()
+	if scoped == 0 {
+		t.Fatal("server scope reused another server's cache")
+	}
+	// Different auth scope on the same URL must fetch independently too.
+	server3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer second-token" && r.Header.Get("Authorization") != "Bearer token" {
+			w.WriteHeader(401)
+			return
+		}
+		r.Header.Set("Authorization", "Bearer token")
+		s.serve(w, r)
+	}))
+	defer server3.Close()
+	if err := SaveConfig(Config{true, server3.URL}); err != nil {
+		t.Fatal(err)
+	}
+	measure() // Warm this URL under the first account before changing tokens.
+	if err := saveSession(session{"second-token", "second", now + 3600}); err != nil {
+		t.Fatal(err)
+	}
+	_, scoped, _ = measure()
+	if scoped == 0 {
+		t.Fatal("auth scope did not fetch blocks")
+	}
+	// Publish changed actual content with an unchanged/empty hint hash.
+	if err := SaveConfig(Config{true, server.URL}); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomic("device.json", []byte(`{"id":"local"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSession(session{"token", "user", now + 3600}); err != nil {
+		t.Fatal(err)
+	}
+	local.Turns[0].InputTokens = 2
+	if _, err := Cycle(ctx, local); err != nil {
+		t.Fatal(err)
+	}
+	// A changed head with a copied source hash is not evidence of unchanged
+	// content. The publisher must merge/recompute under the new CAS base.
+	s.mu.Lock()
+	var changedHead head
+	json.Unmarshal(s.objects["v3-head-local.json"], &changedHead)
+	var changedManifest manifest
+	json.Unmarshal(s.objects["v3-manifest-"+changedHead.Manifest+".json"], &changedManifest)
+	changedManifest.DeviceName = "renamed remotely"
+	changedBytes, _ := json.Marshal(changedManifest)
+	injected := hash(changedBytes)
+	s.objects["v3-manifest-"+injected+".json"] = changedBytes
+	changedHead.Manifest = injected
+	s.objects["v3-head-local.json"], _ = json.Marshal(changedHead)
+	s.mu.Unlock()
+	if _, err := Cycle(ctx, local); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	json.Unmarshal(s.objects["v3-head-local.json"], &changedHead)
+	s.mu.Unlock()
+	if changedHead.Manifest == injected {
+		t.Fatal("changed head trusted a stale source hash")
+	}
+	if err := atomic("device.json", []byte(`{"id":"reader"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSession(session{"token", "user", now + 3600}); err != nil {
+		t.Fatal(err)
+	}
+	remote, _, _ = measure()
+	found := false
+	for _, turn := range remote.Turns {
+		found = found || turn.InputTokens == 2
+	}
+	if !found {
+		t.Fatal("changed input did not propagate")
+	}
+	// A previous-generation recovery must validate the server's blocks even
+	// when that generation has already been read as a healthy current head.
+	s.mu.Lock()
+	var h head
+	if err := json.Unmarshal(s.objects["v3-head-local.json"], &h); err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	previous := h.Manifest
+	h.Previous, h.Manifest = &previous, strings.Repeat("0", 64)
+	s.objects["v3-head-local.json"], _ = json.Marshal(h)
+	var m manifest
+	json.Unmarshal(s.objects["v3-manifest-"+previous+".json"], &m)
+	s.objects[m.Blocks[0].File] = []byte("corrupt")
+	s.mu.Unlock()
+	if _, err := Cycle(ctx, model.Data{}); err == nil {
+		t.Fatal("cached current generation hid corruption during fallback")
+	}
+}
+
+func BenchmarkUnchangedCycle(b *testing.B) {
+	setup(b)
+	s := &objectServer{objects: map[string][]byte{}}
+	var requests, blocks, delay stdatomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(time.Duration(delay.Load()))
+		if r.Method == "GET" {
+			requests.Add(1)
+			if strings.HasSuffix(r.URL.Path, ".zst") {
+				blocks.Add(1)
+			}
+		}
+		s.serve(w, r)
+	}))
+	defer server.Close()
+	if err := SaveConfig(Config{true, server.URL}); err != nil {
+		b.Fatal(err)
+	}
+	if err := saveSession(session{"token", "user", time.Now().Unix() + 3600}); err != nil {
+		b.Fatal(err)
+	}
+	now := time.Now().Unix()
+	makeData := func(id string) model.Data {
+		d := model.Data{TurnsStart: 0, TurnsEnd: now + 3600}
+		for i := 0; i < 100; i++ {
+			d.Sessions = append(d.Sessions, model.Session{Agent: model.Claude, DeviceID: id, Key: fmt.Sprintf("s-%d", i), CreatedAt: now - 86400, LastActivityAt: now})
+		}
+		for i := 0; i < 12000; i++ {
+			turn := model.Turn{Agent: model.Claude, DeviceID: id, SessionKey: fmt.Sprintf("s-%d", i%100), Model: "claude-sonnet-4-5", CreatedAt: now - int64(i%14)*86400}
+			turn.InputTokens = float64(i + 200)
+			turn.OutputTokens = 37
+			d.Turns = append(d.Turns, turn)
+		}
+		return d
+	}
+	ctx := context.Background()
+	if err := (transport{server.URL, "token"}).publish(ctx, "other", makeData("other"), nil); err != nil {
+		b.Fatal(err)
+	}
+	local := makeData("local")
+	if _, err := Cycle(ctx, local); err != nil {
+		b.Fatal(err)
+	}
+	for _, latency := range []time.Duration{0, 20 * time.Millisecond} {
+		b.Run(latency.String(), func(b *testing.B) {
+			delay.Store(int64(latency))
+			requests.Store(0)
+			blocks.Store(0)
+			for i := 0; i < b.N; i++ {
+				local.TurnsEnd = time.Now().Unix() + 3600 + int64(i)
+				remote, err := Cycle(ctx, local)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(remote.Turns) != 12000 {
+					b.Fatal("remote records lost")
+				}
+			}
+			b.ReportMetric(float64(requests.Load())/float64(b.N), "GET/op")
+			b.ReportMetric(float64(blocks.Load())/float64(b.N), "blockGET/op")
+		})
 	}
 }

@@ -13,7 +13,15 @@ import (
 )
 
 func (a *App) usageView(c *ui.Context) {
-	bs := analytics.Build(a.allData(), a.period, a.page, a.agent, a.device, time.Now())
+	d := a.allData()
+	now := time.Now()
+	start, end := analytics.Window(a.period, a.page, now)
+	cache := &a.usageCache
+	if cache.buckets == nil || cache.period != a.period || cache.page != a.page || cache.device != a.device || cache.start != start.Unix() {
+		cache.buckets = analytics.Build(d, a.period, a.page, a.agent, a.device, now)
+		cache.period, cache.page, cache.device, cache.start = a.period, a.page, a.device, start.Unix()
+	}
+	bs := cache.buckets
 	var total analytics.Bucket
 	for _, b := range bs {
 		total.Input += b.Input
@@ -23,9 +31,8 @@ func (a *App) usageView(c *ui.Context) {
 		total.Cost += b.Cost
 		total.Turns += b.Turns
 	}
-	start, end := analytics.Window(a.period, a.page, time.Now())
 	sessions := map[string]bool{}
-	for _, t := range a.allData().Turns {
+	for _, t := range d.Turns {
 		if t.Agent == a.agent && (a.device == "" || a.device == t.DeviceID) && t.CreatedAt >= start.Unix() && t.CreatedAt < end.Unix() {
 			sessions[t.DeviceID+"/"+t.SessionKey] = true
 		}

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/egoist/mygo/plugins/sqlite"
@@ -37,7 +38,7 @@ type databaseCache struct {
 	Data      model.Data
 }
 
-var parsedDatabases = map[string]databaseCache{}
+var parsedDatabases sync.Map
 
 func databaseSignature(p string) string {
 	var b strings.Builder
@@ -48,7 +49,7 @@ func databaseSignature(p string) string {
 	}
 	return b.String()
 }
-func loadDBs(d *model.Data, a model.Agent, refresh bool) {
+func loadDBs(d *model.Data, a model.Agent, refresh bool, previous *model.Data, signatures map[string]string) map[string]string {
 	var paths []string
 	switch a {
 	case model.Devin:
@@ -73,7 +74,7 @@ func loadDBs(d *model.Data, a model.Agent, refresh bool) {
 		}
 		paths = []string{filepath.Join(base, string(a), string(a)+".db"), home(".local/share/" + string(a) + "/" + string(a) + ".db")}
 	}
-	found := false
+	var existing []string
 	seen := map[string]bool{}
 	for _, p := range paths {
 		if seen[p] {
@@ -83,47 +84,94 @@ func loadDBs(d *model.Data, a model.Agent, refresh bool) {
 		if _, e := os.Stat(p); os.IsNotExist(e) {
 			continue
 		}
-		found = true
-		signature := databaseSignature(p)
-		part := empty(d.TurnsStart, d.TurnsEnd)
-		cached, ok := parsedDatabases[p]
-		if !refresh && ok && cached.Signature == signature && cached.Data.TurnsStart <= d.TurnsStart && cached.Data.TurnsEnd >= d.TurnsEnd {
-			part = filter(cached.Data, d.TurnsStart, d.TurnsEnd)
-		} else {
-			db, e := sqlite.Open(context.Background(), p, sqlite.OpenOptions{ReadOnly: true, BusyTimeout: time.Second})
-			if e != nil {
-				fail(d, a, fmt.Errorf("%s: %w", p, e))
-				continue
-			}
-			switch a {
-			case model.Devin:
-				parseDevin(&part, db, filepath.Base(filepath.Dir(p)))
-			case model.Antigravity:
-				parseAG(&part, db, strings.TrimSuffix(filepath.Base(p), ".db"))
-			default:
-				parseSQLAgent(&part, a, db)
-			}
-			db.Close()
-			// A concurrent writer invalidates this parse for reuse, not for display.
-			if len(part.Errors) == 0 && databaseSignature(p) == signature {
-				parsedDatabases[p] = databaseCache{signature, part}
-			}
-		}
-		d.Sessions = append(d.Sessions, part.Sessions...)
-		d.Turns = append(d.Turns, part.Turns...)
-		d.Errors = append(d.Errors, part.Errors...)
-		if info, e := os.Stat(p); e == nil {
-			d.FileMtimes[p] = info.ModTime().UnixNano()
-		}
+		existing = append(existing, p)
 		if a != model.Devin && a != model.Antigravity {
 			break
 		}
 	}
-	if !found && a != model.Antigravity {
+	if len(existing) == 0 && a != model.Antigravity {
 		fail(d, a, "database not found: "+strings.Join(paths, ", "))
 	}
+	parts := make([]model.Data, len(existing))
+	current := make([]string, len(existing))
+	var wg sync.WaitGroup
+	limit := make(chan struct{}, 4)
+	for i, p := range existing {
+		wg.Go(func() {
+			limit <- struct{}{}
+			defer func() { <-limit }()
+			signature := databaseSignature(p)
+			part := empty(d.TurnsStart, d.TurnsEnd)
+			var cached databaseCache
+			if value, ok := parsedDatabases.Load(p); ok {
+				cached = value.(databaseCache)
+			}
+			if !refresh && previous != nil && a == model.Devin {
+				// Split the persisted agent snapshot by source, including hidden-session turns.
+				base := empty(previous.TurnsStart, previous.TurnsEnd)
+				prefix := filepath.Base(filepath.Dir(p)) + "/"
+				for _, s := range previous.Sessions {
+					if strings.HasPrefix(s.Key, prefix) {
+						base.Sessions = append(base.Sessions, s)
+					}
+				}
+				for _, turn := range previous.Turns {
+					if strings.HasPrefix(turn.SessionKey, prefix) {
+						base.Turns = append(base.Turns, turn)
+					}
+				}
+				cached = databaseCache{signatures[p], base}
+			} else if !refresh && previous != nil && len(existing) == 1 && a != model.Antigravity {
+				cached = databaseCache{signatures[p], *previous}
+			}
+			covered := cached.Data.TurnsStart <= d.TurnsStart && cached.Data.TurnsEnd >= min(d.TurnsEnd, time.Now().Unix())
+			if !refresh && covered && cached.Signature == signature {
+				part = filter(cached.Data, d.TurnsStart, d.TurnsEnd)
+			} else {
+				db, e := sqlite.Open(context.Background(), p, sqlite.OpenOptions{ReadOnly: true, BusyTimeout: time.Second})
+				if e != nil {
+					fail(&part, a, fmt.Errorf("%s: %w", p, e))
+				} else {
+					switch a {
+					case model.Devin:
+						var baseline *model.Data
+						if !refresh && covered {
+							baseline = &cached.Data
+						}
+						parseDevin(&part, db, filepath.Base(filepath.Dir(p)), baseline)
+					case model.Antigravity:
+						parseAG(&part, db, strings.TrimSuffix(filepath.Base(p), ".db"))
+					default:
+						parseSQLAgent(&part, a, db)
+					}
+					db.Close()
+				}
+			}
+			// Never persist a signature for a partial parse or a concurrent write.
+			if len(part.Errors) == 0 && databaseSignature(p) == signature {
+				current[i] = signature
+				parsedDatabases.Store(p, databaseCache{signature, part})
+			}
+			parts[i] = part
+		})
+	}
+	wg.Wait()
+	out := map[string]string{}
+	for i, p := range existing {
+		part := parts[i]
+		d.Sessions = append(d.Sessions, part.Sessions...)
+		d.Turns = append(d.Turns, part.Turns...)
+		d.Errors = append(d.Errors, part.Errors...)
+		if current[i] != "" {
+			out[p] = current[i]
+		}
+		if info, e := os.Stat(p); e == nil {
+			d.FileMtimes[p] = info.ModTime().UnixNano()
+		}
+	}
+	return out
 }
-func parseDevin(d *model.Data, db *sqlite.DB, source string) {
+func parseDevin(d *model.Data, db *sqlite.DB, source string, previous *model.Data) {
 	a := model.Devin
 	rows := query(d, a, db, "SELECT * FROM sessions ORDER BY last_activity_at DESC LIMIT 20001")
 	if len(rows) > 20000 {
@@ -169,37 +217,86 @@ func parseDevin(d *model.Data, db *sqlite.DB, source string) {
 		d.Sessions = append(d.Sessions, *s)
 	}
 	seen := map[string]bool{}
-	for _, r := range query(d, a, db, "SELECT session_id, created_at, chat_message FROM message_nodes WHERE created_at >= ? AND created_at < ?", d.TurnsStart-86400, d.TurnsEnd+7*86400) {
-		id := str(r["session_id"])
-		if !ids[id] {
-			continue
-		}
-		var v obj
-		if e := json.Unmarshal([]byte(str(r["chat_message"])), &v); e != nil {
-			fail(d, a, e)
-			continue
-		}
-		m := v["metadata"]
-		u := get(m, "metrics")
-		if u == nil {
-			continue
-		}
-		at := ts(first(get(m, "started_generation_at"), get(m, "created_at")))
-		if at <= 0 {
-			at = ts(r["created_at"])
-		}
-		key := str(first(v["message_id"], get(m, "request_id")))
-		if key != "" {
-			key = id + "\x00" + key
-			if seen[key] {
+	latest := map[string]int64{}
+	legacy := map[string]bool{}
+	watermark := d.TurnsStart
+	if previous != nil {
+		for _, turn := range previous.Turns {
+			id := strings.TrimPrefix(turn.SessionKey, source+"/")
+			if !ids[id] || turn.CreatedAt < d.TurnsStart || turn.CreatedAt >= d.TurnsEnd {
 				continue
 			}
-			seen[key] = true
+			if turn.DedupKey == "" {
+				legacy[id] = true
+				continue
+			}
+			if turn.DedupKey != "" && seen[turn.DedupKey] {
+				continue
+			}
+			if turn.DedupKey != "" {
+				seen[turn.DedupKey] = true
+			}
+			latest[id] = max(latest[id], turn.CreatedAt)
+			watermark = max(watermark, turn.CreatedAt)
+			d.Turns = append(d.Turns, turn)
 		}
-		if at < d.TurnsStart || at >= d.TurnsEnd {
+	}
+	var active []any
+	queryStart := d.TurnsEnd
+	for _, row := range rows {
+		id := str(row["id"])
+		floor, cached := latest[id]
+		if !cached || legacy[id] {
+			floor = d.TurnsStart
+		}
+		if cached && !legacy[id] && ts(row["last_activity_at"]) < watermark-86400 {
 			continue
 		}
-		d.Turns = append(d.Turns, model.Turn{Agent: a, SessionKey: source + "/" + id, CreatedAt: at, Model: str(get(m, "generation_model")), InputTokens: num(get(u, "input_tokens")), OutputTokens: num(get(u, "output_tokens")), CacheReadTokens: num(get(u, "cache_read_tokens")), CacheCreationTokens: num(get(u, "cache_creation_tokens")), TTFTMs: max(0, num(get(u, "ttft_ms"))), TotalTimeMs: num(get(u, "total_time_ms")), DedupKey: key})
+		active = append(active, id)
+		queryStart = min(queryStart, floor)
+	}
+	// Chunk the IN list below SQLite's parameter limit. LIKE avoids transferring
+	// large non-metric messages; metrics without ttft_ms remain valid calls.
+	for offset := 0; offset < len(active); offset += 500 {
+		batch := active[offset:min(offset+500, len(active))]
+		marks := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+		args := append(append([]any{}, batch...), queryStart-86400, d.TurnsEnd+7*86400)
+		sql := "SELECT rowid AS node_id, session_id, created_at, chat_message FROM message_nodes WHERE session_id IN (" + marks + ") AND created_at >= ? AND created_at < ? AND chat_message LIKE '%\"metrics\"%'"
+		for _, r := range query(d, a, db, sql, args...) {
+			id := str(r["session_id"])
+			if !ids[id] {
+				continue
+			}
+			var v obj
+			if e := json.Unmarshal([]byte(str(r["chat_message"])), &v); e != nil {
+				fail(d, a, e)
+				continue
+			}
+			m := v["metadata"]
+			u := get(m, "metrics")
+			if u == nil {
+				continue
+			}
+			at := ts(first(get(m, "started_generation_at"), get(m, "created_at")))
+			if at <= 0 {
+				at = ts(r["created_at"])
+			}
+			key := str(first(v["message_id"], get(m, "request_id")))
+			if key == "" {
+				key = fmt.Sprint("row:", r["node_id"])
+			}
+			if key != "" {
+				key = id + "\x00" + key
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+			}
+			if at < d.TurnsStart || at >= d.TurnsEnd {
+				continue
+			}
+			d.Turns = append(d.Turns, model.Turn{Agent: a, SessionKey: source + "/" + id, CreatedAt: at, Model: str(get(m, "generation_model")), InputTokens: num(get(u, "input_tokens")), OutputTokens: num(get(u, "output_tokens")), CacheReadTokens: num(get(u, "cache_read_tokens")), CacheCreationTokens: num(get(u, "cache_creation_tokens")), TTFTMs: max(0, num(get(u, "ttft_ms"))), TotalTimeMs: num(get(u, "total_time_ms")), DedupKey: key})
+		}
 	}
 }
 func parseSQLAgent(d *model.Data, a model.Agent, db *sqlite.DB) {

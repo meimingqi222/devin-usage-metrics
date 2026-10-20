@@ -13,6 +13,10 @@ import (
 )
 
 func (t transport) publish(ctx context.Context, id string, data model.Data, previous *devicePackage) error {
+	input, e := exportFingerprint(data)
+	if e != nil {
+		return e
+	}
 	name := "v3-head-" + id + ".json"
 	raw, h, status, e := t.request(ctx, "GET", "/v1/objects/"+url.PathEscape(name), nil, nil)
 	if e != nil {
@@ -38,7 +42,7 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 		// Re-read under the CAS base, so a concurrent publish cannot lose history.
 		p, e := t.loadManifest(ctx, id, 3, old.Manifest)
 		if e != nil && old.Previous != nil {
-			p, e = t.loadManifest(ctx, id, 3, *old.Previous)
+			p, e = t.loadManifestFresh(ctx, id, 3, *old.Previous)
 			parent = old.Previous
 		}
 		if e != nil {
@@ -49,6 +53,9 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 		if e != nil {
 			return e
 		}
+		if hash(b) != *parent {
+			return errors.New("manifest hash mismatch")
+		}
 		if e = json.Unmarshal(b, &prior); e != nil {
 			return e
 		}
@@ -57,6 +64,9 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 	}
 	now := time.Now().Unix()
 	retained := now - 366*86400
+	if parent != nil && *parent == old.Manifest && lastExport.scope == t.scope() && lastExport.device == id && lastExport.head == old.Manifest && lastExport.input == input && retained < lastExport.expires && previous.Start <= max(data.TurnsStart, retained) && previous.End >= min(data.TurnsEnd, now) {
+		return nil
+	}
 	turns := map[string]model.Turn{}
 	sessions := map[string]model.Session{}
 	add := func(ss []model.Session, ts []model.Turn) {
@@ -92,6 +102,18 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 	}
 	if parent == nil && len(sessions)+len(turns) == 0 {
 		return nil
+	}
+	// Retention can change the export even when the input has not changed.
+	expires := int64(1<<63 - 1)
+	for _, v := range turns {
+		expires = min(expires, v.CreatedAt)
+	}
+	for _, v := range sessions {
+		expires = min(expires, max(v.CreatedAt, v.LastActivityAt))
+	}
+	remember := func(digest string) {
+		lastExport.scope, lastExport.device = t.scope(), id
+		lastExport.head, lastExport.input, lastExport.expires = digest, input, expires
 	}
 	groups := map[string][]model.Turn{}
 	sgroups := map[string][]model.Session{}
@@ -248,6 +270,7 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 			return e
 		}
 		if s == 200 && hash(b) == hash(z) {
+			t.rememberBlock(file, z)
 			continue
 		}
 		if s != 200 && s != 404 {
@@ -256,14 +279,19 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 		if e = t.put(ctx, file, z, nil); e != nil {
 			return e
 		}
+		t.rememberBlock(file, z)
 	}
 	if parent != nil {
 		b, e := t.get(ctx, "v3-manifest-"+*parent+".json", 8<<20)
 		if e != nil {
 			return e
 		}
+		if hash(b) != *parent {
+			return errors.New("manifest hash mismatch")
+		}
 		var prior manifest
 		if json.Unmarshal(b, &prior) == nil && prior.Source == m.Source && *parent == old.Manifest {
+			remember(old.Manifest)
 			return nil
 		}
 	}
@@ -295,5 +323,9 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 	if e != nil {
 		return e
 	}
-	return t.put(ctx, name, b, condition)
+	if e = t.put(ctx, name, b, condition); e != nil {
+		return e
+	}
+	remember(digest)
+	return nil
 }

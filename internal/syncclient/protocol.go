@@ -104,11 +104,17 @@ func (t transport) load(ctx context.Context, id string, h head) (devicePackage, 
 	}
 	p, e := attempt(digest)
 	if e != nil && previous != nil {
-		return attempt(*previous)
+		return t.loadManifestFresh(ctx, id, h.Protocol, *previous)
 	}
 	return p, e
 }
 func (t transport) loadManifest(ctx context.Context, id string, protocol int, digest string) (devicePackage, error) {
+	return t.readManifest(ctx, id, protocol, digest, true)
+}
+func (t transport) loadManifestFresh(ctx context.Context, id string, protocol int, digest string) (devicePackage, error) {
+	return t.readManifest(ctx, id, protocol, digest, false)
+}
+func (t transport) readManifest(ctx context.Context, id string, protocol int, digest string, useCache bool) (devicePackage, error) {
 	var p devicePackage
 	if !validHash(digest) || (protocol != 2 && protocol != 3) {
 		return p, errors.New("invalid head")
@@ -123,6 +129,13 @@ func (t transport) loadManifest(ctx context.Context, id string, protocol int, di
 	}
 	if hash(b) != digest {
 		return p, errors.New("manifest hash mismatch")
+	}
+	cutoff := day(time.Now().Unix() - 366*86400)
+	cacheKey := t.scope() + "/" + id + "/" + prefix + digest + "/" + cutoff
+	if useCache {
+		if cached, ok := cachedPackage(cacheKey); ok {
+			return cached, nil
+		}
 	}
 	var m manifest
 	if e = json.Unmarshal(b, &m); e != nil {
@@ -162,14 +175,20 @@ func (t transport) loadManifest(ctx context.Context, id string, protocol int, di
 		if r.Sessions < 0 || r.Turns < 0 || r.Part < 0 || r.Part > 65535 {
 			return p, errors.New("negative record count")
 		}
-		if protocol == 3 && r.Day != "" && r.Day < day(time.Now().Unix()-366*86400) {
+		if protocol == 3 && r.Day != "" && r.Day < cutoff {
 			continue
 		}
 		expectedSessions += r.Sessions
 		expectedTurns += r.Turns
-		z, e := t.get(ctx, r.File, maxCompressed)
-		if e != nil {
-			return p, e
+		var z []byte
+		if useCache {
+			z = t.cachedBlock(r.File)
+		}
+		if z == nil {
+			z, e = t.get(ctx, r.File, maxCompressed)
+			if e != nil {
+				return p, e
+			}
 		}
 		if len(z) != r.Compressed || hash(z) != r.Hash {
 			return p, errors.New("shard hash/size mismatch")
@@ -234,11 +253,17 @@ func (t transport) loadManifest(ctx context.Context, id string, protocol int, di
 				return p, errors.New("session device mismatch")
 			}
 		}
+		if useCache {
+			t.rememberBlock(r.File, z)
+		}
 		p.Sessions = append(p.Sessions, block.Sessions...)
 		p.Turns = append(p.Turns, block.Turns...)
 	}
 	if len(p.Sessions) != expectedSessions || len(p.Turns) != expectedTurns || (protocol == 2 && (expectedSessions != m.SessionCount || expectedTurns != m.TurnCount)) {
 		return p, errors.New("manifest record count mismatch")
+	}
+	if useCache {
+		rememberPackage(cacheKey, p)
 	}
 	return p, nil
 }

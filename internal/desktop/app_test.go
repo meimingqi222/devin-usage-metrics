@@ -2,6 +2,7 @@ package desktop
 
 import (
 	"context"
+	"fmt"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -14,7 +15,7 @@ import (
 	"github.com/meimingqi222/devin-usage-metrics/internal/quota"
 )
 
-func fixture(t *testing.T) *App {
+func fixture(t testing.TB) *App {
 	t.Helper()
 	h := t.TempDir()
 	for k, v := range map[string]string{"HOME": h, "USERPROFILE": h, "APPDATA": filepath.Join(h, "config"), "XDG_CONFIG_HOME": filepath.Join(h, "config"), "XDG_CACHE_HOME": filepath.Join(h, "cache"), "LANG": "en_US.UTF-8", "DEVIN_USAGE_DISABLE_MODELS_FETCH": "1"} {
@@ -220,5 +221,113 @@ func TestCompactionRequiresConfirmationAndSupportsUndo(t *testing.T) {
 	restored, _ := os.ReadFile(path)
 	if string(restored) != initial {
 		t.Fatalf("undo did not restore original settings: %s", restored)
+	}
+}
+
+func TestDerivedCostsUpdateWithoutMixingDevices(t *testing.T) {
+	a := fixture(t)
+	now := time.Now().Unix()
+	localPrice, remotePrice := 2.5, 7.0
+	s := model.Session{Agent: model.Claude, Key: "shared", ID: "local", DeviceID: a.localID, Title: "Local shared key", CreatedAt: now, LastActivityAt: now}
+	r := s
+	r.ID = "remote"
+	r.DeviceID = "other"
+	r.Title = "Remote shared key"
+	a.loaded[model.Claude] = model.Data{Sessions: []model.Session{s}, Turns: []model.Turn{{Agent: model.Claude, DeviceID: s.DeviceID, SessionKey: s.Key, CreatedAt: now, InputTokens: 10, RecordedCost: &localPrice}}}
+	a.remote = model.Data{Sessions: []model.Session{r}, Turns: []model.Turn{{Agent: model.Claude, DeviceID: r.DeviceID, SessionKey: r.Key, CreatedAt: now, InputTokens: 20, RecordedCost: &remotePrice}}}
+	tt := ui.NewTester(a.View, 1240, 780)
+	if !tt.HasText("$9.50") {
+		t.Fatal("incorrect initial aggregate")
+	}
+	click(t, tt, "Sessions")
+	if !tt.HasText("$2.50") || !tt.HasText("$7.00") {
+		t.Fatal("session costs mixed device identities")
+	}
+	a.post(func() {
+		d := a.loaded[model.Claude]
+		price := 5.0
+		d.Turns = append(d.Turns, model.Turn{Agent: model.Claude, DeviceID: s.DeviceID, SessionKey: s.Key, CreatedAt: now, InputTokens: 30, RecordedCost: &price})
+		a.loaded[model.Claude] = d
+	})
+	click(t, tt, "Usage")
+	if !tt.HasText("$14.50") {
+		t.Fatal("background update left stale aggregate")
+	}
+	click(t, tt, "Sessions")
+	if !tt.HasText("$7.50") || !tt.HasText("$7.00") {
+		t.Fatal("background update left stale per-session costs")
+	}
+}
+
+func TestAgentSwitchKeepsLoadedDataUntilReload(t *testing.T) {
+	a := fixture(t)
+	a.remote = model.Data{}
+	a.installed[model.Codex] = true
+	home, _ := os.UserHomeDir()
+	p := filepath.Join(home, ".claude/projects/example/session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+		t.Fatal(err)
+	}
+	line := fmt.Sprintf(`{"type":"assistant","timestamp":%d,"message":{"id":"new","model":"claude-sonnet-4-5","usage":{"input_tokens":9}}}`+"\n", time.Now().Unix())
+	if err := os.WriteFile(p, []byte(line), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tt := ui.NewTester(a.View, 1240, 780)
+	click(t, tt, "Codex")
+	click(t, tt, "Claude Code")
+	wait := func() {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for tt.HasText("Loading…") && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+			click(t, tt, "Usage")
+		}
+		if tt.HasText("Loading…") {
+			t.Fatal("reload timed out")
+		}
+	}
+	wait()
+	if !tt.HasText("168.0K") {
+		t.Fatal("switching agent discarded the loaded snapshot")
+	}
+	click(t, tt, "Reload")
+	wait()
+	if tt.HasText("168.0K") || !tt.HasText("9") {
+		t.Fatal("explicit reload failed to discover changed history")
+	}
+}
+
+func BenchmarkDashboardRedraw(b *testing.B) {
+	for _, tab := range []string{"sessions", "usage"} {
+		b.Run(tab, func(b *testing.B) {
+			a := fixture(b)
+			d := model.Data{}
+			price := .01
+			for i := 0; i < 100; i++ {
+				s := model.Session{Agent: model.Claude, Key: fmt.Sprint(i), ID: fmt.Sprint(i), Title: fmt.Sprint("Session ", i), DeviceID: a.localID, CreatedAt: time.Now().Unix(), LastActivityAt: time.Now().Unix()}
+				d.Sessions = append(d.Sessions, s)
+				for j := 0; j < 200; j++ {
+					d.Turns = append(d.Turns, model.Turn{Agent: s.Agent, SessionKey: s.Key, DeviceID: s.DeviceID, CreatedAt: s.CreatedAt, InputTokens: 10, RecordedCost: &price})
+				}
+			}
+			a.loaded[model.Claude], a.remote, a.tab = d, model.Data{}, tab
+			tt := ui.NewTester(a.View, 1240, 780)
+			if tab == "sessions" && !tt.HasText("$2.00") {
+				b.Fatal("wrong session cost")
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				label := "Hide inactive dates"
+				if tab == "sessions" {
+					label = "Hide Reviews"
+					if i%2 == 1 {
+						label = "Show Reviews"
+					}
+				}
+				if err := tt.Click(label); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

@@ -18,7 +18,7 @@ import (
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 )
 
-var loadMu sync.Mutex
+var loadLocks sync.Map
 var deviceMu sync.Mutex
 
 func home(p string) string { h, _ := os.UserHomeDir(); return filepath.Join(h, p) }
@@ -129,9 +129,11 @@ func SetDeviceName(n string) error {
 }
 
 type snapshot struct {
-	Version int
-	At      int64
-	Data    model.Data
+	Version   int
+	At        int64
+	Data      model.Data
+	Databases map[string]string
+	Files     map[string]string
 }
 
 func empty(start, end int64) model.Data {
@@ -143,8 +145,11 @@ func fail(d *model.Data, a model.Agent, e any) {
 
 // Load returns the selected agent's records. Refresh bypasses all cached records.
 func Load(a model.Agent, start, end int64, refresh bool) model.Data {
-	loadMu.Lock()
-	defer loadMu.Unlock()
+	cache, _ := os.UserCacheDir()
+	path := filepath.Join(cache, "devin-usage-metrics", "go-data-"+string(a)+".json")
+	lock, _ := loadLocks.LoadOrStore(path, new(sync.Mutex))
+	lock.(*sync.Mutex).Lock()
+	defer lock.(*sync.Mutex).Unlock()
 	valid := false
 	for _, known := range model.Agents {
 		if a == known {
@@ -157,8 +162,6 @@ func Load(a model.Agent, start, end int64, refresh bool) model.Data {
 		fail(&d, a, "unsupported agent or invalid time range")
 		return d
 	}
-	cache, _ := os.UserCacheDir()
-	path := filepath.Join(cache, "devin-usage-metrics", "go-data-"+string(a)+".json")
 	var old snapshot
 	b, _ := os.ReadFile(path)
 	_ = json.Unmarshal(b, &old)
@@ -168,11 +171,17 @@ func Load(a model.Agent, start, end int64, refresh bool) model.Data {
 		return filter(old.Data, start, end)
 	}
 	d := empty(start, end)
+	var previous *model.Data
+	if !refresh && covers && len(old.Data.Errors) == 0 {
+		previous = &old.Data
+	}
+	var databases map[string]string
+	var sourceFiles map[string]string
 	switch a {
 	case model.Claude, model.Codex, model.Pi, model.WorkBuddy, model.Grok:
-		loadFiles(&d, a, refresh)
+		sourceFiles = loadFiles(&d, a, refresh, previous, old.Files)
 	case model.Devin, model.ZCode, model.OpenCode, model.MimoCode, model.Antigravity:
-		loadDBs(&d, a, refresh)
+		databases = loadDBs(&d, a, refresh, previous, old.Databases)
 	default:
 		fail(&d, a, "unsupported agent")
 	}
@@ -189,7 +198,7 @@ func Load(a model.Agent, start, end int64, refresh bool) model.Data {
 	}
 	raw, _ := json.Marshal([]any{d.Sessions, d.Turns})
 	d.SyncContentHash = fmt.Sprintf("%x", sha256.Sum256(raw))
-	if e := atomicJSON(path, snapshot{1, now, d}); e != nil {
+	if e := atomicJSON(path, snapshot{Version: 1, At: now, Data: d, Databases: databases, Files: sourceFiles}); e != nil {
 		fail(&d, a, fmt.Errorf("save cache: %w", e))
 	}
 	return d
@@ -208,8 +217,18 @@ func filter(d model.Data, start, end int64) model.Data {
 }
 func LoadAll(start, end int64, refresh bool) model.Data {
 	d := empty(start, end)
-	for _, a := range model.Agents {
-		p := Load(a, start, end, refresh)
+	parts := make([]model.Data, len(model.Agents))
+	var wg sync.WaitGroup
+	limit := make(chan struct{}, 4)
+	for i, a := range model.Agents {
+		wg.Go(func() {
+			limit <- struct{}{}
+			defer func() { <-limit }()
+			parts[i] = Load(a, start, end, refresh)
+		})
+	}
+	wg.Wait()
+	for _, p := range parts {
 		d.Sessions = append(d.Sessions, p.Sessions...)
 		d.Turns = append(d.Turns, p.Turns...)
 		d.Errors = append(d.Errors, p.Errors...)

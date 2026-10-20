@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
@@ -181,7 +183,7 @@ type lineCache struct {
 	Errors []error
 }
 
-var decodedFiles = map[string]lineCache{}
+var decodedFiles sync.Map
 
 // Only changed transcripts are decoded again after the five-minute snapshot
 // expires. Rebuild accounting globally so resumed Claude copies still dedup
@@ -193,7 +195,8 @@ func readLines(d *model.Data, a model.Agent, p string, refresh bool) []obj {
 		return nil
 	}
 	d.FileMtimes[p] = info.ModTime().UnixNano()
-	cached, ok := decodedFiles[p]
+	value, ok := decodedFiles.Load(p)
+	cached, _ := value.(lineCache)
 	if refresh || !ok || cached.Mtime != info.ModTime().UnixNano() || cached.Size != info.Size() {
 		cached = lineCache{Mtime: info.ModTime().UnixNano(), Size: info.Size()}
 		f, e := os.Open(p)
@@ -218,7 +221,7 @@ func readLines(d *model.Data, a model.Agent, p string, refresh bool) []obj {
 			cached.Errors = append(cached.Errors, fmt.Errorf("%s: %w", p, e))
 		}
 		f.Close()
-		decodedFiles[p] = cached
+		decodedFiles.Store(p, cached)
 	}
 	for _, e := range cached.Errors {
 		fail(d, a, e)
@@ -226,10 +229,48 @@ func readLines(d *model.Data, a model.Agent, p string, refresh bool) []obj {
 	return cached.Lines
 }
 
-func loadFiles(d *model.Data, a model.Agent, refresh bool) {
+func loadFiles(d *model.Data, a model.Agent, refresh bool, previous *model.Data, signatures map[string]string) map[string]string {
 	paths := files(d, a, roots(a), ".jsonl")
 	if a == model.Grok {
 		paths = files(d, a, roots(a), "summary.json")
+	}
+	tracked := append([]string(nil), paths...)
+	if a == model.Grok {
+		for _, p := range paths {
+			tracked = append(tracked, filepath.Join(filepath.Dir(p), "updates.jsonl"))
+		}
+	}
+	if a == model.Codex {
+		base := os.Getenv("CODEX_HOME")
+		if base == "" {
+			base = home(".codex")
+		}
+		tracked = append(tracked, filepath.Join(base, "session_index.jsonl"))
+	}
+	current := map[string]string{}
+	for _, p := range tracked {
+		if info, err := os.Stat(p); err == nil {
+			current[p] = fmt.Sprintf("%d:%d", info.ModTime().UnixNano(), info.Size())
+		}
+	}
+	if previous != nil && len(d.Errors) == 0 && maps.Equal(current, signatures) {
+		*d = filter(*previous, d.TurnsStart, d.TurnsEnd)
+		return current
+	}
+	// Decode independent files concurrently, then retain deterministic serial
+	// accounting for resumed-session and cross-file message deduplication.
+	if a != model.Grok {
+		var wg sync.WaitGroup
+		limit := make(chan struct{}, 4)
+		for _, p := range paths {
+			wg.Go(func() {
+				limit <- struct{}{}
+				defer func() { <-limit }()
+				part := empty(d.TurnsStart, d.TurnsEnd)
+				readLines(&part, a, p, refresh)
+			})
+		}
+		wg.Wait()
 	}
 	sessions := map[string]*model.Session{}
 	seen := map[string]bool{}
@@ -248,7 +289,7 @@ func loadFiles(d *model.Data, a model.Agent, refresh bool) {
 		var ordered []model.Turn
 		activeModel := ""
 		order := uint64(0)
-		for _, v := range readLines(d, a, p, refresh) {
+		for _, v := range readLines(d, a, p, false) {
 			order++
 			if v == nil {
 				continue
@@ -473,6 +514,7 @@ func loadFiles(d *model.Data, a model.Agent, refresh bool) {
 		}
 		d.Sessions = append(d.Sessions, *s)
 	}
+	return current
 }
 func modelName(provider, id string) string {
 	id = strings.TrimSpace(strings.SplitN(id, "(", 2)[0])

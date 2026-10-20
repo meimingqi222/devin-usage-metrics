@@ -117,7 +117,11 @@ func Run(icon []byte) error {
 						a.refreshQuota(false)
 						if hourly {
 							a.sync()
-							go pricing.Refresh(ctx, false)
+							go func() {
+								if pricing.Refresh(ctx, false) {
+									a.post(func() {})
+								}
+							}()
 						}
 					})
 				}

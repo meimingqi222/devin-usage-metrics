@@ -14,7 +14,7 @@ import (
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 )
 
-func env(t *testing.T) string {
+func env(t testing.TB) string {
 	t.Helper()
 	h := t.TempDir()
 	t.Setenv("USERPROFILE", h)
@@ -25,7 +25,7 @@ func env(t *testing.T) string {
 	}
 	return h
 }
-func write(t *testing.T, h, p, s string) {
+func write(t testing.TB, h, p, s string) {
 	t.Helper()
 	p = filepath.Join(h, p)
 	if e := os.MkdirAll(filepath.Dir(p), 0700); e != nil {
@@ -35,7 +35,7 @@ func write(t *testing.T, h, p, s string) {
 		t.Fatal(e)
 	}
 }
-func db(t *testing.T, h, p string) *sqlite.DB {
+func db(t testing.TB, h, p string) *sqlite.DB {
 	t.Helper()
 	p = filepath.Join(h, p)
 	if e := os.MkdirAll(filepath.Dir(p), 0700); e != nil {
@@ -48,13 +48,13 @@ func db(t *testing.T, h, p string) *sqlite.DB {
 	t.Cleanup(func() { db.Close() })
 	return db
 }
-func exec(t *testing.T, db *sqlite.DB, s string, args ...any) {
+func exec(t testing.TB, db *sqlite.DB, s string, args ...any) {
 	t.Helper()
 	if _, e := db.Execute(context.Background(), s, args...); e != nil {
 		t.Fatal(e)
 	}
 }
-func check(t *testing.T, d model.Data, n int) {
+func check(t testing.TB, d model.Data, n int) {
 	t.Helper()
 	if len(d.Errors) > 0 {
 		t.Fatalf("errors: %+v", d.Errors)
