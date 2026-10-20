@@ -2,14 +2,12 @@ name: Release
 
 on:
   push:
-    tags:
-      - '*'
+    tags: ['*']
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name for release'
-        required: false
-        default: '0.0.1'
+        description: Tag name for release
+        required: true
 
 permissions:
   contents: write
@@ -22,95 +20,70 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-pc-windows-msvc
+          - target: windows/amd64
             os: windows-latest
-            artifact_name: devin-usage-metrics-windows-x64.zip
-            asset_path: devin-usage-metrics-windows-x64.zip
-          - target: aarch64-apple-darwin
+            directory: windows-amd64
+            artifact: devin-usage-metrics-windows-x64.zip
+          - target: darwin/arm64
             os: macos-latest
-            artifact_name: devin-usage-metrics-macos-arm64.zip
-            asset_path: devin-usage-metrics-macos-arm64.zip
-
+            directory: darwin-arm64
+            artifact: devin-usage-metrics-macos-arm64.zip
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - uses: ./.github/actions/gpui-kit
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          token: ${{ secrets.GPUI_APP_KIT_TOKEN }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build Windows Release
-        if: matrix.os == 'windows-latest'
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Set package version from release tag
+        shell: python
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
+        run: |
+          import json, os, re
+          from pathlib import Path
+          version = os.environ['RELEASE_TAG'].removeprefix('v')
+          if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+              raise SystemExit('Release tag must be a stable x.y.z or vx.y.z version')
+          path = Path('mygo.json')
+          config = json.loads(path.read_text())
+          config['version'] = version
+          path.write_text(json.dumps(config, indent=2) + '\n')
+      - name: Build native app and its runtime resources
+        run: go tool mygo build -platform ${{ matrix.target }} -skip-dmg
+      - name: Package Windows portable app
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cargo build --release --target ${{ matrix.target }}
-          Compress-Archive -Path target/${{ matrix.target }}/release/devin-usage-metrics.exe, assets -DestinationPath ${{ matrix.asset_path }}
-          $hash = (Get-FileHash -Path ${{ matrix.asset_path }} -Algorithm SHA256).Hash.ToLower()
-          "$hash  ${{ matrix.artifact_name }}" | Out-File -Encoding utf8 "${{ matrix.asset_path }}.sha256"
-
-      - name: Build macOS Release & Bundle
-        if: startsWith(matrix.os, 'macos')
+          Compress-Archive -Path 'build/${{ matrix.directory }}/Agent Usage Metrics.exe', 'build/${{ matrix.directory }}/mygo-sqlite3.dll' -DestinationPath '${{ matrix.artifact }}'
+          $hash = (Get-FileHash '${{ matrix.artifact }}' -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.artifact }}" | Out-File -Encoding utf8 '${{ matrix.artifact }}.sha256'
+      - name: Package signed macOS bundle
+        if: runner.os == 'macOS'
         shell: bash
         run: |
-          cargo build --release --target ${{ matrix.target }}
-          if cargo install cargo-bundle --locked && cargo bundle --release --target ${{ matrix.target }}; then
-            cd target/${{ matrix.target }}/release/bundle/osx
-            codesign --force --deep --sign - "Agent Usage Metrics.app"
-            codesign --verify --deep --strict --verbose=2 "Agent Usage Metrics.app"
-            zip -r ../../../../../${{ matrix.asset_path }} "Agent Usage Metrics.app"
-            cd ../../../../..
-          else
-            echo "Bundle failed, falling back to standalone binary zip"
-            cd target/${{ matrix.target }}/release
-            chmod +x devin-usage-metrics
-            codesign --force --sign - devin-usage-metrics
-            codesign --verify --strict --verbose=2 devin-usage-metrics
-            zip -r ../../../${{ matrix.asset_path }} devin-usage-metrics
-            cd ../../..
-          fi
-          shasum -a 256 ${{ matrix.asset_path }} | awk '{print $1"  ${{ matrix.artifact_name }}"}' > ${{ matrix.asset_path }}.sha256
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+          codesign --verify --deep --strict --verbose=2 'build/${{ matrix.directory }}/Agent Usage Metrics.app'
+          (cd 'build/${{ matrix.directory }}' && zip -r '../../${{ matrix.artifact }}' 'Agent Usage Metrics.app')
+          shasum -a 256 '${{ matrix.artifact }}' > '${{ matrix.artifact }}.sha256'
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
+          name: ${{ matrix.artifact }}
           path: |
-            ${{ matrix.asset_path }}
-            ${{ matrix.asset_path }}.sha256
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.sha256
 
   release:
     name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download all built artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
-
-      - name: Prepare Release Assets
-        run: |
-          mkdir -p release-assets
-          find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} release-assets/ \;
-          ls -la release-assets/
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
-          files: release-assets/*
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
+          files: artifacts/*
           draft: false
           prerelease: false
           generate_release_notes: true

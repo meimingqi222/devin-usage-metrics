@@ -2,45 +2,42 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
 
-# GPUI 的系统依赖在 Windows/macOS 上开箱即用，
-# Linux 需要额外图形库；桌面 CI 覆盖 macOS 与 Windows。
 jobs:
-  check:
-    name: fmt / clippy / test
+  desktop:
+    name: Go / MyGo (${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - uses: ./.github/actions/gpui-kit
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          token: ${{ secrets.GPUI_APP_KIT_TOKEN }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
       - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets
-
-      - name: Check content boundary
-        run: python ../gpui-app-kit/tools/check_content.py --forbid-call start_load --forbid-call start_tick --forbid-call switch_period src/tray.rs
-
-      - name: Run tests
-        run: cargo test
+        shell: bash
+        run: test -z "$(gofmt -l main.go internal)"
+      - name: Build native package and bundle SQLite runtime
+        run: go tool mygo build -skip-dmg
+      - name: Locate bundled SQLite for offline fixtures
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          library = next(p for p in Path('build').rglob('*mygo-sqlite3*') if p.is_file())
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write(f'MYGO_SQLITE_LIBRARY={library.resolve()}\n')
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: Verify no cgo is needed
+        env:
+          CGO_ENABLED: '0'
+        run: go test ./...
 
   sync-server:
     name: Sync server race / vet
@@ -49,14 +46,10 @@ jobs:
       run:
         working-directory: sync-server
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Install Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version-file: sync-server/go.mod
-          cache: false
-      - name: Run race tests
-        run: go test -race ./...
-      - name: Vet
-        run: go vet ./...
+          cache-dependency-path: sync-server/go.sum
+      - run: go test -race ./...
+      - run: go vet ./...

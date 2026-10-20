@@ -1,0 +1,13 @@
+{
+  "name": "Agent Usage Metrics",
+  "identifier": "com.devin.usage-metrics",
+  "version": "0.2.11",
+  "icon": "assets/icon.png",
+  "out": "build",
+  "main": ".",
+  "linux": {
+    "comment": "Local coding-agent usage analytics",
+    "categories": ["Development"],
+    "depends": ["libayatana-appindicator3-1"]
+  }
+}

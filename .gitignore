@@ -1,7 +1,11 @@
-# Rust 构建产物
+# 构建产物（Rust 仅保留迁移对照）
 /target/
 /dist/
 /build/
+/devin-usage-metrics
+/devin-usage-metrics.exe
+/agent-usage-metrics
+/Agent Usage Metrics.exe
 # Go 同步服务本地构建产物
 /sync-server/sync-server
 /sync-server/sync-server.exe

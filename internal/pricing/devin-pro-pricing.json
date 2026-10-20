@@ -1,0 +1,3144 @@
+{
+  "adaptive": {
+    "i": 0.5,
+    "o": 2.0,
+    "cw": 0.5,
+    "cr": 0.1,
+    "l": "Adaptive",
+    "ctx": null
+  },
+  "arena-fast": {
+    "i": 0.1,
+    "o": 0.5,
+    "cw": 0.0,
+    "cr": 0.0,
+    "l": "Fast Arena",
+    "ctx": null
+  },
+  "arena-mixed": {
+    "i": 1.0,
+    "o": 5.0,
+    "cw": 1.25,
+    "cr": 0.1,
+    "l": "Hybrid Arena",
+    "ctx": null
+  },
+  "arena-smart": {
+    "i": 3.0,
+    "o": 15.0,
+    "cw": 3.75,
+    "cr": 0.3,
+    "l": "Frontier Arena",
+    "ctx": null
+  },
+  "claude-5-fable-high": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Fable 5 High",
+    "ctx": null
+  },
+  "claude-5-fable-low": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Fable 5 Low",
+    "ctx": null
+  },
+  "claude-5-fable-max": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Fable 5 Max",
+    "ctx": null
+  },
+  "claude-5-fable-medium": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Fable 5 Medium",
+    "ctx": null
+  },
+  "claude-5-fable-xhigh": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Fable 5 XHigh",
+    "ctx": null
+  },
+  "claude-fable-5-1-high": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 0.25,
+    "l": "Claude Fable 5.1 High",
+    "ctx": null
+  },
+  "claude-fable-5-1-low": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 0.25,
+    "l": "Claude Fable 5.1 Low",
+    "ctx": null
+  },
+  "claude-fable-5-1-max": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 0.25,
+    "l": "Claude Fable 5.1 Max",
+    "ctx": null
+  },
+  "claude-fable-5-1-medium": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 0.25,
+    "l": "Claude Fable 5.1 Medium",
+    "ctx": null
+  },
+  "claude-fable-5-1-xhigh": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 0.25,
+    "l": "Claude Fable 5.1 XHigh",
+    "ctx": null
+  },
+  "claude-opus-4-6": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.6",
+    "ctx": null
+  },
+  "claude-opus-4-6-1m": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.6 1M",
+    "ctx": null
+  },
+  "claude-opus-4-6-thinking": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.6 Thinking",
+    "ctx": null
+  },
+  "claude-opus-4-6-thinking-1m": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.6 Thinking 1M",
+    "ctx": null
+  },
+  "claude-opus-4-7-high": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.7 High",
+    "ctx": null
+  },
+  "claude-opus-4-7-low": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.7 Low",
+    "ctx": null
+  },
+  "claude-opus-4-7-max": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.7 Max",
+    "ctx": null
+  },
+  "claude-opus-4-7-medium": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.7 Medium",
+    "ctx": null
+  },
+  "claude-opus-4-7-xhigh": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.7 XHigh",
+    "ctx": null
+  },
+  "claude-opus-4-8-high": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.8 High",
+    "ctx": null
+  },
+  "claude-opus-4-8-high-fast": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Opus 4.8 High Fast",
+    "ctx": null
+  },
+  "claude-opus-4-8-low": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.8 Low",
+    "ctx": null
+  },
+  "claude-opus-4-8-low-fast": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Opus 4.8 Low Fast",
+    "ctx": null
+  },
+  "claude-opus-4-8-max": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.8 Max",
+    "ctx": null
+  },
+  "claude-opus-4-8-max-fast": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Opus 4.8 Max Fast",
+    "ctx": null
+  },
+  "claude-opus-4-8-medium": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.8 Medium",
+    "ctx": null
+  },
+  "claude-opus-4-8-medium-fast": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Opus 4.8 Medium Fast",
+    "ctx": null
+  },
+  "claude-opus-4-8-xhigh": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.8 XHigh",
+    "ctx": null
+  },
+  "claude-opus-4-8-xhigh-fast": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Opus 4.8 XHigh Fast",
+    "ctx": null
+  },
+  "claude-opus-5-5-high": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.2,
+    "l": "Claude Opus 5.5 High",
+    "ctx": null
+  },
+  "claude-opus-5-5-high-fast": {
+    "i": 8.0,
+    "o": 40.0,
+    "cw": 10.0,
+    "cr": 0.4,
+    "l": "Claude Opus 5.5 High Fast",
+    "ctx": null
+  },
+  "claude-opus-5-5-low": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.2,
+    "l": "Claude Opus 5.5 Low",
+    "ctx": null
+  },
+  "claude-opus-5-5-low-fast": {
+    "i": 8.0,
+    "o": 40.0,
+    "cw": 10.0,
+    "cr": 0.4,
+    "l": "Claude Opus 5.5 Low Fast",
+    "ctx": null
+  },
+  "claude-opus-5-5-max": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.2,
+    "l": "Claude Opus 5.5 Max",
+    "ctx": null
+  },
+  "claude-opus-5-5-max-fast": {
+    "i": 8.0,
+    "o": 40.0,
+    "cw": 10.0,
+    "cr": 0.4,
+    "l": "Claude Opus 5.5 Max Fast",
+    "ctx": null
+  },
+  "claude-opus-5-5-medium": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.2,
+    "l": "Claude Opus 5.5 Medium",
+    "ctx": null
+  },
+  "claude-opus-5-5-medium-fast": {
+    "i": 8.0,
+    "o": 40.0,
+    "cw": 10.0,
+    "cr": 0.4,
+    "l": "Claude Opus 5.5 Medium Fast",
+    "ctx": null
+  },
+  "claude-opus-5-5-xhigh": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.2,
+    "l": "Claude Opus 5.5 XHigh",
+    "ctx": null
+  },
+  "claude-opus-5-5-xhigh-fast": {
+    "i": 8.0,
+    "o": 40.0,
+    "cw": 10.0,
+    "cr": 0.4,
+    "l": "Claude Opus 5.5 XHigh Fast",
+    "ctx": null
+  },
+  "claude-opus-5-high": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 5 High",
+    "ctx": null
+  },
+  "claude-opus-5-high-fast": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Opus 5 High Fast",
+    "ctx": null
+  },
+  "claude-opus-5-low": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 5 Low",
+    "ctx": null
+  },
+  "claude-opus-5-low-fast": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Opus 5 Low Fast",
+    "ctx": null
+  },
+  "claude-opus-5-max": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 5 Max",
+    "ctx": null
+  },
+  "claude-opus-5-max-fast": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Opus 5 Max Fast",
+    "ctx": null
+  },
+  "claude-opus-5-medium": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 5 Medium",
+    "ctx": null
+  },
+  "claude-opus-5-medium-fast": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Opus 5 Medium Fast",
+    "ctx": null
+  },
+  "claude-opus-5-xhigh": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 5 XHigh",
+    "ctx": null
+  },
+  "claude-opus-5-xhigh-fast": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "Claude Opus 5 XHigh Fast",
+    "ctx": null
+  },
+  "claude-sonnet-4-6": {
+    "i": 3.0,
+    "o": 15.0,
+    "cw": 3.75,
+    "cr": 0.3,
+    "l": "Claude Sonnet 4.6",
+    "ctx": null
+  },
+  "claude-sonnet-4-6-1m": {
+    "i": 3.0,
+    "o": 15.0,
+    "cw": 3.75,
+    "cr": 0.3,
+    "l": "Claude Sonnet 4.6 1M",
+    "ctx": null
+  },
+  "claude-sonnet-4-6-thinking": {
+    "i": 3.0,
+    "o": 15.0,
+    "cw": 3.75,
+    "cr": 0.3,
+    "l": "Claude Sonnet 4.6 Thinking",
+    "ctx": null
+  },
+  "claude-sonnet-4-6-thinking-1m": {
+    "i": 3.0,
+    "o": 15.0,
+    "cw": 3.75,
+    "cr": 0.3,
+    "l": "Claude Sonnet 4.6 Thinking 1M",
+    "ctx": null
+  },
+  "claude-sonnet-5-5-high": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "Claude Sonnet 5.5 High",
+    "ctx": null
+  },
+  "claude-sonnet-5-5-low": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "Claude Sonnet 5.5 Low",
+    "ctx": null
+  },
+  "claude-sonnet-5-5-max": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "Claude Sonnet 5.5 Max",
+    "ctx": null
+  },
+  "claude-sonnet-5-5-medium": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "Claude Sonnet 5.5 Medium",
+    "ctx": null
+  },
+  "claude-sonnet-5-5-xhigh": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "Claude Sonnet 5.5 XHigh",
+    "ctx": null
+  },
+  "claude-sonnet-5-high": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "Claude Sonnet 5 High",
+    "ctx": null
+  },
+  "claude-sonnet-5-low": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "Claude Sonnet 5 Low",
+    "ctx": null
+  },
+  "claude-sonnet-5-max": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "Claude Sonnet 5 Max",
+    "ctx": null
+  },
+  "claude-sonnet-5-medium": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "Claude Sonnet 5 Medium",
+    "ctx": null
+  },
+  "claude-sonnet-5-xhigh": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "Claude Sonnet 5 XHigh",
+    "ctx": null
+  },
+  "deepseek-v4-1-flash-high": {
+    "i": 0.22,
+    "o": 0.66,
+    "cw": 0.0,
+    "cr": 0.007,
+    "l": "DeepSeek V4.1 Flash High",
+    "ctx": null
+  },
+  "deepseek-v4-1-flash-max": {
+    "i": 0.22,
+    "o": 0.66,
+    "cw": 0.0,
+    "cr": 0.007,
+    "l": "DeepSeek V4.1 Flash Max",
+    "ctx": null
+  },
+  "deepseek-v4-flash-high": {
+    "i": 0.14,
+    "o": 0.28,
+    "cw": 0.0,
+    "cr": 0.028,
+    "l": "DeepSeek V4 Flash High",
+    "ctx": null
+  },
+  "deepseek-v4-flash-low": {
+    "i": 0.14,
+    "o": 0.28,
+    "cw": 0.0,
+    "cr": 0.028,
+    "l": "DeepSeek V4 Flash Low",
+    "ctx": null
+  },
+  "deepseek-v4-flash-max": {
+    "i": 0.14,
+    "o": 0.28,
+    "cw": 0.0,
+    "cr": 0.028,
+    "l": "DeepSeek V4 Flash Max",
+    "ctx": null
+  },
+  "deepseek-v4-pro-high": {
+    "i": 1.32,
+    "o": 3.96,
+    "cw": 0.0,
+    "cr": 0.044,
+    "l": "DeepSeek V4 Pro High",
+    "ctx": null
+  },
+  "deepseek-v4-pro-low": {
+    "i": 1.32,
+    "o": 3.96,
+    "cw": 0.0,
+    "cr": 0.044,
+    "l": "DeepSeek V4 Pro Low",
+    "ctx": null
+  },
+  "deepseek-v4-pro-max": {
+    "i": 1.32,
+    "o": 3.96,
+    "cw": 0.0,
+    "cr": 0.044,
+    "l": "DeepSeek V4 Pro Max",
+    "ctx": null
+  },
+  "gemini-3-1-pro-high": {
+    "i": 2.0,
+    "o": 12.0,
+    "cw": 4.5,
+    "cr": 0.2,
+    "l": "Gemini 3.1 Pro High Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 200000,
+        "i": 4.0,
+        "o": 18.0,
+        "cw": 4.5,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gemini-3-1-pro-low": {
+    "i": 2.0,
+    "o": 12.0,
+    "cw": 4.5,
+    "cr": 0.2,
+    "l": "Gemini 3.1 Pro Low Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 200000,
+        "i": 4.0,
+        "o": 18.0,
+        "cw": 4.5,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gemini-3-5-flash-high": {
+    "i": 1.5,
+    "o": 9.0,
+    "cw": 1.0,
+    "cr": 0.15,
+    "l": "Gemini 3.5 Flash High",
+    "ctx": null
+  },
+  "gemini-3-5-flash-low": {
+    "i": 1.5,
+    "o": 9.0,
+    "cw": 1.0,
+    "cr": 0.15,
+    "l": "Gemini 3.5 Flash Low",
+    "ctx": null
+  },
+  "gemini-3-5-flash-medium": {
+    "i": 1.5,
+    "o": 9.0,
+    "cw": 1.0,
+    "cr": 0.15,
+    "l": "Gemini 3.5 Flash Medium",
+    "ctx": null
+  },
+  "gemini-3-5-flash-minimal": {
+    "i": 1.5,
+    "o": 9.0,
+    "cw": 1.0,
+    "cr": 0.15,
+    "l": "Gemini 3.5 Flash Minimal",
+    "ctx": null
+  },
+  "gemini-3-6-flash-high": {
+    "i": 1.5,
+    "o": 7.5,
+    "cw": 1.5,
+    "cr": 0.15,
+    "l": "Gemini 3.6 Flash High",
+    "ctx": null
+  },
+  "gemini-3-6-flash-low": {
+    "i": 1.5,
+    "o": 7.5,
+    "cw": 1.5,
+    "cr": 0.15,
+    "l": "Gemini 3.6 Flash Low",
+    "ctx": null
+  },
+  "gemini-3-6-flash-medium": {
+    "i": 1.5,
+    "o": 7.5,
+    "cw": 1.5,
+    "cr": 0.15,
+    "l": "Gemini 3.6 Flash Medium",
+    "ctx": null
+  },
+  "gemini-3-6-flash-minimal": {
+    "i": 1.5,
+    "o": 7.5,
+    "cw": 1.5,
+    "cr": 0.15,
+    "l": "Gemini 3.6 Flash Minimal",
+    "ctx": null
+  },
+  "gemini-3-7-flash-high": {
+    "i": 0.75,
+    "o": 3.75,
+    "cw": 0.75,
+    "cr": 0.075,
+    "l": "Gemini 3.7 Flash High",
+    "ctx": null
+  },
+  "gemini-3-7-flash-low": {
+    "i": 0.75,
+    "o": 3.75,
+    "cw": 0.75,
+    "cr": 0.075,
+    "l": "Gemini 3.7 Flash Low",
+    "ctx": null
+  },
+  "gemini-3-7-flash-medium": {
+    "i": 0.75,
+    "o": 3.75,
+    "cw": 0.75,
+    "cr": 0.075,
+    "l": "Gemini 3.7 Flash Medium",
+    "ctx": null
+  },
+  "gemini-3-8-flash-high": {
+    "i": 0.75,
+    "o": 3.75,
+    "cw": 0.75,
+    "cr": 0.075,
+    "l": "Gemini 3.8 Flash High",
+    "ctx": null
+  },
+  "gemini-3-8-flash-low": {
+    "i": 0.75,
+    "o": 3.75,
+    "cw": 0.75,
+    "cr": 0.075,
+    "l": "Gemini 3.8 Flash Low",
+    "ctx": null
+  },
+  "gemini-3-8-flash-medium": {
+    "i": 0.75,
+    "o": 3.75,
+    "cw": 0.75,
+    "cr": 0.075,
+    "l": "Gemini 3.8 Flash Medium",
+    "ctx": null
+  },
+  "gemini-4-argon-high": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.0,
+    "cr": 0.1,
+    "l": "Gemini 4 Argon High",
+    "ctx": null
+  },
+  "gemini-4-argon-low": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.0,
+    "cr": 0.1,
+    "l": "Gemini 4 Argon Low",
+    "ctx": null
+  },
+  "gemini-4-argon-medium": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.0,
+    "cr": 0.1,
+    "l": "Gemini 4 Argon Medium",
+    "ctx": null
+  },
+  "glm-5-2": {
+    "i": 0.0,
+    "o": 0.0,
+    "cw": 0.0,
+    "cr": 0.0,
+    "l": "GLM-5.2 High",
+    "ctx": null
+  },
+  "glm-5-2-1m": {
+    "i": 0.7,
+    "o": 2.2,
+    "cw": 0.0,
+    "cr": 0.13,
+    "l": "GLM-5.2 High 1M",
+    "ctx": null
+  },
+  "glm-5-2-max": {
+    "i": 0.7,
+    "o": 2.2,
+    "cw": 0.0,
+    "cr": 0.13,
+    "l": "GLM-5.2 Max",
+    "ctx": null
+  },
+  "glm-5-2-max-1m": {
+    "i": 0.7,
+    "o": 2.2,
+    "cw": 0.0,
+    "cr": 0.13,
+    "l": "GLM-5.2 Max 1M",
+    "ctx": null
+  },
+  "glm-5-2-none": {
+    "i": 0.7,
+    "o": 2.2,
+    "cw": 0.0,
+    "cr": 0.13,
+    "l": "GLM-5.2 No Thinking",
+    "ctx": null
+  },
+  "glm-5-2-none-1m": {
+    "i": 0.7,
+    "o": 2.2,
+    "cw": 0.0,
+    "cr": 0.13,
+    "l": "GLM-5.2 No Thinking 1M",
+    "ctx": null
+  },
+  "glm-5-3-flash-high": {
+    "i": 0.15,
+    "o": 0.5,
+    "cw": 0.0,
+    "cr": 0.029,
+    "l": "GLM-5.3 Flash High",
+    "ctx": null
+  },
+  "glm-5-3-flash-low": {
+    "i": 0.15,
+    "o": 0.5,
+    "cw": 0.0,
+    "cr": 0.029,
+    "l": "GLM-5.3 Flash Low",
+    "ctx": null
+  },
+  "glm-5-3-flash-max": {
+    "i": 0.15,
+    "o": 0.5,
+    "cw": 0.0,
+    "cr": 0.029,
+    "l": "GLM-5.3 Flash Max",
+    "ctx": null
+  },
+  "glm-5-3-high": {
+    "i": 1.4,
+    "o": 4.4,
+    "cw": 0.0,
+    "cr": 0.26,
+    "l": "GLM-5.3 High",
+    "ctx": null
+  },
+  "glm-5-3-low": {
+    "i": 1.4,
+    "o": 4.4,
+    "cw": 0.0,
+    "cr": 0.26,
+    "l": "GLM-5.3 Low",
+    "ctx": null
+  },
+  "glm-5-3-max": {
+    "i": 1.4,
+    "o": 4.4,
+    "cw": 0.0,
+    "cr": 0.26,
+    "l": "GLM-5.3 Max",
+    "ctx": null
+  },
+  "gpt-5-3-codex-high": {
+    "i": 1.75,
+    "o": 14.0,
+    "cw": 0.0,
+    "cr": 0.175,
+    "l": "GPT-5.3-Codex High",
+    "ctx": null
+  },
+  "gpt-5-3-codex-high-priority": {
+    "i": 3.5,
+    "o": 28.0,
+    "cw": 0.0,
+    "cr": 0.35,
+    "l": "GPT-5.3-Codex High Fast",
+    "ctx": null
+  },
+  "gpt-5-3-codex-low": {
+    "i": 1.75,
+    "o": 14.0,
+    "cw": 0.0,
+    "cr": 0.175,
+    "l": "GPT-5.3-Codex Low",
+    "ctx": null
+  },
+  "gpt-5-3-codex-low-priority": {
+    "i": 3.5,
+    "o": 28.0,
+    "cw": 0.0,
+    "cr": 0.35,
+    "l": "GPT-5.3-Codex Low Fast",
+    "ctx": null
+  },
+  "gpt-5-3-codex-medium": {
+    "i": 1.75,
+    "o": 14.0,
+    "cw": 0.0,
+    "cr": 0.175,
+    "l": "GPT-5.3-Codex Medium",
+    "ctx": null
+  },
+  "gpt-5-3-codex-medium-priority": {
+    "i": 3.5,
+    "o": 28.0,
+    "cw": 0.0,
+    "cr": 0.35,
+    "l": "GPT-5.3-Codex Medium Fast",
+    "ctx": null
+  },
+  "gpt-5-3-codex-spark-medium": {
+    "i": 1.75,
+    "o": 14.0,
+    "cw": 0.0,
+    "cr": 0.175,
+    "l": "GPT-5.3-Codex Spark Medium",
+    "ctx": null
+  },
+  "gpt-5-3-codex-xhigh": {
+    "i": 1.75,
+    "o": 14.0,
+    "cw": 0.0,
+    "cr": 0.175,
+    "l": "GPT-5.3-Codex X-High",
+    "ctx": null
+  },
+  "gpt-5-3-codex-xhigh-priority": {
+    "i": 3.5,
+    "o": 28.0,
+    "cw": 0.0,
+    "cr": 0.35,
+    "l": "GPT-5.3-Codex XHigh Fast",
+    "ctx": null
+  },
+  "gpt-5-4-high": {
+    "i": 2.5,
+    "o": 15.0,
+    "cw": 0.0,
+    "cr": 0.25,
+    "l": "GPT-5.4 High Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 5.0,
+        "o": 22.5,
+        "cw": 0.0,
+        "cr": 0.5
+      }
+    ]
+  },
+  "gpt-5-4-high-priority": {
+    "i": 5.0,
+    "o": 30.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "GPT-5.4 High Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-4-low": {
+    "i": 2.5,
+    "o": 15.0,
+    "cw": 0.0,
+    "cr": 0.25,
+    "l": "GPT-5.4 Low Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 5.0,
+        "o": 22.5,
+        "cw": 0.0,
+        "cr": 0.5
+      }
+    ]
+  },
+  "gpt-5-4-low-priority": {
+    "i": 5.0,
+    "o": 30.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "GPT-5.4 Low Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-4-medium": {
+    "i": 2.5,
+    "o": 15.0,
+    "cw": 0.0,
+    "cr": 0.25,
+    "l": "GPT-5.4 Medium Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 5.0,
+        "o": 22.5,
+        "cw": 0.0,
+        "cr": 0.5
+      }
+    ]
+  },
+  "gpt-5-4-medium-priority": {
+    "i": 5.0,
+    "o": 30.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "GPT-5.4 Medium Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-4-mini-high": {
+    "i": 0.75,
+    "o": 4.5,
+    "cw": 0.0,
+    "cr": 0.075,
+    "l": "GPT-5.4 Mini High Thinking",
+    "ctx": null
+  },
+  "gpt-5-4-mini-low": {
+    "i": 0.75,
+    "o": 4.5,
+    "cw": 0.0,
+    "cr": 0.075,
+    "l": "GPT-5.4 Mini Low Thinking",
+    "ctx": null
+  },
+  "gpt-5-4-mini-medium": {
+    "i": 0.75,
+    "o": 4.5,
+    "cw": 0.0,
+    "cr": 0.075,
+    "l": "GPT-5.4 Mini Medium Thinking",
+    "ctx": null
+  },
+  "gpt-5-4-mini-xhigh": {
+    "i": 0.75,
+    "o": 4.5,
+    "cw": 0.0,
+    "cr": 0.075,
+    "l": "GPT-5.4 Mini XHigh Thinking",
+    "ctx": null
+  },
+  "gpt-5-4-none": {
+    "i": 2.5,
+    "o": 15.0,
+    "cw": 0.0,
+    "cr": 0.25,
+    "l": "GPT-5.4 No Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 5.0,
+        "o": 22.5,
+        "cw": 0.0,
+        "cr": 0.5
+      }
+    ]
+  },
+  "gpt-5-4-none-priority": {
+    "i": 5.0,
+    "o": 30.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "GPT-5.4 No Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-4-xhigh": {
+    "i": 2.5,
+    "o": 15.0,
+    "cw": 0.0,
+    "cr": 0.25,
+    "l": "GPT-5.4 XHigh Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 5.0,
+        "o": 22.5,
+        "cw": 0.0,
+        "cr": 0.5
+      }
+    ]
+  },
+  "gpt-5-4-xhigh-priority": {
+    "i": 5.0,
+    "o": 30.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "GPT-5.4 XHigh Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-5-high": {
+    "i": 5.0,
+    "o": 30.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "GPT-5.5 High Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 10.0,
+        "o": 45.0,
+        "cw": 0.0,
+        "cr": 1.0
+      }
+    ]
+  },
+  "gpt-5-5-high-priority": {
+    "i": 12.5,
+    "o": 75.0,
+    "cw": 0.0,
+    "cr": 1.25,
+    "l": "GPT-5.5 High Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-5-low": {
+    "i": 5.0,
+    "o": 30.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "GPT-5.5 Low Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 10.0,
+        "o": 45.0,
+        "cw": 0.0,
+        "cr": 1.0
+      }
+    ]
+  },
+  "gpt-5-5-low-priority": {
+    "i": 12.5,
+    "o": 75.0,
+    "cw": 0.0,
+    "cr": 1.25,
+    "l": "GPT-5.5 Low Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-5-medium": {
+    "i": 5.0,
+    "o": 30.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "GPT-5.5 Medium Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 10.0,
+        "o": 45.0,
+        "cw": 0.0,
+        "cr": 1.0
+      }
+    ]
+  },
+  "gpt-5-5-medium-priority": {
+    "i": 12.5,
+    "o": 75.0,
+    "cw": 0.0,
+    "cr": 1.25,
+    "l": "GPT-5.5 Medium Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-5-none": {
+    "i": 5.0,
+    "o": 30.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "GPT-5.5 No Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 10.0,
+        "o": 45.0,
+        "cw": 0.0,
+        "cr": 1.0
+      }
+    ]
+  },
+  "gpt-5-5-none-priority": {
+    "i": 12.5,
+    "o": 75.0,
+    "cw": 0.0,
+    "cr": 1.25,
+    "l": "GPT-5.5 No Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-5-review": {
+    "i": 5.0,
+    "o": 30.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "GPT-5.5 Review",
+    "ctx": null
+  },
+  "gpt-5-5-xhigh": {
+    "i": 5.0,
+    "o": 30.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "GPT-5.5 XHigh Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 10.0,
+        "o": 45.0,
+        "cw": 0.0,
+        "cr": 1.0
+      }
+    ]
+  },
+  "gpt-5-5-xhigh-priority": {
+    "i": 12.5,
+    "o": 75.0,
+    "cw": 0.0,
+    "cr": 1.25,
+    "l": "GPT-5.5 XHigh Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-luna-high": {
+    "i": 0.2,
+    "o": 1.2,
+    "cw": 0.25,
+    "cr": 0.02,
+    "l": "GPT-5.6 Luna High Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.4,
+        "o": 1.8,
+        "cw": 0.5,
+        "cr": 0.04
+      }
+    ]
+  },
+  "gpt-5-6-luna-high-priority": {
+    "i": 0.4,
+    "o": 2.4,
+    "cw": 0.5,
+    "cr": 0.04,
+    "l": "GPT-5.6 Luna High Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-luna-low": {
+    "i": 0.2,
+    "o": 1.2,
+    "cw": 0.25,
+    "cr": 0.02,
+    "l": "GPT-5.6 Luna Low Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.4,
+        "o": 1.8,
+        "cw": 0.5,
+        "cr": 0.04
+      }
+    ]
+  },
+  "gpt-5-6-luna-low-priority": {
+    "i": 0.4,
+    "o": 2.4,
+    "cw": 0.5,
+    "cr": 0.04,
+    "l": "GPT-5.6 Luna Low Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-luna-max": {
+    "i": 0.2,
+    "o": 1.2,
+    "cw": 0.25,
+    "cr": 0.02,
+    "l": "GPT-5.6 Luna Max Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.4,
+        "o": 1.8,
+        "cw": 0.5,
+        "cr": 0.04
+      }
+    ]
+  },
+  "gpt-5-6-luna-max-priority": {
+    "i": 0.4,
+    "o": 2.4,
+    "cw": 0.5,
+    "cr": 0.04,
+    "l": "GPT-5.6 Luna Max Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-luna-medium": {
+    "i": 0.2,
+    "o": 1.2,
+    "cw": 0.25,
+    "cr": 0.02,
+    "l": "GPT-5.6 Luna Medium Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.4,
+        "o": 1.8,
+        "cw": 0.5,
+        "cr": 0.04
+      }
+    ]
+  },
+  "gpt-5-6-luna-medium-priority": {
+    "i": 0.4,
+    "o": 2.4,
+    "cw": 0.5,
+    "cr": 0.04,
+    "l": "GPT-5.6 Luna Medium Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-luna-none": {
+    "i": 0.2,
+    "o": 1.2,
+    "cw": 0.25,
+    "cr": 0.02,
+    "l": "GPT-5.6 Luna No Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.4,
+        "o": 1.8,
+        "cw": 0.5,
+        "cr": 0.04
+      }
+    ]
+  },
+  "gpt-5-6-luna-none-priority": {
+    "i": 0.4,
+    "o": 2.4,
+    "cw": 0.5,
+    "cr": 0.04,
+    "l": "GPT-5.6 Luna No Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-luna-xhigh": {
+    "i": 0.2,
+    "o": 1.2,
+    "cw": 0.25,
+    "cr": 0.02,
+    "l": "GPT-5.6 Luna XHigh Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.4,
+        "o": 1.8,
+        "cw": 0.5,
+        "cr": 0.04
+      }
+    ]
+  },
+  "gpt-5-6-luna-xhigh-priority": {
+    "i": 0.4,
+    "o": 2.4,
+    "cw": 0.5,
+    "cr": 0.04,
+    "l": "GPT-5.6 Luna XHigh Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-sol-high": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-5.6 Sol High Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.8
+      }
+    ]
+  },
+  "gpt-5-6-sol-high-priority": {
+    "i": 8.0,
+    "o": 40.0,
+    "cw": 10.0,
+    "cr": 0.8,
+    "l": "GPT-5.6 Sol High Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-sol-low": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-5.6 Sol Low Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.8
+      }
+    ]
+  },
+  "gpt-5-6-sol-low-priority": {
+    "i": 8.0,
+    "o": 40.0,
+    "cw": 10.0,
+    "cr": 0.8,
+    "l": "GPT-5.6 Sol Low Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-sol-max": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-5.6 Sol Max Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.8
+      }
+    ]
+  },
+  "gpt-5-6-sol-max-priority": {
+    "i": 8.0,
+    "o": 40.0,
+    "cw": 10.0,
+    "cr": 0.8,
+    "l": "GPT-5.6 Sol Max Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-sol-medium": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-5.6 Sol Medium Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.8
+      }
+    ]
+  },
+  "gpt-5-6-sol-medium-priority": {
+    "i": 8.0,
+    "o": 40.0,
+    "cw": 10.0,
+    "cr": 0.8,
+    "l": "GPT-5.6 Sol Medium Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-sol-none": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-5.6 Sol No Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.8
+      }
+    ]
+  },
+  "gpt-5-6-sol-none-priority": {
+    "i": 8.0,
+    "o": 40.0,
+    "cw": 10.0,
+    "cr": 0.8,
+    "l": "GPT-5.6 Sol No Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-sol-xhigh": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-5.6 Sol XHigh Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.8
+      }
+    ]
+  },
+  "gpt-5-6-sol-xhigh-priority": {
+    "i": 8.0,
+    "o": 40.0,
+    "cw": 10.0,
+    "cr": 0.8,
+    "l": "GPT-5.6 Sol XHigh Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-terra-high": {
+    "i": 2.0,
+    "o": 12.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "GPT-5.6 Terra High Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 18.0,
+        "cw": 5.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-5-6-terra-high-priority": {
+    "i": 4.0,
+    "o": 24.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-5.6 Terra High Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-terra-low": {
+    "i": 2.0,
+    "o": 12.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "GPT-5.6 Terra Low Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 18.0,
+        "cw": 5.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-5-6-terra-low-priority": {
+    "i": 4.0,
+    "o": 24.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-5.6 Terra Low Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-terra-max": {
+    "i": 2.0,
+    "o": 12.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "GPT-5.6 Terra Max Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 18.0,
+        "cw": 5.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-5-6-terra-max-priority": {
+    "i": 4.0,
+    "o": 24.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-5.6 Terra Max Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-terra-medium": {
+    "i": 2.0,
+    "o": 12.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "GPT-5.6 Terra Medium Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 18.0,
+        "cw": 5.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-5-6-terra-medium-priority": {
+    "i": 4.0,
+    "o": 24.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-5.6 Terra Medium Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-terra-none": {
+    "i": 2.0,
+    "o": 12.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "GPT-5.6 Terra No Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 18.0,
+        "cw": 5.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-5-6-terra-none-priority": {
+    "i": 4.0,
+    "o": 24.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-5.6 Terra No Thinking Fast",
+    "ctx": null
+  },
+  "gpt-5-6-terra-xhigh": {
+    "i": 2.0,
+    "o": 12.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "GPT-5.6 Terra XHigh Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 18.0,
+        "cw": 5.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-5-6-terra-xhigh-priority": {
+    "i": 4.0,
+    "o": 24.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-5.6 Terra XHigh Thinking Fast",
+    "ctx": null
+  },
+  "gpt-6-1-sol-high": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.1,
+    "l": "GPT-6.1 Sol High Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 15.0,
+        "cw": 5.0,
+        "cr": 0.2
+      }
+    ]
+  },
+  "gpt-6-1-sol-high-priority": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.2,
+    "l": "GPT-6.1 Sol High Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-6-1-sol-low": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.1,
+    "l": "GPT-6.1 Sol Low Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 15.0,
+        "cw": 5.0,
+        "cr": 0.2
+      }
+    ]
+  },
+  "gpt-6-1-sol-low-priority": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.2,
+    "l": "GPT-6.1 Sol Low Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-6-1-sol-max": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.1,
+    "l": "GPT-6.1 Sol Max Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 15.0,
+        "cw": 5.0,
+        "cr": 0.2
+      }
+    ]
+  },
+  "gpt-6-1-sol-max-priority": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.2,
+    "l": "GPT-6.1 Sol Max Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-6-1-sol-medium": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.1,
+    "l": "GPT-6.1 Sol Medium Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 15.0,
+        "cw": 5.0,
+        "cr": 0.2
+      }
+    ]
+  },
+  "gpt-6-1-sol-medium-priority": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.2,
+    "l": "GPT-6.1 Sol Medium Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-6-1-sol-xhigh": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.1,
+    "l": "GPT-6.1 Sol XHigh Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 15.0,
+        "cw": 5.0,
+        "cr": 0.2
+      }
+    ]
+  },
+  "gpt-6-1-sol-xhigh-priority": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.2,
+    "l": "GPT-6.1 Sol XHigh Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-6-astra-high": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "GPT-6 Astra High Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 20.0,
+        "o": 75.0,
+        "cw": 25.0,
+        "cr": 2.0
+      }
+    ]
+  },
+  "gpt-6-astra-high-priority": {
+    "i": 20.0,
+    "o": 100.0,
+    "cw": 25.0,
+    "cr": 2.0,
+    "l": "GPT-6 Astra High Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 40.0,
+        "o": 150.0,
+        "cw": 50.0,
+        "cr": 4.0
+      }
+    ]
+  },
+  "gpt-6-astra-low": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "GPT-6 Astra Low Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 20.0,
+        "o": 75.0,
+        "cw": 25.0,
+        "cr": 2.0
+      }
+    ]
+  },
+  "gpt-6-astra-low-priority": {
+    "i": 20.0,
+    "o": 100.0,
+    "cw": 25.0,
+    "cr": 2.0,
+    "l": "GPT-6 Astra Low Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 40.0,
+        "o": 150.0,
+        "cw": 50.0,
+        "cr": 4.0
+      }
+    ]
+  },
+  "gpt-6-astra-max": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "GPT-6 Astra Max Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 20.0,
+        "o": 75.0,
+        "cw": 25.0,
+        "cr": 2.0
+      }
+    ]
+  },
+  "gpt-6-astra-max-priority": {
+    "i": 20.0,
+    "o": 100.0,
+    "cw": 25.0,
+    "cr": 2.0,
+    "l": "GPT-6 Astra Max Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 40.0,
+        "o": 150.0,
+        "cw": 50.0,
+        "cr": 4.0
+      }
+    ]
+  },
+  "gpt-6-astra-medium": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "GPT-6 Astra Medium Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 20.0,
+        "o": 75.0,
+        "cw": 25.0,
+        "cr": 2.0
+      }
+    ]
+  },
+  "gpt-6-astra-medium-priority": {
+    "i": 20.0,
+    "o": 100.0,
+    "cw": 25.0,
+    "cr": 2.0,
+    "l": "GPT-6 Astra Medium Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 40.0,
+        "o": 150.0,
+        "cw": 50.0,
+        "cr": 4.0
+      }
+    ]
+  },
+  "gpt-6-astra-xhigh": {
+    "i": 10.0,
+    "o": 50.0,
+    "cw": 12.5,
+    "cr": 1.0,
+    "l": "GPT-6 Astra XHigh Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 20.0,
+        "o": 75.0,
+        "cw": 25.0,
+        "cr": 2.0
+      }
+    ]
+  },
+  "gpt-6-astra-xhigh-priority": {
+    "i": 20.0,
+    "o": 100.0,
+    "cw": 25.0,
+    "cr": 2.0,
+    "l": "GPT-6 Astra XHigh Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 40.0,
+        "o": 150.0,
+        "cw": 50.0,
+        "cr": 4.0
+      }
+    ]
+  },
+  "gpt-6-luna-high": {
+    "i": 0.1,
+    "o": 0.5,
+    "cw": 0.125,
+    "cr": 0.01,
+    "l": "GPT-6 Luna High Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.2,
+        "o": 0.75,
+        "cw": 0.25,
+        "cr": 0.02
+      }
+    ]
+  },
+  "gpt-6-luna-high-priority": {
+    "i": 0.2,
+    "o": 1.0,
+    "cw": 0.25,
+    "cr": 0.02,
+    "l": "GPT-6 Luna High Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.4,
+        "o": 1.5,
+        "cw": 0.5,
+        "cr": 0.04
+      }
+    ]
+  },
+  "gpt-6-luna-low": {
+    "i": 0.1,
+    "o": 0.5,
+    "cw": 0.125,
+    "cr": 0.01,
+    "l": "GPT-6 Luna Low Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.2,
+        "o": 0.75,
+        "cw": 0.25,
+        "cr": 0.02
+      }
+    ]
+  },
+  "gpt-6-luna-low-priority": {
+    "i": 0.2,
+    "o": 1.0,
+    "cw": 0.25,
+    "cr": 0.02,
+    "l": "GPT-6 Luna Low Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.4,
+        "o": 1.5,
+        "cw": 0.5,
+        "cr": 0.04
+      }
+    ]
+  },
+  "gpt-6-luna-max": {
+    "i": 0.1,
+    "o": 0.5,
+    "cw": 0.125,
+    "cr": 0.01,
+    "l": "GPT-6 Luna Max Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.2,
+        "o": 0.75,
+        "cw": 0.25,
+        "cr": 0.02
+      }
+    ]
+  },
+  "gpt-6-luna-max-priority": {
+    "i": 0.2,
+    "o": 1.0,
+    "cw": 0.25,
+    "cr": 0.02,
+    "l": "GPT-6 Luna Max Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.4,
+        "o": 1.5,
+        "cw": 0.5,
+        "cr": 0.04
+      }
+    ]
+  },
+  "gpt-6-luna-medium": {
+    "i": 0.1,
+    "o": 0.5,
+    "cw": 0.125,
+    "cr": 0.01,
+    "l": "GPT-6 Luna Medium Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.2,
+        "o": 0.75,
+        "cw": 0.25,
+        "cr": 0.02
+      }
+    ]
+  },
+  "gpt-6-luna-medium-priority": {
+    "i": 0.2,
+    "o": 1.0,
+    "cw": 0.25,
+    "cr": 0.02,
+    "l": "GPT-6 Luna Medium Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.4,
+        "o": 1.5,
+        "cw": 0.5,
+        "cr": 0.04
+      }
+    ]
+  },
+  "gpt-6-luna-none": {
+    "i": 0.1,
+    "o": 0.5,
+    "cw": 0.125,
+    "cr": 0.01,
+    "l": "GPT-6 Luna No Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.2,
+        "o": 0.75,
+        "cw": 0.25,
+        "cr": 0.02
+      }
+    ]
+  },
+  "gpt-6-luna-none-priority": {
+    "i": 0.2,
+    "o": 1.0,
+    "cw": 0.25,
+    "cr": 0.02,
+    "l": "GPT-6 Luna No Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.4,
+        "o": 1.5,
+        "cw": 0.5,
+        "cr": 0.04
+      }
+    ]
+  },
+  "gpt-6-luna-xhigh": {
+    "i": 0.1,
+    "o": 0.5,
+    "cw": 0.125,
+    "cr": 0.01,
+    "l": "GPT-6 Luna XHigh Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.2,
+        "o": 0.75,
+        "cw": 0.25,
+        "cr": 0.02
+      }
+    ]
+  },
+  "gpt-6-luna-xhigh-priority": {
+    "i": 0.2,
+    "o": 1.0,
+    "cw": 0.25,
+    "cr": 0.02,
+    "l": "GPT-6 Luna XHigh Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 0.4,
+        "o": 1.5,
+        "cw": 0.5,
+        "cr": 0.04
+      }
+    ]
+  },
+  "gpt-6-sol-high": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "GPT-6 Sol High Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 15.0,
+        "cw": 5.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-6-sol-high-priority": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-6 Sol High Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.8
+      }
+    ]
+  },
+  "gpt-6-sol-low": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "GPT-6 Sol Low Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 15.0,
+        "cw": 5.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-6-sol-low-priority": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-6 Sol Low Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.8
+      }
+    ]
+  },
+  "gpt-6-sol-max": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "GPT-6 Sol Max Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 15.0,
+        "cw": 5.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-6-sol-max-priority": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-6 Sol Max Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.8
+      }
+    ]
+  },
+  "gpt-6-sol-medium": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "GPT-6 Sol Medium Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 15.0,
+        "cw": 5.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-6-sol-medium-priority": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-6 Sol Medium Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.8
+      }
+    ]
+  },
+  "gpt-6-sol-none": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "GPT-6 Sol No Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 15.0,
+        "cw": 5.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-6-sol-none-priority": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-6 Sol No Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.8
+      }
+    ]
+  },
+  "gpt-6-sol-xhigh": {
+    "i": 2.0,
+    "o": 10.0,
+    "cw": 2.5,
+    "cr": 0.2,
+    "l": "GPT-6 Sol XHigh Thinking",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 4.0,
+        "o": 15.0,
+        "cw": 5.0,
+        "cr": 0.4
+      }
+    ]
+  },
+  "gpt-6-sol-xhigh-priority": {
+    "i": 4.0,
+    "o": 20.0,
+    "cw": 5.0,
+    "cr": 0.4,
+    "l": "GPT-6 Sol XHigh Thinking Fast",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 272000,
+        "i": 8.0,
+        "o": 30.0,
+        "cw": 10.0,
+        "cr": 0.8
+      }
+    ]
+  },
+  "grok-4-5-high": {
+    "i": 2.0,
+    "o": 6.0,
+    "cw": 0.0,
+    "cr": 0.3,
+    "l": "Grok 4.5 High",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 200000,
+        "i": 4.0,
+        "o": 12.0,
+        "cw": 0.0,
+        "cr": 0.6
+      }
+    ]
+  },
+  "grok-4-5-low": {
+    "i": 2.0,
+    "o": 6.0,
+    "cw": 0.0,
+    "cr": 0.3,
+    "l": "Grok 4.5 Low",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 200000,
+        "i": 4.0,
+        "o": 12.0,
+        "cw": 0.0,
+        "cr": 0.6
+      }
+    ]
+  },
+  "grok-4-5-medium": {
+    "i": 2.0,
+    "o": 6.0,
+    "cw": 0.0,
+    "cr": 0.3,
+    "l": "Grok 4.5 Medium",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 200000,
+        "i": 4.0,
+        "o": 12.0,
+        "cw": 0.0,
+        "cr": 0.6
+      }
+    ]
+  },
+  "grok-4-6-high": {
+    "i": 2.0,
+    "o": 6.0,
+    "cw": 0.0,
+    "cr": 0.3,
+    "l": "Grok 4.6 High",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 200000,
+        "i": 4.0,
+        "o": 12.0,
+        "cw": 0.0,
+        "cr": 0.6
+      }
+    ]
+  },
+  "grok-4-6-low": {
+    "i": 2.0,
+    "o": 6.0,
+    "cw": 0.0,
+    "cr": 0.3,
+    "l": "Grok 4.6 Low",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 200000,
+        "i": 4.0,
+        "o": 12.0,
+        "cw": 0.0,
+        "cr": 0.6
+      }
+    ]
+  },
+  "grok-4-6-medium": {
+    "i": 2.0,
+    "o": 6.0,
+    "cw": 0.0,
+    "cr": 0.3,
+    "l": "Grok 4.6 Medium",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 200000,
+        "i": 4.0,
+        "o": 12.0,
+        "cw": 0.0,
+        "cr": 0.6
+      }
+    ]
+  },
+  "grok-4-6-xhigh": {
+    "i": 2.0,
+    "o": 6.0,
+    "cw": 0.0,
+    "cr": 0.3,
+    "l": "Grok 4.6 XHigh",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 200000,
+        "i": 4.0,
+        "o": 12.0,
+        "cw": 0.0,
+        "cr": 0.6
+      }
+    ]
+  },
+  "grok-4-7-high": {
+    "i": 2.0,
+    "o": 6.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "Grok 4.7 High",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 200000,
+        "i": 4.0,
+        "o": 12.0,
+        "cw": 0.0,
+        "cr": 1.0
+      }
+    ]
+  },
+  "grok-4-7-low": {
+    "i": 2.0,
+    "o": 6.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "Grok 4.7 Low",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 200000,
+        "i": 4.0,
+        "o": 12.0,
+        "cw": 0.0,
+        "cr": 1.0
+      }
+    ]
+  },
+  "grok-4-7-medium": {
+    "i": 2.0,
+    "o": 6.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "Grok 4.7 Medium",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 200000,
+        "i": 4.0,
+        "o": 12.0,
+        "cw": 0.0,
+        "cr": 1.0
+      }
+    ]
+  },
+  "grok-4-7-xhigh": {
+    "i": 2.0,
+    "o": 6.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "Grok 4.7 XHigh",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 200000,
+        "i": 4.0,
+        "o": 12.0,
+        "cw": 0.0,
+        "cr": 1.0
+      }
+    ]
+  },
+  "inkling-high": {
+    "i": 1.4,
+    "o": 4.4,
+    "cw": 0.0,
+    "cr": 0.26,
+    "l": "Inkling High",
+    "ctx": null
+  },
+  "inkling-low": {
+    "i": 1.4,
+    "o": 4.4,
+    "cw": 0.0,
+    "cr": 0.26,
+    "l": "Inkling Low",
+    "ctx": null
+  },
+  "inkling-max": {
+    "i": 1.4,
+    "o": 4.4,
+    "cw": 0.0,
+    "cr": 0.26,
+    "l": "Inkling Max",
+    "ctx": null
+  },
+  "inkling-medium": {
+    "i": 1.4,
+    "o": 4.4,
+    "cw": 0.0,
+    "cr": 0.26,
+    "l": "Inkling Medium",
+    "ctx": null
+  },
+  "inkling-none": {
+    "i": 1.4,
+    "o": 4.4,
+    "cw": 0.0,
+    "cr": 0.26,
+    "l": "Inkling None",
+    "ctx": null
+  },
+  "inkling-xhigh": {
+    "i": 1.4,
+    "o": 4.4,
+    "cw": 0.0,
+    "cr": 0.26,
+    "l": "Inkling X-High",
+    "ctx": null
+  },
+  "kimi-k2-6": {
+    "i": 0.95,
+    "o": 4.0,
+    "cw": 0.0,
+    "cr": 0.16,
+    "l": "Kimi K2.6",
+    "ctx": null
+  },
+  "kimi-k2-7": {
+    "i": 0.95,
+    "o": 4.0,
+    "cw": 0.0,
+    "cr": 0.19,
+    "l": "Kimi K2.7",
+    "ctx": null
+  },
+  "kimi-k3-high": {
+    "i": 3.0,
+    "o": 15.0,
+    "cw": 0.0,
+    "cr": 0.3,
+    "l": "Kimi K3 High",
+    "ctx": null
+  },
+  "kimi-k3-low": {
+    "i": 3.0,
+    "o": 15.0,
+    "cw": 0.0,
+    "cr": 0.3,
+    "l": "Kimi K3 Low",
+    "ctx": null
+  },
+  "kimi-k3-max": {
+    "i": 3.0,
+    "o": 15.0,
+    "cw": 0.0,
+    "cr": 0.3,
+    "l": "Kimi K3 Max",
+    "ctx": null
+  },
+  "model_chat_gpt_4_1_2025_04_14": {
+    "i": 2.0,
+    "o": 8.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "GPT-4.1",
+    "ctx": null
+  },
+  "model_chat_gpt_4o_2024_08_06": {
+    "i": 2.5,
+    "o": 10.0,
+    "cw": 0.0,
+    "cr": 1.25,
+    "l": "GPT-4o",
+    "ctx": null
+  },
+  "model_chat_o3": {
+    "i": 2.0,
+    "o": 8.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "o3",
+    "ctx": null
+  },
+  "model_chat_o3_high": {
+    "i": 2.0,
+    "o": 8.0,
+    "cw": 0.0,
+    "cr": 0.5,
+    "l": "o3 High Reasoning",
+    "ctx": null
+  },
+  "model_claude_4_5_opus": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.5",
+    "ctx": null
+  },
+  "model_claude_4_5_opus_thinking": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Claude Opus 4.5 Thinking",
+    "ctx": null
+  },
+  "model_google_gemini_2_5_pro": {
+    "i": 1.25,
+    "o": 10.0,
+    "cw": 4.5,
+    "cr": 0.125,
+    "l": "Gemini 2.5 Pro",
+    "ctx": null,
+    "tiers": [
+      {
+        "above": 200000,
+        "i": 2.5,
+        "o": 15.0,
+        "cw": 4.5,
+        "cr": 0.25
+      }
+    ]
+  },
+  "model_google_gemini_3_0_flash_high": {
+    "i": 0.5,
+    "o": 3.0,
+    "cw": 1.0,
+    "cr": 0.05,
+    "l": "Gemini 3 Flash High",
+    "ctx": null
+  },
+  "model_google_gemini_3_0_flash_low": {
+    "i": 0.5,
+    "o": 3.0,
+    "cw": 1.0,
+    "cr": 0.05,
+    "l": "Gemini 3 Flash Low",
+    "ctx": null
+  },
+  "model_google_gemini_3_0_flash_medium": {
+    "i": 0.5,
+    "o": 3.0,
+    "cw": 1.0,
+    "cr": 0.05,
+    "l": "Gemini 3 Flash Medium",
+    "ctx": null
+  },
+  "model_google_gemini_3_0_flash_minimal": {
+    "i": 0.5,
+    "o": 3.0,
+    "cw": 1.0,
+    "cr": 0.05,
+    "l": "Gemini 3 Flash Minimal",
+    "ctx": null
+  },
+  "model_gpt_5_2_high": {
+    "i": 1.75,
+    "o": 14.0,
+    "cw": 0.0,
+    "cr": 0.175,
+    "l": "GPT-5.2 High Thinking",
+    "ctx": null
+  },
+  "model_gpt_5_2_high_priority": {
+    "i": 3.5,
+    "o": 28.0,
+    "cw": 0.0,
+    "cr": 0.35,
+    "l": "GPT-5.2 High Thinking Fast",
+    "ctx": null
+  },
+  "model_gpt_5_2_low": {
+    "i": 1.75,
+    "o": 14.0,
+    "cw": 0.0,
+    "cr": 0.175,
+    "l": "GPT-5.2 Low Thinking",
+    "ctx": null
+  },
+  "model_gpt_5_2_low_priority": {
+    "i": 3.5,
+    "o": 28.0,
+    "cw": 0.0,
+    "cr": 0.35,
+    "l": "GPT-5.2 Low Thinking Fast",
+    "ctx": null
+  },
+  "model_gpt_5_2_medium": {
+    "i": 1.75,
+    "o": 14.0,
+    "cw": 0.0,
+    "cr": 0.175,
+    "l": "GPT-5.2 Medium Thinking",
+    "ctx": null
+  },
+  "model_gpt_5_2_medium_priority": {
+    "i": 3.5,
+    "o": 28.0,
+    "cw": 0.0,
+    "cr": 0.35,
+    "l": "GPT-5.2 Medium Thinking Fast",
+    "ctx": null
+  },
+  "model_gpt_5_2_none": {
+    "i": 1.75,
+    "o": 14.0,
+    "cw": 0.0,
+    "cr": 0.175,
+    "l": "GPT-5.2 No Thinking",
+    "ctx": null
+  },
+  "model_gpt_5_2_none_priority": {
+    "i": 3.5,
+    "o": 28.0,
+    "cw": 0.0,
+    "cr": 0.35,
+    "l": "GPT-5.2 No Thinking Fast",
+    "ctx": null
+  },
+  "model_gpt_5_2_xhigh": {
+    "i": 1.75,
+    "o": 14.0,
+    "cw": 0.0,
+    "cr": 0.175,
+    "l": "GPT-5.2 XHigh Thinking",
+    "ctx": null
+  },
+  "model_gpt_5_2_xhigh_priority": {
+    "i": 3.5,
+    "o": 28.0,
+    "cw": 0.0,
+    "cr": 0.35,
+    "l": "GPT-5.2 XHigh Thinking Fast",
+    "ctx": null
+  },
+  "model_gpt_oss_120b": {
+    "i": 0.15,
+    "o": 0.6,
+    "cw": 0.0,
+    "cr": 0.07,
+    "l": "GPT-OSS 120B Medium Thinking",
+    "ctx": null
+  },
+  "model_private_11": {
+    "i": 1.0,
+    "o": 5.0,
+    "cw": 1.25,
+    "cr": 0.1,
+    "l": "Claude Haiku 4.5",
+    "ctx": null
+  },
+  "model_private_12": {
+    "i": 1.25,
+    "o": 10.0,
+    "cw": 0.0,
+    "cr": 0.125,
+    "l": "GPT-5.1 No Thinking",
+    "ctx": null
+  },
+  "model_private_13": {
+    "i": 1.25,
+    "o": 10.0,
+    "cw": 0.0,
+    "cr": 0.125,
+    "l": "GPT-5.1 Low Thinking",
+    "ctx": null
+  },
+  "model_private_14": {
+    "i": 1.25,
+    "o": 10.0,
+    "cw": 0.0,
+    "cr": 0.125,
+    "l": "GPT-5.1 Medium Thinking",
+    "ctx": null
+  },
+  "model_private_15": {
+    "i": 1.25,
+    "o": 10.0,
+    "cw": 0.0,
+    "cr": 0.125,
+    "l": "GPT-5.1 High Thinking",
+    "ctx": null
+  },
+  "model_private_20": {
+    "i": 2.5,
+    "o": 20.0,
+    "cw": 0.0,
+    "cr": 0.25,
+    "l": "GPT-5.1 No Thinking Fast",
+    "ctx": null
+  },
+  "model_private_21": {
+    "i": 2.5,
+    "o": 20.0,
+    "cw": 0.0,
+    "cr": 0.25,
+    "l": "GPT-5.1 Low Thinking Fast",
+    "ctx": null
+  },
+  "model_private_22": {
+    "i": 2.5,
+    "o": 20.0,
+    "cw": 0.0,
+    "cr": 0.25,
+    "l": "GPT-5.1 Medium Thinking Fast",
+    "ctx": null
+  },
+  "model_private_23": {
+    "i": 2.5,
+    "o": 20.0,
+    "cw": 0.0,
+    "cr": 0.25,
+    "l": "GPT-5.1 High Thinking Fast",
+    "ctx": null
+  },
+  "model_private_4": {
+    "i": 0.2,
+    "o": 1.5,
+    "cw": 0.0,
+    "cr": 0.02,
+    "l": "Grok Code Fast 1",
+    "ctx": null
+  },
+  "model_private_6": {
+    "i": 1.25,
+    "o": 10.0,
+    "cw": 0.0,
+    "cr": 0.125,
+    "l": "GPT-5 Low Thinking",
+    "ctx": null
+  },
+  "model_private_7": {
+    "i": 1.25,
+    "o": 10.0,
+    "cw": 0.0,
+    "cr": 0.125,
+    "l": "GPT-5 Medium Thinking",
+    "ctx": null
+  },
+  "model_private_8": {
+    "i": 1.25,
+    "o": 10.0,
+    "cw": 0.0,
+    "cr": 0.125,
+    "l": "GPT-5 High Thinking",
+    "ctx": null
+  },
+  "model_xai_grok_3": {
+    "i": 3.0,
+    "o": 15.0,
+    "cw": 0.0,
+    "cr": 0.0,
+    "l": "xAI Grok-3",
+    "ctx": null
+  },
+  "model_xai_grok_3_mini_reasoning": {
+    "i": 0.3,
+    "o": 0.5,
+    "cw": 0.0,
+    "cr": 0.0,
+    "l": "xAI Grok-3 mini Thinking",
+    "ctx": null
+  },
+  "nemotron-3-ultra-high": {
+    "i": 0.6,
+    "o": 2.4,
+    "cw": 0.0,
+    "cr": 0.12,
+    "l": "Nemotron 3 Ultra High",
+    "ctx": null
+  },
+  "nemotron-3-ultra-medium": {
+    "i": 0.6,
+    "o": 2.4,
+    "cw": 0.0,
+    "cr": 0.12,
+    "l": "Nemotron 3 Ultra Medium",
+    "ctx": null
+  },
+  "nemotron-3-ultra-none": {
+    "i": 0.6,
+    "o": 2.4,
+    "cw": 0.0,
+    "cr": 0.12,
+    "l": "Nemotron 3 Ultra None",
+    "ctx": null
+  },
+  "opus-4-7-review": {
+    "i": 5.0,
+    "o": 25.0,
+    "cw": 6.25,
+    "cr": 0.5,
+    "l": "Opus 4.7 Review",
+    "ctx": null
+  },
+  "penguin-high": {
+    "i": 0.5,
+    "o": 2.5,
+    "cw": 0.0,
+    "cr": 0.2,
+    "l": "Penguin High",
+    "ctx": null
+  },
+  "penguin-max": {
+    "i": 0.5,
+    "o": 2.5,
+    "cw": 0.0,
+    "cr": 0.2,
+    "l": "Penguin Max",
+    "ctx": null
+  },
+  "penguin-medium": {
+    "i": 0.5,
+    "o": 2.5,
+    "cw": 0.0,
+    "cr": 0.2,
+    "l": "Penguin Medium",
+    "ctx": null
+  },
+  "swe-1-6": {
+    "i": 0.5,
+    "o": 2.5,
+    "cw": 0.0,
+    "cr": 0.2,
+    "l": "SWE-1.6",
+    "ctx": null
+  },
+  "swe-1-6-fast": {
+    "i": 0.5,
+    "o": 2.5,
+    "cw": 0.0,
+    "cr": 0.2,
+    "l": "SWE-1.6 Fast",
+    "ctx": null
+  },
+  "swe-1-7": {
+    "i": 0.0,
+    "o": 0.0,
+    "cw": 0.0,
+    "cr": 0.0,
+    "l": "SWE-1.7 Max",
+    "ctx": null
+  },
+  "swe-1-7-lightning": {
+    "i": 2.5,
+    "o": 12.5,
+    "cw": 0.0,
+    "cr": 1.0,
+    "l": "SWE-1.7 Lightning Max",
+    "ctx": null
+  },
+  "swe-1-7-lightning-medium": {
+    "i": 2.5,
+    "o": 12.5,
+    "cw": 0.0,
+    "cr": 1.0,
+    "l": "SWE-1.7 Lightning Medium",
+    "ctx": null
+  },
+  "swe-1-7-medium": {
+    "i": 0.0,
+    "o": 0.0,
+    "cw": 0.0,
+    "cr": 0.0,
+    "l": "SWE-1.7 Medium",
+    "ctx": null
+  },
+  "swe-2-high": {
+    "i": 0.0,
+    "o": 0.0,
+    "cw": 0.0,
+    "cr": 0.0,
+    "l": "SWE-2 High",
+    "ctx": null
+  },
+  "swe-2-max": {
+    "i": 0.0,
+    "o": 0.0,
+    "cw": 0.0,
+    "cr": 0.0,
+    "l": "SWE-2 Max",
+    "ctx": null
+  },
+  "swe-2-medium": {
+    "i": 0.0,
+    "o": 0.0,
+    "cw": 0.0,
+    "cr": 0.0,
+    "l": "SWE-2 Medium",
+    "ctx": null
+  },
+  "swe-check": {
+    "i": 0.0,
+    "o": 0.0,
+    "cw": 0.0,
+    "cr": 0.0,
+    "l": "SWE-check",
+    "ctx": null
+  }
+}

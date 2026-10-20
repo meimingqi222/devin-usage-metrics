@@ -1,9 +1,16 @@
-# Agent Usage Metrics UI boundaries
+# Agent Usage Metrics
 
-状态栏与桌面窗口机制统一使用 `gpui-app-kit`，Cargo.toml 固定 Git 提交；兄弟目录 `../gpui-app-kit` 用于联合开发和内容守卫。
-`src/tray.rs` 只读取 TrayModel、渲染内容并发送 TraySession 事件；改UI时不编辑宿主。
-配额加载、成本总览、刷新频率与任务属于 `src/tray_model.rs`；产品动作路由属于 `src/tray_controller.rs`。
-禁止在内容中新增窗口句柄、原生托盘、focus/close事件接线、defer/spawn/quit或直接更新模型。
-检查：cargo fmt --all --check；cargo clippy --all-targets；cargo test；
-python3 ../gpui-app-kit/tools/check_content.py src/tray.rs。
-本地路径、Git固定版本与CI配置见 `../gpui-app-kit/README.md`。
+主实现使用 Go 1.27.1+ 与固定版本的 `github.com/egoist/mygo` 原生 UI，不使用 WebView 或 cgo。
+迁移只替换技术栈，不重新设计：以 `src/main.rs`、`src/tray.rs` 为布局与视觉依据，保留原版尺寸、配色、信息层级及交互。
+`internal/desktop/host.go` 独占窗口、托盘、focus/close 和应用生命周期；界面内容不持有窗口句柄。
+业务状态与后台任务在 `internal/desktop/app.go`；后台通过事件队列交付结果，只在主线程更新界面状态。
+数据导入、定价、统计、配额、同步、压缩建议分别在 `internal/` 下的对应包；会话数据库只读。
+保留既有设备 ID、配置和同步协议，不在日志/界面/测试输出中暴露账号凭证；压缩建议写入 Agent 设置必须显式确认并可撤销。
+
+检查：`gofmt -l main.go internal`、`go vet ./...`、`go test -race ./...`、`CGO_ENABLED=0 go build ./...`。
+同步服务是独立 Go module，另在 `sync-server/` 执行 `go test -race ./...`、`go vet ./...`。
+打包：`go tool mygo build`；必须包含 SQLite 插件的预编译动态库，不能只分发裸 exe。
+原生 UI 回归：`go test ./internal/desktop`；`AUM_SCREENSHOTS=/absolute/path` 可保存 fixture 渲染截图。
+
+`src/`、`Cargo.toml` 与 Rust 测试暂留作迁移行为对照，不参与 Go 构建/发布。
+迁移状态和未验证的兼容性见 `docs/go-migration.md`。不要把交叉编译当作原生平台安装/更新验证。
