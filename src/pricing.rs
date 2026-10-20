@@ -13,7 +13,7 @@
 //! 启动时先加载内嵌快照，再用本地缓存覆盖；缓存缺失或超过 24h 时从
 //! 上游（与 OpenCode 默认同源）拉取刷新，原子写文件，失败静默保留旧数据
 //! 并记 1h 退避（离线环境不会每次启动都付出网络超时）。
-//! GUI 启动后在后台检查一次（新价格下次数据加载时生效），
+//! GUI 启动后每小时在后台检查缓存有效期（新价格下次数据加载时生效），
 //! CLI 每次运行时检查一次。
 //!
 //! 所有价格均以"美元 / 百万 token"为单位。
@@ -29,7 +29,6 @@ const DEVIN_PRICING_JSON: &str = include_str!("devin-model-pricing.json");
 const DEVIN_PRO_PRICING_JSON: &str = include_str!("devin-pro-pricing.json");
 const DEVIN_PRO_URL: &str = "https://docs.devin.ai/desktop/models.md";
 const MODELS_DEV_PRICING_JSON: &str = include_str!("models-dev-pricing.json");
-const GPT_5_6_LONG_CONTEXT_THRESHOLD: f64 = 272_000.0;
 
 /// models.dev 价格源，与 OpenCode 默认同源。
 /// 可用 `DEVIN_USAGE_MODELS_URL` 覆盖地址，`DEVIN_USAGE_MODELS_PATH` 覆盖本地缓存路径，
@@ -158,44 +157,6 @@ impl Pricing {
     }
 }
 
-/// GPT-5.6 标准（非 Fast）模型超过 272K prompt 后使用的整轮费率。
-/// prompt 包含普通输入、cache read 与 cache write。
-fn gpt_5_6_long_context_pricing(model: &str) -> Option<Pricing> {
-    let model = model.trim().to_ascii_lowercase();
-    if model.contains("-priority") || model.contains(" thinking fast") || model.contains("-fast") {
-        return None;
-    }
-
-    let rates = if model.contains("gpt-5-6-luna")
-        || model.contains("gpt-5.6-luna")
-        || model.contains("gpt-5.6 luna")
-    {
-        (0.4, 1.8, 0.04, 0.5)
-    } else if model.contains("gpt-5-6-sol")
-        || model.contains("gpt-5.6-sol")
-        || model.contains("gpt-5.6 sol")
-    {
-        (8.0, 30.0, 0.8, 10.0)
-    } else if model.contains("gpt-5-6-terra")
-        || model.contains("gpt-5.6-terra")
-        || model.contains("gpt-5.6 terra")
-    {
-        (4.0, 18.0, 0.4, 5.0)
-    } else {
-        return None;
-    };
-
-    Some(Pricing {
-        i: rates.0,
-        o: rates.1,
-        cr: rates.2,
-        cw: rates.3,
-        l: None,
-        ctx: None,
-        ..Default::default()
-    })
-}
-
 /// 嵌入的定价表，运行期只读。
 /// `models_dev` 用锁包装，支持后台刷新热更新（读多写少，日常查找无影响）。
 pub struct PricingTable {
@@ -269,7 +230,7 @@ impl PricingTable {
     /// 模型的上下文窗口（token）。压缩建议用它做上界，避免建议出模型
     /// 装不下的阈值。Devin 表不带窗口信息，返回 None。
     pub fn context_window(&self, model: &str) -> Option<u64> {
-        self.find(model).and_then(|p| p.ctx)
+        self.find_api(model).and_then(|p| p.ctx)
     }
 
     /// Devin Self-serve/Pro prices; missing entries never use enterprise prices.
@@ -571,7 +532,8 @@ struct DevinPriceRow {
     cache_read_cost_per_million_usd: f64,
 }
 
-fn extract_devin_pro_pricing(text: &str) -> Result<HashMap<String, Pricing>, String> {
+/// Extract Pro quotes and their published context tiers without executing document code.
+pub fn extract_devin_pro_pricing(text: &str) -> Result<HashMap<String, Pricing>, String> {
     let marker = "export const modelCostData = ";
     let data = text.split_once(marker).ok_or("missing modelCostData")?.1;
     let mut deserializer = serde_json::Deserializer::from_str(data);
@@ -602,7 +564,126 @@ fn extract_devin_pro_pricing(text: &str) -> Result<HashMap<String, Pricing>, Str
     if prices.is_empty() {
         return Err("no Pro model prices".into());
     }
+    apply_devin_context_tiers(text, &mut prices)?;
     Ok(prices)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DevinContextRates {
+    threshold: String,
+    input: String,
+    output: String,
+    cache_input: String,
+    cache_write: Option<String>,
+}
+
+// These are JSON5 object literals, not JSON. Parse only the literal; never eval JS.
+fn document_object<'a>(text: &'a str, name: &str) -> Result<Option<&'a str>, String> {
+    let marker = format!("const {name} =");
+    let Some((_, tail)) = text.split_once(&marker) else {
+        return Ok(None);
+    };
+    let tail = tail.trim_start();
+    if !tail.starts_with('{') {
+        return Err(format!("invalid {name} object"));
+    }
+    let mut depth = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in tail.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(Some(&tail[..=index]));
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(format!("unterminated {name} object"))
+}
+
+fn apply_devin_context_tiers(
+    text: &str,
+    prices: &mut HashMap<String, Pricing>,
+) -> Result<(), String> {
+    let families = document_object(text, "longContextFamilies")?;
+    let models = document_object(text, "longContextModelFamilies")?;
+    let (families, models) = match (families, models) {
+        (None, None) => return Ok(()),
+        (Some(families), Some(models)) => (families, models),
+        _ => return Err("incomplete Devin context tier tables".into()),
+    };
+    let families: HashMap<String, DevinContextRates> =
+        json5::from_str(families).map_err(|error| error.to_string())?;
+    let models: HashMap<String, String> =
+        json5::from_str(models).map_err(|error| error.to_string())?;
+    for (model, family) in models {
+        let Some(price) = prices.get_mut(&model.to_ascii_lowercase()) else {
+            continue; // The document also maps models belonging to other billing tiers.
+        };
+        let rates = families
+            .get(&family)
+            .ok_or("missing Devin context family")?;
+        let threshold = rates.threshold.trim().to_ascii_uppercase();
+        let (number, multiplier) = if let Some(number) = threshold.strip_suffix('K') {
+            (number, 1_000.)
+        } else if let Some(number) = threshold.strip_suffix('M') {
+            (number, 1_000_000.)
+        } else {
+            (threshold.as_str(), 1.)
+        };
+        let above = number
+            .parse::<f64>()
+            .ok()
+            .map(|number| number * multiplier)
+            .filter(|number| {
+                number.is_finite()
+                    && *number > 0.
+                    && number.fract() == 0.
+                    && *number < u64::MAX as f64
+            })
+            .ok_or("invalid Devin context threshold")? as u64;
+        let rate = |value: &str| {
+            value
+                .trim()
+                .strip_prefix('$')
+                .unwrap_or(value.trim())
+                .parse::<f64>()
+                .ok()
+                .filter(|rate| rate.is_finite() && *rate >= 0.)
+                .ok_or("invalid Devin context rate")
+        };
+        price.tiers.push(ContextTier {
+            above,
+            i: rate(&rates.input)?,
+            o: rate(&rates.output)?,
+            cr: rate(&rates.cache_input)?,
+            cw: rates
+                .cache_write
+                .as_deref()
+                .map(rate)
+                .transpose()?
+                .unwrap_or(price.cw),
+            missing_cache_read: false,
+            missing_cache_write: false,
+        });
+    }
+    Ok(())
 }
 
 /// Refresh official Self-serve/Pro data, preserving the last good table on failure.
@@ -614,7 +695,12 @@ pub fn refresh_devin_pro(force: bool) -> bool {
         return false;
     };
     let marker = retry_marker_path(&path);
-    if !force && (cache_is_fresh(&path) || retry_backoff_active(&marker)) {
+    let valid_cache = || {
+        std::fs::read_to_string(&path)
+            .ok()
+            .is_some_and(|text| extract_devin_pro_pricing(&text).is_ok())
+    };
+    if !force && ((cache_is_fresh(&path) && valid_cache()) || retry_backoff_active(&marker)) {
         return false;
     }
     let url = std::env::var("DEVIN_USAGE_PRO_PRICING_URL").unwrap_or_else(|_| DEVIN_PRO_URL.into());
@@ -1018,17 +1104,19 @@ pub fn refresh_models_dev(force: bool) -> bool {
     true
 }
 
-/// GUI 启动时调用：在后台线程检查一次，调用后立即返回，不阻塞界面。
-/// 拉取到的新价格在下次数据加载时生效（启动时即决定本次视图的价格表，
-/// 常驻期间价格源变化不频繁，不做周期轮询）。
+/// GUI 启动时调用一次：后台定期检查缓存有效期，新价格在下次聚合时生效。
 pub fn ensure_fresh_async() {
-    std::thread::Builder::new()
-        .name("pricing-refresh".into())
-        .spawn(|| {
-            refresh_devin_pro(false);
-            refresh_models_dev(false);
-        })
-        .ok();
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("pricing-refresh".into())
+            .spawn(|| loop {
+                refresh_devin_pro(false);
+                refresh_models_dev(false);
+                std::thread::sleep(Duration::from_secs(MODELS_DEV_RETRY_BACKOFF_SECS));
+            })
+            .ok();
+    });
 }
 
 /// 计算单轮对话的费用（美元）。模型未知时返回 None。
@@ -1091,8 +1179,7 @@ pub fn turn_cost_antigravity(
         .then(|| price.cost_with_cache_write(input, output, cached, cache_creation))
 }
 
-/// 计算单次请求费用。与聚合用量不同，这里会按该请求的 prompt 总量应用
-/// GPT-5.6 的 272K 长上下文阶梯价。
+/// 计算单次 Devin 请求费用，按该请求的 prompt 总量应用官方阶梯报价。
 pub fn single_turn_cost(
     model: &str,
     input: f64,
@@ -1110,37 +1197,18 @@ pub fn single_turn_cost(
     )
 }
 
-/// Pro promotions use the usage date, so old free SWE-2 turns remain free.
+/// Current Pro quote estimate. Public catalogs contain no historical effective dates;
+/// recorded billed costs take precedence in aggregation. Keep the timestamp argument
+/// for caller compatibility, but never infer a price or promotion from the calendar.
 pub fn devin_pro_turn_cost(
     model: &str,
     input: f64,
     output: f64,
     cached: f64,
     cache_creation: f64,
-    created_at: i64,
+    _created_at: i64,
 ) -> Option<f64> {
-    let mut base = PricingTable::instance().find_devin_pro(model)?;
-    let normalized = model.trim().to_ascii_lowercase();
-    let label = base.l.as_deref().unwrap_or("").to_ascii_lowercase();
-    if normalized.starts_with("swe-2-") || label.starts_with("swe-2 ") {
-        let date = chrono::DateTime::from_timestamp(created_at, 0)?.date_naive();
-        if date <= chrono::NaiveDate::from_ymd_opt(2026, 10, 15)? {
-            return Some(0.);
-        }
-        // Published list price after the promotion. A newer nonzero official
-        // price takes precedence over the initial zero-price snapshot.
-        if base.i == 0. && base.o == 0. && base.cr == 0. && base.cw == 0. {
-            base.i = 3.;
-            base.o = 15.;
-            base.cr = 0.3;
-        }
-    }
-    let prompt = input + cached + cache_creation;
-    if prompt > GPT_5_6_LONG_CONTEXT_THRESHOLD {
-        if let Some(long_context) = gpt_5_6_long_context_pricing(model) {
-            return Some(long_context.cost_with_cache_write(input, output, cached, cache_creation));
-        }
-    }
+    let base = PricingTable::instance().find_devin_pro(model)?;
     Some(base.cost_with_cache_write(input, output, cached, cache_creation))
 }
 
@@ -1190,22 +1258,51 @@ mod tests {
     }
 
     #[test]
-    fn swe_pro_promotion_uses_turn_date_and_expiry() {
-        let day = |year, month, day| {
-            chrono::NaiveDate::from_ymd_opt(year, month, day)
-                .unwrap()
-                .and_hms_opt(12, 0, 0)
-                .unwrap()
-                .and_utc()
-                .timestamp()
-        };
+    fn pro_quote_is_not_overridden_by_calendar() {
         for model in ["swe-2-high", "swe-2-medium", "swe-2-max", "SWE-2 High"] {
-            assert_eq!(
-                devin_pro_turn_cost(model, 1e6, 1e6, 1e6, 0., day(2026, 10, 15)),
-                Some(0.)
+            for created_at in [0, 1_792_195_200, 2_000_000_000] {
+                assert_eq!(
+                    devin_pro_turn_cost(model, 1e6, 1e6, 1e6, 0., created_at),
+                    Some(0.),
+                    "current zero quote must remain free regardless of usage date"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn official_document_supplies_long_context_models_thresholds_and_rates() {
+        let document = r#"
+export const modelCostData = [{
+    "tier": "TEAMS_TIER_PRO", "model_uid": "future-model-fast", "label": "Future Model Fast",
+    "input_cost_per_million_usd": 1, "output_cost_per_million_usd": 2,
+    "cache_write_cost_per_million_usd": 3, "cache_read_cost_per_million_usd": 0.1
+}];
+const longContextFamilies = {
+    'Future Model Fast': {threshold: '123K', input: '$7.00', output: '$9.00', cacheInput: '$0.70'}
+};
+const longContextModelFamilies = {'future-model-fast': 'Future Model Fast'};
+"#;
+        let prices = extract_devin_pro_pricing(document).unwrap();
+        let price = &prices["future-model-fast"];
+        assert_eq!(price.for_prompt(123_000.).i, 1.);
+        let long = price.for_prompt(123_001.);
+        assert_eq!((long.i, long.o, long.cr, long.cw), (7., 9., 0.7, 3.));
+        let changed = document.replace("123K", "0.2M").replace("$7.00", "$11.00");
+        let changed = extract_devin_pro_pricing(&changed).unwrap();
+        assert_eq!(changed["future-model-fast"].for_prompt(123_001.).i, 1.);
+        assert_eq!(changed["future-model-fast"].for_prompt(200_001.).i, 11.);
+        for bad in [
+            document.replace("123K", "unknown"),
+            document.replace("$7.00", "$-1"),
+            document.replace("threshold:", "badThreshold:"),
+            document.replace("'Future Model Fast'}", "'Missing Family'}"),
+            document.replace("const longContextFamilies =", "const removed ="),
+        ] {
+            assert!(
+                extract_devin_pro_pricing(&bad).is_err(),
+                "invalid tier data accepted"
             );
-            let after = devin_pro_turn_cost(model, 1e6, 1e6, 1e6, 0., day(2026, 10, 16)).unwrap();
-            assert!((after - 18.3).abs() < 1e-9);
         }
     }
 

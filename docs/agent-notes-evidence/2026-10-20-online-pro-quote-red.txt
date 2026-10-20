@@ -1,0 +1,24 @@
+   Compiling devin-usage-metrics v0.2.11 (/Users/yuqiang/work/code/devin-usage-metrics)
+    Finished `test` profile [unoptimized] target(s) in 6.31s
+     Running unittests src/lib.rs (target/debug/deps/devin_usage_metrics-95514a78968e8a27)
+
+running 1 test
+test pricing::tests::pro_quote_is_not_overridden_by_calendar ... FAILED
+
+failures:
+
+---- pricing::tests::pro_quote_is_not_overridden_by_calendar stdout ----
+
+thread 'pricing::tests::pro_quote_is_not_overridden_by_calendar' (16713880) panicked at src/pricing.rs:1202:17:
+assertion `left == right` failed: current zero quote must remain free regardless of usage date
+  left: Some(18.3)
+ right: Some(0.0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    pricing::tests::pro_quote_is_not_overridden_by_calendar
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 195 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `--lib`

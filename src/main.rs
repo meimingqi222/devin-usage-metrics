@@ -5307,7 +5307,7 @@ fn main() {
         tray_controller::TrayController::open_dashboard(cx, Arc::new(open_main_window));
     });
     application.run(move |cx: &mut App| {
-        // 价格表后台自动更新（对标 OpenCode）：启动后在后台检查一次，
+        // 价格表后台定期检查更新（对标 OpenCode），
         // 新价格在下次数据加载时生效；失败静默保留旧数据。
         pricing::ensure_fresh_async();
         #[cfg(target_os = "macos")]

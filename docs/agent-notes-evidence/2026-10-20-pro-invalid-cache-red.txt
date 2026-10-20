@@ -1,0 +1,23 @@
+   Compiling devin-usage-metrics v0.2.11 (/Users/yuqiang/work/code/devin-usage-metrics)
+    Finished `test` profile [unoptimized] target(s) in 10.28s
+     Running tests/devin_pro_pricing.rs (target/debug/deps/devin_pro_pricing-1e63079aada7f45c)
+
+running 1 test
+test pro_refresh_preserves_free_prices_and_keeps_cache_on_bad_response ... FAILED
+
+failures:
+
+---- pro_refresh_preserves_free_prices_and_keeps_cache_on_bad_response stdout ----
+WARN Devin Pro price refresh failed: invalid Devin context threshold; keeping cached prices
+
+thread 'pro_refresh_preserves_free_prices_and_keeps_cache_on_bad_response' (16739348) panicked at tests/devin_pro_pricing.rs:155:5:
+assertion failed: refresh_devin_pro(false)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    pro_refresh_preserves_free_prices_and_keeps_cache_on_bad_response
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+error: test failed, to rerun pass `--test devin_pro_pricing`
