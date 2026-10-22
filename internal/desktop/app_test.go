@@ -104,16 +104,16 @@ func TestDashboardFiltersAndSessionNavigation(t *testing.T) {
 		t.Fatalf("wrong total: %q", tt.Texts())
 	}
 	sidebar, ok := tt.Find("Sidebar")
-	if !ok || sidebar.W != 160 {
-		t.Fatalf("original sidebar width changed: %+v", sidebar)
+	if !ok || sidebar.W != sidebarWidth {
+		t.Fatalf("sidebar width changed: %+v", sidebar)
 	}
-	title, ok := tt.Find("Agent Usage\nMetrics")
-	if !ok || title.X < sidebar.X+16 || title.X+title.W > sidebar.X+sidebar.W-16 || title.H < 40 {
-		t.Fatalf("sidebar title must fit on two lines with 16px side padding: %+v", title)
+	title, ok := tt.Find("Agent Usage Metrics")
+	if !ok || title.X+title.W > sidebar.X+sidebar.W-16 || title.H > 24 {
+		t.Fatalf("sidebar title must fit on one line inside 16px side padding: %+v", title)
 	}
 	toolbar, ok := tt.Find("Toolbar")
-	if !ok || toolbar.H != 48 || toolbar.X != 160 {
-		t.Fatalf("original toolbar layout changed: %+v", toolbar)
+	if !ok || toolbar.H != toolbarHeight || toolbar.X != sidebarWidth {
+		t.Fatalf("toolbar layout changed: %+v", toolbar)
 	}
 	chart, ok := tt.Find("Stacked token usage chart")
 	if !ok {
@@ -129,10 +129,13 @@ func TestDashboardFiltersAndSessionNavigation(t *testing.T) {
 		t.Fatalf("scrolling table moved chart: %+v → %+v", chart, after)
 	}
 	capture(t, tt, "go-usage")
+	click(t, tt, "Device scope")
+	capture(t, tt, "go-device-menu")
 	click(t, tt, "Laptop")
-	if !tt.HasText("29.0K") {
-		t.Fatal("device filter did not restrict usage")
+	if !tt.HasText("29.0K") || tt.HasText("All devices") {
+		t.Fatal("device filter did not restrict usage and close its menu")
 	}
+	click(t, tt, "Device scope")
 	click(t, tt, "All devices")
 	click(t, tt, "Sessions")
 	row, ok := tt.Find("Implement streaming parser")

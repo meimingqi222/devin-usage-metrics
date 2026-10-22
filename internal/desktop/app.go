@@ -54,7 +54,7 @@ type App struct {
 	pendingApply                               func() error
 	settingsUI                                 settingsUIState
 	trayUI                                     trayUIState
-	otherAgents, agentsClosed, devicesClosed   bool
+	otherAgents, agentsClosed, deviceMenu      bool
 	expandedBuckets                            map[int64]bool
 	sessionsUI                                 sessionsUIState
 	loadedAt                                   string

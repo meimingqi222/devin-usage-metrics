@@ -104,29 +104,20 @@ func TestOriginalDenseVisualStates(t *testing.T) {
 	capture(t, tt, "parity-settings-general")
 }
 
-// Long hostnames must end with an ellipsis inside the 160 DIP sidebar
-// instead of running past the row into the window edge.
-func TestDeviceNamesFitSidebar(t *testing.T) {
+// Long hostnames end with an ellipsis inside the toolbar's device pill
+// instead of pushing the reload button off the window.
+func TestDeviceNamesFitDeviceScope(t *testing.T) {
 	a := fixture(t)
-	a.lang, a.agentsClosed = "en", true
-	a.device = a.localID
-	a.remote = model.Data{Sessions: []model.Session{{DeviceID: "laptop", DeviceName: "LAPTOP-9MA1G6D"}}}
-	tt := ui.NewTester(func(c *ui.Context) {
-		a.theme(c)
-		ui.Row(c).Fill().Children(func() { a.sidebar(c) })
-	}, 160, 600)
-	row, ok := tt.Find("LAPTOP-9MA1G6D")
-	if !ok {
-		t.Fatalf("no device row: %v", tt.Texts())
+	a.lang = "en"
+	a.device = "laptop"
+	a.remote = model.Data{Sessions: []model.Session{{DeviceID: "laptop", DeviceName: "LAPTOP-9MA1G6D-WITH-A-VERY-LONG-HOSTNAME.example.internal"}}}
+	tt := ui.NewTester(a.View, 1240, 780)
+	pill, ok := tt.Find("Device scope")
+	if !ok || pill.W > 240 {
+		t.Fatalf("device pill grew with the hostname: %+v", pill)
 	}
-	// The row's 8 DIP right padding must stay clear of glyphs.
-	img := tt.Image()
-	for y := int(row.Y + 4); y < int(row.Y+row.H-4); y++ {
-		for x := int(row.X + row.W - 6); x < int(row.X+row.W-1); x++ {
-			r, g, b, _ := img.At(x, y).RGBA()
-			if r>>8 > 100 || g>>8 > 100 || b>>8 > 100 {
-				t.Fatalf("device name overflows into the right padding at %d,%d", x, y)
-			}
-		}
+	reload, ok := tt.Find("Reload")
+	if !ok || reload.X+reload.W > 1240 {
+		t.Fatalf("reload pushed off the toolbar: %+v", reload)
 	}
 }
