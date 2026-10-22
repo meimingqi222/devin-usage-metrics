@@ -18,8 +18,8 @@ func TestUsageSummaryCacheInvalidatesWithInputs(t *testing.T) {
 	check := func(sessions, turns int, input float64) {
 		t.Helper()
 		a.usageData(now)
-		if a.usageCache.sessions != sessions || a.usageCache.total.Turns != turns || a.usageCache.total.Input != input {
-			t.Fatalf("summary: sessions=%d turns=%d input=%v", a.usageCache.sessions, a.usageCache.total.Turns, a.usageCache.total.Input)
+		if a.usageUI.cache.sessions != sessions || a.usageUI.cache.total.Turns != turns || a.usageUI.cache.total.Input != input {
+			t.Fatalf("summary: sessions=%d turns=%d input=%v", a.usageUI.cache.sessions, a.usageUI.cache.total.Turns, a.usageUI.cache.total.Input)
 		}
 	}
 	check(2, 2, 30)

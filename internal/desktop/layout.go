@@ -332,9 +332,9 @@ func (a *App) syncStatus(c *ui.Context) {
 		label, color = a.t("Sync on", "同步已开"), syncOnColor
 		if a.busy["sync"] {
 			label = a.t("Syncing…", "正在同步…")
-		} else if a.syncError != "" {
+		} else if a.syncUI.err != "" {
 			label, color = a.t("Sync failed", "同步失败"), syncFailColor
-		} else if a.syncLastAt != "" {
+		} else if a.syncUI.lastAt != "" {
 			label = a.t("Synced", "已同步")
 		}
 	}
@@ -357,12 +357,12 @@ func (a *App) syncStatus(c *ui.Context) {
 	r.Children(func() {
 		ui.Box(c).Size(6, 6).Shrink(0).Radius(3).Background(color)
 		ui.Text(c, label).FontSize(11).FontWeight(500).TextColor(t.TextMuted).Grow(1).NoWrap()
-		if cfg.Enabled && !a.busy["sync"] && a.syncError == "" && a.syncLastAt != "" {
-			ui.Text(c, a.syncLastAt).FontSize(10).FontFeatures("tnum").TextColor(faint(t)).Label(a.t("Last sync ", "上次同步 ") + a.syncLastAt)
+		if cfg.Enabled && !a.busy["sync"] && a.syncUI.err == "" && a.syncUI.lastAt != "" {
+			ui.Text(c, a.syncUI.lastAt).FontSize(10).FontFeatures("tnum").TextColor(faint(t)).Label(a.t("Last sync ", "上次同步 ") + a.syncUI.lastAt)
 		}
 	})
-	if cfg.Enabled && !a.busy["sync"] && a.syncError != "" {
-		ui.Text(c, a.syncError).FontSize(11).TextColor(syncFailColor).Margin(-4, 0, 0, 0)
+	if cfg.Enabled && !a.busy["sync"] && a.syncUI.err != "" {
+		ui.Text(c, a.syncUI.err).FontSize(11).TextColor(syncFailColor).Margin(-4, 0, 0, 0)
 	}
 }
 

@@ -21,7 +21,7 @@ func TestReloadSyncIntervalMatchesRust(t *testing.T) {
 	if !a.syncDue(now) {
 		t.Fatal("first refresh should allow sync")
 	}
-	a.syncCompletedAt = now
+	a.syncUI.completedAt = now
 	if a.syncDue(now.Add(5*time.Minute - time.Nanosecond)) {
 		t.Fatal("refresh repeated sync before five minutes")
 	}

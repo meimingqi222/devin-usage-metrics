@@ -17,7 +17,7 @@ import (
 func (a *App) usageData(now time.Time) (time.Time, time.Time) {
 	d := a.allData()
 	start, end := analytics.Window(a.period, a.page, now)
-	cache := &a.usageCache
+	cache := &a.usageUI.cache
 	if cache.buckets != nil && cache.period == a.period && cache.page == a.page && cache.device == a.device && cache.start == start.Unix() {
 		return start, end
 	}
@@ -44,11 +44,27 @@ func (a *App) usageData(now time.Time) (time.Time, time.Time) {
 	return start, end
 }
 
+// usageUIState is the usage page's own state and its derived-data cache.
+type usageUIState struct {
+	chartMode        int
+	hideEmptyBuckets bool
+	expandedBuckets  map[int64]bool
+	cache            struct {
+		period   analytics.Period
+		page     int
+		device   string
+		start    int64
+		buckets  []analytics.Bucket
+		total    analytics.Bucket
+		sessions int
+	}
+}
+
 func (a *App) usageView(c *ui.Context) {
 	start, end := a.usageData(time.Now())
-	bs, total := a.usageCache.buckets, a.usageCache.total
+	bs, total := a.usageUI.cache.buckets, a.usageUI.cache.total
 	a.usageHeader(c, start, end)
-	a.usageSummary(c, total, a.usageCache.sessions)
+	a.usageSummary(c, total, a.usageUI.cache.sessions)
 	if total.Turns == 0 {
 		ui.Text(c, a.t("No usage in this period. Select another agent or previous period.", "此周期没有用量，请切换 Agent 或查看上一周期。")).FontSize(12).TextColor(c.Theme().TextMuted).Padding(8, 12).Background(c.Theme().Surface).Border(1, c.Theme().Border).Radius(6)
 	}
@@ -58,15 +74,15 @@ func (a *App) usageView(c *ui.Context) {
 			ui.Row(c).AlignItems(ui.Center).Padding(0, 0, 8, 0).Children(func() {
 				ui.Text(c, a.t("Period", "周期")).FontSize(12).Bold().Grow(1)
 				mark := "☐"
-				if a.hideEmptyBuckets {
+				if a.usageUI.hideEmptyBuckets {
 					mark = "☑"
 				}
 				b := textButton(c, mark+"  "+a.t("Hide inactive dates", "隐藏无活动日期"), false).Label(a.t("Hide inactive dates", "隐藏无活动日期")).Height(24).Padding(2, 8)
-				if a.hideEmptyBuckets {
+				if a.usageUI.hideEmptyBuckets {
 					b.TextColor(c.Theme().Accent).Background(c.Theme().Accent.Alpha(.15))
 				}
 				if b.Clicked() {
-					a.hideEmptyBuckets = !a.hideEmptyBuckets
+					a.usageUI.hideEmptyBuckets = !a.usageUI.hideEmptyBuckets
 				}
 			})
 			head := []string{a.t("Period", "周期"), a.t("Sessions", "会话"), a.t("Turns", "轮次"), a.t("Input", "输入"), a.t("Output", "输出"), a.t("Cache Write", "缓存写入"), a.t("Cache Read", "缓存读取"), a.t("Total", "总计"), a.t("Cost", "费用"), a.t("Models", "模型分布")}
@@ -74,7 +90,7 @@ func (a *App) usageView(c *ui.Context) {
 			visible := 0
 			for i := len(bs) - 1; i >= 0; i-- {
 				b := bs[i]
-				if a.hideEmptyBuckets && b.Total() == 0 && b.Turns == 0 {
+				if a.usageUI.hideEmptyBuckets && b.Total() == 0 && b.Turns == 0 {
 					continue
 				}
 				visible++
@@ -84,17 +100,17 @@ func (a *App) usageView(c *ui.Context) {
 					label += " " + time.Unix(b.Start, 0).Format("Mon")
 				}
 				if len(names) > 1 {
-					label = a.sectionTitle(a.expandedBuckets[b.Start], label)
+					label = a.sectionTitle(a.usageUI.expandedBuckets[b.Start], label)
 				} else {
 					label = "    " + label
 				}
 				values := []string{label, fmt.Sprint(b.Sessions), fmt.Sprint(b.Turns), formatTokens(b.Input), formatTokens(b.Output), formatTokens(b.CacheWrite), formatTokens(b.Cached), formatTokens(b.Total()), usageMoney(b.Cost), ""}
 				a.usageRow(c.Key(fmt.Sprint(b.Start)), values, false, b.Total() == 0, func() {
 					if len(names) > 1 {
-						a.expandedBuckets[b.Start] = !a.expandedBuckets[b.Start]
+						a.usageUI.expandedBuckets[b.Start] = !a.usageUI.expandedBuckets[b.Start]
 					}
 				}, b.ByModel)
-				if a.expandedBuckets[b.Start] && len(names) > 1 {
+				if a.usageUI.expandedBuckets[b.Start] && len(names) > 1 {
 					a.modelBreakdown(c, b, names)
 				}
 			}
@@ -320,9 +336,9 @@ const (
 
 func (a *App) usageChart(c *ui.Context, bs []analytics.Bucket) {
 	t := c.Theme()
-	cost := a.chartMode == chartCost
+	cost := a.usageUI.chartMode == chartCost
 	var series []chartSeries
-	switch a.chartMode {
+	switch a.usageUI.chartMode {
 	case chartCost:
 		series = []chartSeries{{"Cost", "费用", costColor, func(b analytics.Bucket) float64 { return b.Cost }}}
 	case chartNewTokens:
@@ -377,7 +393,7 @@ func (a *App) usageChart(c *ui.Context, bs []analytics.Bucket) {
 					})
 				}
 			}
-			ui.Segmented(c, &a.chartMode, "Tokens", a.t("Without cache reads", "不含缓存读取"), a.t("Cost", "费用")).FontSize(12).Label(a.t("Chart metric", "图表指标"))
+			ui.Segmented(c, &a.usageUI.chartMode, "Tokens", a.t("Without cache reads", "不含缓存读取"), a.t("Cost", "费用")).FontSize(12).Label(a.t("Chart metric", "图表指标"))
 		})
 		if hi <= 0 {
 			msg := a.t("No usage in this period", "此周期没有用量")

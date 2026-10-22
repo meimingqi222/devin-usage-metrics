@@ -17,7 +17,7 @@ import (
 func denseFixture(t *testing.T) *App {
 	a := fixture(t)
 	a.agent, a.lang, a.device = model.Devin, "zh", a.localID
-	a.loadedAt, a.syncLastAt = "10:52:53", "11:53:16"
+	a.loadedAt, a.syncUI.lastAt = "10:52:53", "11:53:16"
 	a.remote = model.Data{Sessions: []model.Session{{DeviceID: "laptop", DeviceName: "LAPTOP-9MA1G6"}}}
 	if err := syncclient.SaveConfig(syncclient.Config{Enabled: true, APIURL: "https://sync.example.test"}); err != nil {
 		t.Fatal(err)

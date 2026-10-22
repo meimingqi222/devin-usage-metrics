@@ -44,10 +44,6 @@ type App struct {
 	loginCancel                                context.CancelFunc
 	confirm                                    bool
 	pending                                    *compaction.Recommendation
-	resetConfirm                               bool
-	quotaAt                                    string
-	resetAccount                               *quota.Account
-	resetClears                                string
 	release                                    updater.Release
 	payload                                    string
 	quit                                       func()
@@ -59,38 +55,31 @@ type App struct {
 	settingsUI                                 settingsUIState
 	trayUI                                     trayUIState
 	otherAgents, agentsClosed, deviceMenu      bool
-	expandedBuckets                            map[int64]bool
 	sessionsUI                                 sessionsUIState
 	loadedAt                                   string
 	hasLoaded                                  bool
-	keychainDismissed                          bool
-	keychainLikely                             bool
 	compactionDetails                          bool
 	installed                                  map[model.Agent]bool
-	hideEmptyBuckets                           bool
-	syncLastAt, syncError                      string
-	syncCompletedAt                            time.Time
 	cachedData                                 *model.Data
 	cachedKey                                  dataKey
 	compactionUI                               compactionState
-	chartMode                                  int
 	sessionCosts                               map[sessionIdentity]sessionUsage
 	sessionList                                sessionListCache
-	usageCache                                 struct {
-		period   analytics.Period
-		page     int
-		device   string
-		start    int64
-		buckets  []analytics.Bucket
-		total    analytics.Bucket
-		sessions int
-	}
+	quotaUI                                    quotaUIState
+	usageUI                                    usageUIState
+	syncUI                                     syncState
+}
+
+// syncState is the last sync's outcome shown in the sidebar.
+type syncState struct {
+	lastAt, err string
+	completedAt time.Time
 }
 
 func New(ctx context.Context) *App {
 	// Like Rust, start on this device's data; All devices is one click away.
 	id := data.DeviceID()
-	return &App{ctx: ctx, events: make(chan func(), 64), agent: model.Devin, period: analytics.Day, tab: "usage", screen: "history", lang: language(), loaded: map[model.Agent]model.Data{}, busy: map[string]bool{}, apiURL: syncclient.ReadConfig().APIURL, deviceName: data.DeviceName(), localID: id, device: id, expandedBuckets: map[int64]bool{}, sessionsUI: loadSessionUI(), installed: installedAgents(), keychainLikely: quota.MacOSMayHaveKeychainAccounts(), updatePrefs: loadUpdatePrefs()}
+	return &App{ctx: ctx, events: make(chan func(), 64), agent: model.Devin, period: analytics.Day, tab: "usage", screen: "history", lang: language(), loaded: map[model.Agent]model.Data{}, busy: map[string]bool{}, apiURL: syncclient.ReadConfig().APIURL, deviceName: data.DeviceName(), localID: id, device: id, usageUI: usageUIState{expandedBuckets: map[int64]bool{}}, sessionsUI: loadSessionUI(), installed: installedAgents(), quotaUI: quotaUIState{keychainLikely: quota.MacOSMayHaveKeychainAccounts()}, updatePrefs: loadUpdatePrefs()}
 }
 
 func (a *App) t(en, zh string) string {
@@ -162,7 +151,7 @@ func (a *App) load(agent model.Agent, refresh bool) {
 }
 
 func (a *App) syncDue(now time.Time) bool {
-	return a.syncCompletedAt.IsZero() || now.Sub(a.syncCompletedAt) >= 5*time.Minute
+	return a.syncUI.completedAt.IsZero() || now.Sub(a.syncUI.completedAt) >= 5*time.Minute
 }
 
 // syncDeadline bounds a whole cycle. Individual requests already time out, but
@@ -197,12 +186,12 @@ func (a *App) sync() {
 			syncdiag.Log(runCtx, "desktop_sync_applied", "remote_replaced", usable, "apply_wait_ms", time.Since(readyAt).Milliseconds())
 			if usable {
 				a.remote = remote
-				a.syncCompletedAt = time.Now()
-				a.syncLastAt = a.syncCompletedAt.Format("15:04:05")
+				a.syncUI.completedAt = time.Now()
+				a.syncUI.lastAt = a.syncUI.completedAt.Format("15:04:05")
 			}
-			a.syncError = ""
+			a.syncUI.err = ""
 			if err != nil {
-				a.syncError = err.Error()
+				a.syncUI.err = err.Error()
 			}
 		}
 	})
@@ -223,7 +212,7 @@ func (a *App) refreshQuota(force bool) {
 			})
 		}
 		wg.Wait()
-		return func() { a.accounts, a.quotaAt = out, time.Now().Format("15:04:05") }
+		return func() { a.accounts, a.quotaUI.queriedAt = out, time.Now().Format("15:04:05") }
 	})
 }
 
@@ -265,7 +254,7 @@ func (a *App) allData() model.Data {
 	a.cachedData, a.cachedKey = &d, key
 	a.sessionCosts = nil
 	a.sessionList.valid = false
-	a.usageCache.buckets = nil
+	a.usageUI.cache.buckets = nil
 	return d
 }
 

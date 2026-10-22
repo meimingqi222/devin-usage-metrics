@@ -12,6 +12,18 @@ import (
 	"github.com/meimingqi222/devin-usage-metrics/internal/quota"
 )
 
+// quotaUIState is the quota page's own state.
+type quotaUIState struct {
+	keychainDismissed, keychainLikely bool
+	// queriedAt is when the accounts were last queried.
+	queriedAt string
+	// The reset dialog: the account a confirmation would spend a grant of,
+	// and the windows it clears.
+	resetConfirm bool
+	resetAccount *quota.Account
+	resetClears  string
+}
+
 func providerName(provider string) string {
 	switch strings.ToLower(provider) {
 	case "claude":
@@ -111,7 +123,7 @@ func (a *App) duration(secs int64) string {
 func (a *App) quotaView(c *ui.Context) {
 	t := c.Theme()
 	// Like Rust, offer Keychain access only where a Keychain login may exist.
-	if a.keychainLikely && !quota.KeychainAllowed() && !a.keychainDismissed {
+	if a.quotaUI.keychainLikely && !quota.KeychainAllowed() && !a.quotaUI.keychainDismissed {
 		a.keychainBanner(c)
 	}
 	if a.busy["quota"] && len(a.accounts) == 0 {
@@ -155,8 +167,8 @@ func (a *App) quotaView(c *ui.Context) {
 		if requery.Clicked() {
 			a.refreshQuota(true)
 		}
-		if a.quotaAt != "" {
-			ui.Text(c, a.quotaAt).FontSize(11).FontFeatures("tnum").TextColor(faint(t))
+		if a.quotaUI.queriedAt != "" {
+			ui.Text(c, a.quotaUI.queriedAt).FontSize(11).FontFeatures("tnum").TextColor(faint(t))
 		}
 	})
 	// A uniform two-column grid: cards in a row share its height.
@@ -185,7 +197,7 @@ func (a *App) keychainBanner(c *ui.Context) {
 				}
 			}
 			if textButton(c, a.t("Not now", "暂不"), false).Height(24).Clicked() {
-				a.keychainDismissed = true
+				a.quotaUI.keychainDismissed = true
 			}
 		})
 	})
@@ -375,26 +387,26 @@ func (a *App) claudeResetBar(c *ui.Context, account quota.Account, r quota.Claud
 		}
 		if b.Clicked() && !disabled {
 			account := account
-			a.resetAccount, a.resetClears, a.resetConfirm = &account, a.resetWindows(r.Clears), true
+			a.quotaUI.resetAccount, a.quotaUI.resetClears, a.quotaUI.resetConfirm = &account, a.resetWindows(r.Clears), true
 		}
 	})
 }
 
 func (a *App) claudeResetDialog(c *ui.Context) {
-	if a.resetAccount == nil {
+	if a.quotaUI.resetAccount == nil {
 		return
 	}
-	account := *a.resetAccount
+	account := *a.quotaUI.resetAccount
 	text := fmt.Sprintf(a.t("Spend one Claude reset grant for %s? This clears its usage window now and cannot be undone.", "为 %s 消耗 1 次 Claude 重置权益？用量窗口会立即清空，且无法撤销。"), account.Label)
-	if a.resetClears != "" {
-		text = fmt.Sprintf(a.t("Spend one Claude reset grant for %s? This clears %s now and cannot be undone.", "为 %s 消耗 1 次 Claude 重置权益？会立即清空 %s，且无法撤销。"), account.Label, a.resetClears)
+	if a.quotaUI.resetClears != "" {
+		text = fmt.Sprintf(a.t("Spend one Claude reset grant for %s? This clears %s now and cannot be undone.", "为 %s 消耗 1 次 Claude 重置权益？会立即清空 %s，且无法撤销。"), account.Label, a.quotaUI.resetClears)
 	}
-	if ui.AlertDialog(c, &a.resetConfirm, a.t("Reset Claude usage", "重置 Claude 用量"), text, a.t("Cancel", "取消"), a.t("Reset", "重置")) == 1 {
-		a.resetAccount = nil
+	if ui.AlertDialog(c, &a.quotaUI.resetConfirm, a.t("Reset Claude usage", "重置 Claude 用量"), text, a.t("Cancel", "取消"), a.t("Reset", "重置")) == 1 {
+		a.quotaUI.resetAccount = nil
 		a.claimClaudeReset(account)
 	}
-	if !a.resetConfirm {
-		a.resetAccount = nil
+	if !a.quotaUI.resetConfirm {
+		a.quotaUI.resetAccount = nil
 	}
 }
 

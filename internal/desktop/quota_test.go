@@ -93,7 +93,7 @@ func TestClaudeResetGrantNeedsConfirmation(t *testing.T) {
 	}
 	capture(t, tt, "go-claude-reset-confirm")
 	click(t, tt, "Cancel")
-	if a.resetAccount != nil || a.busy["claude-reset"] {
+	if a.quotaUI.resetAccount != nil || a.busy["claude-reset"] {
 		t.Fatal("cancelling still spent a reset")
 	}
 }
@@ -102,12 +102,12 @@ func TestClaudeResetGrantNeedsConfirmation(t *testing.T) {
 // login may live in the macOS Keychain.
 func TestKeychainBannerOnlyWhereLikely(t *testing.T) {
 	a := quotaFixture(t)
-	a.keychainLikely = false
+	a.quotaUI.keychainLikely = false
 	tt := ui.NewTester(a.View, 1240, 780)
 	if tt.HasText("Allow Keychain access") {
 		t.Fatal("banner shown without any Keychain login")
 	}
-	a.keychainLikely = true
+	a.quotaUI.keychainLikely = true
 	tt.Frame()
 	if quota.KeychainAllowed() == tt.HasText("Allow Keychain access") {
 		t.Fatalf("banner state wrong: allowed=%v", quota.KeychainAllowed())
