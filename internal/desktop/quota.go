@@ -332,8 +332,13 @@ func (a *App) claudeResetBar(c *ui.Context, account quota.Account, r quota.Claud
 	t := c.Theme()
 	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 		info := fmt.Sprintf(a.t("Reset grants: %d of %d left", "储备权益：剩余 %d / %d 次"), r.Left, r.Total)
+		// Grants expire at an exact instant; the hour decides whether one
+		// can still be used before it lapses.
 		if r.EndsAt > 0 {
-			info += fmt.Sprintf(a.t(" · expires %s", " · %s 到期"), time.Unix(r.EndsAt, 0).Format("01-02"))
+			info += fmt.Sprintf(a.t(" · expires %s", " · %s 到期"), time.Unix(r.EndsAt, 0).Format("01-02 15:04"))
+			if left := r.EndsAt - time.Now().Unix(); left > 0 && left < 7*86400 {
+				info += fmt.Sprintf(a.t(" (in %s)", "（剩 %s）"), a.duration(left))
+			}
 		}
 		ui.Text(c, info).FontSize(11).TextColor(faint(t)).Grow(1).MinWidth(0).SingleLine()
 		label := a.t("Reset now", "立即重置")

@@ -21,7 +21,7 @@ func quotaFixture(t *testing.T) *App {
 		{account: quota.Account{Key: "grok-1", Provider: "grok", Label: "me"}, err: errors.New("HTTP 401")},
 		{account: quota.Account{Key: "ag-1", Provider: "antigravity", Label: "g@example.com"}, result: quota.Result{Windows: []quota.Window{{Label: "Gemini 3 Pro – 5h", UsedPercent: 90, ResetsAt: h(time.Hour)}, {Label: "Claude Sonnet – 5h", UsedPercent: 0, ResetsAt: h(time.Hour)}}}},
 		{account: quota.Account{Key: "devin-cli", Provider: "devin", Label: "cli"}, result: quota.Result{}},
-		{account: quota.Account{Key: "claude-2", Provider: "claude", Label: "home@example.com"}, result: quota.Result{Windows: []quota.Window{{Label: "5h", UsedPercent: 100, ResetsAt: h(10 * time.Minute)}}, Stale: "HTTP 429", StaleAge: 300, RetryIn: 120, Reset: &quota.ClaudeReset{Left: 1, Total: 1, GrantID: "g", Blocker: "cooldown", CooldownUntil: h(30 * time.Minute)}}},
+		{account: quota.Account{Key: "claude-2", Provider: "claude", Label: "home@example.com"}, result: quota.Result{Windows: []quota.Window{{Label: "5h", UsedPercent: 100, ResetsAt: h(10 * time.Minute)}}, Stale: "HTTP 429", StaleAge: 300, RetryIn: 120, Reset: &quota.ClaudeReset{Left: 1, Total: 1, EndsAt: h(26*time.Hour + 30*time.Second), GrantID: "g", Blocker: "cooldown", CooldownUntil: h(30 * time.Minute)}}},
 	}
 	return a
 }
@@ -74,12 +74,14 @@ func TestClaudeResetGrantNeedsConfirmation(t *testing.T) {
 	a := quotaFixture(t)
 	tt := ui.NewTester(a.View, 1240, 780)
 	tt.SetScale(2)
-	expires := time.Now().Add(24 * 24 * time.Hour).Format("01-02")
+	// The expiry shows its hour and minute, since a grant lapses at an instant.
+	expires := time.Unix(a.accounts[0].result.Reset.EndsAt, 0).Format("01-02 15:04")
 	if !tt.HasText("Reset grants: 2 of 3 left · expires " + expires) {
 		t.Fatalf("missing grant summary: %q", tt.Texts())
 	}
 	tt.Scroll(600, 400, 0, 400)
-	if !tt.HasText("Reset grants: 1 of 1 left") {
+	soon := time.Unix(a.accounts[6].result.Reset.EndsAt, 0).Format("01-02 15:04")
+	if !tt.HasText("Reset grants: 1 of 1 left · expires " + soon + " (in 1d 2h)") {
 		t.Fatalf("missing blocked grant: %q", tt.Texts())
 	}
 	tt.Scroll(600, 400, 0, -400)
