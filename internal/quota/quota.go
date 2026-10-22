@@ -35,7 +35,12 @@ type Result struct {
 	Plan    string   `json:"plan"`
 	Extra   string   `json:"extra"`
 	Windows []Window `json:"windows"`
-	Stale   string   `json:"stale"`
+	// Stale is the refresh error when cached data is shown instead.
+	Stale string `json:"stale"`
+	// StaleAge is how old the cached data is; RetryIn is the remaining
+	// rate-limit cooldown, zero when the refresh failed otherwise.
+	StaleAge int64 `json:"stale_age_secs,omitempty"`
+	RetryIn  int64 `json:"retry_in_secs,omitempty"`
 }
 type object = map[string]any
 
@@ -190,7 +195,11 @@ func Fetch(ctx context.Context, a Account, force bool) (Result, error) {
 	fallback := func(e error) (Result, error) {
 		if !s.at.IsZero() && now.Sub(s.at) <= 2*time.Hour {
 			r := clone(s.result)
-			r.Stale = fmt.Sprintf("%s; cached %ds ago", e, int(now.Sub(s.at).Seconds()))
+			r.Stale = e.Error()
+			r.StaleAge = int64(now.Sub(s.at).Seconds())
+			if now.Before(s.until) {
+				r.RetryIn = int64(s.until.Sub(now).Seconds()) + 1
+			}
 			return r, nil
 		}
 		return Result{}, e

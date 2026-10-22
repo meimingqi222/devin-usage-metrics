@@ -59,6 +59,7 @@ type App struct {
 	sessionsUI                                 sessionsUIState
 	loadedAt                                   string
 	hasLoaded                                  bool
+	keychainDismissed                          bool
 	compactionDetails                          bool
 	installed                                  map[model.Agent]bool
 	hideEmptyBuckets                           bool
