@@ -45,8 +45,12 @@ func RuntimeFields() []any {
 	return []any{"heap_alloc_bytes", m.HeapAlloc, "heap_sys_bytes", m.HeapSys, "gc_cycles", m.NumGC, "gc_pause_total_ms", m.PauseTotalNs / uint64(time.Millisecond), "goroutines", runtime.NumGoroutine()}
 }
 
+// AppVersion is the app's version, set at startup with the rest of the
+// app's version reporting.
+var AppVersion string
+
 func BuildFields() []any {
-	fields := []any{"go_version", runtime.Version()}
+	fields := []any{"app_version", AppVersion, "go_version", runtime.Version()}
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, s := range info.Settings {
 			switch s.Key {

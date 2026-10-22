@@ -15,6 +15,7 @@ import (
 	"github.com/meimingqi222/devin-usage-metrics/internal/data"
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 	"github.com/meimingqi222/devin-usage-metrics/internal/pricing"
+	"github.com/meimingqi222/devin-usage-metrics/internal/updater"
 )
 
 const help = `Agent Usage Metrics CLI
@@ -31,6 +32,7 @@ Options:
   --by-agent           Include per-agent rows
   --refresh            Ignore cache and reload local data
   -h, --help           Show help
+  --version            Show the app version
 `
 
 type options struct {
@@ -159,6 +161,10 @@ func Run(args []string, out, errOut io.Writer) error {
 	for _, a := range args {
 		if a == "--help" || a == "-h" {
 			_, e := io.WriteString(out, help)
+			return e
+		}
+		if a == "--version" {
+			_, e := fmt.Fprintln(out, "Agent Usage Metrics "+updater.CurrentVersion)
 			return e
 		}
 	}

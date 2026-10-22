@@ -52,7 +52,7 @@ func TestReleaseDownload(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	r, e := check(context.Background(), CurrentVersion, server.URL+"/latest", "windows", "amd64")
+	r, e := check(context.Background(), "0.2.11", server.URL+"/latest", "windows", "amd64")
 	if e != nil || r.Version != "0.2.12" || r.Notes != "notes" {
 		t.Fatalf("%+v %v", r, e)
 	}

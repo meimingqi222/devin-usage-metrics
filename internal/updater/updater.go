@@ -22,8 +22,9 @@ import (
 	"time"
 )
 
-// Packaged builds set this from MyGo's linked application version at startup.
-var CurrentVersion = "0.2.11"
+// CurrentVersion is set at startup from mygo.json, the single source of the
+// app's version; the packaged bundle carries the same value.
+var CurrentVersion = "0.0.0"
 
 const latestURL = "https://api.github.com/repos/meimingqi222/devin-usage-metrics/releases/latest"
 const maxArchive = 512 << 20
