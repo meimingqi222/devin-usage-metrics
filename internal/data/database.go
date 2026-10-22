@@ -33,6 +33,21 @@ func query(d *model.Data, a model.Agent, db *sqlite.DB, sql string, args ...any)
 	return out
 }
 
+// each streams a query's rows as objects; a query error is recorded like query.
+func each(d *model.Data, a model.Agent, db *sqlite.DB, sql string, fn func(obj), args ...any) {
+	e := db.Each(context.Background(), sql, func(columns []string, row []any) error {
+		v := obj{}
+		for i, k := range columns {
+			v[k] = row[i]
+		}
+		fn(v)
+		return nil
+	}, args...)
+	if e != nil {
+		fail(d, a, e)
+	}
+}
+
 type databaseCache struct {
 	Signature string
 	Data      model.Data
@@ -262,20 +277,22 @@ func parseDevin(d *model.Data, db *sqlite.DB, source string, previous *model.Dat
 		marks := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
 		args := append(append([]any{}, batch...), queryStart-86400, d.TurnsEnd+7*86400)
 		sql := "SELECT rowid AS node_id, session_id, created_at, chat_message FROM message_nodes WHERE session_id IN (" + marks + ") AND created_at >= ? AND created_at < ? AND chat_message LIKE '%\"metrics\"%'"
-		for _, r := range query(d, a, db, sql, args...) {
+		// Stream: each chat_message carries the whole message and tool output,
+		// so materializing the result set peaked at gigabytes.
+		each(d, a, db, sql, func(r obj) {
 			id := str(r["session_id"])
 			if !ids[id] {
-				continue
+				return
 			}
 			var v obj
 			if e := json.Unmarshal([]byte(str(r["chat_message"])), &v); e != nil {
 				fail(d, a, e)
-				continue
+				return
 			}
 			m := v["metadata"]
 			u := get(m, "metrics")
 			if u == nil {
-				continue
+				return
 			}
 			at := ts(first(get(m, "started_generation_at"), get(m, "created_at")))
 			if at <= 0 {
@@ -288,15 +305,15 @@ func parseDevin(d *model.Data, db *sqlite.DB, source string, previous *model.Dat
 			if key != "" {
 				key = id + "\x00" + key
 				if seen[key] {
-					continue
+					return
 				}
 				seen[key] = true
 			}
 			if at < d.TurnsStart || at >= d.TurnsEnd {
-				continue
+				return
 			}
 			d.Turns = append(d.Turns, model.Turn{Agent: a, SessionKey: source + "/" + id, CreatedAt: at, Model: str(get(m, "generation_model")), InputTokens: num(get(u, "input_tokens")), OutputTokens: num(get(u, "output_tokens")), CacheReadTokens: num(get(u, "cache_read_tokens")), CacheCreationTokens: num(get(u, "cache_creation_tokens")), TTFTMs: max(0, num(get(u, "ttft_ms"))), TotalTimeMs: num(get(u, "total_time_ms")), DedupKey: key})
-		}
+		}, args...)
 	}
 }
 func parseSQLAgent(d *model.Data, a model.Agent, db *sqlite.DB) {
@@ -339,7 +356,8 @@ func parseSQLAgent(d *model.Data, a model.Agent, db *sqlite.DB) {
 	if a == model.ZCode {
 		sql = "SELECT * FROM model_usage WHERE status='completed' OR input_tokens>0 OR output_tokens>0"
 	}
-	for _, r := range query(d, a, db, sql) {
+	// Stream: message rows carry full message bodies.
+	each(d, a, db, sql, func(r obj) {
 		id := root(str(r["session_id"]))
 		s := sessions[id]
 		if s == nil {
@@ -360,10 +378,10 @@ func parseSQLAgent(d *model.Data, a model.Agent, db *sqlite.DB) {
 			var v obj
 			if e := json.Unmarshal([]byte(str(r["data"])), &v); e != nil {
 				fail(d, a, e)
-				continue
+				return
 			}
 			if str(v["role"]) != "assistant" && str(r["type"]) != "assistant" {
-				continue
+				return
 			}
 			t.CreatedAt = ts(r["time_created"])
 			t.Model = modelName(str(first(get(v, "model", "providerID"), v["providerID"])), str(first(get(v, "model", "id"), v["modelID"])))
@@ -388,7 +406,7 @@ func parseSQLAgent(d *model.Data, a model.Agent, db *sqlite.DB) {
 		if t.CreatedAt >= d.TurnsStart && t.CreatedAt < d.TurnsEnd {
 			d.Turns = append(d.Turns, t)
 		}
-	}
+	})
 	for id, s := range sessions {
 		if parents[id] == "" {
 			if s.Title == "" {

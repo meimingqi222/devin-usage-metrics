@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 )
@@ -189,9 +191,113 @@ type lineCache struct {
 	Size   int64
 	Lines  []obj
 	Errors []error
+	// Weight estimates the decoded lines' memory for the cache budget.
+	Weight int64
 }
 
 var decodedFiles sync.Map
+
+// decodedBudget caps the decoded-transcript cache. Beyond it the files
+// modified longest ago are dropped and decoded again on the next reload:
+// a large history otherwise kept over a gigabyte resident in the tray app.
+const decodedBudget = 128 << 20
+
+var decodedWeight struct {
+	sync.Mutex
+	total int64
+}
+
+func rememberDecoded(p string, c lineCache) {
+	decodedWeight.Lock()
+	defer decodedWeight.Unlock()
+	if old, ok := decodedFiles.Swap(p, c); ok {
+		decodedWeight.total -= old.(lineCache).Weight
+	}
+	decodedWeight.total += c.Weight
+	if decodedWeight.total <= decodedBudget {
+		return
+	}
+	type entry struct {
+		path         string
+		mtime, bytes int64
+	}
+	var all []entry
+	decodedFiles.Range(func(key, value any) bool {
+		if key != p {
+			v := value.(lineCache)
+			all = append(all, entry{key.(string), v.Mtime, v.Weight})
+		}
+		return true
+	})
+	sort.Slice(all, func(i, j int) bool { return all[i].mtime < all[j].mtime })
+	for _, e := range all {
+		if decodedWeight.total <= decodedBudget {
+			break
+		}
+		decodedFiles.Delete(e.path)
+		decodedWeight.total -= e.bytes
+	}
+}
+
+func forgetDecoded(p string) {
+	decodedWeight.Lock()
+	defer decodedWeight.Unlock()
+	if old, ok := decodedFiles.LoadAndDelete(p); ok {
+		decodedWeight.total -= old.(lineCache).Weight
+	}
+}
+
+// slimThreshold bounds strings kept in decoded transcripts. Message bodies
+// and tool output made the cache over a gigabyte, while parsers read only
+// identifiers, numbers, roles, short metadata and titles that compact()
+// limits to 100 runes.
+const slimThreshold = 1024
+
+// slim shortens long strings in a decoded line in place, keeping a prefix
+// that leaves every parsed value unchanged (see titlePrefix). It returns the
+// slimmed value and a rough estimate of its memory.
+func slim(v any) (any, int64) {
+	switch x := v.(type) {
+	case map[string]any:
+		weight := int64(48)
+		for k, e := range x {
+			var w int64
+			x[k], w = slim(e)
+			weight += int64(len(k)) + 48 + w
+		}
+		return x, weight
+	case []any:
+		weight := int64(24)
+		for i, e := range x {
+			var w int64
+			x[i], w = slim(e)
+			weight += 16 + w
+		}
+		return x, weight
+	case string:
+		if len(x) > slimThreshold {
+			x = titlePrefix(x)
+		}
+		return x, int64(len(x)) + 16
+	}
+	return v, 16
+}
+
+// titlePrefix keeps at least slimThreshold bytes and at least 101
+// non-space runes: compact() then yields the same first 100 runes and a
+// blank check the same answer as for the whole string.
+func titlePrefix(s string) string {
+	visible := 0
+	for i, r := range s {
+		if !unicode.IsSpace(r) {
+			visible++
+		}
+		if end := i + utf8.RuneLen(r); visible > 100 && end >= slimThreshold {
+			return strings.Clone(s[:end]) // a substring would pin the whole body
+		}
+	}
+	return s
+}
 
 // forgetRemoved drops decoded transcripts that disappeared from a walked root,
 // so deleted sessions do not stay in memory for the life of the process.
@@ -204,7 +310,7 @@ func forgetRemoved(roots []string, ext string, seen map[string]bool) {
 		for _, root := range roots {
 			if strings.HasPrefix(p, filepath.Clean(root)+string(filepath.Separator)) {
 				if _, e := os.Stat(p); os.IsNotExist(e) {
-					decodedFiles.Delete(p)
+					forgetDecoded(p)
 				}
 				break
 			}
@@ -243,13 +349,15 @@ func readLines(d *model.Data, a model.Agent, p string, refresh bool) []obj {
 			if e := json.Unmarshal(scan.Bytes(), &v); e != nil {
 				cached.Errors = append(cached.Errors, fmt.Errorf("%s:%d: %w", p, order, e))
 			}
+			_, weight := slim(v)
+			cached.Weight += weight
 			cached.Lines = append(cached.Lines, v)
 		}
 		if e := scan.Err(); e != nil {
 			cached.Errors = append(cached.Errors, fmt.Errorf("%s: %w", p, e))
 		}
 		f.Close()
-		decodedFiles.Store(p, cached)
+		rememberDecoded(p, cached)
 	}
 	for _, e := range cached.Errors {
 		fail(d, a, e)

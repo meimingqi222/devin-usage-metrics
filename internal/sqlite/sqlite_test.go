@@ -3,6 +3,7 @@ package sqlite
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -113,5 +114,37 @@ func TestQueryHonoursCancellation(t *testing.T) {
 	cancel()
 	if _, err = db.Query(ctx, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c"); err == nil {
 		t.Fatal("canceled query ran to completion")
+	}
+}
+
+func TestEachStreamsRowsAndStopsOnError(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "e.db"), OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err = db.Execute(ctx, "CREATE TABLE t(v)"); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 5 {
+		if _, err = db.Execute(ctx, "INSERT INTO t VALUES(?)", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var seen []any
+	if err = db.Each(ctx, "SELECT v FROM t ORDER BY v", func(columns []string, row []any) error {
+		if columns[0] != "v" {
+			t.Fatalf("columns %v", columns)
+		}
+		seen = append(seen, row[0])
+		return nil
+	}); err != nil || len(seen) != 5 || seen[4] != int64(4) {
+		t.Fatalf("rows %v err %v", seen, err)
+	}
+	stop := errors.New("stop")
+	calls := 0
+	if err = db.Each(ctx, "SELECT v FROM t", func([]string, []any) error { calls++; return stop }); err != stop || calls != 1 {
+		t.Fatalf("callback error must stop the query: calls=%d err=%v", calls, err)
 	}
 }

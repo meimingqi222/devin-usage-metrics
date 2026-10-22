@@ -91,6 +91,34 @@ func (d *DB) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
 	return rows, err
 }
 
+// Each runs one statement and calls fn for every row as it is read, so large
+// result sets never sit in memory at once. fn must not keep row; an error
+// from fn stops the query and is returned.
+func (d *DB) Each(ctx context.Context, sql string, fn func(columns []string, row []any) error, args ...any) error {
+	var columns []string
+	var stop error
+	err := d.run(ctx, sql, args, func(s *sqlite3.Stmt) {
+		if stop != nil {
+			return
+		}
+		if columns == nil {
+			columns = make([]string, s.ColumnCount())
+			for i := range columns {
+				columns[i] = s.ColumnName(i)
+			}
+		}
+		row := make([]any, len(columns))
+		for i := range row {
+			row[i] = column(s, i)
+		}
+		stop = fn(columns, row)
+	})
+	if stop != nil {
+		return stop
+	}
+	return err
+}
+
 // Result reports what a statement changed.
 type Result struct {
 	Changes      int64

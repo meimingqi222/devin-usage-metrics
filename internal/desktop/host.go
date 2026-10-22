@@ -3,7 +3,9 @@ package desktop
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime"
+	"runtime/debug"
 	"time"
 
 	"github.com/egoist/mygo"
@@ -18,8 +20,17 @@ const (
 	updateCheckInterval = 4 * time.Hour
 )
 
+// trayMemoryLimit is a soft heap limit for the long-running tray process.
+// Loading every agent briefly needs several times the data it keeps, and
+// without a limit the GC let that resident set grow far beyond Rust's. Above
+// it the GC works harder; nothing fails. GOMEMLIMIT still takes precedence.
+const trayMemoryLimit = 384 << 20
+
 // Run starts the native desktop host. The content views never own window handles.
 func Run(icon []byte) error {
+	if os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(trayMemoryLimit)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if version := mygo.App.Version(); version != "" {

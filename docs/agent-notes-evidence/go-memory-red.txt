@@ -1,0 +1,12 @@
+$ string slimming disabled
+    files_internal_test.go:51: case 0: long string was not shortened
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/data	1.355s
+FAIL
+$ cache budget disabled
+    files_internal_test.go:62: over budget kept the oldest file
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/data	0.918s
+FAIL
+$ guards restored
+ok  	github.com/meimingqi222/devin-usage-metrics/internal/data	0.388s
