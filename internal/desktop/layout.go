@@ -465,20 +465,20 @@ func (a *App) deviceScope(c *ui.Context) {
 		case "":
 			return a.t("All devices", "全部设备")
 		case a.localID:
-			return a.t("This device", "本机") + " (" + a.deviceName + ")"
+			return a.t("This device", "本机") + " (" + strings.TrimSuffix(a.deviceName, ".local") + ")"
 		}
 		return devices[id]
 	}
-	pill := ui.ButtonBase(c).Label(a.t("Device scope", "设备范围")).Padding(4, 10).Radius(6).Background(ui.Hex("#161b26")).Border(1, ui.Hex("#283347")).TextColor(t.Text)
+	// A row, not a button: the name must shrink to its ellipsis inside the
+	// pill's maximum width while the icon and arrow keep their size.
+	pill := ui.Row(c).MaxWidth(260).Gap(7).Padding(4, 10).Radius(6).AlignItems(ui.Center).Background(ui.Hex("#161b26")).Border(1, ui.Hex("#283347")).Label(a.t("Device scope", "设备范围")).Focusable()
 	if pill.Hovered() || a.deviceMenu {
 		pill.Background(ui.Hex("#1c2333")).Border(1, ui.Hex("#3b82f6"))
 	}
 	pill.Children(func() {
-		ui.Row(c).Gap(7).AlignItems(ui.Center).Children(func() {
-			ui.Icon(c, monitorIcon).Size(13, 13).TextColor(t.Accent)
-			ui.Text(c, name(a.device)).FontSize(12).FontWeight(500).MaxWidth(180).NoWrap().Ellipsis("…")
-			ui.Text(c, "▾").FontSize(9).TextColor(faint(t))
-		})
+		ui.Icon(c, monitorIcon).Size(13, 13).Shrink(0).TextColor(t.Accent)
+		ui.Text(c, name(a.device)).FontSize(12).FontWeight(500).Shrink(1).MinWidth(0).NoWrap().Ellipsis("…")
+		ui.Text(c, "▾").FontSize(9).Shrink(0).TextColor(faint(t))
 	})
 	if pill.Clicked() {
 		a.deviceMenu = !a.deviceMenu

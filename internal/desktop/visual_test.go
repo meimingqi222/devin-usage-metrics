@@ -113,8 +113,15 @@ func TestDeviceNamesFitDeviceScope(t *testing.T) {
 	a.remote = model.Data{Sessions: []model.Session{{DeviceID: "laptop", DeviceName: "LAPTOP-9MA1G6D-WITH-A-VERY-LONG-HOSTNAME.example.internal"}}}
 	tt := ui.NewTester(a.View, 1240, 780)
 	pill, ok := tt.Find("Device scope")
-	if !ok || pill.W > 240 {
+	if !ok || pill.W > 260 {
 		t.Fatalf("device pill grew with the hostname: %+v", pill)
+	}
+	// The name and the arrow stay inside the pill's border and padding.
+	for _, text := range []string{"LAPTOP-9MA1G6D-WITH-A-VERY-LONG-HOSTNAME.example.internal", "▾"} {
+		r, ok := tt.Find(text)
+		if !ok || r.X+r.W > pill.X+pill.W-8 {
+			t.Fatalf("%q overflows the pill %+v: %+v", text, pill, r)
+		}
 	}
 	reload, ok := tt.Find("Reload")
 	if !ok || reload.X+reload.W > 1240 {
