@@ -577,6 +577,16 @@ func TestTurnIdentityMatchesTurnID(t *testing.T) {
 		func(t *model.Turn) { t.RecordedCost = &negZero },
 		func(t *model.Turn) { t.InputTokens = negZero },
 		func(t *model.Turn) { t.TTFTMs = 0 },
+		// encoding/json writes each invalid UTF-8 byte as U+FFFD, so turnID
+		// merges these; the identity must agree.
+		func(t *model.Turn) { t.SessionKey = "\xff" },
+		func(t *model.Turn) { t.SessionKey = "\xfe" },
+		func(t *model.Turn) { t.SessionKey = "\xff\xfe" },
+		func(t *model.Turn) { t.SessionKey = "\ufffd" },
+		func(t *model.Turn) { t.SessionKey = "\ufffd\ufffd" },
+		func(t *model.Turn) { t.Model = "m\x80" },
+		func(t *model.Turn) { t.Model = "m\xc3" },
+		func(t *model.Turn) { t.DeviceID = "\xff" },
 		// Fields outside the identity must not split a record.
 		func(t *model.Turn) { t.DeviceName = "renamed"; t.DedupKey = "k"; t.ContextStream = "c" },
 	}

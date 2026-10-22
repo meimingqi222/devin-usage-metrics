@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 	"math"
+	"strings"
+	"unicode/utf8"
 )
 
 func slug(a model.Agent) string {
@@ -39,12 +41,32 @@ type turnIdentity struct {
 	hasCost                                       bool
 }
 
+// jsonText returns s as encoding/json writes it: each byte of invalid UTF-8
+// becomes U+FFFD. turnID hashes that text, so distinct invalid bytes collide
+// there and must collide here too.
+func jsonText(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			b.WriteRune(utf8.RuneError)
+		} else {
+			b.WriteString(s[i : i+size])
+		}
+		i += size
+	}
+	return b.String()
+}
+
 func identityOf(t model.Turn) turnIdentity {
 	id := turnIdentity{
-		device:  t.DeviceID,
-		session: t.SessionKey,
-		model:   t.Model,
-		agent:   t.Agent,
+		device:  jsonText(t.DeviceID),
+		session: jsonText(t.SessionKey),
+		model:   jsonText(t.Model),
+		agent:   model.Agent(jsonText(string(t.Agent))),
 		created: t.CreatedAt,
 		input:   math.Float64bits(t.InputTokens),
 		output:  math.Float64bits(t.OutputTokens),

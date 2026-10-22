@@ -418,12 +418,17 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 	// data just written, so keep it under the key a read of this manifest
 	// uses instead of decoding every block again.
 	published := devicePackage{Schema: 1, DeviceID: id, DeviceName: host, Start: start, End: end, Exported: now}
+	cutoff := day(time.Now().Unix() - 366*86400)
 	for _, v := range sessions {
-		published.Sessions = append(published.Sessions, v)
+		// A read skips session shards dated before the cutoff, even when a
+		// recent turn kept the session in this publication.
+		if day(max(v.CreatedAt, v.LastActivityAt)) >= cutoff {
+			published.Sessions = append(published.Sessions, v)
+		}
 	}
 	for _, v := range turns {
 		published.Turns = append(published.Turns, v)
 	}
-	rememberPackage(t.packageKey(id, "v3-manifest-"+digest, day(time.Now().Unix()-366*86400)), published)
+	rememberPackage(t.packageKey(id, "v3-manifest-"+digest, cutoff), published)
 	return nil
 }
