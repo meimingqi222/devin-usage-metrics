@@ -15,6 +15,21 @@ import (
 	"github.com/meimingqi222/devin-usage-metrics/internal/quota"
 )
 
+func TestReloadSyncIntervalMatchesRust(t *testing.T) {
+	now := time.Now()
+	a := &App{}
+	if !a.syncDue(now) {
+		t.Fatal("first refresh should allow sync")
+	}
+	a.syncCompletedAt = now
+	if a.syncDue(now.Add(5*time.Minute - time.Nanosecond)) {
+		t.Fatal("refresh repeated sync before five minutes")
+	}
+	if !a.syncDue(now.Add(5 * time.Minute)) {
+		t.Fatal("sync remained suppressed after five minutes")
+	}
+}
+
 func fixture(t testing.TB) *App {
 	t.Helper()
 	h := t.TempDir()

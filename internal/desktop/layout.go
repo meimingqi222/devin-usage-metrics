@@ -329,7 +329,6 @@ func (a *App) header(c *ui.Context) {
 			} else {
 				a.load(a.agent, true)
 			}
-			a.sync()
 		}
 		if a.busy[string(a.agent)] || a.busy["quota"] {
 			ui.Text(c, a.t("Loading…", "加载中…")).FontSize(12).TextColor(c.Theme().TextMuted)

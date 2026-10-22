@@ -2,10 +2,12 @@
 package data
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
+	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 )
 
 var loadLocks sync.Map
@@ -144,6 +147,9 @@ type snapshot struct {
 	Data      model.Data
 	Databases map[string]string
 	Files     map[string]string
+	// FreshSources is false after an incremental update of a changed source.
+	// A manual reload must still rebuild historical edits outside its watermark.
+	FreshSources bool
 }
 
 func empty(start, end int64) model.Data {
@@ -155,10 +161,43 @@ func fail(d *model.Data, a model.Agent, e any) {
 
 // Load returns the selected agent's records. Refresh bypasses all cached records.
 func Load(a model.Agent, start, end int64, refresh bool) model.Data {
+	return LoadContext(context.Background(), a, start, end, refresh)
+}
+
+// LoadContext preserves the caller's diagnostic run across source workers.
+func LoadContext(ctx context.Context, a model.Agent, start, end int64, refresh bool) model.Data {
+	return load(syncdiag.WithRun(ctx), a, start, end, refresh, false)
+}
+
+// Reload checks sources immediately, bypassing the five-minute snapshot TTL.
+// Unchanged sources may reuse their parsed snapshot; changed sources are fully
+// parsed, including historical edits. Load(..., true) always rebuilds instead.
+func Reload(a model.Agent, start, end int64) model.Data {
+	return ReloadContext(context.Background(), a, start, end)
+}
+
+func ReloadContext(ctx context.Context, a model.Agent, start, end int64) model.Data {
+	return load(syncdiag.WithRun(ctx), a, start, end, true, true)
+}
+
+func load(ctx context.Context, a model.Agent, start, end int64, refresh, reuseUnchanged bool) (result model.Data) {
+	ctx = syncdiag.WithFields(ctx, "agent", diagnosticAgent(a), "refresh", refresh, "reuse_unchanged", reuseUnchanged)
+	ctx, finish := syncdiag.Watch(ctx, "agent_load")
+	started := time.Now()
+	stats := new(decodeStats)
+	ctx = context.WithValue(ctx, decodeStatsKey{}, stats)
+	mode := "invalid"
+	defer func() {
+		logDecodeTotals(ctx, stats)
+		syncdiag.Log(ctx, "agent_load_result", "mode", mode, "elapsed_ms", stageMS(started), "sessions", len(result.Sessions), "turns", len(result.Turns), "source_errors", len(result.Errors))
+		finish(sourceResultError(result))
+	}()
 	cache := cacheDir()
 	path := filepath.Join(cache, "devin-usage-metrics", "go-data-"+string(a)+".json")
 	lock, _ := loadLocks.LoadOrStore(path, new(sync.Mutex))
+	_, locked := syncdiag.Watch(ctx, "agent_lock_wait")
 	lock.(*sync.Mutex).Lock()
+	locked(nil)
 	defer lock.(*sync.Mutex).Unlock()
 	valid := false
 	for _, known := range model.Agents {
@@ -173,30 +212,52 @@ func Load(a model.Agent, start, end int64, refresh bool) model.Data {
 		return d
 	}
 	var old snapshot
-	b, _ := os.ReadFile(path)
-	_ = json.Unmarshal(b, &old)
+	_, readSnapshot := syncdiag.Watch(ctx, "read_snapshot")
+	readStarted := time.Now()
+	b, readErr := os.ReadFile(path)
+	readMS := stageMS(readStarted)
+	readSnapshot(readErr)
+	_, decodeSnapshot := syncdiag.Watch(ctx, "decode_snapshot")
+	decodeStarted := time.Now()
+	decodeErr := json.Unmarshal(b, &old)
+	decodeMS := stageMS(decodeStarted)
+	decodeSnapshot(decodeErr)
 	now := time.Now().Unix()
-	covers := old.Version == snapshotVersion && old.Data.TurnsStart <= start && old.Data.TurnsEnd >= min(end, now)
+	coversStart := old.Version == snapshotVersion && old.Data.TurnsStart <= start
+	covers := coversStart && old.Data.TurnsEnd >= min(end, now)
+	age := int64(-1)
+	if old.At > 0 {
+		age = max(0, now-old.At)
+	}
+	syncdiag.Log(ctx, "snapshot_result", "reason", snapshotReason(old, start, end, now, refresh, reuseUnchanged, readErr, decodeErr), "read_ms", readMS, "decode_ms", decodeMS, "bytes", len(b), "age_seconds", age, "covers_start", coversStart, "covers_end", covers, "fresh_sources", old.FreshSources, "read_error", syncdiag.ErrorCode(readErr), "decode_error", syncdiag.ErrorCode(decodeErr))
 	if !refresh && covers && now-old.At <= 300 {
+		mode = "snapshot"
 		return filter(old.Data, start, end)
 	}
+	mode = "sources"
 	d := empty(start, end)
+	// Devin re-queries newer records from its watermark even when the cached
+	// window has expired. Other importers require coverage before reusing data.
 	var previous *model.Data
-	if !refresh && covers && len(old.Data.Errors) == 0 {
+	canSeed := covers || a == model.Devin && coversStart && old.Data.TurnsEnd > start
+	if (!refresh || reuseUnchanged && old.FreshSources) && canSeed && len(old.Data.Errors) == 0 {
 		previous = &old.Data
 	}
 	var databases map[string]string
 	var sourceFiles map[string]string
 	switch a {
 	case model.Claude, model.Codex, model.Pi, model.WorkBuddy, model.Grok:
-		sourceFiles = loadFiles(&d, a, refresh, previous, old.Files)
+		sourceFiles = loadFiles(ctx, &d, a, refresh, previous, old.Files)
 	case model.Devin, model.ZCode, model.OpenCode, model.MimoCode, model.Antigravity:
-		databases = loadDBs(&d, a, refresh, previous, old.Databases)
+		databases = loadDBs(ctx, &d, a, refresh, previous, old.Databases)
 	default:
 		fail(&d, a, "unsupported agent")
 	}
+	_, sorted := syncdiag.Watch(ctx, "sort_records")
 	sort.SliceStable(d.Turns, func(i, j int) bool { return d.Turns[i].CreatedAt < d.Turns[j].CreatedAt })
 	sort.Slice(d.Sessions, func(i, j int) bool { return d.Sessions[i].Key < d.Sessions[j].Key })
+	sorted(nil)
+	_, stamped := syncdiag.Watch(ctx, "stamp_device")
 	id, name := DeviceID(), DeviceName()
 	for i := range d.Sessions {
 		d.Sessions[i].DeviceID = id
@@ -206,10 +267,19 @@ func Load(a model.Agent, start, end int64, refresh bool) model.Data {
 		d.Turns[i].DeviceID = id
 		d.Turns[i].DeviceName = name
 	}
-	raw, _ := json.Marshal([]any{d.Sessions, d.Turns})
+	stamped(nil)
+	_, hashed := syncdiag.Watch(ctx, "hash_records")
+	raw, hashErr := json.Marshal([]any{d.Sessions, d.Turns})
 	d.SyncContentHash = fmt.Sprintf("%x", sha256.Sum256(raw))
-	if e := atomicJSON(path, snapshot{Version: snapshotVersion, At: now, Data: d, Databases: databases, Files: sourceFiles}); e != nil {
+	hashed(hashErr)
+	unchanged := maps.Equal(databases, old.Databases) && maps.Equal(sourceFiles, old.Files)
+	freshSources := len(d.Errors) == 0 && (refresh || old.FreshSources && covers && unchanged)
+	_, saved := syncdiag.Watch(ctx, "write_snapshot")
+	if e := atomicJSON(path, snapshot{Version: snapshotVersion, At: now, Data: d, Databases: databases, Files: sourceFiles, FreshSources: freshSources}); e != nil {
+		saved(e)
 		fail(&d, a, fmt.Errorf("save cache: %w", e))
+	} else {
+		saved(nil)
 	}
 	return d
 }
@@ -226,18 +296,33 @@ func filter(d model.Data, start, end int64) model.Data {
 	return d
 }
 func LoadAll(start, end int64, refresh bool) model.Data {
+	return LoadAllContext(context.Background(), start, end, refresh)
+}
+
+func LoadAllContext(ctx context.Context, start, end int64, refresh bool) (result model.Data) {
+	ctx, finish := syncdiag.Watch(syncdiag.WithRun(ctx), "collect_agents")
+	syncdiag.Log(ctx, "collection_runtime", append(syncdiag.BuildFields(), syncdiag.RuntimeFields()...)...)
+	defer func() {
+		syncdiag.Log(ctx, "local_collection_result", append([]any{"sessions", len(result.Sessions), "turns", len(result.Turns), "source_errors", len(result.Errors)}, syncdiag.RuntimeFields()...)...)
+		finish(sourceResultError(result))
+	}()
 	d := empty(start, end)
 	parts := make([]model.Data, len(model.Agents))
 	var wg sync.WaitGroup
 	limit := make(chan struct{}, 4)
 	for i, a := range model.Agents {
 		wg.Go(func() {
+			agentCtx := syncdiag.WithFields(ctx, "agent", diagnosticAgent(a))
+			queued := time.Now()
+			syncdiag.Log(agentCtx, "agent_queue_start")
 			limit <- struct{}{}
 			defer func() { <-limit }()
-			parts[i] = Load(a, start, end, refresh)
+			syncdiag.Log(agentCtx, "agent_queue_result", "elapsed_ms", stageMS(queued))
+			parts[i] = LoadContext(agentCtx, a, start, end, refresh)
 		})
 	}
 	wg.Wait()
+	_, merged := syncdiag.Stage(ctx, "merge_agents")
 	for _, p := range parts {
 		d.Sessions = append(d.Sessions, p.Sessions...)
 		d.Turns = append(d.Turns, p.Turns...)
@@ -249,6 +334,9 @@ func LoadAll(start, end int64, refresh bool) model.Data {
 			d.FileSessions[k] = v
 		}
 	}
+	merged(nil)
+	_, sorted := syncdiag.Stage(ctx, "sort_collection")
 	sort.SliceStable(d.Turns, func(i, j int) bool { return d.Turns[i].CreatedAt < d.Turns[j].CreatedAt })
+	sorted(nil)
 	return d
 }

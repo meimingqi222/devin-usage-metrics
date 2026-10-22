@@ -34,27 +34,30 @@ type readFile struct {
 	vfs.File
 	blocks [16]readBlock
 	active bool
+	stats  ReadStats
 }
 
 func (f *readFile) ReadAt(p []byte, off int64) (int, error) {
+	f.stats.Requests++
 	if len(p) == 0 {
 		return 0, nil
 	}
 	if !f.active || off < 0 || len(p) > readAheadSize {
-		return f.File.ReadAt(p, off)
+		return f.readFileAt(p, off)
 	}
 	base := off / readAheadSize * readAheadSize
 	if off-base+int64(len(p)) > readAheadSize {
-		return f.File.ReadAt(p, off)
+		return f.readFileAt(p, off)
 	}
 	block := &f.blocks[base/readAheadSize%int64(len(f.blocks))]
 	if block.offset == base && off-base+int64(len(p)) <= int64(len(block.buffer)) {
+		f.stats.CacheHits++
 		return copy(p, block.buffer[off-base:]), nil
 	}
 	if cap(block.buffer) == 0 {
 		block.buffer = make([]byte, readAheadSize)
 	}
-	n, err := f.File.ReadAt(block.buffer[:cap(block.buffer)], base)
+	n, err := f.readFileAt(block.buffer[:cap(block.buffer)], base)
 	block.buffer, block.offset = block.buffer[:n], base
 	if err != nil && err != io.EOF {
 		block.buffer = block.buffer[:0]
@@ -68,6 +71,13 @@ func (f *readFile) ReadAt(p []byte, off int64) (int, error) {
 		return n, io.EOF
 	}
 	return n, nil
+}
+
+func (f *readFile) readFileAt(p []byte, off int64) (int, error) {
+	f.stats.FileReads++
+	n, err := f.File.ReadAt(p, off)
+	f.stats.FileBytes += uint64(n)
+	return n, err
 }
 
 func (f *readFile) Lock(level vfs.LockLevel) error {

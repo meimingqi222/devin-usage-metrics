@@ -64,6 +64,7 @@ type App struct {
 	installed                                  map[model.Agent]bool
 	hideEmptyBuckets                           bool
 	syncLastAt, syncError                      string
+	syncCompletedAt                            time.Time
 	cachedData                                 *model.Data
 	cachedKey                                  dataKey
 	compactionUI                               compactionState
@@ -127,9 +128,30 @@ func (a *App) work(key string, fn func() func()) {
 
 func (a *App) load(agent model.Agent, refresh bool) {
 	a.work(string(agent), func() func() {
-		d := data.Load(agent, 0, time.Now().Add(time.Hour).Unix(), refresh)
-		return func() { a.loaded[agent] = d; a.loadedAt = time.Now().Format("15:04:05"); a.hasLoaded = true }
+		ctx := syncdiag.WithFields(syncdiag.WithRun(a.ctx), "operation", "desktop_load", "agent", string(agent), "refresh", refresh)
+		syncdiag.Log(ctx, "desktop_load_start", syncdiag.BuildFields()...)
+		end := time.Now().Add(time.Hour).Unix()
+		var d model.Data
+		if refresh {
+			d = data.ReloadContext(ctx, agent, 0, end)
+		} else {
+			d = data.LoadContext(ctx, agent, 0, end, false)
+		}
+		readyAt := time.Now()
+		return func() {
+			syncdiag.Log(ctx, "desktop_load_applied", "apply_wait_ms", time.Since(readyAt).Milliseconds())
+			a.loaded[agent] = d
+			a.loadedAt = time.Now().Format("15:04:05")
+			a.hasLoaded = true
+			if refresh && a.syncDue(time.Now()) {
+				a.sync()
+			}
+		}
 	})
+}
+
+func (a *App) syncDue(now time.Time) bool {
+	return a.syncCompletedAt.IsZero() || now.Sub(a.syncCompletedAt) >= 5*time.Minute
 }
 
 // syncDeadline bounds a whole cycle. Individual requests already time out, but
@@ -142,27 +164,30 @@ func (a *App) sync() {
 		return
 	}
 	a.work("sync", func() func() {
-		runCtx := syncdiag.WithRun(a.ctx)
-		syncdiag.Log(runCtx, "desktop_sync_start", "network_deadline_ms", syncDeadline.Milliseconds())
-		collectCtx, collected := syncdiag.Stage(runCtx, "local_collection")
-		local := data.LoadAll(0, time.Now().Add(time.Hour).Unix(), false)
+		runCtx := syncdiag.WithFields(syncdiag.WithRun(a.ctx), "operation", "sync")
+		started := time.Now()
+		syncdiag.Log(runCtx, "desktop_sync_start", append([]any{"network_deadline_ms", syncDeadline.Milliseconds()}, syncdiag.BuildFields()...)...)
+		collectCtx, collected := syncdiag.Watch(runCtx, "local_collection")
+		local := data.LoadAllContext(collectCtx, 0, time.Now().Add(time.Hour).Unix(), false)
 		syncdiag.Log(collectCtx, "collection_result", "sessions", len(local.Sessions), "turns", len(local.Turns), "source_errors", len(local.Errors))
 		collected(nil)
 		ctx, cancel := context.WithTimeout(runCtx, syncDeadline)
 		defer cancel()
 		remote, err := syncclient.Cycle(ctx, local)
-		syncdiag.Log(runCtx, "desktop_sync_result", "error", syncdiag.ErrorCode(err), "remote_sessions", len(remote.Sessions), "remote_turns", len(remote.Turns))
+		syncdiag.Log(runCtx, "desktop_sync_result", "elapsed_ms", time.Since(started).Milliseconds(), "error", syncdiag.ErrorCode(err), "remote_sessions", len(remote.Sessions), "remote_turns", len(remote.Turns))
 		if errors.Is(err, context.DeadlineExceeded) {
 			err = fmt.Errorf("sync timed out after %s", syncDeadline)
 		}
 		// A partial cycle still returns every device it could read, with the
 		// last good data for those it could not.
 		usable := err == nil || errors.Is(err, syncclient.ErrPartial)
+		readyAt := time.Now()
 		return func() {
-			syncdiag.Log(runCtx, "desktop_sync_applied", "remote_replaced", usable)
+			syncdiag.Log(runCtx, "desktop_sync_applied", "remote_replaced", usable, "apply_wait_ms", time.Since(readyAt).Milliseconds())
 			if usable {
 				a.remote = remote
-				a.syncLastAt = time.Now().Format("15:04:05")
+				a.syncCompletedAt = time.Now()
+				a.syncLastAt = a.syncCompletedAt.Format("15:04:05")
 			}
 			a.syncError = ""
 			if err != nil {

@@ -55,12 +55,17 @@ func TestReadAheadReducesSQLiteOverflowReads(t *testing.T) {
 	}
 	count := &countedFile{File: r.reader.File}
 	r.reader.File = count
+	before := r.ReadStats()
 	rows, err := r.Query(ctx, "SELECT body FROM t")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(rows.Values[0][0].([]byte), make([]byte, 2097152)) {
 		t.Fatal("overflow data changed")
+	}
+	after := r.ReadStats()
+	if after.FileReads-before.FileReads != uint64(count.reads) || after.FileBytes <= before.FileBytes || after.CacheHits <= before.CacheHits || after.Requests-before.Requests <= after.FileReads-before.FileReads {
+		t.Fatalf("read counters disagree with actual VFS reads: before=%+v after=%+v reads=%d", before, after, count.reads)
 	}
 	if count.reads >= 128 {
 		t.Fatalf("2 MiB query used %d file reads; expected coalesced overflow pages", count.reads)

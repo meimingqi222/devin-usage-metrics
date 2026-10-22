@@ -1,0 +1,13 @@
+Disabled read-ahead:
+=== RUN   TestReadAheadReducesSQLiteOverflowReads
+    readvfs_test.go:66: 2 MiB query used 515 file reads; expected coalesced overflow pages
+--- FAIL: TestReadAheadReducesSQLiteOverflowReads (0.03s)
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/sqlite	0.436s
+FAIL
+
+Restored read-ahead:
+=== RUN   TestReadAheadReducesSQLiteOverflowReads
+--- PASS: TestReadAheadReducesSQLiteOverflowReads (0.03s)
+PASS
+ok  	github.com/meimingqi222/devin-usage-metrics/internal/sqlite	0.382s

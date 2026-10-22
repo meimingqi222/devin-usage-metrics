@@ -2,6 +2,7 @@ package data
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -17,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
+	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 )
 
 type obj = map[string]any
@@ -207,7 +209,7 @@ var decodedWeight struct {
 	total int64
 }
 
-func rememberDecoded(p string, c lineCache) {
+func rememberDecoded(p string, c lineCache) (evicted int) {
 	decodedWeight.Lock()
 	defer decodedWeight.Unlock()
 	if old, ok := decodedFiles.Swap(p, c); ok {
@@ -236,7 +238,9 @@ func rememberDecoded(p string, c lineCache) {
 		}
 		decodedFiles.Delete(e.path)
 		decodedWeight.total -= e.bytes
+		evicted++
 	}
+	return
 }
 
 func forgetDecoded(p string) {
@@ -323,24 +327,68 @@ func forgetRemoved(roots []string, ext string, seen map[string]bool) {
 // expires. Rebuild accounting globally so resumed Claude copies still dedup
 // against unchanged files, and removed files cannot leave stale turns behind.
 func readLines(d *model.Data, a model.Agent, p string, refresh bool) []obj {
+	return readLinesContext(context.Background(), d, a, p, refresh)
+}
+
+func readLinesContext(ctx context.Context, d *model.Data, a model.Agent, p string, refresh bool) []obj {
+	started := time.Now()
+	ctx = sourceContext(ctx, p)
+	stats, _ := ctx.Value(decodeStatsKey{}).(*decodeStats)
+	mode, reason := "error", "stat_failed"
+	var cached lineCache
+	var inputBytes, sourceBytes int64
+	var diagnosticErr error
+	defer func() {
+		if stats != nil {
+			switch mode {
+			case "hit":
+				stats.hits.Add(1)
+			case "decode":
+				stats.misses.Add(1)
+				stats.bytes.Add(inputBytes)
+				stats.lines.Add(int64(len(cached.Lines)))
+			}
+		}
+		if syncdiag.HasRun(ctx) && (diagnosticErr != nil || time.Since(started) >= 100*time.Millisecond || mode == "decode" && sourceBytes >= 1<<20) {
+			syncdiag.Log(ctx, "file_read_result", "mode", mode, "reason", reason, "elapsed_ms", stageMS(started), "file_bytes", sourceBytes, "decoded_input_bytes", inputBytes, "lines", len(cached.Lines), "error", syncdiag.ErrorCode(diagnosticErr))
+		}
+	}()
 	info, e := os.Stat(p)
 	if e != nil {
+		diagnosticErr = e
 		fail(d, a, e)
 		return nil
 	}
+	sourceBytes = info.Size()
 	d.FileMtimes[p] = info.ModTime().UnixNano()
 	value, ok := decodedFiles.Load(p)
-	cached, _ := value.(lineCache)
+	cached, _ = value.(lineCache)
+	mode, reason = "hit", "unchanged"
 	if refresh || !ok || cached.Mtime != info.ModTime().UnixNano() || cached.Size != info.Size() {
+		mode = "decode"
+		switch {
+		case refresh:
+			reason = "forced_rebuild"
+		case !ok:
+			reason = "decoded_cache_miss"
+		default:
+			reason = "source_changed"
+		}
+		if syncdiag.HasRun(ctx) && sourceBytes >= 1<<20 {
+			_, finished := syncdiag.Watch(ctx, "file_decode")
+			defer func() { finished(diagnosticErr) }()
+		}
 		cached = lineCache{Mtime: info.ModTime().UnixNano(), Size: info.Size()}
 		f, e := os.Open(p)
 		if e != nil {
+			diagnosticErr = e
 			fail(d, a, e)
 			return nil
 		}
 		scan := bufio.NewScanner(f)
 		scan.Buffer(make([]byte, 65536), 64*1024*1024)
 		for order := 1; scan.Scan(); order++ {
+			inputBytes += int64(len(scan.Bytes()))
 			var v obj
 			if len(strings.TrimSpace(scan.Text())) == 0 {
 				cached.Lines = append(cached.Lines, nil)
@@ -357,15 +405,24 @@ func readLines(d *model.Data, a model.Agent, p string, refresh bool) []obj {
 			cached.Errors = append(cached.Errors, fmt.Errorf("%s: %w", p, e))
 		}
 		f.Close()
-		rememberDecoded(p, cached)
+		evicted := rememberDecoded(p, cached)
+		if stats != nil {
+			stats.evictions.Add(int64(evicted))
+		}
 	}
 	for _, e := range cached.Errors {
+		if diagnosticErr == nil {
+			diagnosticErr = e
+		}
 		fail(d, a, e)
 	}
 	return cached.Lines
 }
 
-func loadFiles(d *model.Data, a model.Agent, refresh bool, previous *model.Data, signatures map[string]string) map[string]string {
+func loadFiles(ctx context.Context, d *model.Data, a model.Agent, refresh bool, previous *model.Data, signatures map[string]string) map[string]string {
+	ctx, finish := syncdiag.Watch(ctx, "file_sources")
+	defer func() { finish(sourceResultError(*d)) }()
+	_, discovered := syncdiag.Watch(ctx, "discover_files")
 	paths := files(d, a, roots(a), ".jsonl")
 	if a == model.Grok {
 		paths = files(d, a, roots(a), "summary.json")
@@ -389,13 +446,29 @@ func loadFiles(d *model.Data, a model.Agent, refresh bool, previous *model.Data,
 			current[p] = fmt.Sprintf("%d:%d", info.ModTime().UnixNano(), info.Size())
 		}
 	}
+	discovered(sourceResultError(*d))
+	changed, removed := 0, 0
+	for p, signature := range current {
+		if signatures[p] != signature {
+			changed++
+		}
+	}
+	for p := range signatures {
+		if _, ok := current[p]; !ok {
+			removed++
+		}
+	}
+	syncdiag.Log(ctx, "file_sources_plan", "files", len(paths), "tracked_files", len(tracked), "changed_files", changed, "removed_files", removed, "has_baseline", previous != nil)
 	if previous != nil && len(d.Errors) == 0 && maps.Equal(current, signatures) {
+		syncdiag.Log(ctx, "file_sources_cache", "mode", "unchanged")
 		*d = filter(*previous, d.TurnsStart, d.TurnsEnd)
 		return current
 	}
+	syncdiag.Log(ctx, "file_sources_cache", "mode", "reparse", "refresh", refresh)
 	// Decode independent files concurrently, then retain deterministic serial
 	// accounting for resumed-session and cross-file message deduplication.
 	if a != model.Grok {
+		_, decoded := syncdiag.Watch(ctx, "decode_files")
 		var wg sync.WaitGroup
 		limit := make(chan struct{}, 4)
 		for _, p := range paths {
@@ -403,11 +476,14 @@ func loadFiles(d *model.Data, a model.Agent, refresh bool, previous *model.Data,
 				limit <- struct{}{}
 				defer func() { <-limit }()
 				part := empty(d.TurnsStart, d.TurnsEnd)
-				readLines(&part, a, p, refresh)
+				readLinesContext(ctx, &part, a, p, refresh)
 			})
 		}
 		wg.Wait()
+		decoded(nil)
 	}
+	_, accounted := syncdiag.Watch(ctx, "account_file_records")
+	defer func() { accounted(sourceResultError(*d)) }()
 	sessions := map[string]*model.Session{}
 	seen := map[string]bool{}
 	for _, p := range paths {
@@ -418,14 +494,14 @@ func loadFiles(d *model.Data, a model.Agent, refresh bool, previous *model.Data,
 			stream = "subagent/" + strings.TrimSuffix(filepath.Base(p), ".jsonl")
 		}
 		if a == model.Grok {
-			parseGrok(d, p, sessions, refresh)
+			parseGrok(ctx, d, p, sessions, refresh)
 			continue
 		}
 		latest := map[string]model.Turn{}
 		var ordered []model.Turn
 		activeModel := ""
 		order := uint64(0)
-		for _, v := range readLines(d, a, p, false) {
+		for _, v := range readLinesContext(ctx, d, a, p, false) {
 			order++
 			if v == nil {
 				continue
@@ -631,7 +707,7 @@ func loadFiles(d *model.Data, a model.Agent, refresh bool, previous *model.Data,
 		}
 		index := filepath.Join(base, "session_index.jsonl")
 		if _, e := os.Stat(index); e == nil {
-			for _, v := range readLines(d, a, index, refresh) {
+			for _, v := range readLinesContext(ctx, d, a, index, refresh) {
 				if s := sessions[str(v["id"])]; s != nil {
 					if title := strings.TrimSpace(str(v["thread_name"])); title != "" {
 						s.Title = title
@@ -698,7 +774,7 @@ func buddyUsage(u, raw any) (input, output, cached, write float64) {
 	output = max(0, num(first(pick(u, "outputTokens", "output_tokens", "completion_tokens"), pick(raw, "completion_tokens", "outputTokens", "output_tokens"))))
 	return
 }
-func parseGrok(d *model.Data, p string, sessions map[string]*model.Session, refresh bool) {
+func parseGrok(ctx context.Context, d *model.Data, p string, sessions map[string]*model.Session, refresh bool) {
 	b, e := os.ReadFile(p)
 	if e != nil {
 		fail(d, model.Grok, e)
@@ -738,7 +814,7 @@ func parseGrok(d *model.Data, p string, sessions map[string]*model.Session, refr
 	if _, err := os.Stat(updates); os.IsNotExist(err) {
 		return
 	}
-	for _, v := range readLines(d, model.Grok, updates, refresh) {
+	for _, v := range readLinesContext(ctx, d, model.Grok, updates, refresh) {
 		u := get(v, "params", "update")
 		if str(get(u, "sessionUpdate")) != "turn_completed" {
 			continue

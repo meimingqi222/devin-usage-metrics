@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -26,6 +27,7 @@ const (
 	runKey key = iota
 	stageKey
 	deviceKey
+	fieldsKey
 )
 
 var sequence atomic.Uint64
@@ -49,6 +51,24 @@ func WithRun(ctx context.Context) context.Context {
 		return ctx
 	}
 	return context.WithValue(ctx, runKey, fmt.Sprintf("%d-%d", os.Getpid(), sequence.Add(1)))
+}
+
+func HasRun(ctx context.Context) bool { return ctx.Value(runKey) != nil }
+
+// WithFields scopes fixed diagnostic metadata. Callers must hash paths and
+// identifiers and must not supply payloads, credentials or arbitrary errors.
+func WithFields(ctx context.Context, fields ...any) context.Context {
+	old, _ := ctx.Value(fieldsKey).(map[string]any)
+	values := maps.Clone(old)
+	if values == nil {
+		values = map[string]any{}
+	}
+	for i := 0; i+1 < len(fields); i += 2 {
+		if k, ok := fields[i].(string); ok {
+			values[k] = fields[i+1]
+		}
+	}
+	return context.WithValue(ctx, fieldsKey, values)
 }
 
 // ID permits correlation without exposing device IDs, URLs or object names.
@@ -106,6 +126,8 @@ func ErrorCode(err error) string {
 		err = errors.Unwrap(err)
 	}
 	switch err.Error() {
+	case "local collection source errors":
+		return "source_errors"
 	case "invalid zstd frame header", "truncated zstd block", "reserved zstd block type", "zstd requires exactly one complete frame", "invalid zstd size", "zstd size mismatch", "device identity must be initialized before sync", "missing device identity", "invalid encrypted session", "cannot decrypt session", "invalid sync API URL", "sync response exceeds limit", "single turn exceeds protocol block limit", "single session exceeds protocol block limit", "too many blocks", "manifest exceeds limit", "too many shards", "invalid generation content hash", "negative record count", "invalid session partition", "invalid turn partition", "unknown record kind", "v1 identity/schema mismatch":
 		return err.Error()
 	case "shard hash/size mismatch", "manifest hash mismatch", "manifest record count mismatch", "shard record count mismatch", "invalid shard reference", "invalid head", "invalid existing head", "head identity mismatch", "manifest identity/schema mismatch", "shard schema mismatch", "turn partition mismatch", "session device mismatch", "sync login expired", "sync transport request failed", "sync head CAS conflict", "object exceeds protocol limit", "existing immutable manifest is corrupt", "strong head ETag required for safe publication":
@@ -120,7 +142,12 @@ func ErrorCode(err error) string {
 }
 
 func Log(ctx context.Context, event string, fields ...any) {
-	record := map[string]any{"time": time.Now().Format(time.RFC3339Nano), "pid": os.Getpid(), "event": event}
+	record := map[string]any{"time": time.Now().Format(time.RFC3339Nano), "pid": os.Getpid(), "event": event, "diagnostics_version": 2}
+	if fields, ok := ctx.Value(fieldsKey).(map[string]any); ok {
+		for k, v := range fields {
+			record[k] = v
+		}
+	}
 	for k, name := range map[key]string{runKey: "run", stageKey: "stage", deviceKey: "device"} {
 		if v := ctx.Value(k); v != nil {
 			record[name] = v

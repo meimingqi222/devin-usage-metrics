@@ -36,3 +36,5 @@ Reloading the dashboard with real history took about 5.4–8.4 s in local collec
 - `internal/sqlite/readvfs_test.go::TestReadAheadObservesRollbackJournalWrites`
 - `internal/sqlite/readvfs_test.go::TestReadOnlyURIShapes`
 - `internal/sqlite/readvfs_test.go::TestEachAbortLeavesConnectionUsable`
+
+Proved: disabling read-ahead made the 2 MiB overflow-read regression fail with 515 file reads; restoring it passed. Output saved to `docs/agent-notes-evidence/sqlite-read-ahead-red.txt`.

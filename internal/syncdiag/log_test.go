@@ -126,3 +126,66 @@ func TestStalledTransferEmitsHeartbeatAndFinishesOnDeadline(t *testing.T) {
 		t.Fatal(last)
 	}
 }
+
+func TestFieldsRemainIsolatedAcrossWorkers(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	parent := WithFields(WithRun(context.Background()), "operation", "sync")
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Go(func() {
+			child := WithFields(parent, "worker", i)
+			Log(WithFields(child, "operation", "query"), "child")
+			Log(child, "worker")
+		})
+	}
+	wg.Wait()
+	Log(parent, "parent")
+	for _, r := range readRecords(t) {
+		if r["run"] != parent.Value(runKey) || r["diagnostics_version"] != float64(2) {
+			t.Fatal("missing correlation or version", r)
+		}
+		switch r["event"] {
+		case "child":
+			if r["operation"] != "query" || r["worker"] == nil {
+				t.Fatal(r)
+			}
+		case "worker":
+			if r["operation"] != "sync" || r["worker"] == nil {
+				t.Fatal("child mutated worker scope", r)
+			}
+		case "parent":
+			if r["operation"] != "sync" || r["worker"] != nil {
+				t.Fatal("worker mutated parent scope", r)
+			}
+		}
+	}
+}
+
+func TestWatchJoinsHeartbeatBeforeStageEnds(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	ctx, finish := watch(WithRun(context.Background()), "local_collection", 5*time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
+	found := false
+	for time.Now().Before(deadline) && !found {
+		time.Sleep(5 * time.Millisecond)
+		for _, r := range readRecords(t) {
+			if r["event"] == "stage_progress" {
+				found = true
+				if r["run"] != ctx.Value(runKey) || r["elapsed_ms"] == nil {
+					t.Fatal(r)
+				}
+			}
+		}
+	}
+	finish(context.DeadlineExceeded)
+	finish(nil)
+	if !found {
+		t.Fatal("watch emitted no heartbeat")
+	}
+	before := len(readRecords(t))
+	time.Sleep(20 * time.Millisecond)
+	records := readRecords(t)
+	if len(records) != before || records[len(records)-1]["event"] != "stage_end" || records[len(records)-1]["error"] != "deadline_exceeded" {
+		t.Fatal("heartbeat outlived stage or finish was not idempotent", records)
+	}
+}

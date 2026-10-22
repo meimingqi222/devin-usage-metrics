@@ -1,0 +1,78 @@
+disable unchanged-source reuse
+Disabled:
+=== RUN   TestReloadReusesUnchangedDecodedFiles
+    files_internal_test.go:62: unchanged reload decoded transcript again
+--- FAIL: TestReloadReusesUnchangedDecodedFiles (0.01s)
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/data	0.478s
+FAIL
+
+Restored:
+=== RUN   TestReloadReusesUnchangedDecodedFiles
+--- PASS: TestReloadReusesUnchangedDecodedFiles (0.01s)
+PASS
+ok  	github.com/meimingqi222/devin-usage-metrics/internal/data	0.374s
+
+
+remove source-freshness guard
+Disabled:
+=== RUN   TestDevinStaleWindowKeepsIncrementalBaseline
+    performance_test.go:306: manual reload reused incremental history: turns=2 errors=0
+--- FAIL: TestDevinStaleWindowKeepsIncrementalBaseline (0.03s)
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/data	0.391s
+FAIL
+
+Restored:
+=== RUN   TestDevinStaleWindowKeepsIncrementalBaseline
+--- PASS: TestDevinStaleWindowKeepsIncrementalBaseline (0.03s)
+PASS
+ok  	github.com/meimingqi222/devin-usage-metrics/internal/data	0.322s
+
+
+discard stale incremental baseline
+Disabled:
+=== RUN   TestDevinStaleWindowKeepsIncrementalBaseline
+    performance_test.go:302: expired window discarded baseline: turns=1 errors=0
+--- FAIL: TestDevinStaleWindowKeepsIncrementalBaseline (0.03s)
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/data	0.392s
+FAIL
+
+Restored:
+=== RUN   TestDevinStaleWindowKeepsIncrementalBaseline
+--- PASS: TestDevinStaleWindowKeepsIncrementalBaseline (0.03s)
+PASS
+ok  	github.com/meimingqi222/devin-usage-metrics/internal/data	0.392s
+
+
+incrementally parse changed sources on manual reload
+Disabled:
+=== RUN   TestReloadRebuildsHistoricalDevinEdits
+    performance_test.go:277: manual reload kept old historical metrics: 2
+--- FAIL: TestReloadRebuildsHistoricalDevinEdits (0.02s)
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/data	0.369s
+FAIL
+
+Restored:
+=== RUN   TestReloadRebuildsHistoricalDevinEdits
+--- PASS: TestReloadRebuildsHistoricalDevinEdits (0.01s)
+PASS
+ok  	github.com/meimingqi222/devin-usage-metrics/internal/data	0.303s
+
+
+remove five-minute sync cooldown
+Disabled:
+=== RUN   TestReloadSyncIntervalMatchesRust
+    app_test.go:26: refresh repeated sync before five minutes
+--- FAIL: TestReloadSyncIntervalMatchesRust (0.00s)
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/desktop	1.135s
+FAIL
+
+Restored:
+=== RUN   TestReloadSyncIntervalMatchesRust
+--- PASS: TestReloadSyncIntervalMatchesRust (0.00s)
+PASS
+ok  	github.com/meimingqi222/devin-usage-metrics/internal/desktop	0.821s

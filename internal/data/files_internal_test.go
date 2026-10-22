@@ -3,6 +3,7 @@ package data
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -26,6 +27,51 @@ func TestDecodedTranscriptsAreForgottenAfterDeletion(t *testing.T) {
 	files(&d, model.Claude, []string{root}, ".jsonl")
 	if _, ok := decodedFiles.Load(p); ok {
 		t.Fatal("deleted transcript stayed cached")
+	}
+}
+
+func TestReloadReusesUnchangedDecodedFiles(t *testing.T) {
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, "config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, "cache"))
+	p := filepath.Join(h, ".pi/agent/sessions/s.jsonl")
+	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"type":"message","timestamp":100,"message":{"role":"assistant","usage":{"input":1}}}` + "\n"
+	if err := os.WriteFile(p, []byte(line), 0600); err != nil {
+		t.Fatal(err)
+	}
+	first := Load(model.Pi, 0, 200, true)
+	if len(first.Errors) != 0 || len(first.Turns) != 1 {
+		t.Fatal("initial parse failed")
+	}
+	old, ok := decodedFiles.Load(p)
+	if !ok {
+		t.Fatal("decoded transcript missing")
+	}
+	pointer := reflect.ValueOf(old.(lineCache).Lines[0]).Pointer()
+	again := Reload(model.Pi, 0, 200)
+	if len(again.Errors) != 0 || !reflect.DeepEqual(first.Turns, again.Turns) {
+		t.Fatal("unchanged reload changed records")
+	}
+	current, _ := decodedFiles.Load(p)
+	if reflect.ValueOf(current.(lineCache).Lines[0]).Pointer() != pointer {
+		t.Fatal("unchanged reload decoded transcript again")
+	}
+	if err := os.WriteFile(p, []byte(line+line), 0600); err != nil {
+		t.Fatal(err)
+	}
+	changed := Reload(model.Pi, 0, 200)
+	if len(changed.Errors) != 0 || len(changed.Turns) != 2 {
+		t.Fatal("reload reused stale TTL snapshot after source changed")
+	}
+	Load(model.Pi, 0, 200, true)
+	current, _ = decodedFiles.Load(p)
+	if reflect.ValueOf(current.(lineCache).Lines[0]).Pointer() == pointer {
+		t.Fatal("full rebuild reused decoded source")
 	}
 }
 

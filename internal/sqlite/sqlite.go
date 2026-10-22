@@ -33,6 +33,21 @@ type Rows struct {
 	Values  [][]any
 }
 
+// ReadStats counts main-file VFS requests and actual reads on this connection.
+// WAL reads are excluded. A connection without the read-ahead VFS returns zero.
+type ReadStats struct {
+	Requests, CacheHits, FileReads, FileBytes uint64
+}
+
+func (d *DB) ReadStats() ReadStats {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.reader == nil {
+		return ReadStats{}
+	}
+	return d.reader.stats
+}
+
 // DB is safe for use from several goroutines; calls serialize on the connection.
 type DB struct {
 	mu     sync.Mutex

@@ -171,3 +171,138 @@ func BenchmarkDevinExpiredSnapshot(b *testing.B) {
 		check(b, restartedDevin(b, result), 2001+i)
 	}
 }
+
+// ageDevinWindow rewrites the snapshot as if it had been written more than an
+// hour ago: its cached window no longer reaches the current time.
+func ageDevinWindow(t testing.TB, h string, at, turnsEnd int64) {
+	t.Helper()
+	p := filepath.Join(h, "cache/devin-usage-metrics/go-data-devin.json")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot map[string]json.RawMessage
+	if err = json.Unmarshal(b, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	var data map[string]json.RawMessage
+	if err = json.Unmarshal(snapshot["Data"], &data); err != nil {
+		t.Fatal(err)
+	}
+	data["turns_end"], _ = json.Marshal(turnsEnd)
+	if snapshot["Data"], err = json.Marshal(data); err != nil {
+		t.Fatal(err)
+	}
+	snapshot["At"], _ = json.Marshal(at)
+	if b, err = json.Marshal(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(p, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A snapshot whose window ended in the past is still a valid incremental
+// baseline: an app restarted after an hour must not fall back to a full scan.
+func TestDevinStaleWindowSnapshotSeedsIncrementalParse(t *testing.T) {
+	h := env(t)
+	now := time.Now().Unix()
+	message := func(id string, at int64, tokens int) string {
+		return fmt.Sprintf(`{"message_id":%q,"metadata":{"started_generation_at":%d,"metrics":{"ttft_ms":null,"input_tokens":%d}}}`, id, at, tokens)
+	}
+	var cli *sqlite.DB
+	for _, source := range []string{"cli", "cli-next"} {
+		c := devinDB(t, h, source)
+		if source == "cli" {
+			cli = c
+		}
+		for i, id := range []string{"active", "older"} {
+			at := now - int64(i+3)*3600
+			exec(t, c, "INSERT INTO sessions VALUES (?,?,?,?,?)", id, id, at, at, 0)
+			exec(t, c, "INSERT INTO message_nodes VALUES (?,?,?)", id, at, message(id, at, []int{1, 3}[i]))
+		}
+	}
+	check(t, data.Load(model.Devin, 0, now+3600, true), 4)
+	exec(t, cli, "INSERT INTO message_nodes VALUES ('active',?,?)", now, message("new", now, 13))
+	exec(t, cli, "UPDATE sessions SET last_activity_at=? WHERE id='active'", now)
+	ageDevinWindow(t, h, now-7200, now-3600)
+	d := restartedDevin(t, filepath.Join(h, "result.json"))
+	check(t, d, 5)
+	var tokens float64
+	for _, turn := range d.Turns {
+		tokens += turn.InputTokens
+	}
+	// The fixture writes the same sessions into both databases.
+	if tokens != 21 {
+		t.Fatalf("tokens=%v, want 21", tokens)
+	}
+	full := data.Load(model.Devin, 0, d.TurnsEnd, true)
+	check(t, full, 5)
+	counts := func(d model.Data) map[string]float64 {
+		m := map[string]float64{}
+		for _, turn := range d.Turns {
+			m[turn.SessionKey+"/"+turn.DedupKey] += turn.InputTokens
+		}
+		return m
+	}
+	if !reflect.DeepEqual(counts(d), counts(full)) {
+		t.Fatal("incremental accounting differs from full scan")
+	}
+}
+
+func TestReloadRebuildsHistoricalDevinEdits(t *testing.T) {
+	h := env(t)
+	now := time.Now().Unix()
+	c := devinDB(t, h, "cli")
+	msg := func(id string, n int) string {
+		return fmt.Sprintf(`{"message_id":%q,"metadata":{"metrics":{"ttft_ms":null,"input_tokens":%d}}}`, id, n)
+	}
+	for _, s := range []struct {
+		id string
+		at int64
+	}{{"old", now - 30*86400}, {"new", now}} {
+		exec(t, c, "INSERT INTO sessions VALUES(?,?,?,?,0)", s.id, s.id, s.at, s.at)
+		exec(t, c, "INSERT INTO message_nodes VALUES(?,?,?)", s.id, s.at, msg(s.id, 1))
+	}
+	check(t, data.Load(model.Devin, 0, now+3600, true), 2)
+	// The old session lies outside the ordinary incremental query overlap.
+	exec(t, c, "UPDATE message_nodes SET chat_message=? WHERE session_id='old'", msg("old", 99))
+	d := data.Reload(model.Devin, 0, now+3600)
+	check(t, d, 2)
+	var tokens float64
+	for _, turn := range d.Turns {
+		tokens += turn.InputTokens
+	}
+	if tokens != 100 {
+		t.Fatalf("manual reload kept old historical metrics: %v", tokens)
+	}
+}
+
+// Normal background collection can keep old inferences outside the overlap;
+// manual Reload must still rebuild them when the database signature changes.
+func TestDevinStaleWindowKeepsIncrementalBaseline(t *testing.T) {
+	h := env(t)
+	now := time.Now().Unix()
+	c := devinDB(t, h, "cli")
+	for _, s := range []struct {
+		id string
+		at int64
+	}{{"old", now - 30*86400}, {"new", now - 7200}} {
+		exec(t, c, "INSERT INTO sessions VALUES(?,?,?,?,0)", s.id, s.id, s.at, s.at)
+		msg := fmt.Sprintf(`{"message_id":%q,"metadata":{"metrics":{"ttft_ms":null,"input_tokens":1}}}`, s.id)
+		exec(t, c, "INSERT INTO message_nodes VALUES(?,?,?)", s.id, s.at, msg)
+	}
+	check(t, data.Load(model.Devin, 0, now+3600, true), 2)
+	// Removing a historical message distinguishes an incremental read from a
+	// full scan: the former keeps its previously accounted inference.
+	exec(t, c, "DELETE FROM message_nodes WHERE session_id='old'")
+	ageDevinWindow(t, h, now-7200, now-3600)
+	incremental := restartedDevin(t, filepath.Join(h, "result.json"))
+	if len(incremental.Errors) != 0 || len(incremental.Turns) != 2 {
+		t.Fatalf("expired window discarded baseline: turns=%d errors=%d", len(incremental.Turns), len(incremental.Errors))
+	}
+	reloaded := data.Reload(model.Devin, 0, now+3600)
+	if len(reloaded.Errors) != 0 || len(reloaded.Turns) != 1 {
+		t.Fatalf("manual reload reused incremental history: turns=%d errors=%d", len(reloaded.Turns), len(reloaded.Errors))
+	}
+}

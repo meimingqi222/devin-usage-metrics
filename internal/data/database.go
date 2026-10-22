@@ -14,16 +14,22 @@ import (
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 	"github.com/meimingqi222/devin-usage-metrics/internal/sqlite"
+	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 )
 
-func query(d *model.Data, a model.Agent, db *sqlite.DB, sql string, args ...any) []obj {
-	r, e := db.Query(context.Background(), sql, args...)
+func query(ctx context.Context, d *model.Data, a model.Agent, db *sqlite.DB, label, sql string, args ...any) []obj {
+	done := queryDiagnostic(ctx, db, label)
+	r, e := db.Query(ctx, sql, args...)
+	var bytes int64
+	consumer := time.Now()
+	defer func() { done(len(r.Values), bytes, time.Since(consumer), e) }()
 	if e != nil {
 		fail(d, a, e)
 		return nil
 	}
 	var out []obj
 	for _, row := range r.Values {
+		bytes += materializedBytes(row)
 		v := obj{}
 		for i, k := range r.Columns {
 			v[k] = row[i]
@@ -34,15 +40,24 @@ func query(d *model.Data, a model.Agent, db *sqlite.DB, sql string, args ...any)
 }
 
 // each streams a query's rows as objects; a query error is recorded like query.
-func each(d *model.Data, a model.Agent, db *sqlite.DB, sql string, fn func(obj), args ...any) {
-	e := db.Each(context.Background(), sql, func(columns []string, row []any) error {
+func each(ctx context.Context, d *model.Data, a model.Agent, db *sqlite.DB, label, sql string, fn func(obj), args ...any) {
+	done := queryDiagnostic(ctx, db, label)
+	var rows int
+	var bytes int64
+	var consumer time.Duration
+	e := db.Each(ctx, sql, func(columns []string, row []any) error {
+		started := time.Now()
+		rows++
+		bytes += materializedBytes(row)
 		v := obj{}
 		for i, k := range columns {
 			v[k] = row[i]
 		}
 		fn(v)
+		consumer += time.Since(started)
 		return nil
 	}, args...)
+	done(rows, bytes, consumer, e)
 	if e != nil {
 		fail(d, a, e)
 	}
@@ -64,7 +79,7 @@ func databaseSignature(p string) string {
 	}
 	return b.String()
 }
-func loadDBs(d *model.Data, a model.Agent, refresh bool, previous *model.Data, signatures map[string]string) map[string]string {
+func loadDBs(ctx context.Context, d *model.Data, a model.Agent, refresh bool, previous *model.Data, signatures map[string]string) map[string]string {
 	var paths []string
 	switch a {
 	case model.Devin:
@@ -113,15 +128,25 @@ func loadDBs(d *model.Data, a model.Agent, refresh bool, previous *model.Data, s
 	limit := make(chan struct{}, 4)
 	for i, p := range existing {
 		wg.Go(func() {
+			sourceCtx := sourceContext(ctx, p)
+			sourceCtx, finished := syncdiag.Watch(sourceCtx, "database_load")
+			queued := time.Now()
 			limit <- struct{}{}
 			defer func() { <-limit }()
+			syncdiag.Log(sourceCtx, "database_queue_result", "elapsed_ms", stageMS(queued))
 			signature := databaseSignature(p)
 			part := empty(d.TurnsStart, d.TurnsEnd)
+			mode := "full"
+			started := time.Now()
+			defer func() {
+				syncdiag.Log(sourceCtx, "database_result", "elapsed_ms", stageMS(started), "mode", mode, "sessions", len(part.Sessions), "turns", len(part.Turns), "source_errors", len(part.Errors), "signature_saved", current[i] != "")
+				finished(sourceResultError(part))
+			}()
 			var cached databaseCache
 			if value, ok := parsedDatabases.Load(p); ok {
 				cached = value.(databaseCache)
 			}
-			if !refresh && previous != nil && a == model.Devin {
+			if previous != nil && a == model.Devin {
 				// Split the persisted agent snapshot by source, including hidden-session turns.
 				base := empty(previous.TurnsStart, previous.TurnsEnd)
 				prefix := filepath.Base(filepath.Dir(p)) + "/"
@@ -136,34 +161,54 @@ func loadDBs(d *model.Data, a model.Agent, refresh bool, previous *model.Data, s
 					}
 				}
 				cached = databaseCache{signatures[p], base}
-			} else if !refresh && previous != nil && len(existing) == 1 && a != model.Antigravity {
+			} else if previous != nil && len(existing) == 1 && a != model.Antigravity {
 				cached = databaseCache{signatures[p], *previous}
 			}
 			covered := cached.Data.TurnsStart <= d.TurnsStart && cached.Data.TurnsEnd >= min(d.TurnsEnd, time.Now().Unix())
-			if !refresh && covered && cached.Signature == signature {
+			var dbBytes, walBytes int64
+			if s, err := os.Stat(p); err == nil {
+				dbBytes = s.Size()
+			}
+			if s, err := os.Stat(p + "-wal"); err == nil {
+				walBytes = s.Size()
+			}
+			syncdiag.Log(sourceCtx, "database_cache_result", "has_baseline", cached.Signature != "", "range_covered", covered, "signature_match", cached.Signature == signature, "forced_rebuild", refresh && previous == nil, "db_bytes", dbBytes, "wal_bytes", walBytes)
+			if (!refresh || previous != nil) && covered && cached.Signature == signature {
+				mode = "unchanged"
 				part = filter(cached.Data, d.TurnsStart, d.TurnsEnd)
 			} else {
-				db, e := sqlite.Open(context.Background(), p, sqlite.OpenOptions{ReadOnly: true, BusyTimeout: time.Second})
+				_, opened := syncdiag.Watch(sourceCtx, "database_open")
+				db, e := sqlite.Open(ctx, p, sqlite.OpenOptions{ReadOnly: true, BusyTimeout: time.Second})
+				opened(e)
 				if e != nil {
 					fail(&part, a, fmt.Errorf("%s: %w", p, e))
 				} else {
 					switch a {
 					case model.Devin:
 						var baseline *model.Data
-						if !refresh && covered {
+						// An expired end still seeds the incremental watermark;
+						// manual reloads of changed sources must rebuild instead.
+						if !refresh && cached.Data.TurnsStart <= d.TurnsStart {
 							baseline = &cached.Data
+							if cached.Signature != "" {
+								mode = "incremental"
+							}
 						}
-						parseDevin(&part, db, filepath.Base(filepath.Dir(p)), baseline)
+						parseDevin(sourceCtx, &part, db, filepath.Base(filepath.Dir(p)), baseline)
 					case model.Antigravity:
-						parseAG(&part, db, strings.TrimSuffix(filepath.Base(p), ".db"))
+						parseAG(sourceCtx, &part, db, strings.TrimSuffix(filepath.Base(p), ".db"))
 					default:
-						parseSQLAgent(&part, a, db)
+						parseSQLAgent(sourceCtx, &part, a, db)
 					}
 					db.Close()
 				}
 			}
 			// Never persist a signature for a partial parse or a concurrent write.
-			if len(part.Errors) == 0 && databaseSignature(p) == signature {
+			stable := databaseSignature(p) == signature
+			if !stable {
+				syncdiag.Log(sourceCtx, "database_changed_during_read")
+			}
+			if len(part.Errors) == 0 && stable {
 				current[i] = signature
 				parsedDatabases.Store(p, databaseCache{signature, part})
 			}
@@ -186,9 +231,9 @@ func loadDBs(d *model.Data, a model.Agent, refresh bool, previous *model.Data, s
 	}
 	return out
 }
-func parseDevin(d *model.Data, db *sqlite.DB, source string, previous *model.Data) {
+func parseDevin(ctx context.Context, d *model.Data, db *sqlite.DB, source string, previous *model.Data) {
 	a := model.Devin
-	rows := query(d, a, db, "SELECT * FROM sessions ORDER BY last_activity_at DESC LIMIT 20001")
+	rows := query(ctx, d, a, db, "devin_sessions", "SELECT * FROM sessions ORDER BY last_activity_at DESC LIMIT 20001")
 	if len(rows) > 20000 {
 		fail(d, a, "session limit exceeded (20000)")
 		rows = rows[:20000]
@@ -270,16 +315,20 @@ func parseDevin(d *model.Data, db *sqlite.DB, source string, previous *model.Dat
 		active = append(active, id)
 		queryStart = min(queryStart, floor)
 	}
-	// Chunk the IN list below SQLite's parameter limit. LIKE avoids transferring
-	// large non-metric messages; metrics without ttft_ms remain valid calls.
+	syncdiag.Log(ctx, "devin_scan_plan", "sessions", len(rows), "active_sessions", len(active), "cached_turns", len(d.Turns), "batches", (len(active)+499)/500, "query_start", queryStart-86400, "query_end", d.TurnsEnd+7*86400, "incremental", previous != nil)
+	// Chunk the IN list below SQLite's parameter limit. Filter like Rust on
+	// "ttft_ms": every node carries a "metrics" key (null without usage), so
+	// matching it selected all rows and decoded every message body in Go. On
+	// real histories "ttft_ms" occurs exactly on nodes whose metrics is an
+	// object; a body that merely mentions it is still rejected below.
 	for offset := 0; offset < len(active); offset += 500 {
 		batch := active[offset:min(offset+500, len(active))]
 		marks := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
 		args := append(append([]any{}, batch...), queryStart-86400, d.TurnsEnd+7*86400)
-		sql := "SELECT rowid AS node_id, session_id, created_at, chat_message FROM message_nodes WHERE session_id IN (" + marks + ") AND created_at >= ? AND created_at < ? AND chat_message LIKE '%\"metrics\"%'"
+		sql := "SELECT rowid AS node_id, session_id, created_at, chat_message FROM message_nodes WHERE session_id IN (" + marks + ") AND created_at >= ? AND created_at < ? AND chat_message LIKE '%\"ttft_ms\"%'"
 		// Stream: each chat_message carries the whole message and tool output,
 		// so materializing the result set peaked at gigabytes.
-		each(d, a, db, sql, func(r obj) {
+		each(ctx, d, a, db, "devin_messages", sql, func(r obj) {
 			id := str(r["session_id"])
 			if !ids[id] {
 				return
@@ -316,10 +365,10 @@ func parseDevin(d *model.Data, db *sqlite.DB, source string, previous *model.Dat
 		}, args...)
 	}
 }
-func parseSQLAgent(d *model.Data, a model.Agent, db *sqlite.DB) {
+func parseSQLAgent(ctx context.Context, d *model.Data, a model.Agent, db *sqlite.DB) {
 	st, mt := "session", "message"
 	if a == model.OpenCode {
-		r := query(d, a, db, "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session_v2','session_message')")
+		r := query(ctx, d, a, db, "schema", "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session_v2','session_message')")
 		if len(r) == 2 {
 			st = "session_v2"
 			mt = "session_message"
@@ -327,7 +376,7 @@ func parseSQLAgent(d *model.Data, a model.Agent, db *sqlite.DB) {
 	}
 	sessions := map[string]*model.Session{}
 	parents := map[string]string{}
-	for _, r := range query(d, a, db, "SELECT * FROM "+st) {
+	for _, r := range query(ctx, d, a, db, "sessions", "SELECT * FROM "+st) {
 		id := str(r["id"])
 		s := session(a, id)
 		s.Title = str(r["title"])
@@ -357,7 +406,7 @@ func parseSQLAgent(d *model.Data, a model.Agent, db *sqlite.DB) {
 		sql = "SELECT * FROM model_usage WHERE status='completed' OR input_tokens>0 OR output_tokens>0"
 	}
 	// Stream: message rows carry full message bodies.
-	each(d, a, db, sql, func(r obj) {
+	each(ctx, d, a, db, "messages_or_usage", sql, func(r obj) {
 		id := root(str(r["session_id"]))
 		s := sessions[id]
 		if s == nil {
@@ -487,10 +536,10 @@ func blob(v any) []byte {
 	}
 	return []byte(str(v))
 }
-func parseAG(d *model.Data, db *sqlite.DB, id string) {
+func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id string) {
 	a := model.Antigravity
 	s := session(a, id)
-	for _, r := range query(d, a, db, "SELECT data FROM trajectory_metadata_blob WHERE id='main'") {
+	for _, r := range query(ctx, d, a, db, "trajectory_metadata", "SELECT data FROM trajectory_metadata_blob WHERE id='main'") {
 		b := blob(r["data"])
 		s.WorkingDirectory = strings.TrimPrefix(string(pb(b, 1, 1).b), "file://")
 		if s.WorkingDirectory == "" {
@@ -498,7 +547,7 @@ func parseAG(d *model.Data, db *sqlite.DB, id string) {
 		}
 		observe(s, int64(pb(b, 2, 1).v))
 	}
-	for _, r := range query(d, a, db, "SELECT step_payload FROM steps WHERE step_type=14 ORDER BY idx LIMIT 5") {
+	for _, r := range query(ctx, d, a, db, "title_steps", "SELECT step_payload FROM steps WHERE step_type=14 ORDER BY idx LIMIT 5") {
 		b := blob(r["step_payload"])
 		for _, path := range [][]uint64{{26, 3, 1}, {26, 2, 1}, {19, 3, 1}, {19, 2, 1}} {
 			if txt := string(pb(b, path...).b); txt != "" && s.Title == "" {
@@ -506,13 +555,13 @@ func parseAG(d *model.Data, db *sqlite.DB, id string) {
 			}
 		}
 	}
-	for _, r := range query(d, a, db, "SELECT data FROM gen_metadata ORDER BY idx") {
+	for _, r := range query(ctx, d, a, db, "generation_metadata", "SELECT data FROM gen_metadata ORDER BY idx") {
 		if m := string(pb(blob(r["data"]), 1, 19).b); m != "" {
 			s.SelectedModel = m
 		}
 	}
 	var full, fallback []model.Turn
-	for _, r := range query(d, a, db, "SELECT metadata FROM steps ORDER BY idx") {
+	for _, r := range query(ctx, d, a, db, "step_usage", "SELECT metadata FROM steps ORDER BY idx") {
 		b := blob(r["metadata"])
 		t := model.Turn{Agent: a, SessionKey: s.Key, CreatedAt: int64(pb(b, 1, 1).v)}
 		observe(s, t.CreatedAt)
