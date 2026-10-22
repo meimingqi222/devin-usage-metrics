@@ -1,7 +1,7 @@
 # Agent Usage Metrics
 
 主实现使用 Go 1.27.1+ 与固定版本的 `github.com/egoist/mygo` 原生 UI，不使用 WebView 或 cgo。
-迁移只替换技术栈：以 `src/main.rs`、`src/tray.rs` 为布局与视觉依据，保留原版尺寸、配色、信息层级及交互。已确认的有意改动不再回退：用量页概览以费用为首、附说明行，趋势图默认显示费用并可切换 Tokens / 不含缓存读取（`internal/desktop/usage.go`）。
+迁移只替换技术栈：以 `src/main.rs`、`src/tray.rs` 为布局与视觉依据，保留原版尺寸、配色、信息层级及交互。已确认的有意改动不再回退：用量页为四张卡片（费用、Token 总量、缓存命中与节省、模型 I/O）与带坐标轴、悬停明细的 Token 趋势图，可切换不含缓存读取 / 费用；配色无紫色（`internal/desktop/usage.go`）。
 `internal/desktop/host.go` 独占窗口、托盘、focus/close 和应用生命周期；界面内容不持有窗口句柄。
 业务状态与后台任务在 `internal/desktop/app.go`；后台通过事件队列交付结果，只在主线程更新界面状态。
 数据导入、定价、统计、配额、同步、压缩建议分别在 `internal/` 下的对应包；会话数据库只读。

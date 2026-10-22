@@ -30,6 +30,18 @@ type Bucket struct {
 	Input, Output, Cached, CacheWrite, Cost float64
 	Turns, Sessions                         int
 	ByModel                                 map[string]ModelUsage
+	// TokenCost is Cost for the turns priced from tokens; UncachedCost prices
+	// the same turns as if cache reads were new input. Recorded billing has
+	// no token prices to compare, so it is in neither.
+	TokenCost, UncachedCost float64
+}
+
+// CacheSavings is the share of the uncached price that cache reads saved.
+func (b Bucket) CacheSavings() float64 {
+	if b.UncachedCost <= 0 {
+		return 0
+	}
+	return 1 - b.TokenCost/b.UncachedCost
 }
 
 func (b Bucket) Total() float64 { return b.Input + b.Output + b.Cached + b.CacheWrite }
@@ -119,6 +131,14 @@ func Build(data model.Data, p Period, page int, agent model.Agent, device string
 			b.Cached += t.CacheReadTokens
 			b.CacheWrite += t.CacheCreationTokens
 			b.Cost += cost
+			if ok && t.RecordedCost == nil {
+				u := t
+				u.InputTokens += u.CacheReadTokens
+				u.CacheReadTokens = 0
+				uncached, _ := pricing.Cost(u, name)
+				b.TokenCost += cost
+				b.UncachedCost += uncached
+			}
 			b.Turns++
 			sets[j][id] = true
 			b.Sessions = len(sets[j])

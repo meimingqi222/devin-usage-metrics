@@ -54,6 +54,9 @@ func TestTotalsFiltersAdaptiveAndSessionIdentity(t *testing.T) {
 		if !b.ByModel["compactor"].Priced {
 			t.Fatal("recorded zero not priced")
 		}
+		if s := b.CacheSavings(); b.TokenCost <= 0 || s <= 0 || s >= 1 {
+			t.Fatalf("cache savings %v from %v of %v", s, b.TokenCost, b.UncachedCost)
+		}
 		if _, ok := b.ByModel["compactor(adaptive)"]; ok {
 			t.Fatal("internal routing label")
 		}

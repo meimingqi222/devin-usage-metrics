@@ -100,7 +100,7 @@ func TestDashboardFiltersAndSessionNavigation(t *testing.T) {
 	a := fixture(t)
 	tt := ui.NewTester(a.View, 1240, 780)
 	tt.SetScale(2)
-	if !tt.HasText("197.0K") {
+	if !tt.HasText("197.0") {
 		t.Fatalf("wrong total: %q", tt.Texts())
 	}
 	sidebar, ok := tt.Find("Sidebar")
@@ -324,12 +324,12 @@ func TestAgentSwitchKeepsLoadedDataUntilReload(t *testing.T) {
 		}
 	}
 	wait()
-	if !tt.HasText("168.0K") {
+	if !tt.HasText("168.0") {
 		t.Fatal("switching agent discarded the loaded snapshot")
 	}
 	click(t, tt, "Reload")
 	wait()
-	if tt.HasText("168.0K") || !tt.HasText("9") {
+	if tt.HasText("168.0") || !tt.HasText("9") {
 		t.Fatal("explicit reload failed to discover changed history")
 	}
 }
