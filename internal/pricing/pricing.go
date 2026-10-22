@@ -67,6 +67,7 @@ func (p Price) Total(input, output, cached, write float64) float64 {
 
 var mu sync.RWMutex
 var api, pro, legacy map[string]Price
+var catalogRevision uint64
 
 func init() {
 	api = embedded("models-dev-pricing.json")
@@ -190,21 +191,34 @@ func Cost(t model.Turn, fallbackModel string) (float64, bool) {
 	if t.RecordedCost != nil && valid(*t.RecordedCost) {
 		return *t.RecordedCost, true
 	}
-	s := t.Model
-	if s == "" {
-		s = fallbackModel
+	p, ok := resolve(t.Agent, costModel(t, fallbackModel))
+	return costWithPrice(t, p, ok)
+}
+
+func costModel(t model.Turn, fallback string) string {
+	if t.Model != "" {
+		return t.Model
 	}
-	s = strings.ToLower(strings.TrimSpace(s))
+	return fallback
+}
+
+func resolve(agent model.Agent, name string) (Price, bool) {
 	mu.RLock()
 	defer mu.RUnlock()
+	return resolveLocked(agent, name)
+}
+
+// Caller holds mu; catalog replacement and lookup share the same lock.
+func resolveLocked(agent model.Agent, name string) (Price, bool) {
+	s := strings.ToLower(strings.TrimSpace(name))
 	var p Price
 	var ok bool
-	if t.Agent == model.Devin {
+	if agent == model.Devin {
 		p, ok = devin(s)
 	} else {
 		p, ok = lookup(api, s)
 	}
-	if !ok && t.Agent == model.Antigravity && strings.HasPrefix(s, "gemini-3.8-flash-") {
+	if !ok && agent == model.Antigravity && strings.HasPrefix(s, "gemini-3.8-flash-") {
 		suffix := strings.TrimPrefix(s, "gemini-3.8-flash-")
 		restricted := suffix == ""
 		for _, f := range []string{"lite", "tts", "cyber"} {
@@ -214,6 +228,10 @@ func Cost(t model.Turn, fallbackModel string) (float64, bool) {
 			p, ok = lookup(api, "gemini-3.8-flash")
 		}
 	}
+	return p, ok
+}
+
+func costWithPrice(t model.Turn, p Price, ok bool) (float64, bool) {
 	if !ok {
 		return 0, false
 	}

@@ -105,6 +105,8 @@ func materializedBytes(row []any) int64 {
 			n += int64(len(v))
 		case []byte:
 			n += int64(len(v))
+		case sqlite.BorrowedText:
+			n += int64(len(v))
 		}
 	}
 	return n

@@ -1,0 +1,5 @@
+--- FAIL: TestExistingImmutableUploadDoesNotTouchDirectory (0.02s)
+    performance_test.go:59: rejected upload created/deleted a temporary file
+FAIL
+exit status 1
+FAIL	github.com/meimingqi222/devin-usage-metrics/sync-server	0.345s

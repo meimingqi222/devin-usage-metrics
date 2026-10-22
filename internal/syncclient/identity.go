@@ -23,9 +23,12 @@ func slug(a model.Agent) string {
 func sessionID(s model.Session) string {
 	return hash([]byte("session-v1\x00" + s.DeviceID + "\x00" + slug(s.Agent) + "\x00" + s.Key))
 }
+
+var v3AgentNames = map[model.Agent]string{model.Devin: "Devin", "amp": "Amp", model.Claude: "Claude", model.Codex: "Codex", model.Antigravity: "Antigravity", model.Grok: "Grok", model.ZCode: "ZCode", model.OpenCode: "OpenCode", model.Pi: "Pi", model.MimoCode: "MimoCode", model.WorkBuddy: "WorkBuddy"}
+
 func v3SessionID(s model.Session) string {
-	names := map[model.Agent]string{model.Devin: "Devin", "amp": "Amp", model.Claude: "Claude", model.Codex: "Codex", model.Antigravity: "Antigravity", model.Grok: "Grok", model.ZCode: "ZCode", model.OpenCode: "OpenCode", model.Pi: "Pi", model.MimoCode: "MimoCode", model.WorkBuddy: "WorkBuddy"}
-	return hash([]byte("session-v1\x00" + s.DeviceID + "\x00" + names[s.Agent] + "\x00" + s.Key))
+
+	return hash([]byte("session-v1\x00" + s.DeviceID + "\x00" + v3AgentNames[s.Agent] + "\x00" + s.Key))
 }
 
 // turnIdentity holds exactly the fields turnID encodes, so two turns have

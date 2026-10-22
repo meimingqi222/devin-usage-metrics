@@ -212,6 +212,8 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 	}
 	m := manifest{Protocol: 3, Schema: 1, DeviceID: id, DeviceName: host, Created: now, Parent: parent, Retained: retained, Start: start, End: end, Blocks: []reference{}, Sessions: []reference{}, SessionCount: len(sessions), TurnCount: len(turns)}
 	objects := map[string][]byte{}
+	var compressor blockCompressor
+	defer compressor.close()
 	var encodeTurns func([]model.Turn, string, int) error
 	encodeTurns = func(values []model.Turn, fingerprint string, part int) error {
 		b, e := json.Marshal(struct {
@@ -222,7 +224,7 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 		if e != nil {
 			return e
 		}
-		z, e := compress(b)
+		z, e := compressor.compress(b)
 		if e != nil {
 			return e
 		}
@@ -252,7 +254,7 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 		if e != nil {
 			return e
 		}
-		z, e := compress(b)
+		z, e := compressor.compress(b)
 		if e != nil {
 			return e
 		}
@@ -289,10 +291,11 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 		if e != nil {
 			return e
 		}
+		fingerprint := hash(b)
 		reused := []reference{}
 		count := 0
 		for _, r := range prior.Blocks {
-			if r.Agent == v[0].Agent && r.Day == day(v[0].CreatedAt) && r.ContentHash == hash(b) {
+			if r.Agent == v[0].Agent && r.Day == day(v[0].CreatedAt) && r.ContentHash == fingerprint {
 				reused = append(reused, r)
 				count += r.Turns
 			}
@@ -302,7 +305,7 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 			continue
 		}
 		first := len(m.Blocks)
-		if e = encodeTurns(v, hash(b), 0); e != nil {
+		if e = encodeTurns(v, fingerprint, 0); e != nil {
 			return e
 		}
 		for index := first; index < len(m.Blocks); index++ {
@@ -310,15 +313,16 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 		}
 	}
 	for _, v := range sgroups {
-		sort.Slice(v, func(i, j int) bool { return v3SessionID(v[i]) < v3SessionID(v[j]) })
+		sortPublishSessions(v)
 		b, e := json.Marshal(v)
 		if e != nil {
 			return e
 		}
+		fingerprint := hash(b)
 		reused := []reference{}
 		count := 0
 		for _, r := range prior.Sessions {
-			if r.Day == day(max(v[0].CreatedAt, v[0].LastActivityAt)) && r.ContentHash == hash(b) {
+			if r.Day == day(max(v[0].CreatedAt, v[0].LastActivityAt)) && r.ContentHash == fingerprint {
 				reused = append(reused, r)
 				count += r.Sessions
 			}
@@ -327,7 +331,7 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 			m.Sessions = append(m.Sessions, reused...)
 			continue
 		}
-		if e = encodeSessions(v, hash(b)); e != nil {
+		if e = encodeSessions(v, fingerprint); e != nil {
 			return e
 		}
 	}

@@ -544,6 +544,14 @@ func (s *server) write(w http.ResponseWriter, r *http.Request, path string) {
 		http.Error(w, "object content does not match its name", http.StatusBadRequest)
 		return
 	}
+	// A validated immutable upload can already be known to fail its create-only
+	// condition. Avoid writing/fsyncing a temporary copy merely to return 412.
+	// New uploads and repairs still recheck conditions under the final rename lock.
+	if _, immutable := contentAddressed(filepath.Base(path)); immutable && r.Header.Get("If-None-Match") == "*" {
+		if s.rejectExistingImmutable(w, r, path) {
+			return
+		}
+	}
 	// Write and fsync outside the tenant lock so parallel uploads overlap;
 	// the lock covers only the precondition, quota and the atomic rename.
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -622,6 +630,32 @@ func (s *server) write(w http.ResponseWriter, r *http.Request, path string) {
 	}
 	w.Header().Set("ETag", etag)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// Called after validating the incoming body. Always return the stored hash,
+// including for a damaged object, so clients can perform their normal repair.
+func (s *server) rejectExistingImmutable(w http.ResponseWriter, r *http.Request, path string) bool {
+	state := s.tenantState(filepath.Base(filepath.Dir(path)))
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if err != nil {
+		http.Error(w, "read object", http.StatusInternalServerError)
+		return true
+	}
+	_, current, err := s.conditionsMatch(r, path, info, true)
+	if err != nil {
+		http.Error(w, "read object", http.StatusInternalServerError)
+		return true
+	}
+	if current != "" {
+		w.Header().Set("ETag", current)
+	}
+	http.Error(w, "precondition failed", http.StatusPreconditionFailed)
+	return true
 }
 
 // syncDir makes a completed rename durable where the platform allows it.

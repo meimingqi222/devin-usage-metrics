@@ -23,6 +23,9 @@ import (
 
 type OpenOptions struct {
 	ReadOnly bool
+	// InterleavedReads uses 64 KiB blocks with an 8 MiB budget for read-only
+	// scans alternating between distant index and payload pages.
+	InterleavedReads bool
 	// BusyTimeout bounds waits for a writer's lock (default 5s, like the plugin).
 	BusyTimeout time.Duration
 }
@@ -95,6 +98,9 @@ func Open(ctx context.Context, path string, opts OpenOptions) (*DB, error) {
 		if file, err := conn.FileControl("main", sqlite3.FCNTL_FILE_POINTER); err == nil {
 			if f, ok := file.(vfs.File); ok {
 				db.reader, _ = vfsutil.UnwrapFile[*readFile](f)
+				if db.reader != nil && opts.InterleavedReads {
+					db.reader.useInterleavedReadAhead()
+				}
 			}
 		}
 	}
@@ -149,17 +155,41 @@ func (d *DB) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
 // result sets never sit in memory at once. fn must not keep row; an error from
 // fn aborts the statement and is returned.
 func (d *DB) Each(ctx context.Context, sql string, fn func(columns []string, row []any) error, args ...any) error {
+	return d.each(ctx, sql, "", fn, args...)
+}
+
+// BorrowedText is read-only SQLite-owned text, valid only inside the EachBorrowedText
+// callback. Copy it before retaining it. Other column storage classes are unchanged.
+type BorrowedText []byte
+
+// EachBorrowedText avoids copying one large TEXT column. It retrieves that column
+// last so no subsequent statement method can invalidate it before fn returns.
+func (d *DB) EachBorrowedText(ctx context.Context, sql, textColumn string, fn func(columns []string, row []any) error, args ...any) error {
+	return d.each(ctx, sql, textColumn, fn, args...)
+}
+
+func (d *DB) each(ctx context.Context, sql, textColumn string, fn func(columns []string, row []any) error, args ...any) error {
 	var columns []string
+	borrowed := -1
 	return d.run(ctx, sql, args, func(s *sqlite3.Stmt) error {
 		if columns == nil {
 			columns = make([]string, s.ColumnCount())
 			for i := range columns {
 				columns[i] = s.ColumnName(i)
+				if textColumn != "" && columns[i] == textColumn {
+					borrowed = i
+				}
 			}
 		}
 		row := make([]any, len(columns))
+		borrowText := borrowed >= 0 && s.ColumnType(borrowed) == sqlite3.TEXT
 		for i := range row {
-			row[i] = column(s, i)
+			if !borrowText || i != borrowed {
+				row[i] = column(s, i)
+			}
+		}
+		if borrowText {
+			row[borrowed] = BorrowedText(s.ColumnRawText(borrowed))
 		}
 		return fn(columns, row)
 	})

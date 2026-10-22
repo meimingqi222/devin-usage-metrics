@@ -40,6 +40,7 @@ func loadSessionUI() sessionsUIState {
 	return s
 }
 func (a *App) saveSessionUI() {
+	a.sessionList.valid = false
 	keys := []string{}
 	for key, v := range a.sessionsUI.hidden {
 		if v {
@@ -111,6 +112,7 @@ func (a *App) sessionUsage(s model.Session) sessionUsage {
 		for _, session := range d.Sessions {
 			models[sessionIdentity{session.Agent, session.DeviceID, session.Key}] = session.DisplayModel()
 		}
+		var calculator pricing.Calculator
 		for _, turn := range d.Turns {
 			key := sessionIdentity{turn.Agent, turn.DeviceID, turn.SessionKey}
 			usage := a.sessionCosts[key]
@@ -118,7 +120,7 @@ func (a *App) sessionUsage(s model.Session) sessionUsage {
 			if turn.TTFTMs > 0 {
 				usage.ttft = append(usage.ttft, turn.TTFTMs)
 			}
-			if v, ok := pricing.Cost(turn, models[key]); ok {
+			if v, ok := calculator.Cost(turn, models[key]); ok {
 				usage.cost += v
 				usage.priced++
 			}
@@ -139,11 +141,26 @@ func (a *App) sessionCostText(s model.Session) string {
 	return trayMoney(cost)
 }
 
-func (a *App) sessionsView(c *ui.Context) {
+type sessionListCache struct {
+	valid                     bool
+	search, device            string
+	showHidden, hideSubagents bool
+	sessions                  []model.Session
+	hasModes                  bool
+	reviews                   int
+}
+
+func (a *App) visibleSessions() ([]model.Session, bool, int) {
+	d := a.allData()
+	cache := &a.sessionList
+	if cache.valid && cache.search == a.search && cache.device == a.device && cache.showHidden == a.sessionsUI.showHidden && cache.hideSubagents == a.sessionsUI.hideSubagents {
+		return cache.sessions, cache.hasModes, cache.reviews
+	}
+	search := strings.ToLower(strings.TrimSpace(a.search))
 	var sessions []model.Session
 	hasModes := false
 	reviews := 0
-	for _, s := range a.allData().Sessions {
+	for _, s := range d.Sessions {
 		if s.Agent != a.agent || (a.device != "" && s.DeviceID != a.device) {
 			continue
 		}
@@ -157,13 +174,22 @@ func (a *App) sessionsView(c *ui.Context) {
 		if !a.sessionsUI.showHidden && a.sessionsUI.hideSubagents && subagent(s) {
 			continue
 		}
-		if !strings.Contains(strings.ToLower(s.Title+" "+s.ID+" "+s.WorkingDirectory+" "+s.DisplayModel()), strings.ToLower(strings.TrimSpace(a.search))) {
+		if search != "" && !strings.Contains(strings.ToLower(s.Title+" "+s.ID+" "+s.WorkingDirectory+" "+s.DisplayModel()), search) {
 			continue
 		}
 		sessions = append(sessions, s)
 	}
 	sort.Slice(sessions, func(i, j int) bool { return sessions[i].LastActivityAt > sessions[j].LastActivityAt })
-	sessions = sessions[:min(500, len(sessions))]
+	if len(sessions) > 500 {
+		// Do not retain every filtered row behind the visible 500-row slice.
+		sessions = append([]model.Session(nil), sessions[:500]...)
+	}
+	*cache = sessionListCache{valid: true, search: a.search, device: a.device, showHidden: a.sessionsUI.showHidden, hideSubagents: a.sessionsUI.hideSubagents, sessions: sessions, hasModes: hasModes, reviews: reviews}
+	return sessions, hasModes, reviews
+}
+
+func (a *App) sessionsView(c *ui.Context) {
+	sessions, hasModes, reviews := a.visibleSessions()
 	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 		ui.TextInput(c, &a.search).Width(240).Height(28).FontSize(12).Radius(6).Background(ui.Hex("#101014")).Border(1, c.Theme().Border).Placeholder(a.t("Search title, ID, path, model...", "搜索标题、ID、路径、模型...")).Label(a.t("Search sessions", "搜索会话"))
 		group := a.t("Flat List", "时间平铺")

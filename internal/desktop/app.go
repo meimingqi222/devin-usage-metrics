@@ -74,12 +74,15 @@ type App struct {
 	compactionUI                               compactionState
 	chartMode                                  int
 	sessionCosts                               map[sessionIdentity]sessionUsage
+	sessionList                                sessionListCache
 	usageCache                                 struct {
-		period  analytics.Period
-		page    int
-		device  string
-		start   int64
-		buckets []analytics.Bucket
+		period   analytics.Period
+		page     int
+		device   string
+		start    int64
+		buckets  []analytics.Bucket
+		total    analytics.Bucket
+		sessions int
 	}
 }
 
@@ -260,6 +263,7 @@ func (a *App) allData() model.Data {
 	d.Turns = append(append([]model.Turn(nil), d.Turns...), a.remote.Turns...)
 	a.cachedData, a.cachedKey = &d, key
 	a.sessionCosts = nil
+	a.sessionList.valid = false
 	a.usageCache.buckets = nil
 	return d
 }

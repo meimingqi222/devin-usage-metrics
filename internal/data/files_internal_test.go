@@ -1,6 +1,7 @@
 package data
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -99,7 +100,7 @@ func TestSlimKeepsTitlesAndBlankness(t *testing.T) {
 	}
 }
 
-func TestDecodedCacheEvictsLeastRecentlyModifiedBeyondBudget(t *testing.T) {
+func TestDecodedCacheEvictsLeastRecentlyUsedBeyondBudget(t *testing.T) {
 	half := int64(decodedBudget/2 + 1)
 	rememberDecoded("/old.jsonl", lineCache{Mtime: 1, Weight: half})
 	rememberDecoded("/new.jsonl", lineCache{Mtime: 2, Weight: half})
@@ -115,5 +116,95 @@ func TestDecodedCacheEvictsLeastRecentlyModifiedBeyondBudget(t *testing.T) {
 	decodedWeight.Unlock()
 	if total > decodedBudget {
 		t.Fatalf("cache weight %d exceeds budget", total)
+	}
+}
+
+func TestDecodedAppendAndRewrite(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "s.jsonl")
+	t.Cleanup(func() { forgetDecoded(p) })
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(p, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func() []obj {
+		t.Helper()
+		d := empty(0, 200)
+		lines := readLines(&d, model.Pi, p, false)
+		if len(d.Errors) != 0 {
+			t.Fatalf("read errors: %v", d.Errors)
+		}
+		return lines
+	}
+	// Keep the old tail identical when rewriting the first record.
+	body := "{\"timestamp\":1}\n" + strings.Repeat("{}\n", 2000)
+	write(body)
+	first := read()
+	pointer := reflect.ValueOf(first[0]).Pointer()
+	write(body + "{\"timestamp\":2}\n")
+	appended := read()
+	if len(appended) != len(first)+1 || reflect.ValueOf(appended[0]).Pointer() != pointer {
+		t.Fatal("append did not retain old decoded records")
+	}
+	if len(first) != 2001 {
+		t.Fatal("append mutated the previous result")
+	}
+	write(strings.Replace(body, `"timestamp":1`, `"timestamp":3`, 1) + "{\"timestamp\":2}\n{\"timestamp\":4}\n")
+	rewritten := read()
+	if rewritten[0]["timestamp"] != float64(3) || len(rewritten) != len(first)+2 {
+		t.Fatal("matching tail hid a rewritten prefix")
+	}
+	// An incomplete final record must be re-decoded when its suffix arrives.
+	write("{\"timestamp\":5}")
+	read()
+	write("{\"timestamp\":5}\n{\"timestamp\":6}\n")
+	if got := read(); len(got) != 2 || got[1]["timestamp"] != float64(6) {
+		t.Fatal("unterminated final line was reused")
+	}
+}
+
+func TestDecodeAheadReportsMissingTranscripts(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "missing.jsonl")
+	r := decodeAhead(context.Background(), model.Claude, []string{p}, 0, 200, false)(0)
+	if len(r.part.Errors) == 0 {
+		t.Fatal("missing transcript was silently ignored")
+	}
+	r = decodeAhead(context.Background(), model.Grok, []string{p}, 0, 200, false)(0)
+	if !r.missing || len(r.part.Errors) != 0 {
+		t.Fatal("optional Grok log is not optional")
+	}
+}
+
+func TestDecodedCacheKeepsRecentlyReadHistory(t *testing.T) {
+	paths := []string{"/lru-a.jsonl", "/lru-b.jsonl", "/lru-c.jsonl"}
+	t.Cleanup(func() {
+		for _, p := range paths {
+			forgetDecoded(p)
+		}
+	})
+	weight := int64(decodedBudget/3 + 1)
+	rememberDecoded(paths[0], lineCache{Mtime: 1, Weight: weight})
+	rememberDecoded(paths[1], lineCache{Mtime: 100, Weight: weight})
+	cachedDecoded(paths[0])
+	rememberDecoded(paths[2], lineCache{Mtime: 200, Weight: weight})
+	if _, ok := decodedFiles.Load(paths[0]); !ok {
+		t.Fatal("recently read old history was evicted")
+	}
+	if _, ok := decodedFiles.Load(paths[1]); ok {
+		t.Fatal("unused newer history stayed cached")
+	}
+}
+
+func TestOversizedDecodedFileDoesNotFlushCache(t *testing.T) {
+	p, huge := "/hot.jsonl", "/oversized.jsonl"
+	t.Cleanup(func() { forgetDecoded(p); forgetDecoded(huge) })
+	rememberDecoded(p, lineCache{Mtime: 1, Weight: 1024})
+	rememberDecoded(huge, lineCache{Mtime: 2, Weight: decodedBudget + 1})
+	if _, ok := decodedFiles.Load(p); !ok {
+		t.Fatal("oversized source flushed useful history")
+	}
+	if _, ok := decodedFiles.Load(huge); ok {
+		t.Fatal("oversized source exceeded the cache budget")
 	}
 }

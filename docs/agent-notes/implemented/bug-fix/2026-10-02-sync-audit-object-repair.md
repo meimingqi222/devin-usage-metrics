@@ -30,3 +30,9 @@ Audited objects can recover without changing record identities. Repair requires 
 Proved: Temporarily disabling the repair source made this test fail on the missing block. Restoring it passes missing, corrupt and oversized object cases for both turns and sessions; read-only checks still fail.
 
 Go proof: disabling the audit, the manifest repair source, and the 412 ETag check each failed its bound assertion (missing referenced block, manifest hash mismatch, existing objects downloaded); all restored and rerun green. Output saved to `docs/agent-notes-evidence/go-sync-audit-red.txt`.
+
+Server duplicate-upload refinement: after body/name hash validation, create-only immutable PUT checks the existing object under the tenant lock before writing a temporary file. A rejection returns the stored ETag (including damaged content), not the name hash. Missing objects and If-Match repairs retain the final locked CAS and quota checks after fsync. This avoids redundant disk writes without weakening repair semantics.
+
+- `sync-server/performance_test.go::TestExistingImmutableUploadDoesNotTouchDirectory`
+
+Proved: disabling the early check failed the directory-mtime assertion because rejected uploads created and deleted temporary files; the restored production path passed, including damage, repair and invalid-body cases. Evidence: `docs/agent-notes-evidence/server-duplicate-upload-red.txt`.

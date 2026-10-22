@@ -1,0 +1,10 @@
+--- FAIL: TestDecodedCacheKeepsRecentlyReadHistory (0.00s)
+    files_internal_test.go:192: recently read old history was evicted
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/data	0.372s
+FAIL
+--- FAIL: TestOversizedDecodedFileDoesNotFlushCache (0.00s)
+    files_internal_test.go:205: oversized source flushed useful history
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/data	0.356s
+FAIL

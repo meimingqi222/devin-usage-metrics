@@ -15,7 +15,7 @@ The Go Reload button called `data.Load(..., true)`, rebuilding all local history
 
 ## Alternatives considered
 
-Increasing decoded JSONL retention from 128 MiB to 384 MiB risks undoing the importer memory fix. Append-tail and per-file reuse experiments did not reliably detect in-place history rewrites and cross-file accounting changes. Parallel database scans did not provide a consistent cold-load improvement. These experiments are excluded; the existing bounded decoded cache and parser accounting remain unchanged.
+Increasing decoded JSONL retention from 128 MiB to 384 MiB risks undoing the importer memory fix. Tail-only append validation did not reliably detect in-place history rewrites. File append reuse now hashes the complete old prefix through the same open descriptor used for reading the suffix; incomplete final lines and prior errors force full decoding. Global ordered accounting still reruns, preserving cross-file deduplication. Parallel database scans did not provide a consistent cold-load improvement. Parallel database scans remain excluded. The bounded decoded cache now uses access recency and Claude field projection; see `2026-10-22-go-importer-memory.md`.
 
 ## Consequences
 

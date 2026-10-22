@@ -12,18 +12,19 @@ import (
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 )
 
-func (a *App) usageView(c *ui.Context) {
+// usageData caches all overview aggregates with the bucket data. Mouse hover
+// and chart-mode redraws must not rescan the full turn history.
+func (a *App) usageData(now time.Time) (time.Time, time.Time) {
 	d := a.allData()
-	now := time.Now()
 	start, end := analytics.Window(a.period, a.page, now)
 	cache := &a.usageCache
-	if cache.buckets == nil || cache.period != a.period || cache.page != a.page || cache.device != a.device || cache.start != start.Unix() {
-		cache.buckets = analytics.Build(d, a.period, a.page, a.agent, a.device, now)
-		cache.period, cache.page, cache.device, cache.start = a.period, a.page, a.device, start.Unix()
+	if cache.buckets != nil && cache.period == a.period && cache.page == a.page && cache.device == a.device && cache.start == start.Unix() {
+		return start, end
 	}
-	bs := cache.buckets
+	cache.buckets = analytics.Build(d, a.period, a.page, a.agent, a.device, now)
+	cache.period, cache.page, cache.device, cache.start = a.period, a.page, a.device, start.Unix()
 	var total analytics.Bucket
-	for _, b := range bs {
+	for _, b := range cache.buckets {
 		total.Input += b.Input
 		total.Output += b.Output
 		total.Cached += b.Cached
@@ -33,14 +34,21 @@ func (a *App) usageView(c *ui.Context) {
 		total.UncachedCost += b.UncachedCost
 		total.Turns += b.Turns
 	}
-	sessions := map[string]bool{}
+	sessions := map[sessionIdentity]bool{}
 	for _, t := range d.Turns {
 		if t.Agent == a.agent && (a.device == "" || a.device == t.DeviceID) && t.CreatedAt >= start.Unix() && t.CreatedAt < end.Unix() {
-			sessions[t.DeviceID+"/"+t.SessionKey] = true
+			sessions[sessionIdentity{t.Agent, t.DeviceID, t.SessionKey}] = true
 		}
 	}
+	cache.total, cache.sessions = total, len(sessions)
+	return start, end
+}
+
+func (a *App) usageView(c *ui.Context) {
+	start, end := a.usageData(time.Now())
+	bs, total := a.usageCache.buckets, a.usageCache.total
 	a.usageHeader(c, start, end)
-	a.usageSummary(c, total, len(sessions))
+	a.usageSummary(c, total, a.usageCache.sessions)
 	if total.Turns == 0 {
 		ui.Text(c, a.t("No usage in this period. Select another agent or previous period.", "此周期没有用量，请切换 Agent 或查看上一周期。")).FontSize(12).TextColor(c.Theme().TextMuted).Padding(8, 12).Background(c.Theme().Surface).Border(1, c.Theme().Border).Radius(6)
 	}

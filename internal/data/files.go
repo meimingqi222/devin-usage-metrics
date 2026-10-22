@@ -2,13 +2,18 @@ package data
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"hash"
+	"io"
 	"maps"
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -195,23 +200,51 @@ type lineCache struct {
 	Errors []error
 	// Weight estimates the decoded lines' memory for the cache budget.
 	Weight int64
+	// Digest verifies the old prefix before decoding only appended bytes.
+	Digest          []byte
+	EndsWithNewline bool
+	access          uint64
+}
+
+// appendHash verifies the entire old prefix before reusing decoded records.
+// A matching tail alone cannot detect a rewrite near the start of the file.
+func appendHash(f *os.File, c lineCache, size int64) hash.Hash {
+	if c.Size <= 0 || size <= c.Size || len(c.Errors) != 0 || !c.EndsWithNewline {
+		return nil
+	}
+	h := sha256.New()
+	if n, err := io.CopyBuffer(h, io.NewSectionReader(f, 0, c.Size), make([]byte, 1<<20)); err != nil || n != c.Size || !bytes.Equal(h.Sum(nil), c.Digest) {
+		return nil
+	}
+	return h
 }
 
 var decodedFiles sync.Map
 
 // decodedBudget caps the decoded-transcript cache. Beyond it the files
-// modified longest ago are dropped and decoded again on the next reload:
+// used longest ago are dropped and decoded again on the next reload:
 // a large history otherwise kept over a gigabyte resident in the tray app.
 const decodedBudget = 128 << 20
 
 var decodedWeight struct {
 	sync.Mutex
 	total int64
+	clock uint64
 }
 
 func rememberDecoded(p string, c lineCache) (evicted int) {
 	decodedWeight.Lock()
 	defer decodedWeight.Unlock()
+	// One oversized source must not evict every useful cached source, then
+	// remain over budget itself. Its prefetched result still reaches accounting.
+	if c.Weight > decodedBudget {
+		if old, ok := decodedFiles.LoadAndDelete(p); ok {
+			decodedWeight.total -= old.(lineCache).Weight
+		}
+		return
+	}
+	decodedWeight.clock++
+	c.access = decodedWeight.clock
 	if old, ok := decodedFiles.Swap(p, c); ok {
 		decodedWeight.total -= old.(lineCache).Weight
 	}
@@ -220,18 +253,19 @@ func rememberDecoded(p string, c lineCache) (evicted int) {
 		return
 	}
 	type entry struct {
-		path         string
-		mtime, bytes int64
+		path   string
+		access uint64
+		bytes  int64
 	}
 	var all []entry
 	decodedFiles.Range(func(key, value any) bool {
 		if key != p {
 			v := value.(lineCache)
-			all = append(all, entry{key.(string), v.Mtime, v.Weight})
+			all = append(all, entry{key.(string), v.access, v.Weight})
 		}
 		return true
 	})
-	sort.Slice(all, func(i, j int) bool { return all[i].mtime < all[j].mtime })
+	sort.Slice(all, func(i, j int) bool { return all[i].access < all[j].access })
 	for _, e := range all {
 		if decodedWeight.total <= decodedBudget {
 			break
@@ -241,6 +275,22 @@ func rememberDecoded(p string, c lineCache) (evicted int) {
 		evicted++
 	}
 	return
+}
+
+// cachedDecoded updates recency on reads too: old history can be hot when the
+// user revisits an agent after another agent's background collection.
+func cachedDecoded(p string) (lineCache, bool) {
+	decodedWeight.Lock()
+	defer decodedWeight.Unlock()
+	value, ok := decodedFiles.Load(p)
+	if !ok {
+		return lineCache{}, false
+	}
+	c := value.(lineCache)
+	decodedWeight.clock++
+	c.access = decodedWeight.clock
+	decodedFiles.Store(p, c)
+	return c, true
 }
 
 func forgetDecoded(p string) {
@@ -336,20 +386,20 @@ func readLinesContext(ctx context.Context, d *model.Data, a model.Agent, p strin
 	stats, _ := ctx.Value(decodeStatsKey{}).(*decodeStats)
 	mode, reason := "error", "stat_failed"
 	var cached lineCache
-	var inputBytes, sourceBytes int64
+	var inputBytes, sourceBytes, decodedLines int64
 	var diagnosticErr error
 	defer func() {
 		if stats != nil {
 			switch mode {
 			case "hit":
 				stats.hits.Add(1)
-			case "decode":
+			case "decode", "append":
 				stats.misses.Add(1)
 				stats.bytes.Add(inputBytes)
-				stats.lines.Add(int64(len(cached.Lines)))
+				stats.lines.Add(decodedLines)
 			}
 		}
-		if syncdiag.HasRun(ctx) && (diagnosticErr != nil || time.Since(started) >= 100*time.Millisecond || mode == "decode" && sourceBytes >= 1<<20) {
+		if syncdiag.HasRun(ctx) && (diagnosticErr != nil || time.Since(started) >= 100*time.Millisecond || mode != "hit" && inputBytes >= 1<<20) {
 			syncdiag.Log(ctx, "file_read_result", "mode", mode, "reason", reason, "elapsed_ms", stageMS(started), "file_bytes", sourceBytes, "decoded_input_bytes", inputBytes, "lines", len(cached.Lines), "error", syncdiag.ErrorCode(diagnosticErr))
 		}
 	}()
@@ -361,50 +411,97 @@ func readLinesContext(ctx context.Context, d *model.Data, a model.Agent, p strin
 	}
 	sourceBytes = info.Size()
 	d.FileMtimes[p] = info.ModTime().UnixNano()
-	value, ok := decodedFiles.Load(p)
-	cached, _ = value.(lineCache)
+	cached, ok := cachedDecoded(p)
 	mode, reason = "hit", "unchanged"
 	if refresh || !ok || cached.Mtime != info.ModTime().UnixNano() || cached.Size != info.Size() {
 		mode = "decode"
-		switch {
-		case refresh:
-			reason = "forced_rebuild"
-		case !ok:
-			reason = "decoded_cache_miss"
-		default:
-			reason = "source_changed"
-		}
-		if syncdiag.HasRun(ctx) && sourceBytes >= 1<<20 {
-			_, finished := syncdiag.Watch(ctx, "file_decode")
-			defer func() { finished(diagnosticErr) }()
-		}
-		cached = lineCache{Mtime: info.ModTime().UnixNano(), Size: info.Size()}
 		f, e := os.Open(p)
 		if e != nil {
 			diagnosticErr = e
 			fail(d, a, e)
 			return nil
 		}
-		scan := bufio.NewScanner(f)
+		defer f.Close()
+		// Verify the prefix and read the suffix through the same descriptor,
+		// even if the path is replaced while a collection is running.
+		info, e = f.Stat()
+		if e != nil {
+			diagnosticErr = e
+			fail(d, a, e)
+			return nil
+		}
+		sourceBytes = info.Size()
+		d.FileMtimes[p] = info.ModTime().UnixNano()
+		var offset int64
+		h := sha256.New()
+		var prefix hash.Hash
+		if !refresh && ok {
+			prefix = appendHash(f, cached, info.Size())
+		}
+		switch {
+		case refresh:
+			reason = "forced_rebuild"
+		case !ok:
+			reason = "decoded_cache_miss"
+		case prefix != nil:
+			// Transcripts are append-only while a session runs: keep the
+			// decoded lines and decode only what was added.
+			mode, reason, offset = "append", "source_appended", cached.Size
+			h = prefix
+		default:
+			reason = "source_changed"
+		}
+		if syncdiag.HasRun(ctx) && sourceBytes-offset >= 1<<20 {
+			_, finished := syncdiag.Watch(ctx, "file_decode")
+			defer func() { finished(diagnosticErr) }()
+		}
+		next := lineCache{Mtime: info.ModTime().UnixNano(), Size: info.Size()}
+		if offset > 0 {
+			// Clip so appending never writes into a slice other loads share.
+			next.Lines = slices.Clip(cached.Lines)
+			next.Errors = slices.Clip(cached.Errors)
+			next.Weight = cached.Weight
+		}
+		// Read exactly the stat'ed size, so Digest and Size describe the same
+		// bytes even while a writer appends.
+		r := io.NewSectionReader(f, offset, info.Size()-offset)
+		scan := bufio.NewScanner(io.TeeReader(r, h))
 		scan.Buffer(make([]byte, 65536), 64*1024*1024)
-		for order := 1; scan.Scan(); order++ {
-			inputBytes += int64(len(scan.Bytes()))
+		for order := len(next.Lines) + 1; scan.Scan(); order++ {
+			raw := scan.Bytes()
+			decodedLines++
+			inputBytes += int64(len(raw))
 			var v obj
-			if len(strings.TrimSpace(scan.Text())) == 0 {
-				cached.Lines = append(cached.Lines, nil)
+			if len(bytes.TrimSpace(raw)) == 0 {
+				next.Lines = append(next.Lines, nil)
 				continue
 			}
-			if e := json.Unmarshal(scan.Bytes(), &v); e != nil {
-				cached.Errors = append(cached.Errors, fmt.Errorf("%s:%d: %w", p, order, e))
+			var e error
+			if a == model.Claude {
+				v, e = decodeClaudeLine(raw)
+			} else if projection := transcriptProjections[a]; projection != nil {
+				v, e = decodeProjectedJSON(raw, projection)
+			} else {
+				e = json.Unmarshal(trimLongStrings(raw), &v)
+			}
+			if e != nil {
+				next.Errors = append(next.Errors, fmt.Errorf("%s:%d: %w", p, order, e))
 			}
 			_, weight := slim(v)
-			cached.Weight += weight
-			cached.Lines = append(cached.Lines, v)
+			next.Weight += weight
+			next.Lines = append(next.Lines, v)
 		}
 		if e := scan.Err(); e != nil {
-			cached.Errors = append(cached.Errors, fmt.Errorf("%s: %w", p, e))
+			next.Errors = append(next.Errors, fmt.Errorf("%s: %w", p, e))
 		}
-		f.Close()
+		var last [1]byte
+		if info.Size() > 0 {
+			if n, _ := f.ReadAt(last[:], info.Size()-1); n == 1 {
+				next.EndsWithNewline = last[0] == '\n'
+			}
+		}
+		next.Digest = h.Sum(nil)
+		cached = next
 		evicted := rememberDecoded(p, cached)
 		if stats != nil {
 			stats.evictions.Add(int64(evicted))
@@ -465,28 +562,30 @@ func loadFiles(ctx context.Context, d *model.Data, a model.Agent, refresh bool, 
 		return current
 	}
 	syncdiag.Log(ctx, "file_sources_cache", "mode", "reparse", "refresh", refresh)
-	// Decode independent files concurrently, then retain deterministic serial
-	// accounting for resumed-session and cross-file message deduplication.
-	if a != model.Grok {
-		_, decoded := syncdiag.Watch(ctx, "decode_files")
-		var wg sync.WaitGroup
-		limit := make(chan struct{}, 4)
-		for _, p := range paths {
-			wg.Go(func() {
-				limit <- struct{}{}
-				defer func() { <-limit }()
-				part := empty(d.TurnsStart, d.TurnsEnd)
-				readLinesContext(ctx, &part, a, p, refresh)
-			})
+	// Decode a few files ahead on worker goroutines while accounting runs
+	// serially in path order, which resumed-session and cross-file dedup
+	// need. Each file is decoded once per load, and only a bounded window of
+	// decoded files is held beyond the cache budget.
+	sources := paths
+	if a == model.Grok {
+		sources = make([]string, len(paths))
+		for i, p := range paths {
+			sources[i] = filepath.Join(filepath.Dir(p), "updates.jsonl")
 		}
-		wg.Wait()
-		decoded(nil)
+	}
+	take := decodeAhead(ctx, a, sources, d.TurnsStart, d.TurnsEnd, refresh)
+	merge := func(r prefetched) []obj {
+		for k, v := range r.part.FileMtimes {
+			d.FileMtimes[k] = v
+		}
+		d.Errors = append(d.Errors, r.part.Errors...)
+		return r.lines
 	}
 	_, accounted := syncdiag.Watch(ctx, "account_file_records")
 	defer func() { accounted(sourceResultError(*d)) }()
 	sessions := map[string]*model.Session{}
 	seen := map[string]bool{}
-	for _, p := range paths {
+	for i, p := range paths {
 		id := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
 		stream := "main"
 		if a == model.Claude && filepath.Base(filepath.Dir(p)) == "subagents" {
@@ -494,14 +593,15 @@ func loadFiles(ctx context.Context, d *model.Data, a model.Agent, refresh bool, 
 			stream = "subagent/" + strings.TrimSuffix(filepath.Base(p), ".jsonl")
 		}
 		if a == model.Grok {
-			parseGrok(ctx, d, p, sessions, refresh)
+			r := take(i)
+			parseGrok(d, p, sessions, r.missing, func() []obj { return merge(r) })
 			continue
 		}
 		latest := map[string]model.Turn{}
 		var ordered []model.Turn
 		activeModel := ""
 		order := uint64(0)
-		for _, v := range readLinesContext(ctx, d, a, p, false) {
+		for _, v := range merge(take(i)) {
 			order++
 			if v == nil {
 				continue
@@ -774,7 +874,10 @@ func buddyUsage(u, raw any) (input, output, cached, write float64) {
 	output = max(0, num(first(pick(u, "outputTokens", "output_tokens", "completion_tokens"), pick(raw, "completion_tokens", "outputTokens", "output_tokens"))))
 	return
 }
-func parseGrok(ctx context.Context, d *model.Data, p string, sessions map[string]*model.Session, refresh bool) {
+
+// parseGrok reads a session summary; updates yields its prefetched update
+// log, which missing reports absent.
+func parseGrok(d *model.Data, p string, sessions map[string]*model.Session, missing bool, updates func() []obj) {
 	b, e := os.ReadFile(p)
 	if e != nil {
 		fail(d, model.Grok, e)
@@ -809,12 +912,11 @@ func parseGrok(ctx context.Context, d *model.Data, p string, sessions map[string
 		d.FileMtimes[p] = info.ModTime().UnixNano()
 		d.FileSessions[p] = s.Key
 	}
-	updates := filepath.Join(filepath.Dir(p), "updates.jsonl")
 	// A Grok summary is a valid session before its optional update log exists.
-	if _, err := os.Stat(updates); os.IsNotExist(err) {
+	if missing {
 		return
 	}
-	for _, v := range readLinesContext(ctx, d, model.Grok, updates, refresh) {
+	for _, v := range updates() {
 		u := get(v, "params", "update")
 		if str(get(u, "sessionUpdate")) != "turn_completed" {
 			continue
@@ -854,5 +956,54 @@ func parseGrok(ctx context.Context, d *model.Data, p string, sessions map[string
 		if t.CreatedAt >= d.TurnsStart && t.CreatedAt < d.TurnsEnd {
 			d.Turns = append(d.Turns, t)
 		}
+	}
+}
+
+// prefetched is one source decoded ahead of accounting: its lines, and the
+// errors and mtime readLinesContext recorded for it.
+type prefetched struct {
+	lines   []obj
+	part    model.Data
+	missing bool
+	done    chan struct{}
+}
+
+// decodeAhead decodes sources on four workers, at most eight ahead of the
+// consumer, and returns take, which waits for source i. Every index must be
+// taken once, in order.
+func decodeAhead(ctx context.Context, a model.Agent, sources []string, start, end int64, refresh bool) (take func(i int) prefetched) {
+	results := make([]prefetched, len(sources))
+	for i := range results {
+		results[i].done = make(chan struct{})
+	}
+	window := make(chan struct{}, 8)
+	work := make(chan int)
+	go func() {
+		for i := range sources {
+			window <- struct{}{}
+			work <- i
+		}
+		close(work)
+	}()
+	for range 4 {
+		go func() {
+			for i := range work {
+				r := &results[i]
+				r.part = empty(start, end)
+				if _, err := os.Stat(sources[i]); a == model.Grok && os.IsNotExist(err) {
+					r.missing = true
+				} else {
+					r.lines = readLinesContext(ctx, &r.part, a, sources[i], refresh)
+				}
+				close(r.done)
+			}
+		}()
+	}
+	return func(i int) prefetched {
+		<-results[i].done
+		<-window
+		r := results[i]
+		results[i] = prefetched{} // let the decoded lines go after use
+		return r
 	}
 }

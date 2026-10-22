@@ -83,6 +83,7 @@ func Refresh(ctx context.Context, force bool) bool {
 			} else {
 				api = cached
 			}
+			catalogRevision++
 			mu.Unlock()
 		}
 		if !force {
@@ -128,6 +129,7 @@ func Refresh(ctx context.Context, force bool) bool {
 		} else {
 			api = table
 		}
+		catalogRevision++
 		mu.Unlock()
 		_ = atomicSave(path, b)
 		_ = os.Remove(path + ".retry")

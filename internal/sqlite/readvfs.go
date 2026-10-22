@@ -23,7 +23,7 @@ func (v readVFS) OpenFilename(name *vfs.Filename, flags vfs.OpenFlag) (vfs.File,
 
 // A small direct-mapped cache coalesces SQLite's overflow-page reads without
 // retaining entire databases. Only DB.run enables it, for one statement.
-const readAheadSize = 64 << 10
+const readAheadSize = 256 << 10
 
 type readBlock struct {
 	buffer []byte
@@ -32,9 +32,10 @@ type readBlock struct {
 
 type readFile struct {
 	vfs.File
-	blocks [16]readBlock
-	active bool
-	stats  ReadStats
+	blocks    []readBlock
+	blockSize int
+	active    bool
+	stats     ReadStats
 }
 
 func (f *readFile) ReadAt(p []byte, off int64) (int, error) {
@@ -42,20 +43,28 @@ func (f *readFile) ReadAt(p []byte, off int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if !f.active || off < 0 || len(p) > readAheadSize {
+	if !f.active || off < 0 {
 		return f.readFileAt(p, off)
 	}
-	base := off / readAheadSize * readAheadSize
-	if off-base+int64(len(p)) > readAheadSize {
+	if f.blocks == nil {
+		f.blocks = make([]readBlock, 16)
+		f.blockSize = readAheadSize
+	}
+	size := int64(f.blockSize)
+	if int64(len(p)) > size {
 		return f.readFileAt(p, off)
 	}
-	block := &f.blocks[base/readAheadSize%int64(len(f.blocks))]
+	base := off / size * size
+	if off-base+int64(len(p)) > size {
+		return f.readFileAt(p, off)
+	}
+	block := &f.blocks[base/size%int64(len(f.blocks))]
 	if block.offset == base && off-base+int64(len(p)) <= int64(len(block.buffer)) {
 		f.stats.CacheHits++
 		return copy(p, block.buffer[off-base:]), nil
 	}
 	if cap(block.buffer) == 0 {
-		block.buffer = make([]byte, readAheadSize)
+		block.buffer = make([]byte, f.blockSize)
 	}
 	n, err := f.readFileAt(block.buffer[:cap(block.buffer)], base)
 	block.buffer, block.offset = block.buffer[:n], base
@@ -104,4 +113,11 @@ func (f *readFile) reset() {
 		f.blocks[i].buffer = f.blocks[i].buffer[:0]
 		f.blocks[i].offset = -1
 	}
+}
+
+// Smaller blocks avoid reading 256 KiB for scattered 4 KiB index pages. More
+// slots retain the alternating index/payload working set without whole-file caching.
+func (f *readFile) useInterleavedReadAhead() {
+	f.blockSize = 64 << 10
+	f.blocks = make([]readBlock, 128)
 }

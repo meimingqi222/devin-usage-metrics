@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -146,5 +148,47 @@ func TestEachStreamsRowsAndStopsOnError(t *testing.T) {
 	calls := 0
 	if err = db.Each(ctx, "SELECT v FROM t", func([]string, []any) error { calls++; return stop }); err != stop || calls != 1 {
 		t.Fatalf("callback error must stop the query: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestEachBorrowedTextPreservesValuesAndStorageClasses(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "borrow.db"), OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err = db.Execute(ctx, "CREATE TABLE t(payload, extra)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []any{strings.Repeat("界", 1<<16), "", nil, []byte("blob"), int64(42)} {
+		if _, err = db.Execute(ctx, "INSERT INTO t VALUES(?,?)", v, strings.Repeat("later column", 10000)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := db.Query(ctx, "SELECT payload, extra FROM t ORDER BY rowid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [][]any
+	err = db.EachBorrowedText(ctx, "SELECT payload, extra FROM t ORDER BY rowid", "payload", func(_ []string, row []any) error {
+		if v, ok := row[0].(BorrowedText); ok {
+			row[0] = string(v)
+		}
+		got = append(got, append([]any(nil), row...))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want.Values) {
+		t.Fatal("borrowed text changed values or storage classes")
+	}
+	stop := errors.New("stop")
+	if err = db.EachBorrowedText(ctx, "SELECT payload FROM t", "payload", func([]string, []any) error { return stop }); err != stop {
+		t.Fatal(err)
+	}
+	if _, err = db.Query(ctx, "SELECT count(*) FROM t"); err != nil {
+		t.Fatal(err)
 	}
 }

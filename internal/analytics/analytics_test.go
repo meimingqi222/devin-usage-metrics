@@ -81,3 +81,19 @@ func TestHalfOpenAndTurnModelPrecedence(t *testing.T) {
 		t.Fatal("boundary or model fallback mismatch")
 	}
 }
+
+func TestSessionProjectionPreservesFallbackAndLastDuplicate(t *testing.T) {
+	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	d := model.Data{Sessions: []model.Session{
+		{Agent: model.Devin, Key: "s", SelectedModel: "old"},
+		{Agent: model.Devin, Key: "s", SelectedModel: "adaptive", RealModel: ptr("swe-2-high")},
+	}, Turns: []model.Turn{
+		{Agent: model.Devin, SessionKey: "s", CreatedAt: now.Unix(), InputTokens: 10},
+		{Agent: model.Claude, SessionKey: "absent", CreatedAt: now.Unix(), InputTokens: 20},
+	}}
+	bs := analytics.Build(d, analytics.Day, 0, "", "", now)
+	last := bs[len(bs)-1]
+	if last.ByModel["swe-2-high(adaptive)"].Input != 10 || last.ByModel["unknown"].Input != 20 {
+		t.Fatal("session fallback projection changed")
+	}
+}

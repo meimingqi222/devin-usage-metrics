@@ -69,11 +69,30 @@ func decompress(b []byte, size int) ([]byte, error) {
 	return out, nil
 }
 
-func compress(b []byte) ([]byte, error) {
-	e, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1), zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(3)), zstd.WithZeroFrames(true))
-	if err != nil {
-		return nil, err
+// A publication owns one encoder and releases it at the end. EncodeAll emits
+// independent frames; reuse avoids rebuilding the match tables for each shard.
+type blockCompressor struct{ encoder *zstd.Encoder }
+
+func (c *blockCompressor) close() {
+	if c.encoder != nil {
+		c.encoder.Close()
+		c.encoder = nil
 	}
-	defer e.Close()
-	return e.EncodeAll(b, nil), nil
+}
+
+func (c *blockCompressor) compress(b []byte) ([]byte, error) {
+	if c.encoder == nil {
+		e, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1), zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(3)), zstd.WithZeroFrames(true))
+		if err != nil {
+			return nil, err
+		}
+		c.encoder = e
+	}
+	return c.encoder.EncodeAll(b, nil), nil
+}
+
+func compress(b []byte) ([]byte, error) {
+	var c blockCompressor
+	defer c.close()
+	return c.compress(b)
 }

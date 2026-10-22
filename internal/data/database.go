@@ -45,7 +45,11 @@ func each(ctx context.Context, d *model.Data, a model.Agent, db *sqlite.DB, labe
 	var rows int
 	var bytes int64
 	var consumer time.Duration
-	e := db.Each(ctx, sql, func(columns []string, row []any) error {
+	textColumn := "data"
+	if a == model.Devin {
+		textColumn = "chat_message"
+	}
+	e := db.EachBorrowedText(ctx, sql, textColumn, func(columns []string, row []any) error {
 		started := time.Now()
 		rows++
 		bytes += materializedBytes(row)
@@ -61,6 +65,15 @@ func each(ctx context.Context, d *model.Data, a model.Agent, db *sqlite.DB, labe
 	if e != nil {
 		fail(d, a, e)
 	}
+}
+
+// Only borrowed TEXT and ordinary strings are JSON inputs. BLOB/numeric values
+// keep the old str() behavior rather than silently becoming accepted JSON.
+func jsonColumnBytes(v any) []byte {
+	if b, ok := v.(sqlite.BorrowedText); ok {
+		return b
+	}
+	return []byte(str(v))
 }
 
 type databaseCache struct {
@@ -178,7 +191,7 @@ func loadDBs(ctx context.Context, d *model.Data, a model.Agent, refresh bool, pr
 				part = filter(cached.Data, d.TurnsStart, d.TurnsEnd)
 			} else {
 				_, opened := syncdiag.Watch(sourceCtx, "database_open")
-				db, e := sqlite.Open(ctx, p, sqlite.OpenOptions{ReadOnly: true, BusyTimeout: time.Second})
+				db, e := sqlite.Open(ctx, p, sqlite.OpenOptions{ReadOnly: true, BusyTimeout: time.Second, InterleavedReads: a == model.Devin})
 				opened(e)
 				if e != nil {
 					fail(&part, a, fmt.Errorf("%s: %w", p, e))
@@ -333,8 +346,8 @@ func parseDevin(ctx context.Context, d *model.Data, db *sqlite.DB, source string
 			if !ids[id] {
 				return
 			}
-			var v obj
-			if e := json.Unmarshal([]byte(str(r["chat_message"])), &v); e != nil {
+			v, e := decodeProjectedJSON(jsonColumnBytes(r["chat_message"]), devinMessageProjection)
+			if e != nil {
 				fail(d, a, e)
 				return
 			}
@@ -424,8 +437,8 @@ func parseSQLAgent(ctx context.Context, d *model.Data, a model.Agent, db *sqlite
 			t.TTFTMs = num(r["time_to_first_token_ms"])
 			t.TotalTimeMs = max(0, num(r["completed_at"])-num(r["started_at"]))
 		} else {
-			var v obj
-			if e := json.Unmarshal([]byte(str(r["data"])), &v); e != nil {
+			v, e := decodeProjectedJSON(jsonColumnBytes(r["data"]), sqlMessageProjection)
+			if e != nil {
 				fail(d, a, e)
 				return
 			}
@@ -473,12 +486,11 @@ type field struct {
 	v uint64
 }
 
-func proto(b []byte) []field {
-	var out []field
+func protoField(b []byte, want uint64) field {
 	for len(b) > 0 {
 		k, n := binary.Uvarint(b)
 		if n <= 0 {
-			return out
+			return field{}
 		}
 		b = b[n:]
 		f := field{n: k >> 3}
@@ -486,43 +498,39 @@ func proto(b []byte) []field {
 		case 0:
 			v, n := binary.Uvarint(b)
 			if n <= 0 {
-				return out
+				return field{}
 			}
 			f.v = v
 			b = b[n:]
 		case 2:
 			l, n := binary.Uvarint(b)
 			if n <= 0 || l > uint64(len(b)-n) {
-				return out
+				return field{}
 			}
 			f.b = b[n : n+int(l)]
 			b = b[n+int(l):]
 		case 1:
 			if len(b) < 8 {
-				return out
+				return field{}
 			}
 			b = b[8:]
 		case 5:
 			if len(b) < 4 {
-				return out
+				return field{}
 			}
 			b = b[4:]
 		default:
-			return out
+			return field{}
 		}
-		out = append(out, f)
+		if f.n == want {
+			return f
+		}
 	}
-	return out
+	return field{}
 }
 func pb(b []byte, path ...uint64) field {
 	for i, n := range path {
-		var found field
-		for _, f := range proto(b) {
-			if f.n == n {
-				found = f
-				break
-			}
-		}
+		found := protoField(b, n)
 		if i == len(path)-1 {
 			return found
 		}

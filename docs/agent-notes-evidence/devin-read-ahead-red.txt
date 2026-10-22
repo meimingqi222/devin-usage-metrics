@@ -1,0 +1,5 @@
+--- FAIL: TestInterleavedReadAheadBoundsScatteredReads (0.00s)
+    readvfs_test.go:358: scattered pages amplified reads: bytes=16777216 calls=64
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/sqlite	0.358s
+FAIL

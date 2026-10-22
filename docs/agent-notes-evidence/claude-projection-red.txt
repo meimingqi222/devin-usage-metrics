@@ -1,0 +1,5 @@
+--- FAIL: TestClaudeProjectionDiscardsNestedTranscripts (0.05s)
+    claude_json_test.go:141: irrelevant nested records retained 8740347 bytes
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/data	1.302s
+FAIL

@@ -102,10 +102,15 @@ func Build(data model.Data, p Period, page int, agent model.Agent, device string
 		sets[i] = map[identity]bool{}
 		models[i] = map[string]map[identity]bool{}
 	}
-	sessions := map[identity]model.Session{}
-	for _, s := range data.Sessions {
-		sessions[identity{s.Agent, s.DeviceID, s.Key}] = s
+	type sessionInfo struct {
+		model    string
+		adaptive bool
 	}
+	sessions := make(map[identity]sessionInfo, len(data.Sessions))
+	for _, s := range data.Sessions {
+		sessions[identity{s.Agent, s.DeviceID, s.Key}] = sessionInfo{s.DisplayModel(), s.SelectedModel == "adaptive"}
+	}
+	var calculator pricing.Calculator
 	for _, t := range data.Turns {
 		if (agent != "" && t.Agent != agent) || (device != "" && t.DeviceID != device) {
 			continue
@@ -119,13 +124,16 @@ func Build(data model.Data, p Period, page int, agent model.Agent, device string
 			s := sessions[id]
 			name := t.Model
 			if name == "" {
-				name = s.DisplayModel()
+				name = s.model
+				if name == "" {
+					name = "unknown"
+				}
 			}
 			label := name
-			if s.SelectedModel == "adaptive" && name != "unknown" && name != "compactor" {
+			if s.adaptive && name != "unknown" && name != "compactor" {
 				label += "(adaptive)"
 			}
-			cost, ok := pricing.Cost(t, name)
+			cost, ok := calculator.Cost(t, name)
 			b.Input += t.InputTokens
 			b.Output += t.OutputTokens
 			b.Cached += t.CacheReadTokens
@@ -135,7 +143,7 @@ func Build(data model.Data, p Period, page int, agent model.Agent, device string
 				u := t
 				u.InputTokens += u.CacheReadTokens
 				u.CacheReadTokens = 0
-				uncached, _ := pricing.Cost(u, name)
+				uncached, _ := calculator.Cost(u, name)
 				b.TokenCost += cost
 				b.UncachedCost += uncached
 			}
