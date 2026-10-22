@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/egoist/mygo/ui"
-	"github.com/meimingqi222/devin-usage-metrics/internal/quota"
 	"github.com/meimingqi222/devin-usage-metrics/internal/syncclient"
 	"github.com/meimingqi222/devin-usage-metrics/internal/updater"
 )
@@ -18,7 +17,6 @@ type settingsUIState struct {
 	open          bool
 	tab           string
 	apiURL        string
-	accountOpen   bool
 	updateOpen    bool
 	updateMessage string
 	updateFailed  bool
@@ -135,7 +133,6 @@ func (a *App) settingsView(c *ui.Context) {
 	if !a.settings && a.settingsUI.open {
 		a.cancelSettings()
 	}
-	a.accountModal(c)
 	a.updateDialog(c)
 }
 
@@ -219,51 +216,6 @@ func (a *App) settingsGeneral(c *ui.Context) {
 			ui.Text(c, a.t("Local Coding Agent usage and quota monitor", "本地 Coding Agent 用量与配额监控工具")).FontSize(12).TextColor(c.Theme().TextMuted)
 		})
 	})
-}
-
-// The quota view owns account management, not the settings tabs.
-func (a *App) openAccountModal() { a.settingsUI.accountOpen = true }
-
-func (a *App) accountModal(c *ui.Context) {
-	ui.Modal(c, &a.settingsUI.accountOpen, func() {
-		ui.Column(c).Width(348).Gap(12).Children(func() {
-			ui.Text(c, a.t("Add Devin account", "添加 Devin 账号")).FontSize(14).Bold()
-			allowed := quota.KeychainAllowed()
-			if ui.Checkbox(c, &allowed, a.t("Allow macOS Keychain account discovery", "允许读取 macOS 钥匙串中的账号")).Changed() {
-				if err := quota.SetKeychainAllowed(allowed); err != nil {
-					a.message = err.Error()
-				} else {
-					a.refreshQuota(false)
-				}
-			}
-			ui.TextInput(c, &a.accountLabel).Label(a.t("Account label", "账号名称")).Placeholder(a.t("Account label", "账号名称"))
-			ui.TextInput(c, &a.cookie).Password().Label(a.t("Session cookie", "会话 Cookie")).Placeholder(a.t("Devin session cookie", "Devin 会话 Cookie"))
-			if ui.PrimaryButton(c, a.t("Validate and add account", "验证并添加账号")).Disabled(a.busy["account"] || a.cookie == "").Clicked() {
-				cookie, label := a.cookie, a.accountLabel
-				a.work("account", func() func() {
-					org, _, err := quota.ValidateDevinCookie(a.ctx, cookie)
-					if err == nil {
-						err = quota.SaveDevinAccount(label, cookie, org)
-					}
-					return func() {
-						if err != nil {
-							a.message = err.Error()
-						} else {
-							a.cookie = ""
-							a.settingsUI.accountOpen = false
-							a.refreshQuota(true)
-						}
-					}
-				})
-			}
-			if ui.Button(c, a.t("Cancel", "取消")).Clicked() {
-				a.settingsUI.accountOpen = false
-			}
-		})
-	})
-	if !a.settingsUI.accountOpen {
-		a.cookie = ""
-	}
 }
 
 // updateVersionRow is intended for the sidebar, matching Rust's separate

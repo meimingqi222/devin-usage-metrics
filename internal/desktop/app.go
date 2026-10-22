@@ -39,7 +39,7 @@ type App struct {
 	accounts                                   []accountResult
 	selected                                   *model.Session
 	settings                                   bool
-	apiURL, deviceName, cookie, accountLabel   string
+	apiURL, deviceName                         string
 	auth                                       syncclient.Authorization
 	loginCancel                                context.CancelFunc
 	confirm                                    bool

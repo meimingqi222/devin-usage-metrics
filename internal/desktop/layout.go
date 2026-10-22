@@ -300,9 +300,6 @@ func (a *App) header(c *ui.Context) {
 	ui.Row(c).Height(48).Shrink(0).Padding(0, max(16, c.TitleBar().Right), 0, 16).Gap(8).AlignItems(ui.Center).Label("Toolbar").DragWindow().Children(func() {
 		if a.screen == "quota" {
 			ui.Text(c, a.t("Live quotas", "实时配额")).FontSize(14).Bold()
-			if textButton(c, "+ "+a.t("Add Devin account", "添加 Devin 账号"), false).Clicked() {
-				a.openAccountModal()
-			}
 		} else {
 			for _, tab := range []struct{ key, en, zh string }{{"usage", "Usage", "用量"}, {"sessions", "Sessions", "会话"}, {"compaction", "Compaction", "压缩建议"}} {
 				if tab.key == "compaction" && a.agent != model.Claude && a.agent != model.Codex {

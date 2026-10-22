@@ -105,7 +105,7 @@ func (a *App) quotaView(c *ui.Context) {
 		return
 	}
 	if len(a.accounts) == 0 {
-		ui.Text(c, a.t("No logged-in accounts detected. Log in via the claude / codex / grok CLI first, or paste an app.devin.ai cookie to add a Devin account.", "未检测到已登录账号。先在 claude / codex / grok CLI 登录，或粘贴 app.devin.ai 的 Cookie 添加 Devin 账号。")).FontSize(14).TextColor(t.TextMuted).Padding(16)
+		ui.Text(c, a.t("No logged-in accounts detected. Log in via the agent CLI first.", "未检测到已登录账号。请先在对应 Agent 的 CLI 中登录。")).FontSize(14).TextColor(t.TextMuted).Padding(16)
 		return
 	}
 	// Cards in a row share its height, as with Rust's default flex stretch.
