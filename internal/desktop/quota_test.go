@@ -13,7 +13,9 @@ func quotaFixture(t *testing.T) *App {
 	a := fixture(t)
 	a.screen = "quota"
 	now := time.Now()
-	h := func(d time.Duration) int64 { return now.Add(d).Unix() }
+	// Half a minute of slack keeps countdowns on the intended minute when a
+	// busy machine renders a second or more after the fixture is built.
+	h := func(d time.Duration) int64 { return now.Add(d + 30*time.Second).Unix() }
 	a.accounts = []accountResult{
 		{account: quota.Account{Key: "claude-1", Provider: "claude", Label: "work@example.com"}, result: quota.Result{Plan: "Max", Windows: []quota.Window{{Label: "5h", UsedPercent: 37.5, ResetsAt: h(2 * time.Hour)}, {Label: "7d", UsedPercent: 82, ResetsAt: h(75 * time.Hour)}, {Label: "7d Opus", UsedPercent: 12, ResetsAt: h(75 * time.Hour)}}, Reset: &quota.ClaudeReset{Left: 2, Total: 3, EndsAt: h(24 * 24 * time.Hour), GrantID: "g", Clears: []string{"five_hour"}}}},
 		{account: quota.Account{Key: "codex-1", Provider: "codex", Label: "a-very-long-account-label-that-must-ellipsize@example.com"}, result: quota.Result{Plan: "Plus", Windows: []quota.Window{{Label: "5h", UsedPercent: 5, ResetsAt: h(30 * time.Minute)}, {Label: "7d", UsedPercent: 64, ResetsAt: h(100 * time.Hour)}}}},
@@ -21,7 +23,7 @@ func quotaFixture(t *testing.T) *App {
 		{account: quota.Account{Key: "grok-1", Provider: "grok", Label: "me"}, err: errors.New("HTTP 401")},
 		{account: quota.Account{Key: "ag-1", Provider: "antigravity", Label: "g@example.com"}, result: quota.Result{Windows: []quota.Window{{Label: "Gemini 3 Pro – 5h", UsedPercent: 90, ResetsAt: h(time.Hour)}, {Label: "Claude Sonnet – 5h", UsedPercent: 0, ResetsAt: h(time.Hour)}}}},
 		{account: quota.Account{Key: "devin-cli", Provider: "devin", Label: "cli"}, result: quota.Result{}},
-		{account: quota.Account{Key: "claude-2", Provider: "claude", Label: "home@example.com"}, result: quota.Result{Windows: []quota.Window{{Label: "5h", UsedPercent: 100, ResetsAt: h(10 * time.Minute)}}, Stale: "HTTP 429", StaleAge: 300, RetryIn: 120, Reset: &quota.ClaudeReset{Left: 1, Total: 1, EndsAt: h(26*time.Hour + 30*time.Second), GrantID: "g", Blocker: "cooldown", CooldownUntil: h(30 * time.Minute)}}},
+		{account: quota.Account{Key: "claude-2", Provider: "claude", Label: "home@example.com"}, result: quota.Result{Windows: []quota.Window{{Label: "5h", UsedPercent: 100, ResetsAt: h(10 * time.Minute)}}, Stale: "HTTP 429", StaleAge: 300, RetryIn: 120, Reset: &quota.ClaudeReset{Left: 1, Total: 1, EndsAt: h(26 * time.Hour), GrantID: "g", Blocker: "cooldown", CooldownUntil: h(30 * time.Minute)}}},
 	}
 	return a
 }
