@@ -30,190 +30,42 @@ func grokEntry(d object) (string, object) {
 }
 func fetch(ctx context.Context, a Account) (Result, error) {
 	if a.Provider == "devin" {
-		if a.Key == "devin-cli" {
-			t, _ := devinCLI()
-			return fetchCLI(ctx, t)
-		}
-		i, e := strconv.Atoi(strings.TrimPrefix(a.source, "stored:"))
-		s := loadStore()
-		if e != nil || i < 0 || i >= len(s.Devin) {
-			return Result{}, errors.New("account no longer exists")
-		}
-		d := s.Devin[i]
-		return fetchDevin(ctx, d.Cookie, d.Org)
+		return fetchDevinAccount(ctx, a)
 	}
-	d, e := loadAccount(a)
+	l, e := openLogin(a)
 	if e != nil {
 		return Result{}, e
 	}
-	c := d
-	entryKey := ""
-	tokenKey := "access_token"
-	expiryKey := "expired"
-	switch a.Provider {
-	case "claude":
-		c = obj(d["claudeAiOauth"])
-		tokenKey = "accessToken"
-		expiryKey = "expiresAt"
-	case "grok":
-		entryKey, c = grokEntry(d)
-		tokenKey = "key"
-		expiryKey = "expires_at"
-	case "antigravity":
-		expiryKey = "expiry_date"
-	}
-	if c == nil {
-		return Result{}, errors.New("missing OAuth credentials")
-	}
-	token := str(c[tokenKey])
-	if token == "" {
+	if l.token == "" {
 		if a.Provider == "codex" {
 			return Result{Plan: "API MODE"}, nil
 		}
 		return Result{}, errors.New("missing access token")
 	}
-	refreshKey := "refresh_token"
-	if a.Provider == "claude" {
-		refreshKey = "refreshToken"
-	}
-	if a.Provider == "antigravity" && str(c[refreshKey]) != "" {
-		if cached := antigravityCachedToken(str(c[refreshKey])); cached != "" {
-			token = cached
-		}
-	}
 	refreshed := false
-	refresh := func() error {
-		latest, source, le := loadAccountSource(a)
-		if a.Provider == "claude" && le != nil {
-			return le
-		}
-		if le == nil && a.Provider == "claude" {
-			lc := obj(latest["claudeAiOauth"])
-			if str(lc[tokenKey]) != token && (when(lc[expiryKey]) == 0 || when(lc[expiryKey]) > time.Now().Unix()+300) {
-				d = latest
-				c = lc
-				token = str(c[tokenKey])
-				return nil
-			}
-			d = latest
-			c = lc
-		}
-		rt := str(c[refreshKey])
-		if rt == "" {
-			return errors.New("no refresh token; sign in again")
-		}
-		v, er := refreshToken(ctx, a.Provider, c, rt)
-		if er != nil {
-			var he *httpError
-			if a.Provider == "claude" && errors.As(er, &he) && (he.status == 400 || he.status == 401) && invalidGrant(he.body) {
-				latest, le := loadAccount(a)
-				lc := obj(latest["claudeAiOauth"])
-				if le == nil && str(lc[refreshKey]) != "" && str(lc[refreshKey]) != rt {
-					d = latest
-					c = lc
-					token = str(c[tokenKey])
-					return nil
-				}
-				return errors.New("Session expired (invalid_grant); run claude to sign in again")
-			}
-			return er
-		}
-		token = str(v["access_token"])
-		if token == "" {
-			return errors.New("refresh response missing access_token")
-		}
-		c[tokenKey] = token
-		if s := str(v["refresh_token"]); s != "" {
-			c[refreshKey] = s
-		}
-		if s := str(v["id_token"]); s != "" {
-			c["id_token"] = s
-		}
-		exp := time.Now().Unix() + int64(num(v["expires_in"]))
-		if a.Provider == "antigravity" {
-			antigravitySaveToken(str(c[refreshKey]), token, exp)
-		}
-		switch a.Provider {
-		case "claude", "antigravity":
-			c[expiryKey] = exp * 1000
-		case "codex":
-			c[expiryKey] = time.Unix(exp, 0).UTC().Format(time.RFC3339)
-			d["last_refresh"] = time.Now().UTC().Format(time.RFC3339)
-		case "grok":
-			if num(c[expiryKey]) > 1e12 {
-				c[expiryKey] = exp * 1000
-			} else {
-				c[expiryKey] = exp
-			}
-		}
-		if a.Provider == "claude" {
-			current, ce := loadAccount(Account{Provider: a.Provider, source: source})
-			if ce == nil && str(at(current, "claudeAiOauth", refreshKey)) == rt {
-				oauth := obj(current["claudeAiOauth"])
-				for _, k := range []string{tokenKey, refreshKey, expiryKey} {
-					oauth[k] = c[k]
-				}
-				d = current
-			} else {
-				return nil
-			}
-		}
-		if a.Provider == "grok" {
-			d[entryKey] = c
-		}
-		if a.Provider == "claude" {
-			if strings.HasPrefix(source, "keychain:") {
-				_ = keyWrite("Claude Code-credentials", d)
-			} else {
-				_ = atomicWrite(source, d)
-			}
-		} else if !strings.HasPrefix(a.source, "keychain:") && filepath.Ext(a.source) != ".vscdb" {
-			_ = atomicWrite(a.source, d)
-		}
-		return nil
-	}
-	if a.Provider == "claude" && when(c[expiryKey]) != 0 && when(c[expiryKey]) <= time.Now().Unix()+300 && str(c[refreshKey]) != "" {
+	if a.Provider == "claude" && when(l.c[l.expiryKey]) != 0 && when(l.c[l.expiryKey]) <= time.Now().Unix()+300 && str(l.c[l.refreshKey]) != "" {
 		refreshed = true
-		if e = refresh(); e != nil && when(c[expiryKey]) <= time.Now().Unix() {
+		if e = l.refresh(ctx); e != nil && when(l.c[l.expiryKey]) <= time.Now().Unix() {
 			return Result{}, e
 		}
 	}
 	reread := false
 	for {
-		h := bearer(token)
-		var usage object
-		switch a.Provider {
-		case "claude":
-			h["anthropic-beta"] = "oauth-2025-04-20"
-			h["User-Agent"] = "claude-cli/2.1.294 (external, cli)"
-			usage, e = jsonRequest(ctx, "GET", anthropicOrigin+claudeUsagePath, "", h, false)
-		case "codex":
-			h["User-Agent"] = "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)"
-			usage, e = jsonRequest(ctx, "GET", "https://chatgpt.com/backend-api/wham/usage", "", h, false)
-		case "grok":
-			h["x-xai-token-auth"] = "xai-grok-cli"
-			h["x-grok-client-version"] = "0.2.91"
-			h["User-Agent"] = "grok-pager/0.2.91 grok-shell/0.2.91 (windows; x86_64)"
-			usage, e = jsonRequest(ctx, "GET", "https://cli-chat-proxy.grok.com/v1/billing?format=credits", "", h, false)
-		case "antigravity":
-			h["User-Agent"] = "antigravity/2.11.0"
-			h["x-goog-api-client"] = "antigravity/2.11.0"
-			usage, e = jsonRequest(ctx, "POST", "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary", "{}", h, false)
-		default:
-			return Result{}, errors.New("unsupported provider")
-		}
+		h := bearer(l.token)
+		usage, e := requestUsage(ctx, a.Provider, h)
+		// Claude Code may have rotated the token since it was read.
 		if status(e) == 401 && a.Provider == "claude" && !reread {
 			reread = true
-			if latest, err := loadAccount(a); err == nil && str(at(latest, "claudeAiOauth", tokenKey)) != "" && str(at(latest, "claudeAiOauth", tokenKey)) != token {
-				d = latest
-				c = obj(d["claudeAiOauth"])
-				token = str(c[tokenKey])
+			if latest, err := loadAccount(a); err == nil && str(at(latest, "claudeAiOauth", l.tokenKey)) != "" && str(at(latest, "claudeAiOauth", l.tokenKey)) != l.token {
+				l.d = latest
+				l.c = obj(l.d["claudeAiOauth"])
+				l.token = str(l.c[l.tokenKey])
 				continue
 			}
 		}
-		if status(e) == 401 && !refreshed && str(c[refreshKey]) != "" {
+		if status(e) == 401 && !refreshed && str(l.c[l.refreshKey]) != "" {
 			refreshed = true
-			if e = refresh(); e != nil {
+			if e = l.refresh(ctx); e != nil {
 				return Result{}, e
 			}
 			continue
@@ -224,29 +76,201 @@ func fetch(ctx context.Context, a Account) (Result, error) {
 			}
 			return Result{}, e
 		}
-		switch a.Provider {
-		case "claude":
-			plan := ""
-			p, _ := jsonRequest(ctx, "GET", anthropicOrigin+"/api/oauth/profile", "", h, false)
-			if at(p, "account", "has_claude_max") == true {
-				plan = "Max"
-			} else if at(p, "account", "has_claude_pro") == true {
-				plan = "Pro"
-			} else if strings.EqualFold(str(at(p, "organization", "organization_type")), "claude_team") && strings.EqualFold(str(at(p, "organization", "subscription_status")), "active") {
-				plan = "Team"
-			}
-			r := ParseClaudeUsage(usage, plan)
-			r.Reset = claudeResetGrants(ctx, a.source, h)
-			return r, nil
-		case "codex":
-			return ParseCodexUsage(usage, str(usage["plan_type"])), nil
-		case "grok":
-			m, _ := jsonRequest(ctx, "GET", "https://cli-chat-proxy.grok.com/v1/billing", "", h, false)
-			return ParseGrokBilling(usage, m), nil
-		default:
-			return ParseAntigravityQuota(usage), nil
+		return finishUsage(ctx, a, usage, h), nil
+	}
+}
+
+func fetchDevinAccount(ctx context.Context, a Account) (Result, error) {
+	if a.Key == "devin-cli" {
+		t, _ := devinCLI()
+		return fetchCLI(ctx, t)
+	}
+	i, e := strconv.Atoi(strings.TrimPrefix(a.source, "stored:"))
+	s := loadStore()
+	if e != nil || i < 0 || i >= len(s.Devin) {
+		return Result{}, errors.New("account no longer exists")
+	}
+	d := s.Devin[i]
+	return fetchDevin(ctx, d.Cookie, d.Org)
+}
+
+// oauthLogin is a provider login read from its credential document: d is
+// the document, c the entry holding the token, under provider-specific keys.
+type oauthLogin struct {
+	a                                      Account
+	d, c                                   object
+	entryKey                               string
+	tokenKey, expiryKey, refreshKey, token string
+}
+
+func openLogin(a Account) (*oauthLogin, error) {
+	d, e := loadAccount(a)
+	if e != nil {
+		return nil, e
+	}
+	l := &oauthLogin{a: a, d: d, c: d, tokenKey: "access_token", expiryKey: "expired", refreshKey: "refresh_token"}
+	switch a.Provider {
+	case "claude":
+		l.c = obj(d["claudeAiOauth"])
+		l.tokenKey, l.expiryKey, l.refreshKey = "accessToken", "expiresAt", "refreshToken"
+	case "grok":
+		l.entryKey, l.c = grokEntry(d)
+		l.tokenKey, l.expiryKey = "key", "expires_at"
+	case "antigravity":
+		l.expiryKey = "expiry_date"
+	}
+	if l.c == nil {
+		return nil, errors.New("missing OAuth credentials")
+	}
+	l.token = str(l.c[l.tokenKey])
+	if a.Provider == "antigravity" && str(l.c[l.refreshKey]) != "" {
+		if cached := antigravityCachedToken(str(l.c[l.refreshKey])); cached != "" {
+			l.token = cached
 		}
 	}
+	return l, nil
+}
+
+// refresh gets a new access token and writes it back where the provider's
+// own CLI keeps it. For Claude it first adopts a fresher token the CLI
+// wrote meanwhile, and never overwrites a login the CLI has since rotated.
+func (l *oauthLogin) refresh(ctx context.Context) error {
+	a := l.a
+	latest, source, le := loadAccountSource(a)
+	if a.Provider == "claude" && le != nil {
+		return le
+	}
+	if le == nil && a.Provider == "claude" {
+		lc := obj(latest["claudeAiOauth"])
+		if str(lc[l.tokenKey]) != l.token && (when(lc[l.expiryKey]) == 0 || when(lc[l.expiryKey]) > time.Now().Unix()+300) {
+			l.d, l.c = latest, lc
+			l.token = str(l.c[l.tokenKey])
+			return nil
+		}
+		l.d, l.c = latest, lc
+	}
+	rt := str(l.c[l.refreshKey])
+	if rt == "" {
+		return errors.New("no refresh token; sign in again")
+	}
+	v, er := refreshToken(ctx, a.Provider, l.c, rt)
+	if er != nil {
+		var he *httpError
+		if a.Provider == "claude" && errors.As(er, &he) && (he.status == 400 || he.status == 401) && invalidGrant(he.body) {
+			latest, le := loadAccount(a)
+			lc := obj(latest["claudeAiOauth"])
+			if le == nil && str(lc[l.refreshKey]) != "" && str(lc[l.refreshKey]) != rt {
+				l.d, l.c = latest, lc
+				l.token = str(l.c[l.tokenKey])
+				return nil
+			}
+			return errors.New("Session expired (invalid_grant); run claude to sign in again")
+		}
+		return er
+	}
+	l.token = str(v["access_token"])
+	if l.token == "" {
+		return errors.New("refresh response missing access_token")
+	}
+	c := l.c
+	c[l.tokenKey] = l.token
+	if s := str(v["refresh_token"]); s != "" {
+		c[l.refreshKey] = s
+	}
+	if s := str(v["id_token"]); s != "" {
+		c["id_token"] = s
+	}
+	exp := time.Now().Unix() + int64(num(v["expires_in"]))
+	if a.Provider == "antigravity" {
+		antigravitySaveToken(str(c[l.refreshKey]), l.token, exp)
+	}
+	switch a.Provider {
+	case "claude", "antigravity":
+		c[l.expiryKey] = exp * 1000
+	case "codex":
+		c[l.expiryKey] = time.Unix(exp, 0).UTC().Format(time.RFC3339)
+		l.d["last_refresh"] = time.Now().UTC().Format(time.RFC3339)
+	case "grok":
+		if num(c[l.expiryKey]) > 1e12 {
+			c[l.expiryKey] = exp * 1000
+		} else {
+			c[l.expiryKey] = exp
+		}
+	}
+	if a.Provider == "claude" {
+		current, ce := loadAccount(Account{Provider: a.Provider, source: source})
+		if ce != nil || str(at(current, "claudeAiOauth", l.refreshKey)) != rt {
+			return nil
+		}
+		oauth := obj(current["claudeAiOauth"])
+		for _, k := range []string{l.tokenKey, l.refreshKey, l.expiryKey} {
+			oauth[k] = c[k]
+		}
+		l.d = current
+		if strings.HasPrefix(source, "keychain:") {
+			_ = keyWrite("Claude Code-credentials", l.d)
+		} else {
+			_ = atomicWrite(source, l.d)
+		}
+		return nil
+	}
+	if a.Provider == "grok" {
+		l.d[l.entryKey] = c
+	}
+	if !strings.HasPrefix(a.source, "keychain:") && filepath.Ext(a.source) != ".vscdb" {
+		_ = atomicWrite(a.source, l.d)
+	}
+	return nil
+}
+
+// requestUsage asks a provider for its quota, as its own CLI does; h is
+// completed with the provider's client headers.
+func requestUsage(ctx context.Context, provider string, h map[string]string) (object, error) {
+	switch provider {
+	case "claude":
+		h["anthropic-beta"] = "oauth-2025-04-20"
+		h["User-Agent"] = "claude-cli/2.1.294 (external, cli)"
+		return jsonRequest(ctx, "GET", anthropicOrigin+claudeUsagePath, "", h, false)
+	case "codex":
+		h["User-Agent"] = "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)"
+		return jsonRequest(ctx, "GET", "https://chatgpt.com/backend-api/wham/usage", "", h, false)
+	case "grok":
+		h["x-xai-token-auth"] = "xai-grok-cli"
+		h["x-grok-client-version"] = "0.2.91"
+		h["User-Agent"] = "grok-pager/0.2.91 grok-shell/0.2.91 (windows; x86_64)"
+		return jsonRequest(ctx, "GET", "https://cli-chat-proxy.grok.com/v1/billing?format=credits", "", h, false)
+	case "antigravity":
+		h["User-Agent"] = "antigravity/2.11.0"
+		h["x-goog-api-client"] = "antigravity/2.11.0"
+		return jsonRequest(ctx, "POST", "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary", "{}", h, false)
+	}
+	return nil, errors.New("unsupported provider")
+}
+
+// finishUsage turns a provider's usage answer into a Result, with the
+// follow-up reads some providers need (plan, reset grants, billing).
+func finishUsage(ctx context.Context, a Account, usage object, h map[string]string) Result {
+	switch a.Provider {
+	case "claude":
+		plan := ""
+		p, _ := jsonRequest(ctx, "GET", anthropicOrigin+"/api/oauth/profile", "", h, false)
+		if at(p, "account", "has_claude_max") == true {
+			plan = "Max"
+		} else if at(p, "account", "has_claude_pro") == true {
+			plan = "Pro"
+		} else if strings.EqualFold(str(at(p, "organization", "organization_type")), "claude_team") && strings.EqualFold(str(at(p, "organization", "subscription_status")), "active") {
+			plan = "Team"
+		}
+		r := ParseClaudeUsage(usage, plan)
+		r.Reset = claudeResetGrants(ctx, a.source, h)
+		return r
+	case "codex":
+		return ParseCodexUsage(usage, str(usage["plan_type"]))
+	case "grok":
+		m, _ := jsonRequest(ctx, "GET", "https://cli-chat-proxy.grok.com/v1/billing", "", h, false)
+		return ParseGrokBilling(usage, m)
+	}
+	return ParseAntigravityQuota(usage)
 }
 func invalidGrant(body string) bool {
 	var v object
