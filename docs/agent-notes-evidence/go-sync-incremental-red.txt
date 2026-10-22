@@ -1,0 +1,17 @@
+$ disk cache guard disabled
+    efficiency_test.go:172: restart re-downloaded blocks: cold=4 warm=4 turns=4 err=<nil>
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/syncclient	0.464s
+FAIL
+$ manifest byte cache disabled
+    efficiency_test.go:142: unchanged heads still downloaded manifests or blocks: [GET /v1/objects?prefix=device-&prefix=v2-head-&prefix=v3-head- GET /v1/object
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/syncclient	0.367s
+FAIL
+$ daily audit spacing disabled
+    efficiency_test.go:151: listing must ask only for heads: [GET /v1/objects?prefix=device-&prefix=v2-head-&prefix=v3-head- GET /v1/objects/v3-head-other.json 
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/syncclient	0.394s
+FAIL
+$ guards restored
+ok  	github.com/meimingqi222/devin-usage-metrics/internal/syncclient	0.373s

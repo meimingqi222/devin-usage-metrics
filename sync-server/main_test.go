@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -485,5 +486,78 @@ func TestBusyTenantDoesNotBlockOtherTenant(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("a different tenant is blocked by the busy tenant")
+	}
+}
+
+func TestContentAddressedWritesListPrefixAndExistingETag(t *testing.T) {
+	handler := newTestServer(t)
+	body := "zstd-bytes"
+	sum := strings.Trim(quoteETag([]byte(body)), `"`)
+	name := "/v1/objects/v3-block-" + sum + ".zst"
+	if got := request(handler, http.MethodPut, "/v1/objects/v3-block-"+strings.Repeat("0", 64)+".zst", body, nil); got.Code != http.StatusBadRequest {
+		t.Fatalf("content not matching its name was stored: %d", got.Code)
+	}
+	if got := request(handler, http.MethodPut, name, body, map[string]string{"If-None-Match": "*"}); got.Code != http.StatusNoContent {
+		t.Fatalf("PUT status=%d", got.Code)
+	}
+	// A repeated immutable upload learns the stored ETag without a download.
+	again := request(handler, http.MethodPut, name, body, map[string]string{"If-None-Match": "*"})
+	if again.Code != http.StatusPreconditionFailed || again.Header().Get("ETag") != `"`+sum+`"` {
+		t.Fatalf("existing object: status=%d etag=%q", again.Code, again.Header().Get("ETag"))
+	}
+	head := request(handler, http.MethodHead, name, "", nil)
+	if head.Code != http.StatusOK || head.Header().Get("ETag") != `"`+sum+`"` || head.Body.Len() != 0 {
+		t.Fatalf("HEAD status=%d etag=%q", head.Code, head.Header().Get("ETag"))
+	}
+	if got := request(handler, http.MethodGet, name, "", nil); got.Body.String() != body {
+		t.Fatalf("GET body=%q", got.Body.String())
+	}
+	request(handler, http.MethodPut, "/v1/objects/v3-head-a.json", `{}`, nil)
+	var names []string
+	list := request(handler, http.MethodGet, "/v1/objects?prefix=v3-head-&prefix=device-", "", nil)
+	if err := json.Unmarshal(list.Body.Bytes(), &names); err != nil || len(names) != 1 || names[0] != "v3-head-a.json" {
+		t.Fatalf("prefix listing=%v err=%v", names, err)
+	}
+	list = request(handler, http.MethodGet, "/v1/objects", "", nil)
+	if err := json.Unmarshal(list.Body.Bytes(), &names); err != nil || len(names) < 3 {
+		t.Fatalf("full listing=%v err=%v", names, err)
+	}
+}
+
+func TestHeadETagTracksSameSizeRewrites(t *testing.T) {
+	handler := newTestServer(t)
+	first := request(handler, http.MethodPut, "/v1/objects/v3-head-d.json", `{"sequence":1}`, nil)
+	second := request(handler, http.MethodPut, "/v1/objects/v3-head-d.json", `{"sequence":2}`, map[string]string{"If-Match": first.Header().Get("ETag")})
+	if second.Code != http.StatusNoContent {
+		t.Fatalf("CAS update status=%d", second.Code)
+	}
+	// The stale revision must lose even though size and mtime may be equal.
+	if got := request(handler, http.MethodPut, "/v1/objects/v3-head-d.json", `{"sequence":3}`, map[string]string{"If-Match": first.Header().Get("ETag")}); got.Code != http.StatusPreconditionFailed {
+		t.Fatalf("stale If-Match accepted: %d", got.Code)
+	}
+	if got := request(handler, http.MethodGet, "/v1/objects/v3-head-d.json", "", nil); got.Header().Get("ETag") != second.Header().Get("ETag") {
+		t.Fatal("GET ETag does not match the latest write")
+	}
+}
+
+func TestParallelUploadsOverlapOutsideTenantLock(t *testing.T) {
+	handler := newTestServer(t)
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Go(func() {
+			body := strings.Repeat("x", 1<<16) + strconv.Itoa(i)
+			name := "/v1/objects/v3-session-" + strings.Trim(quoteETag([]byte(body)), `"`) + ".zst"
+			if got := request(handler, http.MethodPut, name, body, map[string]string{"If-None-Match": "*"}); got.Code != http.StatusNoContent {
+				t.Errorf("parallel PUT status=%d", got.Code)
+			}
+		})
+	}
+	wg.Wait()
+	usage := request(handler, http.MethodGet, "/v1/usage", "", nil)
+	var u struct {
+		Objects int `json:"objects"`
+	}
+	if json.Unmarshal(usage.Body.Bytes(), &u) != nil || u.Objects != 16 {
+		t.Fatalf("usage after parallel writes: %s", usage.Body.String())
 	}
 }

@@ -1,7 +1,11 @@
-# Rust 构建产物
+# 构建产物（Rust 仅保留迁移对照）
 /target/
 /dist/
 /build/
+/devin-usage-metrics
+/devin-usage-metrics.exe
+/agent-usage-metrics
+/Agent Usage Metrics.exe
 # Go 同步服务本地构建产物
 /sync-server/sync-server
 /sync-server/sync-server.exe
@@ -48,7 +52,8 @@ Icon?
 *.p12
 *.mobileprovision
 
-# 本地数据库与应用缓存
+# 本地数据库与应用缓存（含 Agent 原始对话记录，切勿提交）
+*.jsonl
 *.db
 *.db-shm
 *.db-wal
@@ -72,3 +77,6 @@ tmp/
 # Agent 临时工作目录
 .agent-notes/
 .agent-notes-evidence/
+
+# Python acceptance tooling
+__pycache__/

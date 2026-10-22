@@ -1,4 +1,4 @@
-   Compiling devin-usage-metrics v0.2.11 (/Users/yuqiang/work/code/devin-usage-metrics)
+   Compiling devin-usage-metrics v0.2.11 (<repo>)
     Finished `test` profile [unoptimized] target(s) in 6.31s
      Running unittests src/lib.rs (target/debug/deps/devin_usage_metrics-95514a78968e8a27)
 

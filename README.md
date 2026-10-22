@@ -2,155 +2,85 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A native desktop app that reads local sessions from Devin, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, pi-agent, MimoCode, and WorkBuddy and presents token usage, model distribution, and session details. Switch agents from the left sidebar in a Chinese or English interface; local data is sent only after you enable GitHub-authenticated sync to a configured self-hosted API.
+Local coding-agent analytics, now implemented in **Go + [MyGo native UI](https://github.com/egoist/mygo)**. No Rust compilation, WebView, JavaScript runtime, or cgo is required to build the desktop application.
+
+> The Go implementation is a migration candidate, not a claim of proven Rust feature parity. The previous Rust sources remain as a behavior reference and do not participate in the Go build or release workflow. See [migration status and limitations](docs/go-migration.md).
 
 ## Features
 
-- **Usage view**
-  - Left sidebar with every supported agent (Devin, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, pi-agent, MimoCode, WorkBuddy) and its session count
-  - Chinese and English interface, defaulting to the system language; switch from the top bar and the choice is remembered
-  - Aggregate token usage by day (15 days) / week (12 weeks) / month (12 months)
-  - Stat cards for Total Tokens, Input (new), Output, Cached read, and Turns/Sessions
-  - Stacked bar chart of token trends (input / output / cached layers)
-  - Per-period detail table with session count, turns, token breakdown, and per-model usage
-  - Antigravity `gemini-3.8-flash-*` internal variants fall back to the base Flash API quote only when no exact quote exists; original model names are retained and separate Lite/TTS/Cyber families are excluded. If the Google base quote lacks a cache-write rate, first processing is estimated at the input rate. These estimates exclude cache storage-duration charges and are not actual bills.
-- **Sessions view**
-  - Lists the 500 most recent sessions, sorted by last activity
-  - Shows title, working directory, agent mode, selected model, message count, total tokens
-  - Resolves `adaptive` routing to the real backing model
-  - Click any session for details: median TTFT, turn count, agent messages, time span
-- **Compaction advice**
-  - Claude Code / Codex recommendations using the same time range and device filter as Usage, with cost curves and local configuration previews
-  - Replays per-call token history at 10K-token intervals using the existing model price table; shows observed compaction points, suggested trigger thresholds, simulated API-equivalent costs and sample counts
-  - Requires at least 50 valid calls and 3 suspected compactions per device/model (Codex pools models for its global setting). Main contexts, Claude subagents and model-switch segments are isolated; old synced records without context identity are skipped
-  - Chooses the largest threshold within 1% of the cheapest replay and keeps the historical threshold if savings are below 3%; never recommends expanding beyond the observed threshold
-  - Apply writes only the selected local field: Claude `modelSettings.<model>.autoCompactWindow` receives the suggested trigger + 33K reserve; Codex `model_auto_compact_token_limit` receives the trigger and applies globally. Existing fields are journaled for Undo across app restarts; unrelated settings are preserved, and detected external edits or environment overrides prevent overwrites. Remote-device advice is analysis only
-  - This is a heuristic cost estimate against the observed historical point, not current configuration, a quality guarantee, actual bill or subscription-quota prediction. Start a new agent session after applying; project/profile settings and terminal environment may override the user-level config. The Claude conversion follows current Magpie semantics and can vary by agent version
-- **Multi-device sync**
-  - Enter one self-hosted sync API address and sign in with GitHub; devices using the same GitHub account share one sync dataset
-  - Sync is off by default; toggle it from the top bar ("Sync Off / Sync On"), then it runs fully automatically
-  - Once enabled, the app auto-exports local data and imports other devices' data every hour in the background. Startup and a manual reload also sync immediately.
-  - Each device auto-generates a stable device ID. Sync data uses compressed, content-addressed shards with an atomic per-device head, so large histories do not require one ever-growing package.
-  - Existing v1 packages are imported automatically during migration. Upgrade every actively syncing client before relying on v2 because older releases cannot read the new format.
-  - The sidebar "Devices" section lets you view a single device or aggregate all devices
-  - GitHub is used only for identity; sync objects live only in your configured self-hosted service
-- **Data sources**
-  - Devin: `~/.local/share/devin/{cli,cli-next}/sessions.db` (platform data directory on Windows)
-  - Claude Code: `~/.claude/projects/**/*.jsonl` (subagent usage is merged into its parent session)
-  - Codex: `~/.codex/{sessions,archived_sessions}/**/*.jsonl` or `$CODEX_HOME`
-  - Antigravity: `~/.gemini/antigravity/conversations/*.db` (protobuf-encoded SQLite)
-  - Grok Build: `~/.grok/sessions/*/summary.json` (with per-session `updates.jsonl` for turn details)
-  - ZCode: `~/.zcode/cli/db/db.sqlite`
-  - OpenCode: `~/.local/share/opencode/opencode.db` (covers both `opencode` and `opencode2`; legacy `storage/` JSON sessions have been migrated into this database)
-  - pi-agent: `~/.pi/agent/sessions/**/*.jsonl`
-  - MimoCode: `~/.local/share/mimocode/mimocode.db` (OpenCode fork; assistant `message` rows carry `tokens` + non-zero `cost` as recorded cost)
-  - WorkBuddy: `~/.workbuddy/projects/**/*.jsonl` (also `~/.workbuddy-ai/projects` and `~/.codebuddy/projects`, same layout; `$WORKBUDDY_CONFIG_DIR` / `$CODEBUDDY_CONFIG_DIR` relocate the root; per-`messageId` dedup, new camelCase `usage` + `rawUsage` or legacy snake_case `input_tokens`)
-  - Each agent is loaded lazily when first selected, sources parse in parallel
-  - 5-minute on-disk cache in the platform cache directory for fast subsequent launches
-  - "Reload" bypasses the cache; unchanged files are detected by mtime and only modified files are re-parsed
+- Ten local history importers: Devin, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, pi-agent, MimoCode, WorkBuddy / CodeBuddy.
+- Daily (15), weekly (12), and monthly (12) calendar buckets, stacked token charts, per-model distributions, recorded/API-equivalent costs, and device filtering.
+- Latest 500 sessions, search, token totals, model resolution, timestamps, median TTFT and resume commands.
+- Live quotas for Claude, Codex, Grok, Devin and Antigravity, including cached/stale results and rate-limit cooldowns. Keychain discovery requires opt-in.
+- Claude/Codex historical compaction analysis, explicit local apply, external-edit protection and durable undo. Estimates do not predict task quality or subscription billing.
+- Opt-in, GitHub-authenticated self-hosted synchronization, v1/v2 imports and content-addressed v3 publication.
+- Native desktop window and tray quota panel; English/Chinese UI with persisted preference. CLI human-readable output currently remains English; CSV columns are stable English identifiers.
 
-## Interface language
+## Requirements
 
-The UI is available in Simplified Chinese and English. The language is resolved once at startup:
+- Go **1.27.1 or newer**. MyGo is pinned to an exact pseudo-version in `go.mod`; the CLI tool uses the same version.
+- Windows 10/11, macOS 12+, or Linux with GTK 3. Linux tray support additionally needs `libayatana-appindicator3` and a desktop with an indicator host. Linux uses a tray menu rather than direct tray-icon clicks.
+- At least one supported agent's local history for real usage data.
 
-1. `config.json` in the platform config directory, if it holds a valid `lang`
-2. otherwise the system locale (a `zh` prefix selects Chinese, anything else English)
+SQLite is compiled into the executable through the pure-Go [`github.com/ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3), so builds need no C compiler and no native library: the executable (or `.app`) is the whole app.
 
-| Platform | Config file |
+## Run, test and package
+
+```sh
+go run .
+go run . --cli --agent claude --days 30
+go run . --cli --agent all --by-agent --since 2026-08-20 --until 2026-08-30 --format csv
+go run . --cli --help
+
+gofmt -l main.go internal
+go vet ./...
+go test -race ./...
+CGO_ENABLED=0 go build ./...
+
+# Native packaging; no Bun/npm needed
+go tool mygo build
+go tool mygo build -platform darwin/arm64,windows/amd64
+```
+
+Windows PowerShell: set `$env:CGO_ENABLED = '0'` before `go build ./...` instead of using shell-style environment assignment. Race tests need the Go race toolchain/C compiler; release builds do not.
+
+Packaged apps appear in `build/<os>-<arch>/`. macOS signing/DMG creation must run on macOS. Windows installers require NSIS (MyGo can obtain it); the release workflow distributes a portable ZIP holding `devin-usage-metrics.exe`. Updater installation/restart still requires native-platform validation before release.
+
+The sync server is a separate, existing Go module:
+
+```sh
+(cd sync-server && go test -race ./... && go vet ./...)
+```
+
+## Data sources
+
+| Agent | Default history location |
 | --- | --- |
-| macOS | `~/Library/Application Support/devin-usage-metrics/config.json` |
-| Linux | `~/.config/devin-usage-metrics/config.json` |
-| Windows | `%APPDATA%\devin-usage-metrics\config.json` |
+| Devin | `~/.local/share/devin/{cli,cli-next}/sessions.db` (platform data directory on Windows) |
+| Claude Code | `~/.claude/projects/**/*.jsonl` |
+| Codex | `$CODEX_HOME/{sessions,archived_sessions}/**/*.jsonl`, default `~/.codex` |
+| Antigravity | `~/.gemini/antigravity/conversations/*.db` |
+| Grok Build | `~/.grok/sessions/*/{summary.json,updates.jsonl}` |
+| ZCode | `~/.zcode/cli/db/db.sqlite` |
+| OpenCode | platform data directory `opencode/opencode.db`, including `opencode2` |
+| pi-agent | `~/.pi/agent/sessions/**/*.jsonl` |
+| MimoCode | platform data directory `mimocode/mimocode.db` |
+| WorkBuddy | `~/.{workbuddy,workbuddy-ai,codebuddy}/projects/**/*.jsonl`; `WORKBUDDY_CONFIG_DIR` / `CODEBUDDY_CONFIG_DIR` supported |
 
-Clicking 中 / EN in the top bar writes that file immediately, so the choice survives restarts. The same setting applies to human-readable `--cli` output; CSV column names remain stable English identifiers for scripts.
+The Go disk cache has a five-minute TTL and is separate from Rust snapshots. Reload bypasses snapshots. Transcript/database signatures support in-process reuse. Reads never modify session databases.
 
-Known limitation: data-source error messages are produced while loading and stored alongside the cache, so they keep the language of the run that loaded them until the next reload.
+## Configuration and privacy
 
-## Tech stack
+Configuration stays in `devin-usage-metrics/` under the OS configuration directory: `~/.config` on Linux, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows. Existing device identity, language preference, sync configuration, encrypted login and compaction undo records are reused.
 
-| Component | Description |
-| --- | --- |
-| [GPUI](https://github.com/zed-industries/zed) | Zed's high-performance Rust UI framework for native windows and controls |
-| [rusqlite](https://crates.io/crates/rusqlite) | SQLite compiled with the `bundled` feature; opens session DBs read-only |
-| [serde](https://crates.io/crates/serde) / [serde_json](https://crates.io/crates/serde_json) | Parses session metadata and serializes the cache |
-| [chrono](https://crates.io/crates/chrono) | Date/period aggregation and timezone handling |
+- Local history is sent only to the configured self-hosted API while sync is enabled. GitHub is used for identity.
+- Quota queries contact provider APIs and may rotate/write agent OAuth credentials. Keychain access is opt-in.
+- Pricing catalogs refresh from `models.opencode.ai` and Devin documentation (24h TTL, 1h failure backoff). Set `DEVIN_USAGE_DISABLE_MODELS_FETCH=1` to disable catalog fetching; `DEVIN_USAGE_MODELS_URL` / `DEVIN_USAGE_MODELS_PATH` override its source/cache.
+- Packaged builds check GitHub for updates 10 seconds after launch and every four hours and download them (set `auto_check_updates` to `false` in `config.json` to opt out); installing still needs user action. ZIP checksums detect corruption, not publisher authenticity.
+- Only explicit compaction Apply/Undo changes Claude/Codex settings; unrelated fields are preserved, external edits refused, undo stays local. Start a new agent session afterwards.
 
-## Prerequisites
+## Layout
 
-- Windows or macOS (the current implementation has been verified on Windows)
-- Rust toolchain (stable via `rustup` recommended)
-- Prior use of at least one supported coding agent
+`main.go` selects native GUI or CLI. `internal/desktop/host.go` owns windows/tray/lifecycle; `app.go` owns state and event delivery. Other `internal/` packages own `data`, `model`, `pricing`, `analytics`, `cli`, `quota`, `syncclient`, `compaction`, and `updater`. `mygo.json` configures packaging. `sync-server/` remains independent. `src/`, Cargo manifests, and Rust tests are retained only for migration comparison.
 
-## Build and run
-
-```bash
-# Debug run
-cargo run
-
-# CLI: daily Claude Code usage (ccusage-compatible columns)
-cargo run -- --cli --agent claude --since 2026-08-20 --until 2026-08-30 --refresh
-
-# Machine-readable CSV
-cargo run -- --cli --agent claude --days 30 --format csv
-
-# All agents with per-agent breakdowns
-cargo run -- --cli --agent all --by-agent --days 30
-
-# Release build
-cargo build --release
-
-# Run tests (integration tests skip automatically when no local session data exists)
-cargo test
-```
-
-The CLI defaults to the last 30 days of Claude Code usage. It supports `all`, `devin`, `claude`, `codex`, `antigravity`, `grok`, `zcode`, `opencode`, `pi`, `mimocode` (`mimo` alias), and `workbuddy` (`codebuddy`, `wb` aliases). Use `--by-agent` to include per-agent rows under the `all` totals. Run `cargo run -- --cli --help` for all options.
-
-## Pricing auto-update
-
-Non-Devin model prices are refreshed automatically from `https://models.opencode.ai/api.json` (same source as OpenCode): the embedded `models-dev-pricing.json` snapshot loads first, then a local cache (`cache_dir/devin-usage-metrics/models-dev.json`) overlays it. The cache is fetched when missing or older than 24h — once in the background at GUI startup, once per CLI run. Offline or fetch failures silently keep the old data with a 1h retry backoff. Override with `DEVIN_USAGE_MODELS_URL` (source), `DEVIN_USAGE_MODELS_PATH` (cache path), or `DEVIN_USAGE_DISABLE_MODELS_FETCH=1` (embedded snapshot only).
-
-## Bundle as .app
-
-`Cargo.toml` already contains a `[package.metadata.bundle]` section. Use [`cargo-bundle`](https://crates.io/crates/cargo-bundle) to package:
-
-```bash
-cargo install cargo-bundle
-cargo bundle --release
-```
-
-The resulting `.app` appears under `target/release/bundle/osx/` and uses `assets/icon.icns` as its icon.
-
-## Project layout
-
-```
-src/
-├── main.rs    # GPUI app entry, UI rendering, usage/sessions/quota views, multi-device sync UI
-├── lib.rs     # Module exports
-├── data.rs    # Shared records, Devin SQLite reads, on-disk cache, device identity
-├── local_sources.rs # Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, pi-agent, MimoCode, and WorkBuddy importers
-├── sync.rs    # Multi-device sync orchestration, storage transports, and v1 migration
-├── sync/v2.rs # Content-addressed, compressed and integrity-checked sync protocol
-├── pricing.rs # Model pricing table and cost calculation
-├── i18n.rs    # Chinese/English UI strings, language detection and preference file
-├── cli.rs     # --cli mode: daily usage rollup, table and CSV output
-├── devin-pro-pricing.json      # Offline fallback for official Pro/Self-serve prices; refreshed online
-├── devin-model-pricing.json    # Legacy Devin snapshot for compatible model lookups
-├── models-dev-pricing.json     # Non-Devin model prices extracted from models.dev
-└── agg.rs     # Day/week/month bucketing and per-model grouping (with per-device filtering)
-tests/
-└── dump.rs    # End-to-end integration test against real local data
-assets/
-└── icon*.{png,icns}  # App icon assets
-```
-
-## Data and privacy
-
-- Opens Devin databases read-only and only reads the other agents' JSON/JSONL files
-- Only an explicit Apply/Undo action writes Claude/Codex user settings. Undo metadata stays local and is not synced
-- Cache file is written via atomic rename to avoid partial files
-- Makes no network requests; everything shown comes from the local machine and the user's configured shared sync folder
-- Multi-device sync data is written only to your configured self-hosted API; GitHub is used solely for account identity
-
-## License
-
-Private project; no open-source license assigned yet.
+Private project; no open-source license assigned.

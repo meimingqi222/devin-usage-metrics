@@ -1,0 +1,12 @@
+--- FAIL: TestGrokOptionalUpdatesAndUsageMatchRust (0.01s)
+    data_test.go:343: summary-only sessions and unmetered events: sessions=2 turns=2 errors=1
+--- FAIL: TestWorkBuddyMissingSessionIDUsesFileNamePerRecord (0.00s)
+    data_test.go:354: fallback metadata session lost: sessions=1 turns=1
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/data	1.173s
+FAIL
+--- FAIL: TestLegacySnapshotCannotHideImporterFixes (0.00s)
+    data_test.go:378: legacy cache hid corrected importer output
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/data	0.371s
+FAIL

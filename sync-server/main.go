@@ -40,6 +40,24 @@ type server struct {
 	quotaBytes     int64
 	grace          time.Duration
 	tenants        sync.Map
+	etags          sync.Map // path -> etagEntry; avoids re-hashing unchanged files
+}
+
+type etagEntry struct {
+	size int64
+	mod  time.Time
+	etag string
+}
+
+// contentAddressed reports the SHA-256 an object's bytes must have when its
+// name embeds one. v3 clients name blocks, sessions and manifests this way.
+func contentAddressed(name string) (string, bool) {
+	for _, kind := range [][2]string{{"v3-block-", ".zst"}, {"v3-session-", ".zst"}, {"v3-manifest-", ".json"}} {
+		if validObjectName(name, kind[0], kind[1]) {
+			return strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(name, kind[0]), kind[1])), true
+		}
+	}
+	return "", false
 }
 
 type tenantState struct {
@@ -377,10 +395,20 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "read storage", http.StatusInternalServerError)
 		return
 	}
+	// Repeated ?prefix= narrows the listing; clients poll heads every cycle.
+	prefixes := r.URL.Query()["prefix"]
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if entry.Type().IsRegular() {
-			names = append(names, entry.Name())
+		name := entry.Name()
+		if !entry.Type().IsRegular() || strings.HasPrefix(name, ".") {
+			continue
+		}
+		matched := len(prefixes) == 0
+		for _, prefix := range prefixes {
+			matched = matched || strings.HasPrefix(name, prefix)
+		}
+		if matched {
+			names = append(names, name)
 		}
 	}
 	sort.Strings(names)
@@ -449,7 +477,7 @@ func (s *server) object(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) read(w http.ResponseWriter, r *http.Request, path string) {
-	bytes, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		http.NotFound(w, r)
 		return
@@ -458,13 +486,49 @@ func (s *server) read(w http.ResponseWriter, r *http.Request, path string) {
 		http.Error(w, "read object", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("ETag", quoteETag(bytes))
-	w.Header().Set("Content-Length", fmt.Sprint(len(bytes)))
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		http.Error(w, "read object", http.StatusInternalServerError)
+		return
+	}
+	etag, err := s.fileETag(path, f, info)
+	if err != nil {
+		http.Error(w, "read object", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 	w.Header().Set("Cache-Control", "no-store")
 	if r.Method == http.MethodGet {
 		w.Header().Set("Content-Type", "application/octet-stream")
-		_, _ = w.Write(bytes)
+		_, _ = io.Copy(w, f)
 	}
+}
+
+// fileETag streams a file's SHA-256. Content-addressed objects never change
+// under their name, so their ETag is cached and a HEAD costs a stat. Mutable
+// objects such as heads are small and always hashed: a size/mtime key could
+// miss a same-second rewrite and break If-Match.
+func (s *server) fileETag(path string, f *os.File, info os.FileInfo) (string, error) {
+	_, immutable := contentAddressed(filepath.Base(path))
+	if v, ok := s.etags.Load(path); ok && immutable {
+		if e := v.(etagEntry); e.size == info.Size() && e.mod.Equal(info.ModTime()) {
+			return e.etag, nil
+		}
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	etag := `"` + hex.EncodeToString(h.Sum(nil)) + `"`
+	if immutable {
+		s.etags.Store(path, etagEntry{info.Size(), info.ModTime(), etag})
+	}
+	return etag, nil
 }
 
 func (s *server) write(w http.ResponseWriter, r *http.Request, path string) {
@@ -475,36 +539,13 @@ func (s *server) write(w http.ResponseWriter, r *http.Request, path string) {
 		http.Error(w, "object exceeds 8 MiB limit", http.StatusRequestEntityTooLarge)
 		return
 	}
-	tenant := filepath.Base(filepath.Dir(path))
-	state := s.tenantState(tenant)
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	existing, err := os.ReadFile(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		http.Error(w, "read object", http.StatusInternalServerError)
+	etag := quoteETag(bytes)
+	if want, ok := contentAddressed(filepath.Base(path)); ok && etag != `"`+want+`"` {
+		http.Error(w, "object content does not match its name", http.StatusBadRequest)
 		return
 	}
-	exists := err == nil
-	if !conditionsMatch(r, existing, exists) {
-		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
-		return
-	}
-	// Only a newly written/changed object consumes quota. Reads, list and GC
-	// remain available at the hard limit so a client can always recover space.
-	oldSize := int64(0)
-	if exists {
-		oldSize = int64(len(existing))
-	}
-	used, _, usageErr := s.cachedUsage(tenant, state)
-	if usageErr != nil {
-		http.Error(w, "read storage", http.StatusInternalServerError)
-		return
-	}
-	if s.quotaBytes > 0 && used-oldSize+int64(len(bytes)) > s.quotaBytes {
-		w.Header().Set("X-Sync-Quota-Bytes", strconv.FormatInt(s.quotaBytes, 10))
-		http.Error(w, "storage quota exceeded", http.StatusInsufficientStorage)
-		return
-	}
+	// Write and fsync outside the tenant lock so parallel uploads overlap;
+	// the lock covers only the precondition, quota and the atomic rename.
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		http.Error(w, "create storage", http.StatusInternalServerError)
 		return
@@ -525,10 +566,50 @@ func (s *server) write(w http.ResponseWriter, r *http.Request, path string) {
 		http.Error(w, "write object", http.StatusInternalServerError)
 		return
 	}
+	tenant := filepath.Base(filepath.Dir(path))
+	state := s.tenantState(tenant)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	info, err := os.Stat(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		http.Error(w, "read object", http.StatusInternalServerError)
+		return
+	}
+	exists := err == nil
+	if ok, current, err := s.conditionsMatch(r, path, info, exists); err != nil {
+		http.Error(w, "read object", http.StatusInternalServerError)
+		return
+	} else if !ok {
+		// The stored ETag lets a client confirm an immutable object is intact
+		// without downloading it.
+		if current != "" {
+			w.Header().Set("ETag", current)
+		}
+		http.Error(w, "precondition failed", http.StatusPreconditionFailed)
+		return
+	}
+	// Only a newly written/changed object consumes quota. Reads, list and GC
+	// remain available at the hard limit so a client can always recover space.
+	oldSize := int64(0)
+	if exists {
+		oldSize = info.Size()
+	}
+	used, _, usageErr := s.cachedUsage(tenant, state)
+	if usageErr != nil {
+		http.Error(w, "read storage", http.StatusInternalServerError)
+		return
+	}
+	if s.quotaBytes > 0 && used-oldSize+int64(len(bytes)) > s.quotaBytes {
+		w.Header().Set("X-Sync-Quota-Bytes", strconv.FormatInt(s.quotaBytes, 10))
+		http.Error(w, "storage quota exceeded", http.StatusInsufficientStorage)
+		return
+	}
 	if err := os.Rename(tmpName, path); err != nil {
 		http.Error(w, "commit object", http.StatusInternalServerError)
 		return
 	}
+	syncDir(filepath.Dir(path))
+	s.etags.Delete(path)
 	state.bytes += int64(len(bytes)) - oldSize
 	if !exists {
 		state.objects++
@@ -539,8 +620,16 @@ func (s *server) write(w http.ResponseWriter, r *http.Request, path string) {
 		// 因而可以在所有旧设备连续使用 v3 满 14 天后安全清理 v1/v2。
 		_ = s.writeMigrationMarker(filepath.Dir(path), filepath.Base(path), time.Now())
 	}
-	w.Header().Set("ETag", quoteETag(bytes))
+	w.Header().Set("ETag", etag)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// syncDir makes a completed rename durable where the platform allows it.
+func syncDir(dir string) {
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 }
 
 func (s *server) writeMigrationMarker(dir, head string, now time.Time) error {
@@ -566,7 +655,7 @@ func (s *server) tenantUsage(tenant string) (int64, int, error) {
 	var bytes int64
 	objects := 0
 	for _, entry := range entries {
-		if !entry.Type().IsRegular() {
+		if !entry.Type().IsRegular() || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
 		info, err := entry.Info()
@@ -681,6 +770,7 @@ func (s *server) gcTenant(tenant string, now time.Time) (int, error) {
 		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return deleted, err
 		}
+		s.etags.Delete(filepath.Join(dir, entry.Name()))
 		deleted++
 	}
 	return deleted, nil
@@ -788,14 +878,28 @@ func validObjectName(value, prefix, suffix string) bool {
 		validHash(strings.TrimSuffix(strings.TrimPrefix(value, prefix), suffix))
 }
 
-func conditionsMatch(r *http.Request, existing []byte, exists bool) bool {
-	if value := r.Header.Get("If-None-Match"); value != "" {
-		return value == "*" && !exists
+// conditionsMatch evaluates If-None-Match / If-Match. On failure it also
+// returns the stored object's ETag when one exists.
+func (s *server) conditionsMatch(r *http.Request, path string, info os.FileInfo, exists bool) (bool, string, error) {
+	noneMatch, match := r.Header.Get("If-None-Match"), r.Header.Get("If-Match")
+	if noneMatch == "" && match == "" {
+		return true, "", nil
 	}
-	if value := r.Header.Get("If-Match"); value != "" {
-		return exists && value == quoteETag(existing)
+	current := ""
+	if exists {
+		f, err := os.Open(path)
+		if err != nil {
+			return false, "", err
+		}
+		defer f.Close()
+		if current, err = s.fileETag(path, f, info); err != nil {
+			return false, "", err
+		}
 	}
-	return true
+	if noneMatch != "" {
+		return noneMatch == "*" && !exists, current, nil
+	}
+	return exists && match == current, current, nil
 }
 
 func quoteETag(bytes []byte) string {

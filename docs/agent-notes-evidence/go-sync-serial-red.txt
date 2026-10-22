@@ -1,0 +1,7 @@
+--- FAIL: TestColdSyncDownloadsInParallel (1.07s)
+    parallel_test.go:64: cold sync did not complete: turns=0 peak=1 err=device other: context deadline exceeded
+--- FAIL: TestPublishTransfersInParallelAndDoesNotPublishPartialHead (2.01s)
+    parallel_test.go:160: upload concurrency=1
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/syncclient	3.431s
+FAIL

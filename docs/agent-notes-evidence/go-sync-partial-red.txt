@@ -1,0 +1,5 @@
+--- FAIL: TestRemoteFailureNeitherBlocksPublishNorDropsOtherDevices (0.05s)
+    efficiency_test.go:104: failure not reported as partial: device flaky: head identity mismatch
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/syncclient	1.214s
+FAIL

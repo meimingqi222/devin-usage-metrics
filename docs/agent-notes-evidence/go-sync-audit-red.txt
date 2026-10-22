@@ -1,0 +1,18 @@
+$ audit disabled
+    efficiency_test.go:261: published manifest references missing v3-block-f0a2ca33299ad0d042265502bd4eface89c15fb765318f2d2e25924e514b5bd8.zst
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/syncclient	0.447s
+FAIL
+$ manifest repair disabled
+    client_test.go:212: unchanged own cycle: block GETs=0 object GETs=2 elapsed=4.950625ms
+    client_test.go:249: sync incomplete: manifest hash mismatch
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/syncclient	0.447s
+FAIL
+$ stored ETag ignored on 412
+    efficiency_test.go:241: existing objects were downloaded to prove they exist: [GET /v1/objects?prefix=device-&prefix=v2-head-&prefix=v3-head- GET /v1/objects/v3-head-
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/syncclient	0.429s
+FAIL
+$ guards restored
+ok  	github.com/meimingqi222/devin-usage-metrics/internal/syncclient	0.393s

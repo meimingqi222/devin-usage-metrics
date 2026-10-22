@@ -2,155 +2,72 @@
 
 [English](README.md) | **简体中文**
 
-一个原生桌面应用，用于读取 Devin、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode、pi-agent、MimoCode 与 WorkBuddy 在本地留下的会话数据，并展示 token 用量、模型分布与会话详情。从左侧边栏切换 Agent，界面支持中英双语；本地数据只会在用户开启 GitHub 登录同步后发送到所配置的自建 API。
+本地编码 Agent 用量统计工具，主实现已迁移到 **Go + [MyGo 原生 UI](https://github.com/egoist/mygo)**。桌面构建不再需要编译 Rust、WebView、JavaScript 运行时或 cgo。
+
+> 当前是 Go 迁移候选实现，不代表已经证明与 Rust 完全等价。旧 Rust 源码暂留作行为对照，不参与 Go 构建和发布。已知差异和验证边界见 [迁移状态](docs/go-migration.md)。
 
 ## 功能
 
-- **用量视图**
-  - 左侧边栏常驻全部受支持的 Agent（Devin、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode、pi-agent、MimoCode、WorkBuddy）及其会话数
-  - 中英双语界面，默认跟随系统语言；顶栏点「中 / EN」即时切换并记住选择
-  - 按日（15 天）/ 周（12 周）/ 月（12 个月）聚合 token 用量
-  - 总 Tokens、输入（新）、输出、缓存读取、轮次/会话统计卡片
-  - 堆叠柱状图展示 token 用量趋势（输入 / 输出 / 缓存分层）
-  - 周期明细表，含会话数、轮次、各类型 token、按模型分组的用量分布
-  - Antigravity 的 `gemini-3.8-flash-*` 内部变体仅在没有精确报价时回退到基础 Flash API 报价；保留原始模型名，排除独立的 Lite/TTS/Cyber 型号。Google 基础报价缺少缓存写入单价时，首次处理按输入单价估算；不包含缓存按时存储费，也不代表真实账单。
-- **会话视图**
-  - 最近 500 条会话列表，按最后活跃时间倒序
-  - 显示标题、工作目录、agent 模式、所选模型、消息数、总 tokens
-  - 自动识别 `adaptive` 路由模型并显示真实模型
-  - 点击任一会话查看详情：TTFT 中位数、轮次数、agent 消息数、时间区间等
-- **压缩建议**
-  - 为 Claude Code / Codex 提供推荐，沿用用量页的时间范围与设备筛选，展示成本曲线与本机配置变更预览
-  - 按每次调用的 token 历史，以 10K tokens 为步长回放候选阈值，复用现有模型定价；展示历史压缩点、建议触发阈值、模拟 API 等价费用与样本数
-  - 每台设备 / 模型至少需要 50 次有效调用、3 次疑似压缩（Codex 按全局配置汇总各模型）；主上下文、Claude 子 agent 与切模型片段独立分析，旧版同步数据缺少上下文标识时跳过
-  - 在距最低成本 1% 内选择最大阈值，预计收益不足 3% 时保持历史阈值；不建议扩大到未观察过的阈值
-  - 应用仅修改选中的本机字段：Claude 的 `modelSettings.<model>.autoCompactWindow` 写入建议触发点 + 33K 预留；Codex 的 `model_auto_compact_token_limit` 写入触发点，对所有模型生效。保存原字段供撤销，重启应用后仍可恢复；保留其他设置，检测到外部修改或环境变量覆盖时不强行写入。远程设备仅展示分析
-  - 费用收益相对于历史压缩点而非当前配置，是启发式估算，不保证质量，也不是实际账单或订阅配额预测。应用后请开启新的 agent 会话；项目 / profile 设置与终端环境可能覆盖用户配置。Claude 转换参考当前 Magpie 语义，不同 agent 版本可能不同
-- **多设备同步**
-  - 只需填入自建同步 API 地址并登录 GitHub；同一 GitHub 账号的设备自动同步到同一份数据
-  - 同步默认关闭，顶栏点「同步已关 / 同步已开」一键开关，开启后完全自动
-  - 开启后后台每小时自动导出本机数据 + 导入其他设备数据；启动和手动重新加载会立即同步一次
-  - 每台设备自动生成稳定设备 ID；同步数据采用压缩的内容寻址分片和原子更新的设备 head，大历史记录不再形成持续膨胀的单一数据包
-  - 迁移时会自动导入已有 v1 数据包；旧版本无法读取 v2 格式，因此请先升级所有仍在同步的客户端
-  - 侧边栏「设备」区可切换查看单设备或汇总所有设备
-  - GitHub 仅用于登录；同步对象只保存在用户配置的自建服务中
-- **数据源**
-  - Devin：`~/.local/share/devin/{cli,cli-next}/sessions.db`（Windows 使用平台数据目录）
-  - Claude Code：`~/.claude/projects/**/*.jsonl`（子代理用量归并到主会话）
-  - Codex：`~/.codex/{sessions,archived_sessions}/**/*.jsonl` 或 `$CODEX_HOME`
-  - Antigravity：`~/.gemini/antigravity/conversations/*.db`（protobuf 编码的 SQLite）
-  - Grok Build：`~/.grok/sessions/*/summary.json`（轮次明细来自同目录的 `updates.jsonl`）
-  - ZCode：`~/.zcode/cli/db/db.sqlite`
-  - OpenCode：`~/.local/share/opencode/opencode.db`（同时覆盖 `opencode` 与 `opencode2`；旧版 `storage/` 下的 JSON 会话已迁移进该库）
-  - pi-agent：`~/.pi/agent/sessions/**/*.jsonl`
-  - MimoCode：`~/.local/share/mimocode/mimocode.db`（OpenCode 分支；assistant `message` 行自带 `tokens`，非零 `cost` 按自报费用计价）
-  - WorkBuddy：`~/.workbuddy/projects/**/*.jsonl`（同时覆盖 `~/.workbuddy-ai/projects` 与 `~/.codebuddy/projects`，三者同布局；`$WORKBUDDY_CONFIG_DIR` / `$CODEBUDDY_CONFIG_DIR` 可迁移根目录；按 `messageId` 去重，新格式 camelCase `usage` + `rawUsage` 或旧格式 snake_case `input_tokens` 均兼容）
-  - 各 Agent 按需懒加载，数据源并行解析
-  - 使用平台缓存目录中的 5 分钟磁盘缓存，加速二次启动
-  - 顶部「重新加载」按钮可强制绕过缓存；通过 mtime 检测未变化的文件，仅重新解析有改动的文件
+- 读取 Devin、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode、pi-agent、MimoCode、WorkBuddy / CodeBuddy 的本地历史。
+- 按日（15 天）/ 周（12 周）/ 月（12 个月）聚合，堆叠 Token 图、模型分布、自报/API 等价费用、设备筛选。
+- 最近 500 条会话、搜索、模型识别、Token 总数、时间范围、TTFT 中位数及续读命令。
+- Claude、Codex、Grok、Devin、Antigravity 实时配额，缓存过期标记与限流冷却；钥匙串访问需明确开启。
+- Claude / Codex 历史压缩回放、确认应用本机配置、外部修改保护及跨重启撤销。估算不预测质量、订阅配额或实际账单。
+- 默认关闭的 GitHub 身份验证 + 自建 API 同步；导入 v1/v2 历史，以内容寻址 v3 协议发布。
+- 原生桌面窗口与托盘配额面板，中英双语 UI 并记住选择。CLI 人类可读输出目前仍为英文，CSV 列名固定英文。
 
-## 界面语言
+## 环境要求
 
-界面支持简体中文与英文，语言在启动时解析一次：
+- **Go 1.27.1+**。`go.mod` 固定 MyGo 精确版本，`go tool mygo` 与库版本一致。
+- Windows 10/11、macOS 12+，或安装 GTK 3 的 Linux。Linux 托盘额外需要 `libayatana-appindicator3` 及支持 indicator 的桌面，使用托盘菜单打开面板，不支持与 Windows/macOS 相同的直接点击交互。
+- 本机使用过至少一种受支持的 Agent，才有真实统计数据。
 
-1. 若配置目录下的 `config.json` 含有效 `lang`，以它为准
-2. 否则跟随系统 locale（`zh` 前缀选中文，其余一律英文）
+SQLite 通过纯 Go 的 [`github.com/ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3) 编译进可执行文件，无需 C 编译器，也不需要任何原生动态库：单个 exe（或 `.app`）就是完整应用。
 
-| 平台 | 配置文件 |
-| --- | --- |
-| macOS | `~/Library/Application Support/devin-usage-metrics/config.json` |
-| Linux | `~/.config/devin-usage-metrics/config.json` |
-| Windows | `%APPDATA%\devin-usage-metrics\config.json` |
+## 运行、验证与打包
 
-顶栏点击「中 / EN」会立即写入该文件，重启后保持。同一设置也作用于 `--cli` 的人类可读输出；CSV 列名为方便脚本处理，固定使用稳定的英文标识符。
+```sh
+go run .
+go run . --cli --agent claude --days 30
+go run . --cli --agent all --by-agent --since 2026-08-20 --until 2026-08-30 --format csv
+go run . --cli --help
 
-已知限制：数据源错误消息在加载阶段生成，并随缓存一起落盘，因此会保留加载它那一次运行的语言，直到下次重新加载。
+gofmt -l main.go internal
+go vet ./...
+go test -race ./...
+CGO_ENABLED=0 go build ./...
 
-## 技术栈
-
-| 组件 | 说明 |
-| --- | --- |
-| [GPUI](https://github.com/zed-industries/zed) | Zed 的高性能 Rust UI 框架，用于构建原生窗口与控件 |
-| [rusqlite](https://crates.io/crates/rusqlite) | 以 `bundled` 方式编译 SQLite，只读模式打开会话数据库 |
-| [serde](https://crates.io/crates/serde) / [serde_json](https://crates.io/crates/serde_json) | 解析会话 metadata 与缓存序列化 |
-| [chrono](https://crates.io/crates/chrono) | 日期/周期聚合与时区处理 |
-
-## 前置条件
-
-- Windows 或 macOS（当前实现已在 Windows 验证）
-- Rust 工具链（推荐 `rustup` 安装的 stable 版本）
-- 本机使用过至少一种受支持的编码 Agent
-
-## 构建与运行
-
-```bash
-# 调试运行
-cargo run
-
-# CLI：按日输出 Claude Code 用量（表格口径对齐 ccusage）
-cargo run -- --cli --agent claude --since 2026-08-20 --until 2026-08-30 --refresh
-
-# 机器可读 CSV
-cargo run -- --cli --agent claude --days 30 --format csv
-
-# 全部 Agent，并按 Agent 展开
-cargo run -- --cli --agent all --by-agent --days 30
-
-# 发布构建
-cargo build --release
-
-# 运行测试（依赖本机会话数据的集成测试在无数据环境会自动跳过）
-cargo test
+# 原生打包，不需要 Bun/npm
+go tool mygo build
+go tool mygo build -platform darwin/arm64,windows/amd64
 ```
 
-CLI 默认统计 Claude Code 最近 30 天的数据；支持 `all`、`devin`、`claude`、`codex`、`antigravity`、`grok`、`zcode`、`opencode`、`pi`、`mimocode`（`mimo` 别名）和 `workbuddy`（`codebuddy`、`wb` 别名）。`--by-agent` 可在 `all` 汇总下增加逐 Agent 分项。运行 `cargo run -- --cli --help` 查看全部选项。
+Windows PowerShell 应先执行 `$env:CGO_ENABLED = '0'`，再执行 `go build ./...`，不要直接使用上面的 shell 环境变量赋值语法。Race 检测需 Go 的 race 工具链/C 编译器；正式构建不需要。
 
-## 价格表自动更新
+输出位于 `build/<os>-<arch>/`。macOS 签名/DMG 必须在 macOS 执行；Windows 安装器需要 NSIS（MyGo 可获取），发布工作流分发只含 `devin-usage-metrics.exe` 的便携 ZIP。自动更新的安装/重启流程仍需原生平台实测后才能发布。
 
-非 Devin 模型价格会自动从 `https://models.opencode.ai/api.json`（与 OpenCode 同源）刷新：先加载编译期嵌入的 `models-dev-pricing.json` 快照，再用本地缓存（`cache_dir/devin-usage-metrics/models-dev.json`）覆盖。缓存缺失或超过 24h 时拉取——GUI 启动后在后台检查一次，CLI 每次运行时检查一次。离线或拉取失败时静默沿用旧数据，并记 1h 退避。可通过 `DEVIN_USAGE_MODELS_URL`（数据源）、`DEVIN_USAGE_MODELS_PATH`（缓存路径）、`DEVIN_USAGE_DISABLE_MODELS_FETCH=1`（只用内嵌快照）覆盖。
+同步服务本来就是独立的 Go module，不改服务端协议：
 
-## 打包为 .app
-
-`Cargo.toml` 中已配置 `[package.metadata.bundle]`，可配合 [`cargo-bundle`](https://crates.io/crates/cargo-bundle) 打包：
-
-```bash
-cargo install cargo-bundle
-cargo bundle --release
+```sh
+(cd sync-server && go test -race ./... && go vet ./...)
 ```
 
-生成的 `.app` 会出现在 `target/release/bundle/osx/`，图标使用 `assets/icon.icns`。
+## 数据与兼容
 
-## 项目结构
+数据源位置与旧版保持一致：Claude 在 `~/.claude/projects`，Codex 在 `$CODEX_HOME`（默认 `~/.codex`），其他默认路径见 [英文数据源表](README.md#data-sources)。支持 WorkBuddy/CodeBuddy 路径别名、Claude 子 Agent 归并和跨文件去重、Codex 累积用量去重，以及只读 SQLite 导入。
 
-```
-src/
-├── main.rs    # GPUI 应用入口、UI 渲染、用量/会话/配额视图、多设备同步交互
-├── lib.rs     # 模块导出
-├── data.rs    # 公共记录、Devin SQLite 读取、磁盘缓存、设备标识管理
-├── local_sources.rs # Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode、pi-agent、MimoCode 与 WorkBuddy 导入器
-├── sync.rs    # 多设备同步编排、存储传输与 v1 迁移
-├── sync/v2.rs # 内容寻址、压缩并带完整性校验的同步协议
-├── pricing.rs # 模型定价表与费用计算
-├── i18n.rs    # 中英双语文案、系统语言探测与偏好读写
-├── cli.rs     # --cli 模式：按日用量汇总、表格与 CSV 输出
-├── devin-pro-pricing.json      # Devin Pro/Self-serve 官方价格的离线兜底，运行时在线刷新
-├── devin-model-pricing.json    # 旧 Devin 价格快照（兼容其他模型查找）
-├── models-dev-pricing.json     # 从 models.dev 提取的非 Devin 模型价格子集
-└── agg.rs     # 按日/周/月的桶聚合与模型分组（支持按设备过滤）
-tests/
-└── dump.rs    # 端到端集成测试，校验真实数据加载与聚合
-assets/
-└── icon*.{png,icns}  # 应用图标资源
-```
+Go 磁盘缓存与 Rust 快照分开，TTL 为 5 分钟；强制重新加载绕过缓存，进程内按文件/数据库签名复用解析结果。配置目录继续使用平台目录下的 `devin-usage-metrics/`：Linux `~/.config`、macOS `~/Library/Application Support`、Windows `%APPDATA%`。保留设备 ID、语言偏好、同步设置、加密登录及旧版压缩撤销记录。
 
-## 数据与隐私
+## 隐私和网络
 
-- 应用以只读方式打开 Devin 数据库，并且只读取其他 Agent 的 JSON/JSONL 文件
-- 只有明确点击「应用建议 / 撤销修改」才写入 Claude / Codex 用户配置；撤销记录仅保存在本机，不参与同步
-- 缓存文件以原子 rename 写入，避免半截文件
-- 不发起任何网络请求，所有展示均来自本机及用户配置的共享同步目录
-- 多设备同步数据只写入用户配置的自建同步 API；GitHub 仅用于确认账号身份
+- 仅在开启同步后向用户配置的自建 API 发送本地历史，GitHub 仅用于身份验证。
+- 实时配额访问对应供应商 API，OAuth 轮换可能写回 Agent 凭证；钥匙串发现需要明确授权。
+- 定价从 `models.opencode.ai` 与 Devin 文档刷新，缓存 24h，失败退避 1h。`DEVIN_USAGE_DISABLE_MODELS_FETCH=1` 关闭定价拉取；`DEVIN_USAGE_MODELS_URL` / `DEVIN_USAGE_MODELS_PATH` 可覆盖来源和缓存。
+- 打包版本启动 10 秒后及每 4 小时检查一次 GitHub 更新并自动下载（`config.json` 中 `auto_check_updates: false` 可关闭），安装仍需用户确认；ZIP SHA-256 校验用于检测损坏，不代替发布者签名。
+- 压缩建议只有明确应用/撤销才修改 Claude/Codex 设置，保留无关内容、拒绝覆盖检测到的外部修改；撤销记录不参与同步。应用后请开启新的 Agent 会话。
 
-## 许可证
+## 代码边界
+
+`main.go` 选择 GUI/CLI；`internal/desktop/host.go` 独占窗口/托盘/生命周期，`app.go` 管理状态和后台事件。`internal/` 下按数据、定价、统计、CLI、配额、同步、压缩建议、更新器分包。`mygo.json` 管理打包，`sync-server/` 独立。`src/`、Cargo 文件和 Rust 测试目前仅用于迁移对照。
 
 私有项目，暂未指定开源许可证。

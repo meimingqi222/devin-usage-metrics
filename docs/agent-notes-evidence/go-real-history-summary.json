@@ -1,0 +1,1035 @@
+{
+  "since": "2020-01-01",
+  "until": "2026-10-21",
+  "timezone": "<redacted>",
+  "offline_pricing": true,
+  "binary_sha256": {
+    "rust": "1b09408f3adb4b8af53ade95e60dd3aacb8e06178fb133ca91af345a7a1d7018",
+    "go": "ff6f810bf63490de6bd1cc2417cef410a7596e21c0f8a1923d89194d51dcaf01"
+  },
+  "snapshot_files": 983,
+  "snapshot_bytes": 3546648856,
+  "snapshot_manifest_sha256": "7b868a6fd26a78189569412e9db86f744faf8d4eb3c389c9fd3388306596041b",
+  "results": [
+    {
+      "agent": "claude",
+      "phase": "full",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.349,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 16,
+            "turns": 2496,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.723,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 16,
+            "turns": 2496,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "claude",
+      "phase": "cache",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.127,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 16,
+            "turns": 2496,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.039,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 16,
+            "turns": 2496,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "claude",
+      "phase": "expired",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.237,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 16,
+            "turns": 2496,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.073,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 16,
+            "turns": 2496,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "codex",
+      "phase": "full",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.186,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 155,
+            "turns": 1986,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.226,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 155,
+            "turns": 1986,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "codex",
+      "phase": "cache",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.077,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 155,
+            "turns": 1986,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.042,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 155,
+            "turns": 1986,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "codex",
+      "phase": "expired",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.188,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 155,
+            "turns": 1986,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.077,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 155,
+            "turns": 1986,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "devin",
+      "phase": "full",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 11.836,
+          "stderr_bytes": 86,
+          "cache_records": {
+            "sessions": 133,
+            "turns": 22156,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 6.782,
+          "stderr_bytes": 86,
+          "cache_records": {
+            "sessions": 133,
+            "turns": 22156,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "devin",
+      "phase": "cache",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.394,
+          "stderr_bytes": 86,
+          "cache_records": {
+            "sessions": 133,
+            "turns": 22156,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.127,
+          "stderr_bytes": 86,
+          "cache_records": {
+            "sessions": 133,
+            "turns": 22156,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "devin",
+      "phase": "expired",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 1.854,
+          "stderr_bytes": 86,
+          "cache_records": {
+            "sessions": 133,
+            "turns": 22156,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.182,
+          "stderr_bytes": 86,
+          "cache_records": {
+            "sessions": 133,
+            "turns": 22156,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "antigravity",
+      "phase": "full",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 2.085,
+          "stderr_bytes": 132,
+          "cache_records": {
+            "sessions": 57,
+            "turns": 15072,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.288,
+          "stderr_bytes": 132,
+          "cache_records": {
+            "sessions": 57,
+            "turns": 15072,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "antigravity",
+      "phase": "cache",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.332,
+          "stderr_bytes": 132,
+          "cache_records": {
+            "sessions": 57,
+            "turns": 15072,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.076,
+          "stderr_bytes": 132,
+          "cache_records": {
+            "sessions": 57,
+            "turns": 15072,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "antigravity",
+      "phase": "expired",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.92,
+          "stderr_bytes": 132,
+          "cache_records": {
+            "sessions": 57,
+            "turns": 15072,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.29,
+          "stderr_bytes": 132,
+          "cache_records": {
+            "sessions": 57,
+            "turns": 15072,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "grok",
+      "phase": "full",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.459,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 111,
+            "turns": 333,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 1.652,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 111,
+            "turns": 333,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "grok",
+      "phase": "cache",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.04,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 111,
+            "turns": 333,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.088,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 111,
+            "turns": 333,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "grok",
+      "phase": "expired",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.079,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 111,
+            "turns": 333,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.075,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 111,
+            "turns": 333,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "zcode",
+      "phase": "full",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.182,
+          "stderr_bytes": 132,
+          "cache_records": {
+            "sessions": 67,
+            "turns": 1122,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.071,
+          "stderr_bytes": 132,
+          "cache_records": {
+            "sessions": 67,
+            "turns": 1122,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "zcode",
+      "phase": "cache",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.079,
+          "stderr_bytes": 132,
+          "cache_records": {
+            "sessions": 67,
+            "turns": 1122,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.045,
+          "stderr_bytes": 132,
+          "cache_records": {
+            "sessions": 67,
+            "turns": 1122,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "zcode",
+      "phase": "expired",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.132,
+          "stderr_bytes": 132,
+          "cache_records": {
+            "sessions": 67,
+            "turns": 1122,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.038,
+          "stderr_bytes": 132,
+          "cache_records": {
+            "sessions": 67,
+            "turns": 1122,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "opencode",
+      "phase": "full",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 1.84,
+          "stderr_bytes": 814,
+          "cache_records": {
+            "sessions": 260,
+            "turns": 11398,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 1.172,
+          "stderr_bytes": 814,
+          "cache_records": {
+            "sessions": 260,
+            "turns": 11398,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "opencode",
+      "phase": "cache",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.232,
+          "stderr_bytes": 814,
+          "cache_records": {
+            "sessions": 260,
+            "turns": 11398,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.13,
+          "stderr_bytes": 814,
+          "cache_records": {
+            "sessions": 260,
+            "turns": 11398,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "opencode",
+      "phase": "expired",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 1.337,
+          "stderr_bytes": 814,
+          "cache_records": {
+            "sessions": 260,
+            "turns": 11398,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.131,
+          "stderr_bytes": 814,
+          "cache_records": {
+            "sessions": 260,
+            "turns": 11398,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "pi",
+      "phase": "full",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.403,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 117,
+            "turns": 13371,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.405,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 117,
+            "turns": 13371,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "pi",
+      "phase": "cache",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.179,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 117,
+            "turns": 13371,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.078,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 117,
+            "turns": 13371,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "pi",
+      "phase": "expired",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.925,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 117,
+            "turns": 13371,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.129,
+          "stderr_bytes": 0,
+          "cache_records": {
+            "sessions": 117,
+            "turns": 13371,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "mimocode",
+      "phase": "full",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.287,
+          "stderr_bytes": 173,
+          "cache_records": {
+            "sessions": 30,
+            "turns": 1075,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.133,
+          "stderr_bytes": 173,
+          "cache_records": {
+            "sessions": 30,
+            "turns": 1075,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "mimocode",
+      "phase": "cache",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.079,
+          "stderr_bytes": 173,
+          "cache_records": {
+            "sessions": 30,
+            "turns": 1075,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.038,
+          "stderr_bytes": 173,
+          "cache_records": {
+            "sessions": 30,
+            "turns": 1075,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "mimocode",
+      "phase": "expired",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.182,
+          "stderr_bytes": 173,
+          "cache_records": {
+            "sessions": 30,
+            "turns": 1075,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.04,
+          "stderr_bytes": 173,
+          "cache_records": {
+            "sessions": 30,
+            "turns": 1075,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "workbuddy",
+      "phase": "full",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.336,
+          "stderr_bytes": 236,
+          "cache_records": {
+            "sessions": 139,
+            "turns": 2341,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.235,
+          "stderr_bytes": 236,
+          "cache_records": {
+            "sessions": 139,
+            "turns": 2341,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "workbuddy",
+      "phase": "cache",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.129,
+          "stderr_bytes": 236,
+          "cache_records": {
+            "sessions": 139,
+            "turns": 2341,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.042,
+          "stderr_bytes": 236,
+          "cache_records": {
+            "sessions": 139,
+            "turns": 2341,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    },
+    {
+      "agent": "workbuddy",
+      "phase": "expired",
+      "runs": {
+        "rust": {
+          "status": 0,
+          "seconds": 0.35,
+          "stderr_bytes": 236,
+          "cache_records": {
+            "sessions": 139,
+            "turns": 2341,
+            "errors": 0
+          }
+        },
+        "go": {
+          "status": 0,
+          "seconds": 0.071,
+          "stderr_bytes": 236,
+          "cache_records": {
+            "sessions": 139,
+            "turns": 2341,
+            "errors": 0
+          }
+        }
+      },
+      "comparison": {
+        "missing_days": 0,
+        "extra_days": 0,
+        "different_rows": 0,
+        "fields": {},
+        "pass": true,
+        "record_counts_match": true
+      }
+    }
+  ]
+}

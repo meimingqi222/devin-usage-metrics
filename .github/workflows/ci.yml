@@ -2,45 +2,78 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      package_version:
+        description: Acceptance package version (x.y.z); empty keeps mygo.json
+        required: false
+        default: ''
+        type: string
 
-# GPUI 的系统依赖在 Windows/macOS 上开箱即用，
-# Linux 需要额外图形库；桌面 CI 覆盖 macOS 与 Windows。
 jobs:
-  check:
-    name: fmt / clippy / test
+  desktop:
+    name: Go / MyGo (${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+            target: darwin/arm64
+          - os: windows-latest
+            target: windows/amd64
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - uses: ./.github/actions/gpui-kit
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          token: ${{ secrets.GPUI_APP_KIT_TOKEN }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
       - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets
-
-      - name: Check content boundary
-        run: python ../gpui-app-kit/tools/check_content.py --forbid-call start_load --forbid-call start_tick --forbid-call switch_period src/tray.rs
-
-      - name: Run tests
-        run: cargo test
+        shell: bash
+        run: test -z "$(gofmt -l main.go internal)"
+      - name: Set optional acceptance version
+        if: github.event_name == 'workflow_dispatch' && inputs.package_version != ''
+        shell: python
+        env:
+          PACKAGE_VERSION: ${{ inputs.package_version }}
+        run: |
+          import json, os, re
+          from pathlib import Path
+          version = os.environ['PACKAGE_VERSION']
+          if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+              raise SystemExit('Acceptance version must be x.y.z')
+          path = Path('mygo.json')
+          config = json.loads(path.read_text())
+          config['version'] = version
+          path.write_text(json.dumps(config, indent=2) + '\n')
+      - name: Build native package
+        run: go tool mygo build -skip-dmg
+      - name: Verify the package ships no native SQLite library
+        shell: bash
+        run: test -z "$(find build -iname '*sqlite3*' -type f)"
+      - uses: actions/setup-python@v5
+        if: matrix.target != ''
+        with:
+          python-version: '3.12'
+      - name: Package acceptance ZIP and checksum
+        if: matrix.target != ''
+        run: python scripts/package-release.py --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        if: matrix.target != ''
+        with:
+          name: acceptance-${{ matrix.os }}-${{ inputs.package_version || 'repository-version' }}-${{ github.sha }}
+          path: build/acceptance/*
+          if-no-files-found: error
+          retention-days: 14
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: Verify no cgo is needed
+        env:
+          CGO_ENABLED: '0'
+        run: go test ./...
 
   sync-server:
     name: Sync server race / vet
@@ -49,14 +82,10 @@ jobs:
       run:
         working-directory: sync-server
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Install Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version-file: sync-server/go.mod
-          cache: false
-      - name: Run race tests
-        run: go test -race ./...
-      - name: Vet
-        run: go vet ./...
+          cache-dependency-path: sync-server/go.sum
+      - run: go test -race ./...
+      - run: go vet ./...
