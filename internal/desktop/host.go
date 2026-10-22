@@ -27,8 +27,10 @@ const (
 // it the GC works harder; nothing fails. GOMEMLIMIT still takes precedence.
 const trayMemoryLimit = 384 << 20
 
-// Run starts the native desktop host. The content views never own window handles.
-func Run(icon []byte) error {
+// Run starts the native desktop host with the tray's macOS template icon
+// and its color icon for other platforms. The content views never own
+// window handles.
+func Run(templateIcon, colorIcon []byte) error {
 	if os.Getenv("GOMEMLIMIT") == "" {
 		debug.SetMemoryLimit(trayMemoryLimit)
 	}
@@ -132,8 +134,14 @@ func Run(icon []byte) error {
 			})
 		}
 		var err error
-		// The tray shows the app icon itself, in color, on every platform.
-		tray, err = mygo.NewTray(mygo.TrayOptions{Icon: icon, ToolTip: "Agent Usage Metrics"})
+		// macOS menu bar extras are template images the system tints for
+		// light and dark bars, selection and contrast settings; Windows and
+		// Linux trays show the app's color icon.
+		icon, template := colorIcon, false
+		if runtime.GOOS == "darwin" {
+			icon, template = templateIcon, true
+		}
+		tray, err = mygo.NewTray(mygo.TrayOptions{Icon: icon, IconIsTemplate: template, ToolTip: "Agent Usage Metrics"})
 		if err != nil {
 			a.message = fmt.Sprintf("Tray unavailable: %v", err)
 		} else {

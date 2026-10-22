@@ -12,8 +12,14 @@ import (
 	"github.com/meimingqi222/devin-usage-metrics/internal/updater"
 )
 
-//go:embed assets/tray_icon.png
-var trayIcon []byte
+// The tray icon follows each platform: a template of the app icon's glyph
+// that macOS tints for the menu bar, and the color app icon elsewhere.
+var (
+	//go:embed assets/tray_icon.png
+	trayTemplate []byte
+	//go:embed assets/tray_icon_color.png
+	trayColor []byte
+)
 
 // mygo.json's version is the app's only version: it names the package,
 // the bundle and every place the app shows or compares its version.
@@ -34,7 +40,7 @@ func main() {
 	if len(args) > 0 {
 		err = cli.Run(args, os.Stdout, os.Stderr)
 	} else {
-		err = desktop.Run(trayIcon)
+		err = desktop.Run(trayTemplate, trayColor)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
