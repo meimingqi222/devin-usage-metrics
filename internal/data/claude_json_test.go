@@ -115,7 +115,7 @@ func TestClaudeProjectionMatchesFullAccounting(t *testing.T) {
 	// production accounting. Compare that result to selective decoding.
 	for _, p := range paths {
 		d := empty(0, 200)
-		readLines(&d, model.Devin, p, true)
+		readLinesContext(context.Background(), &d, model.Devin, p, true)
 	}
 	want := load()
 	for _, p := range paths {

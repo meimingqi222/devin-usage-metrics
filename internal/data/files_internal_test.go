@@ -18,7 +18,7 @@ func TestDecodedTranscriptsAreForgottenAfterDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := model.Data{FileMtimes: map[string]int64{}}
-	readLines(&d, model.Claude, p, false)
+	readLinesContext(context.Background(), &d, model.Claude, p, false)
 	if _, ok := decodedFiles.Load(p); !ok {
 		t.Fatal("transcript was not cached")
 	}
@@ -131,7 +131,7 @@ func TestDecodedAppendAndRewrite(t *testing.T) {
 	read := func() []obj {
 		t.Helper()
 		d := empty(0, 200)
-		lines := readLines(&d, model.Pi, p, false)
+		lines := readLinesContext(context.Background(), &d, model.Pi, p, false)
 		if len(d.Errors) != 0 {
 			t.Fatalf("read errors: %v", d.Errors)
 		}

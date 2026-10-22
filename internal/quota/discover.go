@@ -200,13 +200,6 @@ func loadStore() store {
 	_ = json.Unmarshal(b, &s)
 	return s
 }
-func SaveDevinAccount(label, cookie, org string) error {
-	storeMu.Lock()
-	defer storeMu.Unlock()
-	s := loadStore()
-	s.Devin = append(s.Devin, storedDevin{label, cookie, org})
-	return atomicWrite(configPath("quota-accounts.json"), s)
-}
 func RemoveDevinAccount(index int) error {
 	storeMu.Lock()
 	defer storeMu.Unlock()

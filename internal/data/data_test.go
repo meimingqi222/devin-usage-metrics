@@ -219,14 +219,9 @@ func TestCacheRefreshExpiryAndDevice(t *testing.T) {
 	d := data.Load(model.Pi, 0, 200, true)
 	check(t, d, 1)
 	id := data.DeviceID()
-	if e := data.SetDeviceName("  Laptop  "); e != nil {
-		t.Fatal(e)
-	}
+	setDeviceName(t, "  Laptop  ")
 	if data.DeviceID() != id || data.DeviceName() != "Laptop" {
 		t.Fatal("identity changed")
-	}
-	if data.SetDeviceName(strings.Repeat("x", 65)) == nil || data.SetDeviceName("a\nb") == nil {
-		t.Fatal("invalid name accepted")
 	}
 	write(t, h, p, line+line)
 	check(t, data.Load(model.Pi, 0, 200, false), 1)
@@ -252,9 +247,7 @@ func TestCacheRefreshExpiryAndDevice(t *testing.T) {
 	if len(d.Errors) == 0 {
 		t.Fatal("malformed input silently dropped")
 	}
-	if e = data.SetDeviceName(""); e != nil {
-		t.Fatal(e)
-	}
+	setDeviceName(t, "")
 	if data.DeviceID() != id || data.DeviceName() == "" {
 		t.Fatal("reset name broke identity")
 	}
@@ -376,5 +369,22 @@ func TestLegacySnapshotCannotHideImporterFixes(t *testing.T) {
 	d := data.Load(model.WorkBuddy, 0, 1800000000, false)
 	if len(d.Sessions) != 1 {
 		t.Fatal("legacy cache hid corrected importer output")
+	}
+}
+
+// setDeviceName writes a name into device.json as the Rust app's device
+// settings did; the Go app honours it but has no editor for it.
+func setDeviceName(t *testing.T, name string) {
+	t.Helper()
+	dir, _ := os.UserConfigDir()
+	p := filepath.Join(dir, "devin-usage-metrics", "device.json")
+	v := map[string]any{}
+	if b, err := os.ReadFile(p); err == nil {
+		_ = json.Unmarshal(b, &v)
+	}
+	v["name"] = name
+	b, _ := json.Marshal(v)
+	if err := os.WriteFile(p, b, 0600); err != nil {
+		t.Fatal(err)
 	}
 }

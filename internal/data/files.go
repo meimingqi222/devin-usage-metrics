@@ -376,10 +376,6 @@ func forgetRemoved(roots []string, ext string, seen map[string]bool) {
 // Only changed transcripts are decoded again after the five-minute snapshot
 // expires. Rebuild accounting globally so resumed Claude copies still dedup
 // against unchanged files, and removed files cannot leave stale turns behind.
-func readLines(d *model.Data, a model.Agent, p string, refresh bool) []obj {
-	return readLinesContext(context.Background(), d, a, p, refresh)
-}
-
 func readLinesContext(ctx context.Context, d *model.Data, a model.Agent, p string, refresh bool) []obj {
 	started := time.Now()
 	ctx = sourceContext(ctx, p)

@@ -71,7 +71,7 @@ func TestDiscoveryAndPrivateStore(t *testing.T) {
 	if !KeychainAllowed() {
 		t.Fatal("preference not saved")
 	}
-	if e := SaveDevinAccount("manual", "fixture-secret", "org-test"); e != nil {
+	if e := saveDevinAccount("manual", "fixture-secret", "org-test"); e != nil {
 		t.Fatal(e)
 	}
 	a := Discover(false)
@@ -183,7 +183,7 @@ func TestProviderWindows(t *testing.T) {
 }
 func TestDevinManualAndCLI(t *testing.T) {
 	fixtureHome(t)
-	if e := SaveDevinAccount("manual", "session=fake", "org-fixture"); e != nil {
+	if e := saveDevinAccount("manual", "session=fake", "org-fixture"); e != nil {
 		t.Fatal(e)
 	}
 	fixture(t, ".local/share/devin/credentials.toml", "windsurf_api_key = \"devin-session-token$fake\"\n")
@@ -215,4 +215,14 @@ func TestDevinManualAndCLI(t *testing.T) {
 			t.Fatalf("%s %+v %v", account, r, e)
 		}
 	}
+}
+
+// saveDevinAccount stores a cookie account the way the Rust app's quota
+// store holds them; the Go app only reads and removes them.
+func saveDevinAccount(label, cookie, org string) error {
+	storeMu.Lock()
+	defer storeMu.Unlock()
+	s := loadStore()
+	s.Devin = append(s.Devin, storedDevin{label, cookie, org})
+	return atomicWrite(configPath("quota-accounts.json"), s)
 }

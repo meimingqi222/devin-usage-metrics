@@ -14,8 +14,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
@@ -118,24 +116,6 @@ func DeviceName() string {
 		h = "This Device"
 	}
 	return h
-}
-func SetDeviceName(n string) error {
-	n = strings.TrimSpace(n)
-	if utf8.RuneCountInString(n) > 64 || strings.ContainsFunc(n, unicode.IsControl) {
-		return fmt.Errorf("device name must be at most 64 characters and contain no controls")
-	}
-	deviceMu.Lock()
-	defer deviceMu.Unlock()
-	unlock, e := lockDevice()
-	if e != nil {
-		return e
-	}
-	defer unlock()
-	id := deviceID()
-	v := readDevice()
-	v["id"] = id
-	v["name"] = n
-	return atomicJSON(configPath(), v)
 }
 
 // Bump when parsing changes so persisted records cannot bypass importer fixes.

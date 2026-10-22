@@ -325,21 +325,6 @@ func DiscoverDevinOrg(ctx context.Context, cookie string) (string, error) {
 	}
 	return s, nil
 }
-func ValidateDevinCookie(ctx context.Context, cookie string) (string, string, error) {
-	v, e := jsonRequest(ctx, "GET", "https://app.devin.ai/api/users/info", "", map[string]string{"Cookie": cookie, "Accept": "application/json"}, false)
-	if e != nil {
-		return "", "", e
-	}
-	org, e := DiscoverDevinOrg(ctx, cookie)
-	label := str(v["email"])
-	if label == "" {
-		label = str(v["username"])
-	}
-	if label == "" {
-		label = "Devin"
-	}
-	return label, org, e
-}
 func fetchDevin(ctx context.Context, cookie, org string) (Result, error) {
 	if org == "" {
 		var e error
