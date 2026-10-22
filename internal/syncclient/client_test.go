@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	stdatomic "sync/atomic"
@@ -80,7 +81,8 @@ func TestLoginRustEncryptedStorageContract(t *testing.T) {
 		t.Fatal("session roundtrip", e)
 	}
 	info, _ := os.Stat(path("github-sync-session.enc"))
-	if info.Mode().Perm() != 0600 {
+	// Windows reports synthetic POSIX modes; ACLs are checked during native acceptance.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 		t.Fatal(info.Mode())
 	}
 	if e = Logout(); e != nil {

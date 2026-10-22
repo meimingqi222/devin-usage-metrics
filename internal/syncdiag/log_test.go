@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -58,7 +59,8 @@ func TestConcurrentLogsKeepRunScopeAndRedactErrors(t *testing.T) {
 		t.Fatal("credential leaked into diagnostic")
 	}
 	info, _ := os.Stat(Path())
-	if info.Mode().Perm() != 0600 {
+	// Windows reports synthetic POSIX modes; ACLs are checked during native acceptance.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 		t.Fatalf("log mode: %v", info.Mode())
 	}
 	if WithRun(ctx).Value(runKey) != ctx.Value(runKey) || WithRun(context.Background()).Value(runKey) == ctx.Value(runKey) {

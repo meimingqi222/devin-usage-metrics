@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -82,7 +83,7 @@ func TestDiscoveryAndPrivateStore(t *testing.T) {
 		t.Fatal("credential leak")
 	}
 	s, e := os.Stat(configPath("quota-accounts.json"))
-	if e != nil || s.Mode().Perm() != 0600 {
+	if e != nil || (runtime.GOOS != "windows" && s.Mode().Perm() != 0600) {
 		t.Fatal("store must be private")
 	}
 	if e := RemoveDevinAccount(0); e != nil {
