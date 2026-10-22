@@ -9,7 +9,7 @@
 
 检查：`gofmt -l main.go internal`、`go vet ./...`、`go test -race ./...`、`CGO_ENABLED=0 go build ./...`。
 同步服务是独立 Go module，另在 `sync-server/` 执行 `go test -race ./...`、`go vet ./...`。
-打包：`go tool mygo build`；必须包含 SQLite 插件的预编译动态库，不能只分发裸 exe。
+打包：`go tool mygo build`。SQLite 通过 `internal/sqlite`（纯 Go 的 `github.com/ncruces/go-sqlite3`）编译进程序，包里不带原生动态库；不要重新引入 MyGo SQLite 插件或任何 SQLite DLL/dylib。Windows 发布包内的可执行文件保持 Rust 的名字 `devin-usage-metrics.exe`，旧版 Rust 更新器才能升级。
 原生 UI 回归：`go test ./internal/desktop`；`AUM_SCREENSHOTS=/absolute/path` 可保存 fixture 渲染截图。
 
 `src/`、`Cargo.toml` 与 Rust 测试暂留作迁移行为对照，不参与 Go 构建/发布。

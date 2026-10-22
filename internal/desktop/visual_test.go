@@ -103,3 +103,30 @@ func TestOriginalDenseVisualStates(t *testing.T) {
 	click(t, tt, "常规偏好")
 	capture(t, tt, "parity-settings-general")
 }
+
+// Long hostnames must end with an ellipsis inside the 160 DIP sidebar
+// instead of running past the row into the window edge.
+func TestDeviceNamesFitSidebar(t *testing.T) {
+	a := fixture(t)
+	a.lang, a.agentsClosed = "en", true
+	a.device = a.localID
+	a.remote = model.Data{Sessions: []model.Session{{DeviceID: "laptop", DeviceName: "LAPTOP-9MA1G6D"}}}
+	tt := ui.NewTester(func(c *ui.Context) {
+		a.theme(c)
+		ui.Row(c).Fill().Children(func() { a.sidebar(c) })
+	}, 160, 600)
+	row, ok := tt.Find("LAPTOP-9MA1G6D")
+	if !ok {
+		t.Fatalf("no device row: %v", tt.Texts())
+	}
+	// The row's 8 DIP right padding must stay clear of glyphs.
+	img := tt.Image()
+	for y := int(row.Y + 4); y < int(row.Y+row.H-4); y++ {
+		for x := int(row.X + row.W - 6); x < int(row.X+row.W-1); x++ {
+			r, g, b, _ := img.At(x, y).RGBA()
+			if r>>8 > 100 || g>>8 > 100 || b>>8 > 100 {
+				t.Fatalf("device name overflows into the right padding at %d,%d", x, y)
+			}
+		}
+	}
+}

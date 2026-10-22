@@ -63,7 +63,13 @@ func local(agent model.Agent, name string) (target, error) {
 	default:
 		return t, errors.New("unsupported agent")
 	}
-	if p, e := filepath.EvalSymlinks(t.path); e == nil {
+	// Rust canonicalizes only a symlinked config file; resolving parent
+	// directories too would change journal keys written by older releases.
+	if info, e := os.Lstat(t.path); e == nil && info.Mode()&os.ModeSymlink != 0 {
+		p, e := filepath.EvalSymlinks(t.path)
+		if e != nil {
+			return t, e
+		}
 		t.path = p
 	}
 	return t, nil
@@ -247,9 +253,10 @@ func (t target) locked(s string) bool {
 	if !t.claude {
 		return false
 	}
+	// A missing settings file still leaves process variables in force.
 	var root map[string]any
-	if json.Unmarshal([]byte(s), &root) != nil {
-		return false
+	if strings.TrimSpace(s) != "" {
+		_ = json.Unmarshal([]byte(s), &root)
 	}
 	env, _ := root["env"].(map[string]any)
 	for _, k := range []string{"CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"} {
@@ -259,6 +266,21 @@ func (t target) locked(s string) bool {
 		}
 	}
 	return false
+}
+
+// Locked reports whether an environment variable overrides the local
+// compaction setting, so applying a recommendation would have no effect.
+func Locked(agent model.Agent) bool {
+	name := ""
+	if agent == model.Claude {
+		name = "claude-opus-4"
+	}
+	t, e := local(agent, name)
+	if e != nil {
+		return false
+	}
+	s, e := readText(t.path)
+	return e == nil && t.locked(s)
 }
 func equal(a, b *uint64) bool { return a == nil && b == nil || a != nil && b != nil && *a == *b }
 func atomicWrite(path string, b []byte) error {

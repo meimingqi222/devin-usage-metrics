@@ -22,7 +22,7 @@
 - Windows 10/11、macOS 12+，或安装 GTK 3 的 Linux。Linux 托盘额外需要 `libayatana-appindicator3` 及支持 indicator 的桌面，使用托盘菜单打开面板，不支持与 Windows/macOS 相同的直接点击交互。
 - 本机使用过至少一种受支持的 Agent，才有真实统计数据。
 
-SQLite 通过 MyGo 插件的预编译动态库加载，无需本机 C 编译器。`go tool mygo build` 自动下载、按上游 SHA-256 校验并打包该库；开发运行可能首次下载到 MyGo 缓存。**不能只分发裸 exe**，Windows 必须同时包含 `mygo-sqlite3.dll`。
+SQLite 通过纯 Go 的 [`github.com/ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3) 编译进可执行文件，无需 C 编译器，也不需要任何原生动态库：单个 exe（或 `.app`）就是完整应用。
 
 ## 运行、验证与打包
 
@@ -37,14 +37,14 @@ go vet ./...
 go test -race ./...
 CGO_ENABLED=0 go build ./...
 
-# 原生打包（包含 SQLite 动态库），不需要 Bun/npm
+# 原生打包，不需要 Bun/npm
 go tool mygo build
 go tool mygo build -platform darwin/arm64,windows/amd64
 ```
 
 Windows PowerShell 应先执行 `$env:CGO_ENABLED = '0'`，再执行 `go build ./...`，不要直接使用上面的 shell 环境变量赋值语法。Race 检测需 Go 的 race 工具链/C 编译器；正式构建不需要。
 
-输出位于 `build/<os>-<arch>/`。macOS 签名/DMG 必须在 macOS 执行；Windows 安装器需要 NSIS（MyGo 可获取），发布工作流分发包含运行库的便携 ZIP。自动更新的安装/重启流程仍需原生平台实测后才能发布。
+输出位于 `build/<os>-<arch>/`。macOS 签名/DMG 必须在 macOS 执行；Windows 安装器需要 NSIS（MyGo 可获取），发布工作流分发只含 `devin-usage-metrics.exe` 的便携 ZIP。自动更新的安装/重启流程仍需原生平台实测后才能发布。
 
 同步服务本来就是独立的 Go module，不改服务端协议：
 
@@ -63,7 +63,7 @@ Go 磁盘缓存与 Rust 快照分开，TTL 为 5 分钟；强制重新加载绕�
 - 仅在开启同步后向用户配置的自建 API 发送本地历史，GitHub 仅用于身份验证。
 - 实时配额访问对应供应商 API，OAuth 轮换可能写回 Agent 凭证；钥匙串发现需要明确授权。
 - 定价从 `models.opencode.ai` 与 Devin 文档刷新，缓存 24h，失败退避 1h。`DEVIN_USAGE_DISABLE_MODELS_FETCH=1` 关闭定价拉取；`DEVIN_USAGE_MODELS_URL` / `DEVIN_USAGE_MODELS_PATH` 可覆盖来源和缓存。
-- 用户点击检查/下载更新才访问 GitHub；ZIP SHA-256 校验用于检测损坏，不代替发布者签名。
+- 打包版本启动 10 秒后及每 4 小时检查一次 GitHub 更新并自动下载（`config.json` 中 `auto_check_updates: false` 可关闭），安装仍需用户确认；ZIP SHA-256 校验用于检测损坏，不代替发布者签名。
 - 压缩建议只有明确应用/撤销才修改 Claude/Codex 设置，保留无关内容、拒绝覆盖检测到的外部修改；撤销记录不参与同步。应用后请开启新的 Agent 会话。
 
 ## 代码边界

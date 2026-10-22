@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/egoist/mygo/plugins/sqlite"
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
+	"github.com/meimingqi222/devin-usage-metrics/internal/sqlite"
 )
 
 func query(d *model.Data, a model.Agent, db *sqlite.DB, sql string, args ...any) []obj {

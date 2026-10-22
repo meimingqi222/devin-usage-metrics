@@ -22,7 +22,7 @@ Local coding-agent analytics, now implemented in **Go + [MyGo native UI](https:/
 - Windows 10/11, macOS 12+, or Linux with GTK 3. Linux tray support additionally needs `libayatana-appindicator3` and a desktop with an indicator host. Linux uses a tray menu rather than direct tray-icon clicks.
 - At least one supported agent's local history for real usage data.
 
-MyGo's SQLite plugin loads a precompiled, platform-specific library via purego. `go tool mygo build` bundles it automatically and checks downloads against upstream SHA-256 metadata. Development runs may download it once into MyGo's cache. **Do not distribute only the executable**, especially on Windows: include `mygo-sqlite3.dll`.
+SQLite is compiled into the executable through the pure-Go [`github.com/ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3), so builds need no C compiler and no native library: the executable (or `.app`) is the whole app.
 
 ## Run, test and package
 
@@ -37,14 +37,14 @@ go vet ./...
 go test -race ./...
 CGO_ENABLED=0 go build ./...
 
-# Native packaging, including SQLite resources; no Bun/npm needed
+# Native packaging; no Bun/npm needed
 go tool mygo build
 go tool mygo build -platform darwin/arm64,windows/amd64
 ```
 
 Windows PowerShell: set `$env:CGO_ENABLED = '0'` before `go build ./...` instead of using shell-style environment assignment. Race tests need the Go race toolchain/C compiler; release builds do not.
 
-Packaged apps appear in `build/<os>-<arch>/`. macOS signing/DMG creation must run on macOS. Windows installers require NSIS (MyGo can obtain it); the release workflow distributes a portable ZIP with its runtime DLL. Updater installation/restart still requires native-platform validation before release.
+Packaged apps appear in `build/<os>-<arch>/`. macOS signing/DMG creation must run on macOS. Windows installers require NSIS (MyGo can obtain it); the release workflow distributes a portable ZIP holding `devin-usage-metrics.exe`. Updater installation/restart still requires native-platform validation before release.
 
 The sync server is a separate, existing Go module:
 
@@ -76,7 +76,7 @@ Configuration stays in `devin-usage-metrics/` under the OS configuration directo
 - Local history is sent only to the configured self-hosted API while sync is enabled. GitHub is used for identity.
 - Quota queries contact provider APIs and may rotate/write agent OAuth credentials. Keychain access is opt-in.
 - Pricing catalogs refresh from `models.opencode.ai` and Devin documentation (24h TTL, 1h failure backoff). Set `DEVIN_USAGE_DISABLE_MODELS_FETCH=1` to disable catalog fetching; `DEVIN_USAGE_MODELS_URL` / `DEVIN_USAGE_MODELS_PATH` override its source/cache.
-- Update checks/downloads contact GitHub only on user action. ZIP checksums detect corruption, not publisher authenticity.
+- Packaged builds check GitHub for updates 10 seconds after launch and every four hours and download them (set `auto_check_updates` to `false` in `config.json` to opt out); installing still needs user action. ZIP checksums detect corruption, not publisher authenticity.
 - Only explicit compaction Apply/Undo changes Claude/Codex settings; unrelated fields are preserved, external edits refused, undo stays local. Start a new agent session afterwards.
 
 ## Layout

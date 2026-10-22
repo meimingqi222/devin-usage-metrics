@@ -22,16 +22,11 @@ jobs:
       - name: Check formatting
         shell: bash
         run: test -z "$(gofmt -l main.go internal)"
-      - name: Build native package and bundle SQLite runtime
+      - name: Build native package
         run: go tool mygo build -skip-dmg
-      - name: Locate bundled SQLite for offline fixtures
-        shell: python
-        run: |
-          import os
-          from pathlib import Path
-          library = next(p for p in Path('build').rglob('*mygo-sqlite3*') if p.is_file())
-          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
-              env.write(f'MYGO_SQLITE_LIBRARY={library.resolve()}\n')
+      - name: Verify the package ships no native SQLite library
+        shell: bash
+        run: test -z "$(find build -iname '*sqlite3*' -type f)"
       - run: go vet ./...
       - run: go test -race ./...
       - name: Verify no cgo is needed

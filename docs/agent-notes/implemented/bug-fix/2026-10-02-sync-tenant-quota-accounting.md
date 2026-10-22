@@ -8,7 +8,7 @@ Every object write rescanned the tenant directory under one global lock, causing
 
 ## Decision
 
-Each tenant has its own lock and lazily initialized usage totals. Successful writes update totals; migration markers and every GC attempt invalidate them. Quota checks, writes and GC serialize within one tenant. Temporary files always close even after write or sync failures.
+Each tenant has its own lock and lazily initialized usage totals. Successful writes update totals; migration markers and every GC attempt invalidate them. Quota checks, writes and GC serialize within one tenant: a body is written and fsynced to a temporary file before the lock is taken, and the lock covers the precondition, quota check and atomic rename. Temporary files always close even after write or sync failures.
 
 ## Alternatives considered
 

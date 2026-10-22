@@ -4,15 +4,83 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 	"net/url"
 	"os"
 	"sort"
 	"strings"
+	stdatomic "sync/atomic"
 	"time"
+
+	"github.com/meimingqi222/devin-usage-metrics/internal/model"
+	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 )
 
-func (t transport) publish(ctx context.Context, id string, data model.Data, previous *devicePackage) error {
+// auditInterval spaces full listings that confirm the parent manifest's
+// objects still exist. Local caches can otherwise hide an object the server
+// lost, and reuse would keep referencing it for every other device.
+const auditInterval = 24 * time.Hour
+
+// Protected by cycleMu.
+var lastAudit = map[string]time.Time{}
+
+// verifyManifest reports whether cached copies of this device's current
+// manifest may be used. Other devices read it from the server, so a HEAD
+// checks the stored copy's ETag each cycle without a download; a damaged or
+// missing copy is restored from the verified cache. Servers without a usable
+// HEAD answer fall back to a fresh download and hash check.
+func (t transport) verifyManifest(ctx context.Context, digest string) bool {
+	name := "v3-manifest-" + digest + ".json"
+	_, h, s, e := t.request(ctx, "HEAD", "/v1/objects/"+url.PathEscape(name), nil, nil)
+	if e != nil {
+		return false
+	}
+	if s == 200 && h.Get("ETag") == `"`+digest+`"` {
+		return true
+	}
+	cached := t.cachedManifest(name)
+	if (s != 200 && s != 404) || (s == 200 && h.Get("ETag") == "") || cached == nil {
+		return false
+	}
+	syncdiag.Log(ctx, "manifest_repair", "object", syncdiag.ID(name), "status", s)
+	_, e = t.putImmutable(ctx, name, cached)
+	return e == nil
+}
+
+// auditPrior drops references to missing objects from the parent manifest, so
+// their groups are encoded and uploaded again instead of being reused.
+func (t transport) auditPrior(ctx context.Context, prior *manifest) error {
+	if time.Since(lastAudit[t.account()]) < auditInterval {
+		return nil
+	}
+	names, e := t.list(ctx)
+	if e != nil {
+		return e
+	}
+	present := make(map[string]bool, len(names))
+	for _, name := range names {
+		present[name] = true
+	}
+	missing := 0
+	keep := func(refs []reference) []reference {
+		out := refs[:0:0]
+		for _, r := range refs {
+			if present[r.File] {
+				out = append(out, r)
+			} else {
+				missing++
+			}
+		}
+		return out
+	}
+	prior.Blocks, prior.Sessions = keep(prior.Blocks), keep(prior.Sessions)
+	syncdiag.Log(ctx, "publish_audit", "objects", len(names), "missing", missing)
+	lastAudit[t.account()] = time.Now()
+	return nil
+}
+
+func (t transport) publish(ctx context.Context, id string, data model.Data, previous *devicePackage) (resultErr error) {
+	ctx, finished := syncdiag.Stage(syncdiag.WithDevice(ctx, id), "publish")
+	defer func() { finished(resultErr) }()
 	input, e := exportFingerprint(data)
 	if e != nil {
 		return e
@@ -40,7 +108,11 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 		condition = map[string]string{"If-Match": revision}
 		parent = &old.Manifest
 		// Re-read under the CAS base, so a concurrent publish cannot lose history.
-		p, e := t.loadManifest(ctx, id, 3, old.Manifest)
+		load := t.loadManifestFresh
+		if t.verifyManifest(ctx, old.Manifest) {
+			load = t.loadManifest
+		}
+		p, e := load(ctx, id, 3, old.Manifest)
 		if e != nil && old.Previous != nil {
 			p, e = t.loadManifestFresh(ctx, id, 3, *old.Previous)
 			parent = old.Previous
@@ -49,14 +121,14 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 			return e
 		}
 		previous = &p
-		b, e := t.get(ctx, "v3-manifest-"+*parent+".json", 8<<20)
+		b, e := t.manifestBytes(ctx, "v3-manifest-"+*parent+".json", *parent, *parent == old.Manifest)
 		if e != nil {
 			return e
 		}
-		if hash(b) != *parent {
-			return errors.New("manifest hash mismatch")
-		}
 		if e = json.Unmarshal(b, &prior); e != nil {
+			return e
+		}
+		if e = t.auditPrior(ctx, &prior); e != nil {
 			return e
 		}
 	} else if status != 404 {
@@ -65,8 +137,11 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 	now := time.Now().Unix()
 	retained := now - 366*86400
 	if parent != nil && *parent == old.Manifest && lastExport.scope == t.scope() && lastExport.device == id && lastExport.head == old.Manifest && lastExport.input == input && retained < lastExport.expires && previous.Start <= max(data.TurnsStart, retained) && previous.End >= min(data.TurnsEnd, now) {
+		syncdiag.Log(ctx, "publish_unchanged", "reason", "input_and_head")
 		return nil
 	}
+	syncdiag.Log(ctx, "encode_start")
+	encodeStarted := time.Now()
 	turns := map[string]model.Turn{}
 	sessions := map[string]model.Session{}
 	add := func(ss []model.Session, ts []model.Turn) {
@@ -264,36 +339,53 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 	}
 	m.Source = hash(source)
 	// Existing content-addressed objects are verified, not blindly overwritten.
-	for file, z := range objects {
-		b, _, s, e := t.request(ctx, "GET", "/v1/objects/"+url.PathEscape(file), nil, nil)
-		if e != nil {
-			return e
+	files := make([]string, 0, len(objects))
+	for file := range objects {
+		files = append(files, file)
+	}
+	syncdiag.Log(ctx, "encode_end", "elapsed_ms", time.Since(encodeStarted).Milliseconds(), "references", len(m.Blocks)+len(m.Sessions), "encoded_objects", len(files), "reused_references", len(m.Blocks)+len(m.Sessions)-len(files))
+	// Objects the parent manifest references are on the server: it roots them
+	// against GC, and auditPrior dropped any that went missing.
+	held := map[string]bool{}
+	for _, r := range append(append([]reference{}, prior.Blocks...), prior.Sessions...) {
+		held[r.File] = true
+	}
+	var uploaded, existing stdatomic.Int64
+	var pending []string
+	for _, file := range files {
+		if held[file] {
+			existing.Add(1)
+			t.rememberBlock(file, objects[file])
+		} else {
+			pending = append(pending, file)
 		}
-		if s == 200 && hash(b) == hash(z) {
-			t.rememberBlock(file, z)
-			continue
+	}
+	uploadCtx, uploadedDone := syncdiag.Stage(ctx, "upload_blocks")
+	if e = parallelTransfers(uploadCtx, len(pending), func(ctx context.Context, index int) error {
+		file := pending[index]
+		z := objects[file]
+		sent, err := t.putImmutable(ctx, file, z)
+		if err != nil {
+			return err
 		}
-		if s != 200 && s != 404 {
-			return statusError(s)
-		}
-		if e = t.put(ctx, file, z, nil); e != nil {
-			return e
+		if sent {
+			uploaded.Add(1)
+		} else {
+			existing.Add(1)
 		}
 		t.rememberBlock(file, z)
+		return nil
+	}); e != nil {
+		syncdiag.Log(uploadCtx, "upload_result", "uploaded", uploaded.Load(), "existing", existing.Load())
+		uploadedDone(e)
+		return e
 	}
-	if parent != nil {
-		b, e := t.get(ctx, "v3-manifest-"+*parent+".json", 8<<20)
-		if e != nil {
-			return e
-		}
-		if hash(b) != *parent {
-			return errors.New("manifest hash mismatch")
-		}
-		var prior manifest
-		if json.Unmarshal(b, &prior) == nil && prior.Source == m.Source && *parent == old.Manifest {
-			remember(old.Manifest)
-			return nil
-		}
+	syncdiag.Log(uploadCtx, "upload_result", "uploaded", uploaded.Load(), "existing", existing.Load())
+	uploadedDone(nil)
+	if parent != nil && *parent == old.Manifest && prior.Source == m.Source {
+		syncdiag.Log(ctx, "publish_unchanged", "reason", "source_hash")
+		remember(old.Manifest)
+		return nil
 	}
 	if len(m.Blocks)+len(m.Sessions) > 16384 {
 		return errors.New("too many blocks")
@@ -306,26 +398,21 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 		return errors.New("manifest exceeds limit")
 	}
 	digest := hash(b)
-	if e = t.put(ctx, "v3-manifest-"+digest+".json", b, map[string]string{"If-None-Match": "*"}); e != nil {
-		if !errors.Is(e, errConflict) {
-			return e
-		}
-		existing, err := t.get(ctx, "v3-manifest-"+digest+".json", 8<<20)
-		if err != nil {
-			return err
-		}
-		if hash(existing) != digest {
-			return errors.New("existing immutable manifest is corrupt")
-		}
+	syncdiag.Log(ctx, "manifest_publish_start")
+	if _, e = t.putImmutable(ctx, "v3-manifest-"+digest+".json", b); e != nil {
+		return e
 	}
+	t.rememberManifest("v3-manifest-"+digest+".json", b)
 	newHead := head{Protocol: 3, Sequence: old.Sequence + 1, Manifest: digest, Previous: parent, Updated: now, DeviceID: id}
 	b, e = json.Marshal(newHead)
 	if e != nil {
 		return e
 	}
+	syncdiag.Log(ctx, "head_cas_start", "sequence", newHead.Sequence)
 	if e = t.put(ctx, name, b, condition); e != nil {
 		return e
 	}
+	syncdiag.Log(ctx, "head_cas_committed", "sequence", newHead.Sequence)
 	remember(digest)
 	return nil
 }

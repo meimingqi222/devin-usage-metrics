@@ -12,26 +12,35 @@ import (
 const CodexGroup = "Codex · all models"
 const CompactReserve uint64 = 33000
 
+// CompactionDrift charges every additional replayed compaction a share of the
+// baseline simulated cost. Replay prices tokens, not the context a compaction
+// discards, so dollar savings alone would overstate the benefit of compacting
+// more often.
+const CompactionDrift = .01
+
 type Point struct {
-	Threshold uint64
-	Cost      float64
+	Threshold   uint64
+	Cost        float64
+	Compactions int
 }
 type Report struct {
 	Recommendations []Recommendation
 	Skipped         int
 }
 type Recommendation struct {
-	DeviceID, DeviceName, Model                                              string
-	Calls, Streams, Compactions                                              int
-	Growth, After, Rework, Observed, Current, Window, Recommended, Candidate uint64
-	BaselineCost, RecommendedCost                                            float64
-	BaselineCompactions, CandidateCompactions                                int
-	OverShare, CandidateSaving, CandidateCost, CautiousSaving                float64
-	SensitivityFailed, BaselineInferred                                      bool
-	PricedCalls                                                              int
-	Curve                                                                    []Point
-	Unpriced                                                                 int
-	Status                                                                   string
+	DeviceID, DeviceName, Model                                                        string
+	Calls, Streams, Compactions                                                        int
+	Growth, After, Rework, Observed, Current, Window, Recommended, Optimal, Candidate  uint64
+	BaselineCost, RecommendedCost                                                      float64
+	BaselineCompactions, CandidateCompactions, RecommendedCompactions, CompactionLimit int
+	OptimalCompactions                                                                 int
+	OverShare, CandidateSaving, CandidateCost, CandidateNetSaving                      float64
+	OptimalCost, OptimalSaving, OptimalNetSaving, CautiousSaving, SavingBar            float64
+	SensitivityFailed, BaselineInferred, Uncalibrated                                  bool
+	PricedCalls                                                                        int
+	Curve                                                                              []Point
+	Unpriced                                                                           int
+	Status                                                                             string
 }
 
 func (r Recommendation) SavingsFraction() float64 { return saving(r.BaselineCost, r.RecommendedCost) }
@@ -180,6 +189,35 @@ func Analyze(data model.Data, agent model.Agent, device string, start, end int64
 	return r
 }
 
+// CalibrationTolerance bounds how far replay at the baseline may drift from
+// the observed compaction count before the verdict is withheld.
+const CalibrationTolerance = 1.5
+
+// calibrate infers an unconfigured threshold as the one whose replay
+// reproduces the observed compaction count. The median compaction point is
+// biased low: manual compactions land early, and streams that climbed past it
+// without compacting are invisible to it. Ties prefer the observed median.
+func calibrate(r Recommendation, run func(threshold, rework uint64) replayResult) uint64 {
+	observed := min(r.Observed, r.Window)
+	candidates := append([]Point{{observed, 0, run(observed, r.Rework).compactions}}, r.Curve...)
+	best := candidates[0]
+	gap := func(p Point) (int, uint64) {
+		d := p.Compactions - r.Compactions
+		if d < 0 {
+			d = -d
+		}
+		return d, max(p.Threshold, observed) - min(p.Threshold, observed)
+	}
+	for _, p := range candidates[1:] {
+		dp, tp := gap(p)
+		db, tb := gap(best)
+		if dp < db || (dp == db && tp < tb) {
+			best = p
+		}
+	}
+	return best.Threshold
+}
+
 type replayResult struct {
 	cost              float64
 	compactions, over int
@@ -318,11 +356,6 @@ func recommend(agent model.Agent, k [2]string, all [][]model.Turn, current uint6
 		}
 		r.Window = min(r.Window, max(w, reached))
 	}
-	r.Current = r.Observed
-	if configured {
-		r.Current = current
-	}
-	r.Current = min(r.Current, r.Window)
 	run := func(threshold, rework uint64) replayResult {
 		sum := replayResult{}
 		for i, s := range streams {
@@ -333,41 +366,101 @@ func recommend(agent model.Agent, k [2]string, all [][]model.Turn, current uint6
 		}
 		return sum
 	}
+	for t := floor; t <= r.Window; t += 10000 {
+		v := run(t, r.Rework)
+		r.Curve = append(r.Curve, Point{t, v.cost, v.compactions})
+	}
+	if configured {
+		r.Current = min(current, r.Window)
+	} else {
+		r.Current = calibrate(r, run)
+	}
 	baseline := run(r.Current, r.Rework)
 	r.BaselineCost = baseline.cost
 	r.BaselineCompactions = baseline.compactions
-	for t := floor; t <= r.Window; t += 10000 {
-		r.Curve = append(r.Curve, Point{t, run(t, r.Rework).cost})
-	}
-	r.Curve = append(r.Curve, Point{r.Current, baseline.cost})
+	r.Curve = append(r.Curve, Point{r.Current, baseline.cost, baseline.compactions})
 	low := math.Inf(1)
 	for _, p := range r.Curve {
 		low = math.Min(low, p.Cost)
 	}
-	for _, p := range r.Curve {
-		if p.Cost <= low*1.01 && p.Threshold >= r.Candidate {
-			r.Candidate = p.Threshold
-			r.CandidateCost = p.Cost
+	// Pure cost minimisation often lands next to the safety floor: it can
+	// recommend tripling compactions for a few dollars. Context discarded by
+	// a compaction is not priced, so cap the additional compactions at half
+	// the baseline (with a floor of ten for small samples). The cap is only a
+	// safety bound: within it, the chosen point minimises simulated cost plus
+	// CompactionDrift for every additional compaction. Candidate below stays
+	// the cheapest cap-compliant point for comparison.
+	limit := r.BaselineCompactions + max(10, r.BaselineCompactions/2)
+	r.CompactionLimit = limit
+	best := -1
+	for i, p := range r.Curve {
+		if p.Cost <= low*1.01 && p.Compactions <= limit && (best < 0 || p.Threshold > r.Curve[best].Threshold) {
+			best = i
 		}
 	}
-	r.Recommended = r.Candidate
-	r.RecommendedCost = r.CandidateCost
-	a := run(r.Candidate, r.Rework)
-	r.CandidateCompactions = a.compactions
-	r.OverShare = float64(a.over) / float64(r.PricedCalls)
+	if best < 0 {
+		for i, p := range r.Curve {
+			if p.Compactions <= limit && (best < 0 || p.Cost < r.Curve[best].Cost) {
+				best = i
+			}
+		}
+	}
+	if best < 0 {
+		for i, p := range r.Curve {
+			if best < 0 || p.Cost < r.Curve[best].Cost {
+				best = i
+			}
+		}
+	}
+	r.Candidate = r.Curve[best].Threshold
+	r.CandidateCost = r.Curve[best].Cost
+	r.CandidateCompactions = r.Curve[best].Compactions
 	r.CandidateSaving = saving(r.BaselineCost, r.CandidateCost)
+	r.CandidateNetSaving = r.CandidateSaving - float64(max(0, r.CandidateCompactions-r.BaselineCompactions))*CompactionDrift
+
+	optimal, adjusted := -1, 0.
+	for i, p := range r.Curve {
+		if p.Compactions > limit {
+			continue
+		}
+		cost := p.Cost + float64(max(0, p.Compactions-r.BaselineCompactions))*CompactionDrift*r.BaselineCost
+		if optimal < 0 || cost < adjusted-1e-9 || (math.Abs(cost-adjusted) <= 1e-9 && p.Threshold > r.Curve[optimal].Threshold) {
+			optimal, adjusted = i, cost
+		}
+	}
+	if optimal < 0 {
+		optimal = best
+	}
+	r.Optimal = r.Curve[optimal].Threshold
+	r.OptimalCost = r.Curve[optimal].Cost
+	r.OptimalCompactions = r.Curve[optimal].Compactions
+	r.OptimalSaving = saving(r.BaselineCost, r.OptimalCost)
+	r.OptimalNetSaving = r.OptimalSaving - float64(max(0, r.OptimalCompactions-r.BaselineCompactions))*CompactionDrift
+	a := run(r.Optimal, r.Rework)
+	r.OverShare = float64(a.over) / float64(r.PricedCalls)
 	bar := .03
-	if r.Candidate < r.Current {
+	if r.Optimal < r.Current {
 		bar = .05
 	}
+	r.SavingBar = bar
 	cautious := max(r.Rework*2, r.Rework+10000)
-	r.CautiousSaving = saving(run(r.Current, cautious).cost, run(r.Candidate, cautious).cost)
-	r.SensitivityFailed = r.CandidateSaving >= bar && r.CautiousSaving < bar
+	r.CautiousSaving = saving(run(r.Current, cautious).cost, run(r.Optimal, cautious).cost)
+	r.SensitivityFailed = r.OptimalSaving >= bar && r.CautiousSaving < bar
+	r.Recommended = r.Optimal
+	r.RecommendedCost = r.OptimalCost
+	r.RecommendedCompactions = r.OptimalCompactions
+	// A baseline whose replay is far from the observed compaction count does
+	// not describe this history, so savings measured against it are not
+	// evidence. This happens when the threshold changed within the range or
+	// many compactions were manual.
+	lo, hi := min(r.Compactions, r.BaselineCompactions), max(r.Compactions, r.BaselineCompactions)
+	r.Uncalibrated = hi >= lo+3 && float64(hi) > float64(lo)*CalibrationTolerance
 	r.Status = "recommend"
-	if r.SavingsFraction() < bar || r.SensitivityFailed {
+	if r.OptimalNetSaving < bar || r.SensitivityFailed || r.Uncalibrated {
 		r.Status = "keep"
 		r.Recommended = r.Current
 		r.RecommendedCost = r.BaselineCost
+		r.RecommendedCompactions = r.BaselineCompactions
 	}
 	sort.Slice(r.Curve, func(i, j int) bool { return r.Curve[i].Threshold < r.Curve[j].Threshold })
 	curve := r.Curve[:0]

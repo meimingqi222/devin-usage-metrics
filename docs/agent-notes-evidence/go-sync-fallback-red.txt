@@ -1,0 +1,5 @@
+--- FAIL: TestCycleFallsBackOnlyAfterInvalidV3 (0.03s)
+    parallel_test.go:101: legacy fallback lost: sessions=0 err=device other: invalid head
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/syncclient	0.376s
+FAIL

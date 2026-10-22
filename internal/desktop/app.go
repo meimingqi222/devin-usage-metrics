@@ -4,6 +4,7 @@ package desktop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 	"github.com/meimingqi222/devin-usage-metrics/internal/quota"
 	"github.com/meimingqi222/devin-usage-metrics/internal/syncclient"
+	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 	"github.com/meimingqi222/devin-usage-metrics/internal/updater"
 )
 
@@ -45,7 +47,9 @@ type App struct {
 	release                                    updater.Release
 	payload                                    string
 	quit                                       func()
-	openFolder                                 func(string)
+	openFolder, openURL                        func(string)
+	languageChanged                            func()
+	updatePrefs                                updatePrefs
 	localID                                    string
 	pendingApply                               func() error
 	settingsUI                                 settingsUIState
@@ -54,12 +58,14 @@ type App struct {
 	expandedBuckets                            map[int64]bool
 	sessionsUI                                 sessionsUIState
 	loadedAt                                   string
+	hasLoaded                                  bool
 	compactionDetails                          bool
 	installed                                  map[model.Agent]bool
 	hideEmptyBuckets                           bool
 	syncLastAt, syncError                      string
 	cachedData                                 *model.Data
-	cachedAgent                                model.Agent
+	cachedKey                                  dataKey
+	compactionUI                               compactionState
 	sessionCosts                               map[sessionIdentity]sessionUsage
 	usageCache                                 struct {
 		period  analytics.Period
@@ -71,7 +77,7 @@ type App struct {
 }
 
 func New(ctx context.Context) *App {
-	return &App{ctx: ctx, events: make(chan func(), 64), agent: model.Devin, period: analytics.Day, tab: "usage", screen: "history", lang: language(), loaded: map[model.Agent]model.Data{}, busy: map[string]bool{}, apiURL: syncclient.ReadConfig().APIURL, deviceName: data.DeviceName(), localID: data.DeviceID(), expandedBuckets: map[int64]bool{}, sessionsUI: loadSessionUI(), installed: installedAgents()}
+	return &App{ctx: ctx, events: make(chan func(), 64), agent: model.Devin, period: analytics.Day, tab: "usage", screen: "history", lang: language(), loaded: map[model.Agent]model.Data{}, busy: map[string]bool{}, apiURL: syncclient.ReadConfig().APIURL, deviceName: data.DeviceName(), localID: data.DeviceID(), expandedBuckets: map[int64]bool{}, sessionsUI: loadSessionUI(), installed: installedAgents(), updatePrefs: loadUpdatePrefs()}
 }
 
 func (a *App) t(en, zh string) string {
@@ -83,7 +89,7 @@ func (a *App) t(en, zh string) string {
 
 func (a *App) post(fn func()) {
 	select {
-	case a.events <- func() { fn(); a.cachedData = nil }:
+	case a.events <- fn:
 		if a.wake != nil {
 			a.wake()
 		}
@@ -121,24 +127,45 @@ func (a *App) work(key string, fn func() func()) {
 func (a *App) load(agent model.Agent, refresh bool) {
 	a.work(string(agent), func() func() {
 		d := data.Load(agent, 0, time.Now().Add(time.Hour).Unix(), refresh)
-		return func() { a.loaded[agent] = d; a.loadedAt = time.Now().Format("15:04:05") }
+		return func() { a.loaded[agent] = d; a.loadedAt = time.Now().Format("15:04:05"); a.hasLoaded = true }
 	})
 }
+
+// syncDeadline bounds a whole cycle. Individual requests already time out, but
+// many devices on a flaky network can otherwise keep the tray in "Syncing" for
+// minutes with no clear failure.
+const syncDeadline = 2 * time.Minute
 
 func (a *App) sync() {
 	if !syncclient.ReadConfig().Enabled {
 		return
 	}
 	a.work("sync", func() func() {
+		runCtx := syncdiag.WithRun(a.ctx)
+		syncdiag.Log(runCtx, "desktop_sync_start", "network_deadline_ms", syncDeadline.Milliseconds())
+		collectCtx, collected := syncdiag.Stage(runCtx, "local_collection")
 		local := data.LoadAll(0, time.Now().Add(time.Hour).Unix(), false)
-		remote, err := syncclient.Cycle(a.ctx, local)
+		syncdiag.Log(collectCtx, "collection_result", "sessions", len(local.Sessions), "turns", len(local.Turns), "source_errors", len(local.Errors))
+		collected(nil)
+		ctx, cancel := context.WithTimeout(runCtx, syncDeadline)
+		defer cancel()
+		remote, err := syncclient.Cycle(ctx, local)
+		syncdiag.Log(runCtx, "desktop_sync_result", "error", syncdiag.ErrorCode(err), "remote_sessions", len(remote.Sessions), "remote_turns", len(remote.Turns))
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = fmt.Errorf("sync timed out after %s", syncDeadline)
+		}
+		// A partial cycle still returns every device it could read, with the
+		// last good data for those it could not.
+		usable := err == nil || errors.Is(err, syncclient.ErrPartial)
 		return func() {
+			syncdiag.Log(runCtx, "desktop_sync_applied", "remote_replaced", usable)
+			if usable {
+				a.remote = remote
+				a.syncLastAt = time.Now().Format("15:04:05")
+			}
+			a.syncError = ""
 			if err != nil {
 				a.syncError = err.Error()
-			} else {
-				a.remote = remote
-				a.syncError = ""
-				a.syncLastAt = time.Now().Format("15:04:05")
 			}
 		}
 	})
@@ -163,14 +190,42 @@ func (a *App) refreshQuota(force bool) {
 	})
 }
 
+// dataKey identifies the slices allData merges. Loads and syncs replace whole
+// slices, so their identity changes whenever the merged view would.
+type dataKey struct {
+	agent                      model.Agent
+	sessions, remoteSessions   *model.Session
+	turns, remoteTurns         *model.Turn
+	nSessions, nRemoteSessions int
+	nTurns, nRemoteTurns       int
+}
+
+func first[T any](s []T) *T {
+	if len(s) == 0 {
+		return nil
+	}
+	return &s[0]
+}
+
+func (a *App) dataKey() dataKey {
+	d := a.loaded[a.agent]
+	return dataKey{a.agent, first(d.Sessions), first(a.remote.Sessions), first(d.Turns), first(a.remote.Turns), len(d.Sessions), len(a.remote.Sessions), len(d.Turns), len(a.remote.Turns)}
+}
+
+// invalidateDerived drops values computed from data, e.g. after prices change.
+func (a *App) invalidateDerived() {
+	a.cachedData = nil
+}
+
 func (a *App) allData() model.Data {
-	if a.cachedData != nil && a.cachedAgent == a.agent {
+	key := a.dataKey()
+	if a.cachedData != nil && a.cachedKey == key {
 		return *a.cachedData
 	}
 	d := a.loaded[a.agent]
 	d.Sessions = append(append([]model.Session(nil), d.Sessions...), a.remote.Sessions...)
 	d.Turns = append(append([]model.Turn(nil), d.Turns...), a.remote.Turns...)
-	a.cachedData, a.cachedAgent = &d, a.agent
+	a.cachedData, a.cachedKey = &d, key
 	a.sessionCosts = nil
 	a.usageCache.buckets = nil
 	return d

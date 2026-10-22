@@ -40,16 +40,6 @@ func loadSessionUI() sessionsUIState {
 	return s
 }
 func (a *App) saveSessionUI() {
-	cfg := map[string]any{}
-	if b, err := os.ReadFile(preferencesPath()); err == nil {
-		if err = json.Unmarshal(b, &cfg); err != nil {
-			a.message = err.Error()
-			return
-		}
-	}
-	if cfg == nil {
-		cfg = map[string]any{}
-	}
 	keys := []string{}
 	for key, v := range a.sessionsUI.hidden {
 		if v {
@@ -57,29 +47,7 @@ func (a *App) saveSessionUI() {
 		}
 	}
 	sort.Strings(keys)
-	cfg["sessions_group_by_project"] = a.sessionsUI.group
-	cfg["sessions_hide_subagents"] = a.sessionsUI.hideSubagents
-	cfg["hidden_session_keys"] = keys
-	b, err := json.MarshalIndent(cfg, "", "  ")
-	if err == nil {
-		err = os.MkdirAll(filepath.Dir(preferencesPath()), 0700)
-	}
-	if err == nil {
-		var f *os.File
-		f, err = os.CreateTemp(filepath.Dir(preferencesPath()), ".sessions-*")
-		if err == nil {
-			defer os.Remove(f.Name())
-			_, err = f.Write(b)
-			closeErr := f.Close()
-			if err == nil {
-				err = closeErr
-			}
-			if err == nil {
-				err = os.Rename(f.Name(), preferencesPath())
-			}
-		}
-	}
-	if err != nil {
+	if err := savePreferences(map[string]any{"sessions_group_by_project": a.sessionsUI.group, "sessions_hide_subagents": a.sessionsUI.hideSubagents, "hidden_session_keys": keys}); err != nil {
 		a.message = err.Error()
 	}
 }
@@ -125,9 +93,17 @@ type sessionIdentity struct {
 type sessionUsage struct {
 	cost          float64
 	priced, turns int
+	ttft          []float64
 }
 
 func (a *App) sessionCost(s model.Session) (float64, int, int) {
+	u := a.sessionUsage(s)
+	return u.cost, u.priced, u.turns
+}
+
+// sessionUsage aggregates every session in one pass over the turns and keeps
+// the result until the data changes.
+func (a *App) sessionUsage(s model.Session) sessionUsage {
 	d := a.allData()
 	if a.sessionCosts == nil {
 		a.sessionCosts = map[sessionIdentity]sessionUsage{}
@@ -139,6 +115,9 @@ func (a *App) sessionCost(s model.Session) (float64, int, int) {
 			key := sessionIdentity{turn.Agent, turn.DeviceID, turn.SessionKey}
 			usage := a.sessionCosts[key]
 			usage.turns++
+			if turn.TTFTMs > 0 {
+				usage.ttft = append(usage.ttft, turn.TTFTMs)
+			}
 			if v, ok := pricing.Cost(turn, models[key]); ok {
 				usage.cost += v
 				usage.priced++
@@ -146,8 +125,7 @@ func (a *App) sessionCost(s model.Session) (float64, int, int) {
 			a.sessionCosts[key] = usage
 		}
 	}
-	usage := a.sessionCosts[sessionIdentity{s.Agent, s.DeviceID, s.Key}]
-	return usage.cost, usage.priced, usage.turns
+	return a.sessionCosts[sessionIdentity{s.Agent, s.DeviceID, s.Key}]
 }
 
 func (a *App) sessionCostText(s model.Session) string {
@@ -422,27 +400,20 @@ func (a *App) sessionDetail(c *ui.Context, s model.Session) {
 				a.selected = nil
 			}
 		})
-		ttft := []float64{}
-		cost := 0.0
-		turns, priced := 0, 0
-		for _, turn := range a.allData().Turns {
-			if turn.Agent == s.Agent && turn.DeviceID == s.DeviceID && turn.SessionKey == s.Key {
-				turns++
-				if turn.TTFTMs > 0 {
-					ttft = append(ttft, turn.TTFTMs)
-				}
-				if v, ok := pricing.Cost(turn, s.DisplayModel()); ok {
-					cost += v
-					priced++
-				}
-			}
+		u := a.sessionUsage(s)
+		costText := a.t("unknown (no pricing match)", "未知（无匹配定价）")
+		if u.priced == u.turns && u.turns > 0 {
+			costText = fmt.Sprintf(a.t("%s (per-turn pricing over %d turns in window)", "%s（窗口内 %d 轮逐轮计价）"), fmt.Sprintf("$%.4f", u.cost), u.turns)
+		} else if u.priced > 0 {
+			costText = fmt.Sprintf(a.t("%s (only %d/%d turns are priced; actual cost is at least this amount)", "%s（仅 %d/%d 轮可定价，实际费用不低于此值）"), fmt.Sprintf("$%.4f", u.cost), u.priced, u.turns)
 		}
-		sort.Float64s(ttft)
-		median := 0.0
-		if len(ttft) > 0 {
-			median = ttft[len(ttft)/2]
+		activity := fmt.Sprintf(a.t("%.0f agent messages · %d turns in window", "%.0f 条 agent 消息 · 窗口内 %d 轮"), s.AgentMessages, u.turns)
+		if len(u.ttft) > 0 {
+			ttft := append([]float64(nil), u.ttft...)
+			sort.Float64s(ttft)
+			activity = fmt.Sprintf(a.t("%.0f agent messages · %d turns in window · median TTFT %.0f ms", "%.0f 条 agent 消息 · 窗口内 %d 轮 · TTFT 中位 %.0f ms"), s.AgentMessages, u.turns, ttft[len(ttft)/2])
 		}
-		for _, v := range [][2]string{{a.t("Session", "会话"), s.ID + " · " + s.Source + " · " + s.AgentMode}, {a.t("Workdir", "工作目录"), s.WorkingDirectory}, {a.t("Model", "模型"), s.DisplayModel()}, {a.t("Time", "时间"), time.Unix(s.CreatedAt, 0).Format(time.DateTime) + " → " + time.Unix(s.LastActivityAt, 0).Format(time.DateTime)}, {"Tokens", fmt.Sprintf(a.t("In %s · Out %s · Cache Write %s · Cache Read %s · Total %s", "输入 %s · 输出 %s · 缓存写入 %s · 缓存读取 %s · 总计 %s"), formatTokens(s.InputTokens), formatTokens(s.OutputTokens), formatTokens(s.CacheCreationTokens), formatTokens(s.CachedTokens), formatTokens(s.TotalTokens()))}, {a.t("Cost", "费用"), fmt.Sprintf("$%.4f (%d/%d)", cost, priced, turns)}, {a.t("Activity", "活动"), fmt.Sprintf(a.t("%.0f messages · %d turns · Median TTFT %.0f ms", "%.0f 条消息 · %d 轮 · TTFT 中位数 %.0f ms"), s.AgentMessages, turns, median)}} {
+		for _, v := range [][2]string{{a.t("Session", "会话"), s.ID + " · " + s.Source + " · " + s.AgentMode}, {a.t("Workdir", "工作目录"), s.WorkingDirectory}, {a.t("Model", "模型"), s.DisplayModel()}, {a.t("Time", "时间"), time.Unix(s.CreatedAt, 0).Format(time.DateTime) + " → " + time.Unix(s.LastActivityAt, 0).Format(time.DateTime)}, {"Tokens", fmt.Sprintf(a.t("In %s · Out %s · Cache Write %s · Cache Read %s · Total %s", "输入 %s · 输出 %s · 缓存写入 %s · 缓存读取 %s · 总计 %s"), formatTokens(s.InputTokens), formatTokens(s.OutputTokens), formatTokens(s.CacheCreationTokens), formatTokens(s.CachedTokens), formatTokens(s.TotalTokens()))}, {a.t("Cost", "费用"), costText}, {a.t("Activity", "活动"), activity}} {
 			ui.Row(c).Gap(8).Children(func() {
 				ui.Text(c, v[0]).Width(84).FontSize(12).TextColor(c.Theme().TextMuted)
 				ui.Text(c, v[1]).Grow(1).FontSize(12)

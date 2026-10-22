@@ -45,6 +45,12 @@ func textButton(c *ui.Context, label string, active bool) ui.Element {
 func (a *App) View(c *ui.Context) {
 	a.drain()
 	a.theme(c)
+	// Match Rust: until the first read finishes, an empty dashboard would
+	// claim there is no usage.
+	if !a.hasLoaded && a.busy[string(a.agent)] {
+		a.loadingView(c)
+		return
+	}
 	ui.Row(c).Fill().Gap(0).FontSize(12).FixedLineHeight(20).Children(func() {
 		a.sidebar(c)
 		ui.Column(c).Grow(1).MinWidth(0).FillHeight().Gap(0).Children(func() {
@@ -77,7 +83,9 @@ func (a *App) View(c *ui.Context) {
 		r := *a.pending
 		text := fmt.Sprintf(a.t("Apply %s threshold %s? Only this device's user configuration changes. Start a new agent session afterwards.", "为 %s 应用 %s 阈值？仅修改本机用户配置，应用后请开启新的 Agent 会话。"), r.Model, formatTokens(float64(r.Recommended)))
 		if ui.AlertDialog(c, &a.confirm, a.t("Apply recommendation", "应用建议"), text, a.t("Cancel", "取消"), a.t("Apply", "应用")) == 1 {
-			if err := a.pendingApply(); err != nil {
+			err := a.pendingApply()
+			a.compactionConfigChanged()
+			if err != nil {
 				a.message = err.Error()
 			} else {
 				a.message = a.t("Applied. Restart your agent session.", "已应用，请开启新的 Agent 会话。")
@@ -90,12 +98,20 @@ func (a *App) View(c *ui.Context) {
 	}
 }
 
+func (a *App) loadingView(c *ui.Context) {
+	ui.Column(c).Fill().AlignItems(ui.Center).Justify(ui.Center).Gap(16).Background(c.Theme().Background).Children(func() {
+		ui.Spinner(c)
+		ui.Text(c, a.t("Reading local agent usage data", "正在读取本地 Agent 用量数据")).FontSize(18).Bold()
+		ui.Text(c, a.t("After the first read, subsequent launches use a 5-minute cache", "首次读取完成后，后续启动会使用 5 分钟缓存")).FontSize(12).TextColor(c.Theme().TextMuted)
+	})
+}
+
 func (a *App) sidebar(c *ui.Context) {
 	t := c.Theme()
 	ui.Column(c).Width(160).Shrink(0).FillHeight().Gap(0).Background(t.Surface).Label("Sidebar").Children(func() {
 		if runtime.GOOS == "darwin" {
 			ui.Box(c).Height(40)
-			ui.Text(c, "Agent Usage\nMetrics").FontSize(14).FixedLineHeight(24).Bold().Padding(0, 16, 8)
+			ui.Column(c).Padding(0, 16, 8).Children(func() { ui.Text(c, "Agent Usage\nMetrics").FontSize(14).FixedLineHeight(24).Bold() })
 		} else {
 			ui.Row(c).Height(48).Padding(0, 16).AlignItems(ui.Center).Children(func() { ui.Text(c, "Agent Usage\nMetrics").FontSize(12).FixedLineHeight(20).Bold() })
 		}
@@ -273,7 +289,7 @@ func (a *App) deviceItem(c *ui.Context, id, name string, color ui.Color) {
 	}
 	r.Children(func() {
 		ui.Box(c).Size(7, 7).Radius(4).Background(color)
-		text := ui.Text(c, name).FontSize(14).FixedLineHeight(24).Grow(1).MinWidth(0).NoWrap().Ellipsis("…")
+		text := ui.Text(c, name).FontSize(14).FixedLineHeight(24).Grow(1).MinWidth(0).SingleLine()
 		if a.device == id {
 			text.Bold().TextColor(c.Theme().Accent)
 		}
@@ -297,6 +313,10 @@ func (a *App) header(c *ui.Context) {
 					b.Background(c.Theme().Accent).TextColor(c.Theme().AccentText)
 				}
 				if b.Clicked() {
+					if tab.key == "compaction" {
+						// Pick up settings edited outside the app.
+						a.compactionConfigChanged()
+					}
 					a.tab = tab.key
 					a.selected = nil
 				}

@@ -30,7 +30,50 @@ func language() string {
 	return "en"
 }
 
-func saveLanguage(lang string) error {
+func saveLanguage(lang string) error { return savePreferences(map[string]any{"lang": lang}) }
+
+// updatePrefs mirrors the update fields Rust keeps in the same config.json.
+type updatePrefs struct {
+	AutoCheck   bool
+	Skipped     string
+	LastCheckAt int64
+}
+
+func loadUpdatePrefs() updatePrefs {
+	var cfg struct {
+		AutoCheck   *bool   `json:"auto_check_updates"`
+		Skipped     *string `json:"skipped_update_version"`
+		LastCheckAt *int64  `json:"last_update_check_at"`
+	}
+	b, _ := os.ReadFile(preferencesPath())
+	_ = json.Unmarshal(b, &cfg)
+	p := updatePrefs{AutoCheck: true}
+	if cfg.AutoCheck != nil {
+		p.AutoCheck = *cfg.AutoCheck
+	}
+	if cfg.Skipped != nil {
+		p.Skipped = *cfg.Skipped
+	}
+	if cfg.LastCheckAt != nil {
+		p.LastCheckAt = *cfg.LastCheckAt
+	}
+	return p
+}
+
+func saveUpdatePrefs(p updatePrefs) error {
+	var skipped, last any
+	if p.Skipped != "" {
+		skipped = p.Skipped
+	}
+	if p.LastCheckAt != 0 {
+		last = p.LastCheckAt
+	}
+	return savePreferences(map[string]any{"auto_check_updates": p.AutoCheck, "skipped_update_version": skipped, "last_update_check_at": last})
+}
+
+// savePreferences merges fields into config.json, keeping keys it does not
+// know, and replaces the file atomically.
+func savePreferences(fields map[string]any) error {
 	path := preferencesPath()
 	cfg := map[string]any{}
 	if b, err := os.ReadFile(path); err == nil {
@@ -43,7 +86,9 @@ func saveLanguage(lang string) error {
 	if cfg == nil {
 		cfg = map[string]any{}
 	}
-	cfg["lang"] = lang
+	for k, v := range fields {
+		cfg[k] = v
+	}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err

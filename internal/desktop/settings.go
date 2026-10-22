@@ -21,6 +21,9 @@ type settingsUIState struct {
 	accountOpen   bool
 	updateOpen    bool
 	updateMessage string
+	updateFailed  bool
+	// downloadPercent is -1 until the download reports a total size.
+	downloadPercent int
 }
 
 func (a *App) cancelSettings() {
@@ -202,6 +205,9 @@ func (a *App) settingsGeneral(c *ui.Context) {
 							a.message = err.Error()
 						} else {
 							a.lang = lang.key
+							if a.languageChanged != nil {
+								a.languageChanged()
+							}
 						}
 					}
 				}
@@ -266,6 +272,13 @@ func (a *App) updateVersionRow(c *ui.Context) {
 	label := "v" + updater.CurrentVersion
 	if a.busy["update"] {
 		label = a.t("Checking for updates…", "正在检查更新…")
+	} else if a.busy["download"] {
+		label = a.t("Downloading…", "正在下载…")
+		if p := a.settingsUI.downloadPercent; p >= 0 {
+			label = fmt.Sprintf(a.t("Downloading… %d%%", "正在下载… %d%%"), p)
+		}
+	} else if a.settingsUI.updateFailed {
+		label = a.t("Update failed", "更新失败")
 	} else if a.payload != "" {
 		label = a.t("Restart to install", "重启并安装")
 	} else if a.release.Version != "" {
@@ -279,21 +292,84 @@ func (a *App) updateVersionRow(c *ui.Context) {
 	}
 }
 
-func (a *App) checkForUpdates() {
-	a.settingsUI.updateMessage = ""
+func (a *App) checkForUpdates() { a.checkUpdates(true) }
+
+// checkUpdates follows Rust: automatic checks run only for packaged installs
+// with auto_check_updates on, skipped versions count as up to date, and an
+// available update starts downloading at once.
+func (a *App) checkUpdates(manual bool) {
+	if !manual && (!a.updatePrefs.AutoCheck || !updater.Packaged()) {
+		return
+	}
+	if a.busy["download"] || a.payload != "" {
+		return
+	}
+	if manual {
+		a.settingsUI.updateMessage, a.settingsUI.updateFailed = "", false
+	}
+	skipped := a.updatePrefs.Skipped
 	a.work("update", func() func() {
 		release, err := updater.Check(a.ctx, updater.CurrentVersion)
 		return func() {
+			a.updatePrefs.LastCheckAt = time.Now().Unix()
+			if err := saveUpdatePrefs(a.updatePrefs); err != nil {
+				a.message = err.Error()
+			}
 			if err != nil {
-				a.settingsUI.updateMessage = err.Error()
-			} else {
-				a.release = release
-				if release.Version == "" {
+				a.settingsUI.updateMessage, a.settingsUI.updateFailed = err.Error(), true
+				return
+			}
+			a.settingsUI.updateFailed = false
+			if updater.IsSkipped(release.Version, skipped) {
+				release = updater.Release{}
+			}
+			a.release = release
+			if release.Version == "" {
+				if manual {
 					a.settingsUI.updateMessage = a.t("Already up to date", "已是最新版本")
 				}
+				return
+			}
+			a.downloadUpdate()
+		}
+	})
+}
+
+func (a *App) downloadUpdate() {
+	release := a.release
+	a.settingsUI.updateMessage, a.settingsUI.updateFailed, a.settingsUI.downloadPercent = "", false, -1
+	a.work("download", func() func() {
+		last := -1
+		payload, err := updater.Download(a.ctx, release, func(done, total int64) {
+			if total <= 0 {
+				return
+			}
+			if p := int(done * 100 / total); p != last {
+				last = p
+				a.post(func() { a.settingsUI.downloadPercent = p })
+			}
+		})
+		return func() {
+			// The user may have skipped this version while it downloaded.
+			if a.release.Version != release.Version {
+				return
+			}
+			if err != nil {
+				a.settingsUI.updateMessage, a.settingsUI.updateFailed = err.Error(), true
+			} else {
+				a.payload = payload
 			}
 		}
 	})
+}
+
+func (a *App) skipUpdate() {
+	a.updatePrefs.Skipped = a.release.Version
+	if err := saveUpdatePrefs(a.updatePrefs); err != nil {
+		a.message = err.Error()
+	}
+	a.release, a.payload = updater.Release{}, ""
+	a.settingsUI.updateOpen, a.settingsUI.updateFailed = false, false
 }
 
 func (a *App) updateDialog(c *ui.Context) {
@@ -317,6 +393,16 @@ func (a *App) updateDialog(c *ui.Context) {
 		if body != "" {
 			ui.Text(c, body).FontSize(12).TextColor(c.Theme().TextMuted).MaxHeight(120)
 		}
+		if a.release.Version != "" {
+			ui.Row(c).Gap(8).Children(func() {
+				if textButton(c, a.t("Skip this version", "跳过此版本"), false).Clicked() {
+					a.skipUpdate()
+				}
+				if a.release.URL != "" && a.openURL != nil && textButton(c, a.t("Open release page", "打开发布页面"), false).Clicked() {
+					a.openURL(a.release.URL)
+				}
+			})
+		}
 		if ui.Button(c, a.t("Later", "稍后")).FontSize(12).Clicked() {
 			a.settingsUI.updateOpen = false
 		}
@@ -336,17 +422,7 @@ func (a *App) updateDialog(c *ui.Context) {
 			} else if a.release.Version == "" {
 				a.checkForUpdates()
 			} else {
-				release := a.release
-				a.work("download", func() func() {
-					payload, err := updater.Download(a.ctx, release, nil)
-					return func() {
-						if err != nil {
-							a.settingsUI.updateMessage = err.Error()
-						} else {
-							a.payload = payload
-						}
-					}
-				})
+				a.downloadUpdate()
 			}
 		}
 	})

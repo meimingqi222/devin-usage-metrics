@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/egoist/mygo/plugins/sqlite"
+	"github.com/meimingqi222/devin-usage-metrics/internal/sqlite"
 )
 
 func TestClaudeFallbackRefreshPersistence(t *testing.T) {
@@ -65,9 +65,6 @@ func TestClaude401RereadsWithoutRefreshToken(t *testing.T) {
 	}
 }
 func TestAntigravityStateReadOnly(t *testing.T) {
-	if os.Getenv("MYGO_SQLITE_LIBRARY") == "" {
-		t.Skip("set MYGO_SQLITE_LIBRARY to a local plugin ABI library; this fixture never downloads native dependencies")
-	}
 	p := filepath.Join(t.TempDir(), "state.vscdb")
 	ctx := context.Background()
 	db, e := sqlite.Open(ctx, p, sqlite.OpenOptions{})

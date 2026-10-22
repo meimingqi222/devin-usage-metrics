@@ -127,3 +127,18 @@ func TestMacBundleAndSymlink(t *testing.T) {
 		t.Fatal("symlink accepted")
 	}
 }
+
+func TestSkippedVersionIgnoresPrefix(t *testing.T) {
+	if !IsSkipped("0.2.0", "v0.2.0") || !IsSkipped("v0.3.1", "0.3.1") || IsSkipped("0.3.1", "") || IsSkipped("0.3.2", "0.3.1") {
+		t.Fatal("skip comparison differs from Rust")
+	}
+}
+
+func TestDevelopmentBuildIsNotPackaged(t *testing.T) {
+	if Packaged() {
+		t.Fatal("test binary must not count as a packaged install")
+	}
+	if err := RemoveBackups(); err != nil {
+		t.Fatal(err)
+	}
+}

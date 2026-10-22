@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 	"io"
@@ -24,6 +25,8 @@ func setup(t testing.TB) {
 	t.Setenv("USERPROFILE", h)
 	t.Setenv("APPDATA", h)
 	t.Setenv("XDG_CONFIG_HOME", h)
+	t.Setenv("XDG_CACHE_HOME", h)
+	t.Setenv("LOCALAPPDATA", h)
 	if e := atomic("device.json", []byte(`{"id":"local"}`)); e != nil {
 		t.Fatal(e)
 	}
@@ -138,11 +141,13 @@ func (s *objectServer) serve(w http.ResponseWriter, r *http.Request) {
 	old, exists := s.objects[name]
 	etag := `"` + hash(old) + `"`
 	switch r.Method {
-	case "GET":
-		if s.gets == nil {
-			s.gets = map[string]int{}
+	case "GET", "HEAD":
+		if r.Method == "GET" {
+			if s.gets == nil {
+				s.gets = map[string]int{}
+			}
+			s.gets[name]++
 		}
-		s.gets[name]++
 		if !exists {
 			w.WriteHeader(404)
 			return
@@ -151,6 +156,7 @@ func (s *objectServer) serve(w http.ResponseWriter, r *http.Request) {
 		w.Write(old)
 	case "PUT":
 		if r.Header.Get("If-None-Match") == "*" && exists {
+			w.Header().Set("ETag", etag)
 			w.WriteHeader(412)
 			return
 		}
@@ -234,7 +240,21 @@ func TestCycleV1MigrationReuseAndReadOnlyMerge(t *testing.T) {
 	if len(local.Turns) != 1 || local.Turns[0].DeviceID != "" {
 		t.Fatal("caller data mutated")
 	}
-	s.objects["v3-manifest-"+h.Manifest+".json"] = []byte(`{}`)
+	// Other devices read this manifest from the server: a damaged stored copy
+	// is restored from the verified local copy rather than ignored.
+	name := "v3-manifest-" + h.Manifest + ".json"
+	good := s.objects[name]
+	s.objects[name] = []byte(`{}`)
+	if _, e = Cycle(ctx, local); e != nil {
+		t.Fatal(e)
+	}
+	if string(s.objects[name]) != string(good) {
+		t.Fatal("damaged manifest was not repaired")
+	}
+	// Without a verified copy the damage is reported, as before.
+	manifestCache = newLRU[[]byte](32<<20, 512)
+	packageCache = newLRU[devicePackage](64<<20, 256)
+	s.objects[name] = []byte(`{}`)
 	if _, e = Cycle(ctx, local); e == nil {
 		t.Fatal("manifest corruption accepted")
 	}
@@ -293,6 +313,18 @@ func TestLoginCancellationDoesNotPersistCredentials(t *testing.T) {
 	}
 	if _, e := os.Stat(path("github-sync-session.enc")); !os.IsNotExist(e) {
 		t.Fatal("cancelled login saved a session")
+	}
+}
+
+func TestCancelledTransportSurfacesDeadline(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, e := (transport{base: server.URL, token: "token"}).get(ctx, "object.json", 1024); !errors.Is(e, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want context deadline", e)
 	}
 }
 

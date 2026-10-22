@@ -136,11 +136,19 @@ func files(d *model.Data, a model.Agent, roots []string, ext string) []string {
 	if !found {
 		fail(d, a, "data source not found: "+strings.Join(roots, ", "))
 	}
+	forgetRemoved(roots, ext, seen)
+	// Stat once per file; the comparator runs O(n log n) times.
+	mtimes := make(map[string]int64, len(paths))
+	for _, p := range paths {
+		if info, e := os.Stat(p); e == nil {
+			mtimes[p] = info.ModTime().UnixNano()
+		}
+	}
 	sort.Slice(paths, func(i, j int) bool {
-		a, _ := os.Stat(paths[i])
-		b, _ := os.Stat(paths[j])
-		if a != nil && b != nil && !a.ModTime().Equal(b.ModTime()) {
-			return a.ModTime().After(b.ModTime())
+		a, okA := mtimes[paths[i]]
+		b, okB := mtimes[paths[j]]
+		if okA && okB && a != b {
+			return a > b
 		}
 		return paths[i] < paths[j]
 	})
@@ -184,6 +192,26 @@ type lineCache struct {
 }
 
 var decodedFiles sync.Map
+
+// forgetRemoved drops decoded transcripts that disappeared from a walked root,
+// so deleted sessions do not stay in memory for the life of the process.
+func forgetRemoved(roots []string, ext string, seen map[string]bool) {
+	decodedFiles.Range(func(key, _ any) bool {
+		p := key.(string)
+		if seen[p] || !strings.HasSuffix(p, ext) {
+			return true
+		}
+		for _, root := range roots {
+			if strings.HasPrefix(p, filepath.Clean(root)+string(filepath.Separator)) {
+				if _, e := os.Stat(p); os.IsNotExist(e) {
+					decodedFiles.Delete(p)
+				}
+				break
+			}
+		}
+		return true
+	})
+}
 
 // Only changed transcripts are decoded again after the five-minute snapshot
 // expires. Rebuild accounting globally so resumed Claude copies still dedup

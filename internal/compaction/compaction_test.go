@@ -40,7 +40,7 @@ func TestAsymmetricSavingsAndCoverage(t *testing.T) {
 		at        uint64
 		status    string
 		sensitive bool
-	}{{320000, "keep", false}, {340000, "keep", true}, {960000, "recommend", false}} {
+	}{{320000, "keep", false}, {380000, "keep", true}, {960000, "recommend", false}} {
 		r := analyze(history(model.Codex, tc.at, 1000), model.Codex)
 		if r.Status != tc.status || r.SensitivityFailed != tc.sensitive {
 			t.Fatalf("%d: %+v", tc.at, r)
@@ -72,6 +72,32 @@ func TestAsymmetricSavingsAndCoverage(t *testing.T) {
 		}
 	}
 }
+func TestRiskAdjustedSelectionRejectsSmallNetGain(t *testing.T) {
+	r := analyze(history(model.Codex, 420000, 1000), model.Codex)
+	if r.Status != "keep" || r.Optimal == r.Current || r.OptimalNetSaving >= r.SavingBar {
+		t.Fatalf("drift charge must reject the small net gain: %+v", r)
+	}
+	if r.CandidateSaving < r.SavingBar || r.CautiousSaving < r.SavingBar {
+		t.Fatalf("case must fail on drift, not raw saving or sensitivity: %+v", r)
+	}
+	if r.OptimalCompactions <= r.BaselineCompactions {
+		t.Fatalf("optimal point must add compactions: %+v", r)
+	}
+}
+
+func TestRecommendationRespectsCompactionCap(t *testing.T) {
+	for _, at := range []uint64{320000, 340000, 960000} {
+		r := analyze(history(model.Codex, at, 1000), model.Codex)
+		limit := r.BaselineCompactions + max(10, r.BaselineCompactions/2)
+		if r.CompactionLimit != limit {
+			t.Fatalf("%d: cap %d, want %d: %+v", at, r.CompactionLimit, limit, r)
+		}
+		if r.CandidateCompactions > limit {
+			t.Fatalf("%d: candidate compacts %d times, cap %d: %+v", at, r.CandidateCompactions, limit, r)
+		}
+	}
+}
+
 func TestSummaryCostAndIndependentPrices(t *testing.T) {
 	d := history(model.Codex, 960000, 50)
 	for i := range d.Turns {
@@ -263,5 +289,41 @@ func TestRustUndoAndConfirmationConflict(t *testing.T) {
 	after, _ := os.ReadFile(path)
 	if string(after) != string(external) {
 		t.Fatal("external edit changed")
+	}
+}
+
+// Two of every three compactions are manual at 120K and the third is automatic
+// at 240K, so the median compaction point (120K) says nothing about how often
+// this history compacts.
+func manualHistory() model.Data {
+	d := model.Data{}
+	ctx, cycle := uint64(30000), 0
+	for i := 0; i < 3000; i++ {
+		d.Turns = append(d.Turns, model.Turn{Agent: model.Codex, SessionKey: "session", DeviceID: "desktop", DeviceName: "Desktop", ContextStream: "main", CreatedAt: 1000 + int64(i)*30, Model: "gpt-5.2", InputTokens: 5000, CacheReadTokens: float64(ctx - 5000), OutputTokens: 800})
+		ctx += 5000
+		if limit := []uint64{120000, 120000, 240000}[cycle%3]; ctx >= limit {
+			ctx, cycle = 60000, cycle+1
+		}
+	}
+	return d
+}
+
+func TestInferredBaselineReproducesObservedCompactions(t *testing.T) {
+	r := analyze(manualHistory(), model.Codex)
+	if r.Observed > 120000 || !r.BaselineInferred {
+		t.Fatalf("fixture changed: observed %d", r.Observed)
+	}
+	if r.Current <= r.Observed || r.Uncalibrated {
+		t.Fatalf("baseline must be calibrated to the compaction count, not the median point: current %d, replay %d vs observed %d", r.Current, r.BaselineCompactions, r.Compactions)
+	}
+	if hi, lo := max(r.Compactions, r.BaselineCompactions), min(r.Compactions, r.BaselineCompactions); float64(hi) > float64(lo)*1.1 {
+		t.Fatalf("calibrated replay %d far from observed %d", r.BaselineCompactions, r.Compactions)
+	}
+}
+
+func TestUncalibratedBaselineWithholdsRecommendation(t *testing.T) {
+	r := c.Analyze(manualHistory(), model.Codex, "", 0, math.MaxInt64, map[[2]string]uint64{{"desktop", c.CodexGroup}: 120000}).Recommendations[0]
+	if !r.Uncalibrated || r.Status != "keep" || r.Recommended != r.Current {
+		t.Fatalf("replay %d vs observed %d must withhold advice: %s", r.BaselineCompactions, r.Compactions, r.Status)
 	}
 }

@@ -9,7 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/egoist/mygo/plugins/sqlite"
+	"github.com/meimingqi222/devin-usage-metrics/internal/sqlite"
 )
 
 func readStateValue(path, key string) (string, error) {

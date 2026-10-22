@@ -9,5 +9,10 @@
     "comment": "Local coding-agent usage analytics",
     "categories": ["Development"],
     "depends": ["libayatana-appindicator3-1"]
+  },
+  "macos": {
+    "infoPlist": {
+      "LSApplicationCategoryType": "public.app-category.developer-tools"
+    }
   }
 }

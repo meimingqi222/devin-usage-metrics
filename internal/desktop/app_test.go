@@ -24,6 +24,7 @@ func fixture(t testing.TB) *App {
 	a := New(context.Background())
 	a.lang = "en"
 	a.agent = model.Claude
+	a.hasLoaded = true // the fixture stands in for a finished first read
 	id := data.DeviceID()
 	now := time.Now()
 	a.loaded[model.Claude] = model.Data{Sessions: []model.Session{{Agent: model.Claude, Key: "claude-code/local", ID: "local", Title: "Implement streaming parser", WorkingDirectory: "/projects/usage-metrics", SelectedModel: "claude-sonnet-4-5", DeviceID: id, DeviceName: "Workstation", InputTokens: 37000, OutputTokens: 8000, CachedTokens: 120000, CacheCreationTokens: 3000, AgentMessages: 2, CreatedAt: now.AddDate(0, 0, -5).Unix(), LastActivityAt: now.Unix()}}, Turns: []model.Turn{{Agent: model.Claude, SessionKey: "claude-code/local", Model: "claude-sonnet-4-5", DeviceID: id, CreatedAt: now.AddDate(0, 0, -4).Unix(), InputTokens: 12000, OutputTokens: 3000, CacheReadTokens: 40000, CacheCreationTokens: 1000, TTFTMs: 150}, {Agent: model.Claude, SessionKey: "claude-code/local", Model: "claude-sonnet-4-5", DeviceID: id, CreatedAt: now.Unix(), InputTokens: 25000, OutputTokens: 5000, CacheReadTokens: 80000, CacheCreationTokens: 2000, TTFTMs: 240}}}
@@ -52,6 +53,24 @@ func capture(t *testing.T, tt *ui.Tester, name string) {
 	defer f.Close()
 	if err = png.Encode(f, tt.Image()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// settleCompaction renders frames until the background replay has delivered
+// the report for the current inputs.
+func settleCompaction(t testing.TB, tt *ui.Tester, a *App) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		tt.Frame()
+		s := a.compactionUI
+		if !a.busy["compaction"] && s.hasReport && s.ready == s.requested {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("compaction replay did not finish")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -107,7 +126,7 @@ func TestDashboardFiltersAndSessionNavigation(t *testing.T) {
 	}
 	capture(t, tt, "go-sessions")
 	click(t, tt, "Implement streaming parser")
-	if !tt.HasText("Median TTFT 240 ms") || !tt.HasText("Workdir") || !tt.HasText("168.0K") {
+	if !tt.HasText("median TTFT 240 ms") || !tt.HasText("per-turn pricing over 2 turns in window") || !tt.HasText("Workdir") || !tt.HasText("168.0K") {
 		t.Fatalf("missing session details: %q", tt.Texts())
 	}
 	capture(t, tt, "go-session-detail")
@@ -150,6 +169,7 @@ func TestQuotaCompactionAndSettingsStates(t *testing.T) {
 	capture(t, tt, "go-quotas")
 	click(t, tt, "Claude Code")
 	click(t, tt, "Compaction")
+	settleCompaction(t, tt, a)
 	if !tt.HasText("No eligible data. Claude Code and Codex require at least 50 calls with context metadata and 3 observed compactions.") {
 		t.Fatal("missing insufficient-data explanation")
 	}
@@ -199,6 +219,7 @@ func TestCompactionRequiresConfirmationAndSupportsUndo(t *testing.T) {
 	a.loaded[model.Codex] = d
 	tt := ui.NewTester(a.View, 1240, 780)
 	tt.SetScale(2)
+	settleCompaction(t, tt, a)
 	capture(t, tt, "go-compaction-recommendation")
 	click(t, tt, "Apply recommendation")
 	before, _ := os.ReadFile(path)
@@ -213,6 +234,7 @@ func TestCompactionRequiresConfirmationAndSupportsUndo(t *testing.T) {
 	}
 	click(t, tt, "Apply recommendation")
 	click(t, tt, "Apply")
+	settleCompaction(t, tt, a)
 	after, _ := os.ReadFile(path)
 	if string(after) == initial || !tt.HasText("Applied. Restart your agent session.") {
 		t.Fatal("confirmed recommendation was not applied")
@@ -329,5 +351,128 @@ func BenchmarkDashboardRedraw(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestCompactionExplainsRiskAdjustedRejection(t *testing.T) {
+	a := fixture(t)
+	d := model.Data{}
+	ctx := uint64(30000)
+	for i := 0; i < 1000; i++ {
+		d.Turns = append(d.Turns, model.Turn{Agent: model.Codex, SessionKey: "replay", DeviceID: a.localID, DeviceName: "Workstation", ContextStream: "main", CreatedAt: time.Now().Add(-10*time.Hour).Unix() + int64(i)*30, Model: "gpt-5.2", InputTokens: 5000, CacheReadTokens: float64(ctx - 5000), OutputTokens: 800})
+		ctx += 5000
+		if ctx >= 420000 {
+			ctx = 60000
+		}
+	}
+	a.loaded[model.Codex] = d
+	a.agent, a.tab = model.Codex, "compaction"
+	tt := ui.NewTester(a.View, 1240, 780)
+	tt.SetScale(2)
+	settleCompaction(t, tt, a)
+	if !tt.HasText("The best alternative") || !tt.HasText("Keeping the current threshold.") {
+		t.Fatalf("missing drift explanation: %q", tt.Texts())
+	}
+	if !tt.HasText("Net saving") || !tt.HasText("Best alternative threshold") {
+		t.Fatal("missing risk-adjusted alternative")
+	}
+	capture(t, tt, "go-compaction-drift-keep")
+}
+
+func TestCompactionReplayRunsOncePerInput(t *testing.T) {
+	a := fixture(t)
+	a.agent, a.tab = model.Codex, "compaction"
+	tt := ui.NewTester(a.View, 1240, 780)
+	settleCompaction(t, tt, a)
+	key := a.compactionUI.ready
+	for i := 0; i < 5; i++ {
+		tt.Frame()
+		if a.busy["compaction"] || a.compactionUI.requested != key {
+			t.Fatal("redraw restarted the replay")
+		}
+	}
+	a.loaded[model.Codex] = model.Data{Turns: []model.Turn{{Agent: model.Codex, CreatedAt: time.Now().Unix()}}}
+	settleCompaction(t, tt, a)
+	if a.compactionUI.ready == key {
+		t.Fatal("new data did not trigger a replay")
+	}
+}
+
+func TestCompactionStatusIsLocalized(t *testing.T) {
+	a := fixture(t)
+	a.agent, a.tab = model.Codex, "compaction"
+	d := model.Data{}
+	for i := 0; i < 60; i++ {
+		d.Turns = append(d.Turns, model.Turn{Agent: model.Codex, SessionKey: "s", DeviceID: a.localID, DeviceName: "Workstation", ContextStream: "main", CreatedAt: time.Now().Add(-time.Hour).Unix() + int64(i), Model: "gpt-5.2", InputTokens: 1000, CacheReadTokens: float64(20000 + i*1000)})
+	}
+	a.loaded[model.Codex] = d
+	tt := ui.NewTester(a.View, 1240, 780)
+	settleCompaction(t, tt, a)
+	if tt.HasText("not_enough_compactions") || !tt.HasText("Too few compactions: at least 3 suspected compactions are required. No default threshold is guessed.") {
+		t.Fatalf("status not explained: %q", tt.Texts())
+	}
+}
+
+func TestCompactionExplainsUncalibratedBaseline(t *testing.T) {
+	a := fixture(t)
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("model_auto_compact_token_limit = 120000\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a.agent, a.tab = model.Codex, "compaction"
+	d := model.Data{}
+	ctx, cycle := 30000, 0
+	for i := 0; i < 3000; i++ {
+		d.Turns = append(d.Turns, model.Turn{Agent: model.Codex, SessionKey: "s", DeviceID: a.localID, DeviceName: "Workstation", ContextStream: "main", CreatedAt: time.Now().Add(-20*time.Hour).Unix() + int64(i)*20, Model: "gpt-5.2", InputTokens: 5000, CacheReadTokens: float64(ctx - 5000), OutputTokens: 800})
+		ctx += 5000
+		if limit := []int{120000, 120000, 240000}[cycle%3]; ctx >= limit {
+			ctx, cycle = 60000, cycle+1
+		}
+	}
+	a.loaded[model.Codex] = d
+	tt := ui.NewTester(a.View, 1240, 780)
+	settleCompaction(t, tt, a)
+	if !tt.HasText("Low confidence") || tt.HasText("Already optimal") {
+		t.Fatalf("uncalibrated baseline not flagged: %q", tt.Texts())
+	}
+}
+
+func TestFirstLoadShowsLoadingInsteadOfEmptyUsage(t *testing.T) {
+	a := fixture(t)
+	delete(a.loaded, a.agent)
+	a.hasLoaded = false
+	a.busy[string(a.agent)] = true
+	tt := ui.NewTester(a.View, 1240, 780)
+	if !tt.HasText("Reading local agent usage data") || tt.HasText("No usage in this period. Select another agent or previous period.") {
+		t.Fatalf("first load must not look empty: %q", tt.Texts())
+	}
+	delete(a.busy, string(a.agent))
+	a.hasLoaded = true
+	tt.Frame()
+	if tt.HasText("Reading local agent usage data") {
+		t.Fatal("loading screen stayed after the first load")
+	}
+}
+
+func TestCompactionApplyDisabledUnderEnvironmentOverride(t *testing.T) {
+	a := fixture(t)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "300000")
+	a.tab = "compaction"
+	d := model.Data{}
+	ctx := 30000
+	for i := 0; i < 1000; i++ {
+		d.Turns = append(d.Turns, model.Turn{Agent: model.Claude, SessionKey: "s", DeviceID: a.localID, DeviceName: "Workstation", ContextStream: "main", CreatedAt: time.Now().Add(-10*time.Hour).Unix() + int64(i)*30, Model: "claude-sonnet-4-5", InputTokens: 500, CacheCreationTokens: 4500, CacheCreation5mTokens: 4500, CacheReadTokens: float64(ctx - 5000), OutputTokens: 800})
+		ctx += 5000
+		if ctx >= 190000 {
+			ctx = 60000
+		}
+	}
+	a.loaded[model.Claude] = d
+	tt := ui.NewTester(a.View, 1240, 780)
+	settleCompaction(t, tt, a)
+	if !tt.HasText("An environment variable overrides compaction. Remove it before applying.") {
+		t.Fatalf("override not explained: %q", tt.Texts())
 	}
 }

@@ -22,6 +22,13 @@ var loadLocks sync.Map
 var deviceMu sync.Mutex
 
 func home(p string) string { h, _ := os.UserHomeDir(); return filepath.Join(h, p) }
+func cacheDir() string {
+	if d := os.Getenv("XDG_CACHE_HOME"); d != "" {
+		return d
+	}
+	d, _ := os.UserCacheDir()
+	return d
+}
 func configPath() string {
 	p, _ := os.UserConfigDir()
 	return filepath.Join(p, "devin-usage-metrics", "device.json")
@@ -145,7 +152,7 @@ func fail(d *model.Data, a model.Agent, e any) {
 
 // Load returns the selected agent's records. Refresh bypasses all cached records.
 func Load(a model.Agent, start, end int64, refresh bool) model.Data {
-	cache, _ := os.UserCacheDir()
+	cache := cacheDir()
 	path := filepath.Join(cache, "devin-usage-metrics", "go-data-"+string(a)+".json")
 	lock, _ := loadLocks.LoadOrStore(path, new(sync.Mutex))
 	lock.(*sync.Mutex).Lock()

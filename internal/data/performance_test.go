@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/egoist/mygo/plugins/sqlite"
 	"github.com/meimingqi222/devin-usage-metrics/internal/data"
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
+	"github.com/meimingqi222/devin-usage-metrics/internal/sqlite"
 )
 
 func devinDB(t testing.TB, h, source string) *sqlite.DB {

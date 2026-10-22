@@ -54,7 +54,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path 'build/${{ matrix.directory }}/Agent Usage Metrics.exe', 'build/${{ matrix.directory }}/mygo-sqlite3.dll' -DestinationPath '${{ matrix.artifact }}'
+          # SQLite is compiled in, so the exe is the whole app. Keep Rust's
+          # file name: Rust's updater only replaces devin-usage-metrics.exe.
+          Copy-Item -LiteralPath 'build/${{ matrix.directory }}/Agent Usage Metrics.exe' -Destination 'devin-usage-metrics.exe'
+          Compress-Archive -Path 'devin-usage-metrics.exe' -DestinationPath '${{ matrix.artifact }}'
           $hash = (Get-FileHash '${{ matrix.artifact }}' -Algorithm SHA256).Hash.ToLower()
           "$hash  ${{ matrix.artifact }}" | Out-File -Encoding utf8 '${{ matrix.artifact }}.sha256'
       - name: Package signed macOS bundle

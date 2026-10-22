@@ -14,14 +14,7 @@ import (
 // never exits the caller. A successful return requires the caller to exit within
 // 120 seconds. Backups are deliberately retained for recovery, not overwritten.
 func Apply(payload string) error {
-	if _, err := assetName(runtime.GOOS, runtime.GOARCH); err != nil {
-		return err
-	}
-	current, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	current, err = filepath.EvalSymlinks(current)
+	current, err := installTarget()
 	if err != nil {
 		return err
 	}
@@ -29,38 +22,11 @@ func Apply(payload string) error {
 	if err != nil {
 		return err
 	}
-	for _, p := range strings.Split(filepath.ToSlash(current), "/") {
-		if p == "target" || p == "go-build" || strings.HasPrefix(p, "go-build") {
-			return errors.New("refusing update of development build")
-		}
-	}
-	if runtime.GOOS == "darwin" {
-		suffix := filepath.Join("Agent Usage Metrics.app", "Contents", "MacOS", filepath.Base(current))
-		if filepath.Base(current) != "Agent Usage Metrics" && filepath.Base(current) != "devin-usage-metrics" {
-			return errors.New("unsupported app executable")
-		}
-		if !strings.HasSuffix(current, string(filepath.Separator)+suffix) {
-			return errors.New("not running from the release .app bundle")
-		}
-		current = strings.TrimSuffix(current, filepath.Join("Contents", "MacOS", filepath.Base(current)))
-		current = filepath.Clean(current)
-	} else if filepath.Base(current) != "devin-usage-metrics.exe" && filepath.Base(current) != "Agent Usage Metrics.exe" {
-		return errors.New("not running the packaged Windows executable")
-	}
 	if runtime.GOOS == "darwin" && filepath.Base(payload) != filepath.Base(current) {
 		return errors.New("payload is not the supported release packaging")
 	}
-	if runtime.GOOS == "windows" {
-		if filepath.Base(payload) != "Agent Usage Metrics.exe" && filepath.Base(payload) != "devin-usage-metrics.exe" {
-			return errors.New("unsupported executable payload")
-		}
-		lib := filepath.Join(filepath.Dir(payload), "mygo-sqlite3.dll")
-		if s, err := os.Lstat(lib); err != nil || !s.Mode().IsRegular() {
-			return errors.New("update is missing its SQLite runtime")
-		}
-		if _, err := os.Stat(filepath.Join(filepath.Dir(current), "mygo-sqlite3.dll.old")); !os.IsNotExist(err) {
-			return errors.New("previous SQLite backup exists")
-		}
+	if runtime.GOOS == "windows" && filepath.Base(payload) != "Agent Usage Metrics.exe" && filepath.Base(payload) != "devin-usage-metrics.exe" {
+		return errors.New("unsupported executable payload")
 	}
 	s, err := os.Lstat(payload)
 	if err != nil {
@@ -118,6 +84,76 @@ func Apply(payload string) error {
 	return nil
 }
 
+// installTarget returns what an update replaces: the .app bundle on macOS or
+// the executable on Windows. Development builds and other platforms fail.
+func installTarget() (string, error) {
+	if _, err := assetName(runtime.GOOS, runtime.GOARCH); err != nil {
+		return "", err
+	}
+	current, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	current, err = filepath.EvalSymlinks(current)
+	if err != nil {
+		return "", err
+	}
+	for _, p := range strings.Split(filepath.ToSlash(current), "/") {
+		if p == "target" || p == "go-build" || strings.HasPrefix(p, "go-build") {
+			return "", errors.New("refusing update of development build")
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		suffix := filepath.Join("Agent Usage Metrics.app", "Contents", "MacOS", filepath.Base(current))
+		if filepath.Base(current) != "Agent Usage Metrics" && filepath.Base(current) != "devin-usage-metrics" {
+			return "", errors.New("unsupported app executable")
+		}
+		if !strings.HasSuffix(current, string(filepath.Separator)+suffix) {
+			return "", errors.New("not running from the release .app bundle")
+		}
+		return filepath.Clean(strings.TrimSuffix(current, filepath.Join("Contents", "MacOS", filepath.Base(current)))), nil
+	}
+	if filepath.Base(current) != "devin-usage-metrics.exe" && filepath.Base(current) != "Agent Usage Metrics.exe" {
+		return "", errors.New("not running the packaged Windows executable")
+	}
+	return current, nil
+}
+
+// Packaged reports whether this process is a release install that updates can
+// replace. Like Rust, automatic checks run only for packaged installs.
+func Packaged() bool {
+	_, err := installTarget()
+	return err == nil
+}
+
+// RemoveBackups deletes the .old copies a previous update left behind. The
+// running process proves the new version starts, and Apply refuses to
+// overwrite existing backups, so Rust also removes them at startup. Windows
+// builds that bundled the MyGo SQLite DLL also leave it, now unused.
+func RemoveBackups() error {
+	current, err := installTarget()
+	if err != nil {
+		return nil
+	}
+	paths := []string{current + ".old"}
+	if runtime.GOOS == "windows" {
+		dir := filepath.Dir(current)
+		paths = append(paths, filepath.Join(dir, "mygo-sqlite3.dll"), filepath.Join(dir, "mygo-sqlite3.dll.old"))
+	}
+	var errs []error
+	for _, p := range paths {
+		if err := os.RemoveAll(p); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// IsSkipped reports whether the user chose to skip this release version.
+func IsSkipped(version, skipped string) bool {
+	return skipped != "" && strings.TrimPrefix(version, "v") == strings.TrimPrefix(skipped, "v")
+}
+
 const macHelper = `#!/bin/sh
 set -eu
 pid=$1; current=$2; payload=$3; stage=$4
@@ -139,29 +175,20 @@ fi
 const windowsHelper = `$ErrorActionPreference = 'Stop'
 $current = $env:AUM_CURRENT
 $stage = $env:AUM_STAGE
-$library = Join-Path (Split-Path -Parent $current) 'mygo-sqlite3.dll'
-$libraryMoved = $false
 $executableMoved = $false
 try {
  Copy-Item -LiteralPath $env:AUM_PAYLOAD -Destination (Join-Path $stage 'new.exe')
- Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $env:AUM_PAYLOAD) 'mygo-sqlite3.dll') -Destination (Join-Path $stage 'new.dll')
  $parent = Get-Process -Id ([int]$env:AUM_PID) -ErrorAction SilentlyContinue
  if ($parent -and -not $parent.WaitForExit(120000)) { throw 'Application did not exit' }
- if ((Test-Path -LiteralPath ($current + '.old')) -or (Test-Path -LiteralPath ($library + '.old'))) { throw 'Backup already exists' }
+ if (Test-Path -LiteralPath ($current + '.old')) { throw 'Backup already exists' }
  Move-Item -LiteralPath $current -Destination ($current + '.old')
  $executableMoved = $true
- if (Test-Path -LiteralPath $library) { Move-Item -LiteralPath $library -Destination ($library + '.old'); $libraryMoved = $true }
- Move-Item -LiteralPath (Join-Path $stage 'new.dll') -Destination $library
  Move-Item -LiteralPath (Join-Path $stage 'new.exe') -Destination $current
  Start-Process -FilePath $current
 } catch {
  if ($executableMoved) {
   Remove-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
   Move-Item -LiteralPath ($current + '.old') -Destination $current
-  if ($libraryMoved) {
-   Remove-Item -LiteralPath $library -Force -ErrorAction SilentlyContinue
-   Move-Item -LiteralPath ($library + '.old') -Destination $library
-  }
   Start-Process -FilePath $current
  }
  throw
