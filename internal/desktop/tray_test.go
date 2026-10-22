@@ -7,6 +7,7 @@ import (
 	"github.com/egoist/mygo/ui"
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 	"github.com/meimingqi222/devin-usage-metrics/internal/quota"
+	"github.com/meimingqi222/devin-usage-metrics/internal/updater"
 )
 
 func TestTrayChinesePopulatedVisual(t *testing.T) {
@@ -28,15 +29,20 @@ func TestTrayChinesePopulatedVisual(t *testing.T) {
 			{Label: "Gemini Models – 5h", UsedPercent: 85},
 		}}},
 	}
-	tt := ui.NewTester(a.trayView, 350, 520)
+	tt := ui.NewTester(a.trayView, trayWidth, 520)
 	tt.SetScale(2)
-	for _, label := range []string{"订阅配额监控", "更新于 12:43:24", "费用与用量", "今天", "昨天", "30 天", "实时配额与限额", "5 小时窗口", "7 天窗口", "剩余 100%", "已用 0.0%", "剩余 35%", "额度预警 · 剩余 15%", "$374.01", "(71%)", "打开控制台 →"} {
+	// Antigravity's unpriced tokens show as free, not a 0% cost share; an
+	// untouched window reads full.
+	for _, label := range []string{"订阅配额监控", "更新于 12:43:24", "费用与用量", "今天", "昨天", "30 天", "实时配额与限额", "5 小时窗口", "7 天窗口", "剩余 100%", "满额", "Gemini Models · 周配额", "剩余 35%", "剩余 15%", "$374.01", "(71%)", "501.8M T", "(免费)", "打开控制台 →", "Agent Metrics v" + updater.CurrentVersion} {
 		if !tt.HasText(label) {
 			t.Fatalf("missing %q: %q", label, tt.Texts())
 		}
 	}
-	if got := tt.Image().Bounds().Size(); got.X != 700 || got.Y != 1040 {
-		t.Fatalf("expected 350x520 logical at 2x, got %v", got)
+	if got := tt.Image().Bounds().Size(); got.X != 2*trayWidth || got.Y != 1040 {
+		t.Fatalf("expected %dx520 logical at 2x, got %v", trayWidth, got)
+	}
+	if got := a.trayAlertTitle(); got != "Antigravity 剩 15%" {
+		t.Fatalf("menubar alert %q", got)
 	}
 	capture(t, tt, "go-tray-zh-populated")
 	click(t, tt, "昨天")
@@ -48,15 +54,15 @@ func TestTrayChinesePopulatedVisual(t *testing.T) {
 func TestTrayContentsAndActions(t *testing.T) {
 	a := fixture(t)
 	a.accounts = []accountResult{
-		{account: quota.Account{Key: "quota", Provider: "claude", Label: "fixture@example.com"}, result: quota.Result{Plan: "Max", Windows: []quota.Window{{Label: "5h", UsedPercent: 85, ResetsAt: time.Now().Add(time.Hour).Unix()}}}},
+		{account: quota.Account{Key: "quota", Provider: "claude", Label: "fixture@example.com"}, result: quota.Result{Plan: "Max", Windows: []quota.Window{{Label: "5h", UsedPercent: 85, ResetsAt: time.Now().Add(time.Hour + 30*time.Second).Unix()}}}},
 		{account: quota.Account{Key: "api", Provider: "codex"}, result: quota.Result{Plan: "API MODE"}},
 	}
 	opened, closed := false, false
 	a.trayUI.openDashboard = func() { opened = true }
 	a.trayUI.closePopup = func() { closed = true }
-	tt := ui.NewTester(a.trayView, 350, 520)
+	tt := ui.NewTester(a.trayView, trayWidth, 520)
 	tt.SetScale(2)
-	for _, text := range []string{"Subscription Quotas", "Cost & Usage", "Today", "Yesterday", "30 Days", "Claude Code", "fixture@example.com", "Max", "5-hour window", "Limit alert · 15% left", "Used: 85.0%", "Open Dashboard →"} {
+	for _, text := range []string{"Subscription Quotas", "Cost & Usage", "Today", "Yesterday", "30 Days", "Claude Code", "fixture@example.com", "MAX", "5-hour window", "15% left", "resets 1h0m", "Open Dashboard →"} {
 		if !tt.HasText(text) {
 			t.Fatalf("missing %q: %q", text, tt.Texts())
 		}
@@ -90,7 +96,7 @@ func TestTrayOverviewIndependentOfDashboardAndRemote(t *testing.T) {
 	now := time.Now().Unix()
 	price := 2.0
 	a.loaded[model.Codex] = model.Data{Turns: []model.Turn{{Agent: model.Codex, CreatedAt: now, DeviceID: a.localID, RecordedCost: &price}}}
-	tt := ui.NewTester(a.trayView, 350, 520)
+	tt := ui.NewTester(a.trayView, trayWidth, 520)
 	tt.SetScale(2)
 	if !tt.HasText("Claude Code") || !tt.HasText("Codex") || tt.HasText("Devin") {
 		t.Fatalf("overview followed dashboard filter: %q", tt.Texts())
@@ -99,5 +105,26 @@ func TestTrayOverviewIndependentOfDashboardAndRemote(t *testing.T) {
 	click(t, tt, "Yesterday")
 	if !tt.HasText("No session records in this period") {
 		t.Fatalf("empty period missing: %q", tt.Texts())
+	}
+}
+
+// A Claude reset can be asked from the tray; its confirmation opens there,
+// not in the dashboard, and cancelling spends nothing.
+func TestTrayClaudeResetConfirmsInTray(t *testing.T) {
+	a := fixture(t)
+	a.accounts = []accountResult{{account: quota.Account{Key: "claude", Provider: "claude", Label: "me@example.com"}, result: quota.Result{Plan: "Pro", Windows: []quota.Window{{Label: "5h", UsedPercent: 100, ResetsAt: time.Now().Add(time.Hour).Unix()}}, Reset: &quota.ClaudeReset{Left: 2, Total: 3, GrantID: "g", Clears: []string{"five_hour"}}}}}
+	tt := ui.NewTester(a.trayView, trayWidth, 520)
+	tt.SetScale(2)
+	if !tt.HasText("Reset grants: 2 of 3 left") {
+		t.Fatalf("tray lacks the grant summary: %q", tt.Texts())
+	}
+	click(t, tt, "Reset now")
+	if !a.quotaUI.resetFromTray || !tt.HasText("Spend one Claude reset grant for me@example.com? This clears 5h now and cannot be undone.") {
+		t.Fatalf("confirmation not in the tray: %q", tt.Texts())
+	}
+	capture(t, tt, "go-tray-reset-confirm")
+	click(t, tt, "Cancel")
+	if a.quotaUI.resetAccount != nil || a.quotaUI.resetFromTray || a.busy["claude-reset"] {
+		t.Fatal("cancelling left reset state or spent a grant")
 	}
 }

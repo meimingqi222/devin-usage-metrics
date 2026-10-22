@@ -12,6 +12,7 @@ import (
 	"github.com/egoist/mygo/ui"
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 	"github.com/meimingqi222/devin-usage-metrics/internal/pricing"
+	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 	"github.com/meimingqi222/devin-usage-metrics/internal/updater"
 )
 
@@ -33,8 +34,11 @@ func Run(icon []byte) error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// A packaged app reports its bundle's version, which the build took
+	// from the same mygo.json main.go embeds.
 	if version := mygo.App.Version(); version != "" {
 		updater.CurrentVersion = version
+		syncdiag.AppVersion = version
 	}
 	a := New(ctx)
 	mygo.App.SetName("Agent Usage Metrics")
@@ -73,7 +77,7 @@ func Run(icon []byte) error {
 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) { quitting = true; cancel() })
 	mygo.App.WhenReady(func() {
 		main = mygo.NewWindow(mygo.WindowOptions{Title: "Agent Usage Metrics", Width: 1240, Height: 780, MinWidth: 1000, MinHeight: 640, TitleBarStyle: mygo.TitleBarHidden, TitleBarHeight: 48, TrafficLightPosition: &mygo.Point{X: 16, Y: 16}, Content: ui.View(a.View)})
-		popup = mygo.NewWindow(mygo.WindowOptions{Title: "Agent Usage Metrics — Quotas", Width: 350, Height: 520, Hidden: true, Frameless: true, DisableResize: true, AlwaysOnTop: true, SkipTaskbar: true, Content: ui.View(a.trayView)})
+		popup = mygo.NewWindow(mygo.WindowOptions{Title: "Agent Usage Metrics — Quotas", Width: trayWidth, Height: 520, Hidden: true, Frameless: true, DisableResize: true, AlwaysOnTop: true, SkipTaskbar: true, Content: ui.View(a.trayView)})
 		openDashboard := func() { popup.Hide(); main.Show(); main.Focus() }
 		a.trayUI.openDashboard = openDashboard
 		a.trayUI.closePopup = popup.Hide
@@ -132,6 +136,19 @@ func Run(icon []byte) error {
 		if err != nil {
 			a.message = fmt.Sprintf("Tray unavailable: %v", err)
 		} else {
+			// A quota under a third left shows beside the icon on macOS. The
+			// Windows and Linux trays have no title, so it joins the tooltip.
+			a.trayUI.setTitle = func(alert string) {
+				if runtime.GOOS == "darwin" {
+					tray.SetTitle(alert)
+					return
+				}
+				tip := "Agent Usage Metrics"
+				if alert != "" {
+					tip += " · " + alert
+				}
+				tray.SetToolTip(tip)
+			}
 			if runtime.GOOS == "linux" {
 				tray.SetMenu(trayMenu())
 				a.languageChanged = func() { tray.SetMenu(trayMenu()) }

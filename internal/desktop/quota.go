@@ -22,6 +22,11 @@ type quotaUIState struct {
 	resetConfirm bool
 	resetAccount *quota.Account
 	resetClears  string
+	// resetFromTray shows the confirmation in the tray popover, where the
+	// reset was asked, instead of the dashboard.
+	resetFromTray bool
+	// resetResult is the last claim's outcome, also shown in the tray.
+	resetResult string
 }
 
 func providerName(provider string) string {
@@ -83,12 +88,15 @@ func quotaAlert(r quota.Result) bool {
 	return false
 }
 
-// windowLabel localizes the provider-neutral window names; model-specific
-// names (Antigravity) pass through with only their window part translated.
+// windowLabel localizes the provider-neutral window names, for the
+// dashboard and the tray alike; model-specific names (Antigravity) keep the
+// model and translate only their window part.
 func (a *App) windowLabel(label string) string {
 	names := map[string][2]string{
 		"5h":            {"5-hour window", "5 小时窗口"},
+		"5-hour":        {"5-hour window", "5 小时窗口"},
 		"7d":            {"7-day window", "7 天窗口"},
+		"7-day":         {"7-day window", "7 天窗口"},
 		"7d OAuth apps": {"7-day · OAuth apps", "7 天 · OAuth 应用"},
 		"7d Opus":       {"7-day · Opus", "7 天 · Opus"},
 		"7d Sonnet":     {"7-day · Sonnet", "7 天 · Sonnet"},
@@ -177,7 +185,9 @@ func (a *App) quotaView(c *ui.Context) {
 			a.quotaCard(c.Key(ar.account.Key), ar)
 		}
 	})
-	a.claudeResetDialog(c)
+	if !a.quotaUI.resetFromTray {
+		a.claudeResetDialog(c)
+	}
 }
 
 func (a *App) keychainBanner(c *ui.Context) {
@@ -341,55 +351,69 @@ func (a *App) resetBlocker(r quota.ClaudeReset) string {
 // claudeResetBar shows the account's reset grants and spends one after a
 // confirmation; it stays disabled with the reason while none can be spent.
 func (a *App) claudeResetBar(c *ui.Context, account quota.Account, r quota.ClaudeReset, windows []quota.Window) {
-	t := c.Theme()
 	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-		// Count and expiry take a line each, so neither is cut at any
-		// width; the hour decides whether a grant can still be used.
-		ui.Column(c).Gap(2).Grow(1).MinWidth(0).Children(func() {
-			ui.Text(c, fmt.Sprintf(a.t("Reset grants: %d of %d left", "储备权益：剩余 %d / %d 次"), r.Left, r.Total)).FontSize(11).TextColor(t.TextMuted)
-			if r.EndsAt > 0 {
-				expiry := fmt.Sprintf(a.t("Expires %s", "%s 到期"), time.Unix(r.EndsAt, 0).Format("01-02 15:04"))
-				if left := r.EndsAt - time.Now().Unix(); left > 0 && left < 7*86400 {
-					expiry += fmt.Sprintf(a.t(" (in %s)", "（剩 %s）"), a.duration(left))
-				}
-				ui.Text(c, expiry).FontSize(11).FontFeatures("tnum").TextColor(faint(t))
+		a.claudeResetControls(c, account, r, windows, false)
+	})
+}
+
+// claudeResetControls is the grant summary and reset button, on the quota
+// page or, smaller, in the tray; the confirmation opens where it was asked.
+func (a *App) claudeResetControls(c *ui.Context, account quota.Account, r quota.ClaudeReset, windows []quota.Window, tray bool) {
+	t := c.Theme()
+	size := float32(11)
+	if tray {
+		size = 10
+	}
+	// Count and expiry take a line each, so neither is cut at any width;
+	// the hour decides whether a grant can still be used.
+	ui.Column(c).Gap(2).Grow(1).MinWidth(0).Children(func() {
+		ui.Text(c, fmt.Sprintf(a.t("Reset grants: %d of %d left", "储备权益：剩余 %d / %d 次"), r.Left, r.Total)).FontSize(size).TextColor(t.TextMuted)
+		if r.EndsAt > 0 {
+			expiry := fmt.Sprintf(a.t("Expires %s", "%s 到期"), time.Unix(r.EndsAt, 0).Format("01-02 15:04"))
+			if left := r.EndsAt - time.Now().Unix(); left > 0 && left < 7*86400 {
+				expiry += fmt.Sprintf(a.t(" (in %s)", "（剩 %s）"), a.duration(left))
 			}
-		})
-		label := a.t("Reset now", "立即重置")
-		busy := a.busy["claude-reset"]
-		if busy {
-			label = a.t("Resetting…", "正在重置…")
-		}
-		// Grant status is read at most hourly, so "not at the limit" may be
-		// stale once a window it clears is full; the claim re-checks live.
-		if r.Blocker == "not_limited" && resetWindowFull(r.Clears, windows) {
-			r.Blocker = ""
-		}
-		disabled := busy || r.Blocker != "" || r.GrantID == ""
-		b := ui.ButtonBase(c).Label(label).FontSize(11).FontWeight(500).Padding(3, 8).Radius(4).Background(t.Accent.Alpha(.08)).Border(1, t.Accent.Alpha(.25)).TextColor(t.Accent).Disabled(disabled)
-		switch {
-		case disabled:
-			b.Background(controlColor).Border(1, t.Border).TextColor(faint(t))
-		case b.Hovered():
-			b.Background(t.Accent.Alpha(.18)).Border(1, t.Accent.Alpha(.45))
-		}
-		b.Children(func() {
-			ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
-				ui.Icon(c, resetIcon).Size(10, 10)
-				ui.Text(c, label).NoWrap()
-			})
-		})
-		switch w := a.resetWindows(r.Clears); {
-		case r.Blocker != "":
-			b.Tooltip(a.resetBlocker(r))
-		case w != "":
-			b.Tooltip(fmt.Sprintf(a.t("Clears %s", "清空 %s"), w))
-		}
-		if b.Clicked() && !disabled {
-			account := account
-			a.quotaUI.resetAccount, a.quotaUI.resetClears, a.quotaUI.resetConfirm = &account, a.resetWindows(r.Clears), true
+			ui.Text(c, expiry).FontSize(size).FontFeatures("tnum").TextColor(faint(t))
 		}
 	})
+	label := a.t("Reset now", "立即重置")
+	busy := a.busy["claude-reset"]
+	if busy {
+		label = a.t("Resetting…", "正在重置…")
+	}
+	// Grant status is read at most hourly, so "not at the limit" may be
+	// stale once a window it clears is full; the claim re-checks live.
+	if r.Blocker == "not_limited" && resetWindowFull(r.Clears, windows) {
+		r.Blocker = ""
+	}
+	disabled := busy || r.Blocker != "" || r.GrantID == ""
+	b := ui.ButtonBase(c).Label(label).FontSize(size).FontWeight(500).Padding(3, 8).Radius(4).Background(t.Accent.Alpha(.08)).Border(1, t.Accent.Alpha(.25)).TextColor(t.Accent).Disabled(disabled)
+	if tray {
+		b.Padding(2, 7).Radius(3)
+	}
+	switch {
+	case disabled:
+		b.Background(controlColor).Border(1, t.Border).TextColor(faint(t))
+	case b.Hovered():
+		b.Background(t.Accent.Alpha(.18)).Border(1, t.Accent.Alpha(.45))
+	}
+	b.Children(func() {
+		ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
+			ui.Icon(c, resetIcon).Size(size-1, size-1)
+			ui.Text(c, label).NoWrap()
+		})
+	})
+	switch w := a.resetWindows(r.Clears); {
+	case r.Blocker != "":
+		b.Tooltip(a.resetBlocker(r))
+	case w != "":
+		b.Tooltip(fmt.Sprintf(a.t("Clears %s", "清空 %s"), w))
+	}
+	if b.Clicked() && !disabled {
+		account := account
+		q := &a.quotaUI
+		q.resetAccount, q.resetClears, q.resetConfirm, q.resetFromTray = &account, a.resetWindows(r.Clears), true, tray
+	}
 }
 
 func (a *App) claudeResetDialog(c *ui.Context) {
@@ -406,7 +430,7 @@ func (a *App) claudeResetDialog(c *ui.Context) {
 		a.claimClaudeReset(account)
 	}
 	if !a.quotaUI.resetConfirm {
-		a.quotaUI.resetAccount = nil
+		a.quotaUI.resetAccount, a.quotaUI.resetFromTray = nil, false
 	}
 }
 
@@ -434,6 +458,7 @@ func (a *App) claimClaudeReset(account quota.Account) {
 			default:
 				a.message = a.resetBlocker(quota.ClaudeReset{Blocker: code})
 			}
+			a.quotaUI.resetResult = a.message
 			a.refreshQuota(true)
 		}
 	})

@@ -212,7 +212,12 @@ func (a *App) refreshQuota(force bool) {
 			})
 		}
 		wg.Wait()
-		return func() { a.accounts, a.quotaUI.queriedAt = out, time.Now().Format("15:04:05") }
+		return func() {
+			a.accounts, a.quotaUI.queriedAt = out, time.Now().Format("15:04:05")
+			if a.trayUI.setTitle != nil {
+				a.trayUI.setTitle(a.trayAlertTitle())
+			}
+		}
 	})
 }
 
