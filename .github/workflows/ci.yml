@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      package_version:
+        description: Acceptance package version (x.y.z); empty keeps mygo.json
+        required: false
+        default: ''
+        type: string
 
 jobs:
   desktop:
@@ -27,6 +34,21 @@ jobs:
       - name: Check formatting
         shell: bash
         run: test -z "$(gofmt -l main.go internal)"
+      - name: Set optional acceptance version
+        if: github.event_name == 'workflow_dispatch' && inputs.package_version != ''
+        shell: python
+        env:
+          PACKAGE_VERSION: ${{ inputs.package_version }}
+        run: |
+          import json, os, re
+          from pathlib import Path
+          version = os.environ['PACKAGE_VERSION']
+          if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+              raise SystemExit('Acceptance version must be x.y.z')
+          path = Path('mygo.json')
+          config = json.loads(path.read_text())
+          config['version'] = version
+          path.write_text(json.dumps(config, indent=2) + '\n')
       - name: Build native package
         run: go tool mygo build -skip-dmg
       - name: Verify the package ships no native SQLite library
@@ -42,7 +64,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: matrix.target != ''
         with:
-          name: acceptance-${{ matrix.os }}-${{ github.sha }}
+          name: acceptance-${{ matrix.os }}-${{ inputs.package_version || 'repository-version' }}-${{ github.sha }}
           path: build/acceptance/*
           if-no-files-found: error
           retention-days: 14

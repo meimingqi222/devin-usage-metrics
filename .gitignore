@@ -76,3 +76,6 @@ tmp/
 # Agent 临时工作目录
 .agent-notes/
 .agent-notes-evidence/
+
+# Python acceptance tooling
+__pycache__/
