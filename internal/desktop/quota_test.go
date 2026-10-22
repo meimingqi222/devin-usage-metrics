@@ -76,17 +76,17 @@ func TestClaudeResetGrantNeedsConfirmation(t *testing.T) {
 	tt.SetScale(2)
 	// The expiry shows its hour and minute, since a grant lapses at an instant.
 	expires := time.Unix(a.accounts[0].result.Reset.EndsAt, 0).Format("01-02 15:04")
-	if !tt.HasText("Reset grants: 2 of 3 left · expires " + expires) {
+	if !tt.HasText("Reset grants: 2 of 3 left") || !tt.HasText("Expires "+expires) {
 		t.Fatalf("missing grant summary: %q", tt.Texts())
 	}
 	tt.Scroll(600, 400, 0, 400)
 	soon := time.Unix(a.accounts[6].result.Reset.EndsAt, 0).Format("01-02 15:04")
-	if !tt.HasText("Reset grants: 1 of 1 left · expires " + soon + " (in 1d 2h)") {
+	if !tt.HasText("Reset grants: 1 of 1 left") || !tt.HasText("Expires "+soon+" (in 1d 2h)") {
 		t.Fatalf("missing blocked grant: %q", tt.Texts())
 	}
 	tt.Scroll(600, 400, 0, -400)
-	click(t, tt, "Reset 5h")
-	if !tt.HasText("Spend one Claude reset grant for work@example.com? This clears its usage window now and cannot be undone.") {
+	click(t, tt, "Reset now")
+	if !tt.HasText("Spend one Claude reset grant for work@example.com? This clears 5h now and cannot be undone.") {
 		t.Fatalf("reset did not ask first: %q", tt.Texts())
 	}
 	capture(t, tt, "go-claude-reset-confirm")

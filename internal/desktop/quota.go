@@ -331,20 +331,19 @@ func (a *App) resetBlocker(r quota.ClaudeReset) string {
 func (a *App) claudeResetBar(c *ui.Context, account quota.Account, r quota.ClaudeReset) {
 	t := c.Theme()
 	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-		info := fmt.Sprintf(a.t("Reset grants: %d of %d left", "储备权益：剩余 %d / %d 次"), r.Left, r.Total)
-		// Grants expire at an exact instant; the hour decides whether one
-		// can still be used before it lapses.
-		if r.EndsAt > 0 {
-			info += fmt.Sprintf(a.t(" · expires %s", " · %s 到期"), time.Unix(r.EndsAt, 0).Format("01-02 15:04"))
-			if left := r.EndsAt - time.Now().Unix(); left > 0 && left < 7*86400 {
-				info += fmt.Sprintf(a.t(" (in %s)", "（剩 %s）"), a.duration(left))
+		// Count and expiry take a line each, so neither is cut at any
+		// width; the hour decides whether a grant can still be used.
+		ui.Column(c).Gap(2).Grow(1).MinWidth(0).Children(func() {
+			ui.Text(c, fmt.Sprintf(a.t("Reset grants: %d of %d left", "储备权益：剩余 %d / %d 次"), r.Left, r.Total)).FontSize(11).TextColor(t.TextMuted)
+			if r.EndsAt > 0 {
+				expiry := fmt.Sprintf(a.t("Expires %s", "%s 到期"), time.Unix(r.EndsAt, 0).Format("01-02 15:04"))
+				if left := r.EndsAt - time.Now().Unix(); left > 0 && left < 7*86400 {
+					expiry += fmt.Sprintf(a.t(" (in %s)", "（剩 %s）"), a.duration(left))
+				}
+				ui.Text(c, expiry).FontSize(11).FontFeatures("tnum").TextColor(faint(t))
 			}
-		}
-		ui.Text(c, info).FontSize(11).TextColor(faint(t)).Grow(1).MinWidth(0).SingleLine()
+		})
 		label := a.t("Reset now", "立即重置")
-		if w := a.resetWindows(r.Clears); w != "" {
-			label = fmt.Sprintf(a.t("Reset %s", "重置 %s"), w)
-		}
 		busy := a.busy["claude-reset"]
 		if busy {
 			label = a.t("Resetting…", "正在重置…")
@@ -363,12 +362,15 @@ func (a *App) claudeResetBar(c *ui.Context, account quota.Account, r quota.Claud
 				ui.Text(c, label).NoWrap()
 			})
 		})
-		if r.Blocker != "" {
+		switch w := a.resetWindows(r.Clears); {
+		case r.Blocker != "":
 			b.Tooltip(a.resetBlocker(r))
+		case w != "":
+			b.Tooltip(fmt.Sprintf(a.t("Clears %s", "清空 %s"), w))
 		}
 		if b.Clicked() && !disabled {
 			account := account
-			a.resetAccount, a.resetConfirm = &account, true
+			a.resetAccount, a.resetClears, a.resetConfirm = &account, a.resetWindows(r.Clears), true
 		}
 	})
 }
@@ -379,6 +381,9 @@ func (a *App) claudeResetDialog(c *ui.Context) {
 	}
 	account := *a.resetAccount
 	text := fmt.Sprintf(a.t("Spend one Claude reset grant for %s? This clears its usage window now and cannot be undone.", "为 %s 消耗 1 次 Claude 重置权益？用量窗口会立即清空，且无法撤销。"), account.Label)
+	if a.resetClears != "" {
+		text = fmt.Sprintf(a.t("Spend one Claude reset grant for %s? This clears %s now and cannot be undone.", "为 %s 消耗 1 次 Claude 重置权益？会立即清空 %s，且无法撤销。"), account.Label, a.resetClears)
+	}
 	if ui.AlertDialog(c, &a.resetConfirm, a.t("Reset Claude usage", "重置 Claude 用量"), text, a.t("Cancel", "取消"), a.t("Reset", "重置")) == 1 {
 		a.resetAccount = nil
 		a.claimClaudeReset(account)

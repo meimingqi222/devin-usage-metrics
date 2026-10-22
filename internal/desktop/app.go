@@ -47,6 +47,7 @@ type App struct {
 	resetConfirm                               bool
 	quotaAt                                    string
 	resetAccount                               *quota.Account
+	resetClears                                string
 	release                                    updater.Release
 	payload                                    string
 	quit                                       func()
