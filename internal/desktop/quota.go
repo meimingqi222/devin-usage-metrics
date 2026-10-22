@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -111,7 +110,8 @@ func (a *App) duration(secs int64) string {
 
 func (a *App) quotaView(c *ui.Context) {
 	t := c.Theme()
-	if runtime.GOOS == "darwin" && !quota.KeychainAllowed() && !a.keychainDismissed {
+	// Like Rust, offer Keychain access only where a Keychain login may exist.
+	if a.keychainLikely && !quota.KeychainAllowed() && !a.keychainDismissed {
 		a.keychainBanner(c)
 	}
 	if a.busy["quota"] && len(a.accounts) == 0 {

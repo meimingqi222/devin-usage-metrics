@@ -95,3 +95,19 @@ func TestClaudeResetGrantNeedsConfirmation(t *testing.T) {
 		t.Fatal("cancelling still spent a reset")
 	}
 }
+
+// Like Rust, the Keychain banner shows only where a Claude or Antigravity
+// login may live in the macOS Keychain.
+func TestKeychainBannerOnlyWhereLikely(t *testing.T) {
+	a := quotaFixture(t)
+	a.keychainLikely = false
+	tt := ui.NewTester(a.View, 1240, 780)
+	if tt.HasText("Allow Keychain access") {
+		t.Fatal("banner shown without any Keychain login")
+	}
+	a.keychainLikely = true
+	tt.Frame()
+	if quota.KeychainAllowed() == tt.HasText("Allow Keychain access") {
+		t.Fatalf("banner state wrong: allowed=%v", quota.KeychainAllowed())
+	}
+}
