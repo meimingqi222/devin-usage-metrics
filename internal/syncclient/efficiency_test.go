@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
+	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 )
 
 // countingServer records every request so tests can assert what a cycle sent.
@@ -284,6 +285,46 @@ func rewriteHead(t *testing.T, s *objectServer, m manifest, h head) {
 	defer s.mu.Unlock()
 	s.objects["v3-manifest-"+h.Manifest+".json"] = b
 	s.objects["v3-head-"+h.DeviceID+".json"] = hb
+}
+
+func TestExistingImmutableObjectsAreNotLoggedAsFailures(t *testing.T) {
+	setup(t)
+	resetMemoryCaches()
+	s := &countingServer{objectServer: &objectServer{objects: map[string][]byte{}}}
+	server := httptest.NewServer(s.handler())
+	defer server.Close()
+	syncTo(t, server.URL)
+	now := time.Now().Unix()
+	ctx := context.Background()
+	local := days(now, 4, model.Claude)
+	if _, err := Cycle(ctx, local); err != nil {
+		t.Fatal(err)
+	}
+	// Drop the parent's references so every block is re-sent and answered 412.
+	s.mu.Lock()
+	var h head
+	unmarshal(t, s.objects["v3-head-local.json"], &h)
+	var m manifest
+	unmarshal(t, s.objects["v3-manifest-"+h.Manifest+".json"], &m)
+	m.Blocks = []reference{}
+	s.mu.Unlock()
+	rewriteHead(t, s.objectServer, m, h)
+	resetMemoryCaches()
+	s.take()
+	local.Turns[0].InputTokens++
+	if _, err := Cycle(ctx, local); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.take(); count(got, "PUT", "v3-block-") < 3 {
+		t.Fatalf("fixture did not re-send existing blocks: %v", got)
+	}
+	b, err := os.ReadFile(syncdiag.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"status":412`) {
+		t.Fatal("expected 412 answers to immutable uploads were logged as failures")
+	}
 }
 
 // The next cycle re-reads this device's head; the package it would assemble is
