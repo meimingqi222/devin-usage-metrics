@@ -1,0 +1,6 @@
+# gofmt emits LF on every platform; do not convert Go sources on Windows checkout.
+*.go text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.yml text eol=lf
+*.py text eol=lf

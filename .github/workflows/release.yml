@@ -50,23 +50,11 @@ jobs:
           path.write_text(json.dumps(config, indent=2) + '\n')
       - name: Build native app and its runtime resources
         run: go tool mygo build -platform ${{ matrix.target }} -skip-dmg
-      - name: Package Windows portable app
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          # SQLite is compiled in, so the exe is the whole app. Keep Rust's
-          # file name: Rust's updater only replaces devin-usage-metrics.exe.
-          Copy-Item -LiteralPath 'build/${{ matrix.directory }}/Agent Usage Metrics.exe' -Destination 'devin-usage-metrics.exe'
-          Compress-Archive -Path 'devin-usage-metrics.exe' -DestinationPath '${{ matrix.artifact }}'
-          $hash = (Get-FileHash '${{ matrix.artifact }}' -Algorithm SHA256).Hash.ToLower()
-          "$hash  ${{ matrix.artifact }}" | Out-File -Encoding utf8 '${{ matrix.artifact }}.sha256'
-      - name: Package signed macOS bundle
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          codesign --verify --deep --strict --verbose=2 'build/${{ matrix.directory }}/Agent Usage Metrics.app'
-          (cd 'build/${{ matrix.directory }}' && zip -r '../../${{ matrix.artifact }}' 'Agent Usage Metrics.app')
-          shasum -a 256 '${{ matrix.artifact }}' > '${{ matrix.artifact }}.sha256'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Package release ZIP and checksum
+        run: python scripts/package-release.py --target ${{ matrix.target }} --output .
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
