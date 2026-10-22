@@ -135,6 +135,9 @@ func SetDeviceName(n string) error {
 	return atomicJSON(configPath(), v)
 }
 
+// Bump when parsing changes so persisted records cannot bypass importer fixes.
+const snapshotVersion = 2
+
 type snapshot struct {
 	Version   int
 	At        int64
@@ -173,7 +176,7 @@ func Load(a model.Agent, start, end int64, refresh bool) model.Data {
 	b, _ := os.ReadFile(path)
 	_ = json.Unmarshal(b, &old)
 	now := time.Now().Unix()
-	covers := old.Version == 1 && old.Data.TurnsStart <= start && old.Data.TurnsEnd >= min(end, now)
+	covers := old.Version == snapshotVersion && old.Data.TurnsStart <= start && old.Data.TurnsEnd >= min(end, now)
 	if !refresh && covers && now-old.At <= 300 {
 		return filter(old.Data, start, end)
 	}
@@ -205,7 +208,7 @@ func Load(a model.Agent, start, end int64, refresh bool) model.Data {
 	}
 	raw, _ := json.Marshal([]any{d.Sessions, d.Turns})
 	d.SyncContentHash = fmt.Sprintf("%x", sha256.Sum256(raw))
-	if e := atomicJSON(path, snapshot{Version: 1, At: now, Data: d, Databases: databases, Files: sourceFiles}); e != nil {
+	if e := atomicJSON(path, snapshot{Version: snapshotVersion, At: now, Data: d, Databases: databases, Files: sourceFiles}); e != nil {
 		fail(&d, a, fmt.Errorf("save cache: %w", e))
 	}
 	return d

@@ -330,3 +330,51 @@ func TestExpiredUnchangedAndDeletedFiles(t *testing.T) {
 		t.Fatal("deleted session retained", d)
 	}
 }
+
+func TestGrokOptionalUpdatesAndUsageMatchRust(t *testing.T) {
+	h := env(t)
+	write(t, h, ".grok/sessions/summary-only/summary.json", `{"info":{"id":"summary-only"},"created_at":1700000000}`)
+	write(t, h, ".grok/sessions/with-updates/summary.json", `{"info":{"id":"with-updates"},"created_at":1700000000}`)
+	write(t, h, ".grok/sessions/with-updates/updates.jsonl", `{"timestamp":1700000001,"params":{"update":{"sessionUpdate":"turn_completed"}}}
+{"timestamp":1700000002,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":10,"outputTokens":2}}}}
+`)
+	d := data.Load(model.Grok, 0, 1800000000, true)
+	if len(d.Errors) != 0 || len(d.Sessions) != 2 || len(d.Turns) != 1 {
+		t.Fatalf("summary-only sessions and unmetered events: sessions=%d turns=%d errors=%d", len(d.Sessions), len(d.Turns), len(d.Errors))
+	}
+}
+
+func TestWorkBuddyMissingSessionIDUsesFileNamePerRecord(t *testing.T) {
+	h := env(t)
+	write(t, h, ".workbuddy/projects/project/fallback.jsonl", `{"sessionId":"explicit","timestamp":1700000000,"providerData":{"usage":{"inputTokens":10,"outputTokens":2}}}
+{"type":"ai-title","aiTitle":"Fallback title","timestamp":1700000001}
+`)
+	d := data.Load(model.WorkBuddy, 0, 1800000000, true)
+	if len(d.Sessions) != 2 || len(d.Turns) != 1 {
+		t.Fatalf("fallback metadata session lost: sessions=%d turns=%d", len(d.Sessions), len(d.Turns))
+	}
+	found := false
+	for _, s := range d.Sessions {
+		if s.ID == "fallback" && s.Title == "Fallback title" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("record without sessionId inherited the previous record's ID")
+	}
+}
+
+func TestLegacySnapshotCannotHideImporterFixes(t *testing.T) {
+	h := env(t)
+	write(t, h, ".workbuddy/projects/project/fallback.jsonl", `{"type":"ai-title","aiTitle":"Recovered session","timestamp":1700000000}`)
+	legacy := map[string]any{"Version": 1, "At": time.Now().Unix(), "Data": model.Data{TurnsStart: 0, TurnsEnd: 1800000000}}
+	b, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, h, "cache/devin-usage-metrics/go-data-workbuddy.json", string(b))
+	d := data.Load(model.WorkBuddy, 0, 1800000000, false)
+	if len(d.Sessions) != 1 {
+		t.Fatal("legacy cache hid corrected importer output")
+	}
+}

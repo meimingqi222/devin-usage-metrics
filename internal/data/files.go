@@ -325,6 +325,10 @@ func loadFiles(d *model.Data, a model.Agent, refresh bool, previous *model.Data,
 			kind := str(v["type"])
 			m := v["message"]
 			payload := v["payload"]
+			if a == model.WorkBuddy {
+				// Rust resolves missing IDs per record, not from the previous line.
+				id = strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+			}
 			if a == model.Codex && kind == "session_meta" {
 				if s := str(first(get(payload, "id"), get(payload, "session_id"))); s != "" {
 					id = s
@@ -621,12 +625,20 @@ func parseGrok(d *model.Data, p string, sessions map[string]*model.Session, refr
 		d.FileMtimes[p] = info.ModTime().UnixNano()
 		d.FileSessions[p] = s.Key
 	}
-	for _, v := range readLines(d, model.Grok, filepath.Join(filepath.Dir(p), "updates.jsonl"), refresh) {
+	updates := filepath.Join(filepath.Dir(p), "updates.jsonl")
+	// A Grok summary is a valid session before its optional update log exists.
+	if _, err := os.Stat(updates); os.IsNotExist(err) {
+		return
+	}
+	for _, v := range readLines(d, model.Grok, updates, refresh) {
 		u := get(v, "params", "update")
 		if str(get(u, "sessionUpdate")) != "turn_completed" {
 			continue
 		}
 		usage := get(u, "usage")
+		if usage == nil {
+			continue
+		}
 		t := model.Turn{Agent: model.Grok, SessionKey: s.Key, CreatedAt: ts(v["timestamp"]), Model: s.SelectedModel}
 		if t.CreatedAt <= 0 {
 			t.CreatedAt = ts(get(v, "_meta", "agentTimestampMs"))
