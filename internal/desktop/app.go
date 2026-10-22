@@ -45,6 +45,7 @@ type App struct {
 	confirm                                    bool
 	pending                                    *compaction.Recommendation
 	resetConfirm                               bool
+	quotaAt                                    string
 	resetAccount                               *quota.Account
 	release                                    updater.Release
 	payload                                    string
@@ -217,7 +218,7 @@ func (a *App) refreshQuota(force bool) {
 			})
 		}
 		wg.Wait()
-		return func() { a.accounts = out }
+		return func() { a.accounts, a.quotaAt = out, time.Now().Format("15:04:05") }
 	})
 }
 

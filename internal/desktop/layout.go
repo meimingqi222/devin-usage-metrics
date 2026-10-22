@@ -132,15 +132,7 @@ const (
 	monitorSVG = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>`
 )
 
-var gearIcon, monitorIcon = mustSVG(gearSVG), mustSVG(monitorSVG)
-
-func mustSVG(s string) *ui.SVG {
-	svg, err := ui.ParseSVG([]byte(s))
-	if err != nil {
-		panic(err)
-	}
-	return svg
-}
+var gearIcon, monitorIcon = svgIcon(gearSVG), svgIcon(monitorSVG)
 
 // faint is the third text level, below the theme's muted text.
 func faint(t *ui.Theme) ui.Color { return t.TextMuted.Alpha(.65) }
@@ -421,22 +413,23 @@ func (a *App) header(c *ui.Context) {
 			}
 		}
 		ui.Spacer(c)
-		if a.screen != "quota" {
-			a.deviceScope(c)
+		if a.screen == "quota" {
+			// The quota page has its own query button and time.
+			if a.busy["quota"] {
+				ui.Text(c, a.t("Querying…", "查询中…")).FontSize(11).TextColor(faint(t)).NoWrap()
+			}
+			return
 		}
-		reload := ui.ButtonBase(c).Label(a.t("Reload", "重新加载")).FontSize(11).Padding(4, 8).Radius(5).Background(ui.Hex("#161b26")).Border(1, t.Border).TextColor(t.TextMuted).Disabled(a.busy[string(a.agent)] || a.busy["quota"])
+		a.deviceScope(c)
+		reload := ui.ButtonBase(c).Label(a.t("Reload", "重新加载")).FontSize(11).Padding(4, 8).Radius(5).Background(ui.Hex("#161b26")).Border(1, t.Border).TextColor(t.TextMuted).Disabled(a.busy[string(a.agent)])
 		if reload.Hovered() {
 			reload.TextColor(t.Text).Border(1, strongBorder)
 		}
 		reload.Children(func() { ui.Text(c, a.t("Reload", "重新加载")).NoWrap() })
 		if reload.Clicked() {
-			if a.screen == "quota" {
-				a.refreshQuota(true)
-			} else {
-				a.load(a.agent, true)
-			}
+			a.load(a.agent, true)
 		}
-		if a.busy[string(a.agent)] || a.busy["quota"] {
+		if a.busy[string(a.agent)] {
 			ui.Text(c, a.t("Loading…", "加载中…")).FontSize(11).TextColor(faint(t)).NoWrap()
 		} else if a.loadedAt != "" {
 			ui.Text(c, a.t("Data as of ", "数据截至 ")+a.loadedAt).FontSize(11).FontFeatures("tnum").TextColor(faint(t)).NoWrap()

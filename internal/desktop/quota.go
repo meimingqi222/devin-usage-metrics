@@ -140,7 +140,24 @@ func (a *App) quotaView(c *ui.Context) {
 		if alerts > 0 {
 			summary += fmt.Sprintf(a.t(" · %d high-usage alerts", " · %d 个高用量告警"), alerts)
 		}
-		ui.Text(c, summary).FontSize(11).Padding(3, 8).Radius(4).Background(ui.Hex("#161a23")).Border(1, t.Border).TextColor(t.TextMuted).NoWrap()
+		ui.Text(c, summary).FontSize(11).Padding(4, 10).Radius(4).Background(ui.Hex("#161a23")).Border(1, t.Border).TextColor(t.TextMuted).NoWrap()
+		ui.Spacer(c)
+		requery := ui.ButtonBase(c).Label(a.t("Query again", "重新查询")).FontSize(11).Padding(3, 8).Radius(4).Background(ui.Hex("#141720")).Border(1, t.Border).TextColor(t.TextMuted).Disabled(a.busy["quota"])
+		if requery.Hovered() {
+			requery.TextColor(t.Text)
+		}
+		requery.Children(func() {
+			ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
+				ui.Icon(c, requeryIcon).Size(11, 11)
+				ui.Text(c, a.t("Query again", "重新查询")).NoWrap()
+			})
+		})
+		if requery.Clicked() {
+			a.refreshQuota(true)
+		}
+		if a.quotaAt != "" {
+			ui.Text(c, a.quotaAt).FontSize(11).FontFeatures("tnum").TextColor(faint(t))
+		}
 	})
 	// A uniform two-column grid: cards in a row share its height.
 	ui.Grid(c).Columns(2).Gap(12).Children(func() {
@@ -188,8 +205,12 @@ func (a *App) quotaCard(c *ui.Context, ar accountResult) {
 	brand := providerColor(ar.account.Provider)
 	card.Label(providerName(ar.account.Provider) + " · " + ar.account.Label).Children(func() {
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Column(c).Size(20, 20).Shrink(0).Radius(4).Background(ui.Hex("#1a202c")).Border(1, brand.Alpha(.3)).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
-				ui.Text(c, strings.ToUpper(providerName(ar.account.Provider)[:1])).FontSize(10).FixedLineHeight(12).Bold().TextColor(brand)
+			ui.Column(c).Size(22, 22).Shrink(0).Radius(5).Background(ui.Hex("#171b24")).Border(1, ui.Hex("#232938")).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+				if logo := providerLogos[providerName(ar.account.Provider)]; logo != nil {
+					ui.Image(c, logo).Size(14, 14)
+				} else {
+					ui.Text(c, strings.ToUpper(providerName(ar.account.Provider)[:1])).FontSize(10).FixedLineHeight(12).Bold().TextColor(brand)
+				}
 			})
 			ui.Text(c, providerName(ar.account.Provider)).FontSize(13).FontWeight(600).NoWrap()
 			ui.Text(c, ar.account.Label).FontSize(11).Grow(1).MinWidth(0).SingleLine().TextColor(faintText)
@@ -226,7 +247,7 @@ func (a *App) quotaCard(c *ui.Context, ar accountResult) {
 			switch {
 			case len(r.Windows) == 0 && r.Plan == "API MODE":
 				ui.Row(c).Gap(6).Padding(4, 0).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, "✓").FontSize(11.5).Bold().TextColor(quotaGreen)
+					ui.Icon(c, checkIcon).Size(12, 12).TextColor(quotaGreen)
 					ui.Text(c, a.t("Pay-as-you-go API · no window limits", "按量直连模式 · 无窗口速率限制")).FontSize(11.5).TextColor(t.TextMuted)
 				})
 			case len(r.Windows) == 0:
@@ -331,7 +352,12 @@ func (a *App) claudeResetBar(c *ui.Context, account quota.Account, r quota.Claud
 		case b.Hovered():
 			b.Background(t.Accent.Alpha(.18)).Border(1, t.Accent.Alpha(.45))
 		}
-		b.Children(func() { ui.Text(c, "⚡ "+label).NoWrap() })
+		b.Children(func() {
+			ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
+				ui.Icon(c, resetIcon).Size(10, 10)
+				ui.Text(c, label).NoWrap()
+			})
+		})
 		if r.Blocker != "" {
 			b.Tooltip(a.resetBlocker(r))
 		}
