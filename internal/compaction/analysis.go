@@ -273,58 +273,13 @@ func replay(s []model.Turn, threshold, after, base, rework uint64, agent model.A
 }
 func recommend(agent model.Agent, k [2]string, all [][]model.Turn, current uint64, configured bool) Recommendation {
 	r := Recommendation{DeviceID: k[0], Model: k[1], DeviceName: all[0][0].DeviceName, Streams: len(all), BaselineInferred: !configured, Status: "not_enough_calls"}
-	var streams [][]model.Turn
-	var prices []pricing.Price
-	for _, s := range all {
-		r.Calls += len(s)
-		p, ok := pricing.Lookup(s[0].Model)
-		ok = ok && p.Input > 0
-		for _, t := range s {
-			ok = ok && p.ForPrompt(float64(prompt(t))).SupportsCacheUsage(t.CacheReadTokens, t.CacheCreation5mTokens)
-		}
-		if ok {
-			streams = append(streams, s)
-			prices = append(prices, p)
-			r.PricedCalls += len(s)
-		} else {
-			r.Unpriced++
-		}
-	}
-	var peaks, afters, growths, reworks, bases []uint64
-	for _, s := range streams {
-		bases = append(bases, prompt(s[0]))
-		var gs []uint64
-		for i := 1; i < len(s); i++ {
-			a, b := prompt(s[i-1]), prompt(s[i])
-			if !cut(a, b) {
-				gs = append(gs, sub(b, a))
-			}
-		}
-		g := median(gs)
-		for i := 1; i < len(s); i++ {
-			a, b := prompt(s[i-1]), prompt(s[i])
-			if cut(a, b) {
-				peaks = append(peaks, a)
-				afters = append(afters, b)
-				if i+10 < len(s) {
-					ok := true
-					for j := i + 1; j <= i+10; j++ {
-						ok = ok && !cut(prompt(s[j-1]), prompt(s[j]))
-					}
-					if ok {
-						reworks = append(reworks, sub(prompt(s[i+10]), b+10*g))
-					}
-				}
-			} else {
-				growths = append(growths, sub(b, a))
-			}
-		}
-	}
-	r.Compactions = len(peaks)
-	r.Growth = median(growths)
-	r.After = median(afters)
-	r.Rework = median(reworks)
-	r.Observed = median(peaks)
+	streams, prices := pricedStreams(&r, all)
+	h := observeHistory(streams)
+	r.Compactions = len(h.peaks)
+	r.Growth = median(h.growths)
+	r.After = median(h.afters)
+	r.Rework = median(h.reworks)
+	r.Observed = median(h.peaks)
 	if len(streams) == 0 {
 		r.Status = "unknown_pricing"
 		return r
@@ -336,7 +291,7 @@ func recommend(agent model.Agent, k [2]string, all [][]model.Turn, current uint6
 		r.Status = "not_enough_compactions"
 		return r
 	}
-	if r.Compactions < 5 || len(reworks) == 0 {
+	if r.Compactions < 5 || len(h.reworks) == 0 {
 		r.Rework = max(r.Rework, 10000)
 	}
 	minimum, baseWindow, hard := uint64(50000), uint64(272000), uint64(1000000)
@@ -344,22 +299,11 @@ func recommend(agent model.Agent, k [2]string, all [][]model.Turn, current uint6
 		minimum, baseWindow, hard = 67000, 200000, 967000
 	}
 	floor := (max(r.After+r.Rework+max(r.After/2, 20*r.Growth), minimum) + 9999) / 10000 * 10000
-	r.Window = hard
-	for i, s := range streams {
-		reached := uint64(0)
-		for _, t := range s {
-			reached = max(reached, prompt(t))
-		}
-		w := prices[i].Context
-		if w == 0 {
-			w = baseWindow
-		}
-		r.Window = min(r.Window, max(w, reached))
-	}
+	r.Window = contextWindow(streams, prices, baseWindow, hard)
 	run := func(threshold, rework uint64) replayResult {
 		sum := replayResult{}
 		for i, s := range streams {
-			p := replay(s, threshold, r.After, median(append([]uint64(nil), bases...)), rework, agent, prices[i])
+			p := replay(s, threshold, r.After, median(append([]uint64(nil), h.bases...)), rework, agent, prices[i])
 			sum.cost += p.cost
 			sum.compactions += p.compactions
 			sum.over += p.over
@@ -379,10 +323,6 @@ func recommend(agent model.Agent, k [2]string, all [][]model.Turn, current uint6
 	r.BaselineCost = baseline.cost
 	r.BaselineCompactions = baseline.compactions
 	r.Curve = append(r.Curve, Point{r.Current, baseline.cost, baseline.compactions})
-	low := math.Inf(1)
-	for _, p := range r.Curve {
-		low = math.Min(low, p.Cost)
-	}
 	// Pure cost minimisation often lands next to the safety floor: it can
 	// recommend tripling compactions for a few dollars. Context discarded by
 	// a compaction is not priced, so cap the additional compactions at half
@@ -392,42 +332,14 @@ func recommend(agent model.Agent, k [2]string, all [][]model.Turn, current uint6
 	// the cheapest cap-compliant point for comparison.
 	limit := r.BaselineCompactions + max(10, r.BaselineCompactions/2)
 	r.CompactionLimit = limit
-	best := -1
-	for i, p := range r.Curve {
-		if p.Cost <= low*1.01 && p.Compactions <= limit && (best < 0 || p.Threshold > r.Curve[best].Threshold) {
-			best = i
-		}
-	}
-	if best < 0 {
-		for i, p := range r.Curve {
-			if p.Compactions <= limit && (best < 0 || p.Cost < r.Curve[best].Cost) {
-				best = i
-			}
-		}
-	}
-	if best < 0 {
-		for i, p := range r.Curve {
-			if best < 0 || p.Cost < r.Curve[best].Cost {
-				best = i
-			}
-		}
-	}
+	best := cheapestWithinLimit(r.Curve, limit)
 	r.Candidate = r.Curve[best].Threshold
 	r.CandidateCost = r.Curve[best].Cost
 	r.CandidateCompactions = r.Curve[best].Compactions
 	r.CandidateSaving = saving(r.BaselineCost, r.CandidateCost)
 	r.CandidateNetSaving = r.CandidateSaving - float64(max(0, r.CandidateCompactions-r.BaselineCompactions))*CompactionDrift
 
-	optimal, adjusted := -1, 0.
-	for i, p := range r.Curve {
-		if p.Compactions > limit {
-			continue
-		}
-		cost := p.Cost + float64(max(0, p.Compactions-r.BaselineCompactions))*CompactionDrift*r.BaselineCost
-		if optimal < 0 || cost < adjusted-1e-9 || (math.Abs(cost-adjusted) <= 1e-9 && p.Threshold > r.Curve[optimal].Threshold) {
-			optimal, adjusted = i, cost
-		}
-	}
+	optimal := driftAdjustedOptimum(r.Curve, limit, r.BaselineCompactions, r.BaselineCost)
 	if optimal < 0 {
 		optimal = best
 	}
@@ -462,13 +374,149 @@ func recommend(agent model.Agent, k [2]string, all [][]model.Turn, current uint6
 		r.RecommendedCost = r.BaselineCost
 		r.RecommendedCompactions = r.BaselineCompactions
 	}
-	sort.Slice(r.Curve, func(i, j int) bool { return r.Curve[i].Threshold < r.Curve[j].Threshold })
-	curve := r.Curve[:0]
-	for _, p := range r.Curve {
-		if len(curve) == 0 || curve[len(curve)-1].Threshold != p.Threshold {
-			curve = append(curve, p)
+	r.Curve = uniqueThresholds(r.Curve)
+	return r
+}
+
+// pricedStreams keeps the streams every call of which can be priced,
+// counting calls and unpriced streams into r.
+func pricedStreams(r *Recommendation, all [][]model.Turn) ([][]model.Turn, []pricing.Price) {
+	var streams [][]model.Turn
+	var prices []pricing.Price
+	for _, s := range all {
+		r.Calls += len(s)
+		p, ok := pricing.Lookup(s[0].Model)
+		ok = ok && p.Input > 0
+		for _, t := range s {
+			ok = ok && p.ForPrompt(float64(prompt(t))).SupportsCacheUsage(t.CacheReadTokens, t.CacheCreation5mTokens)
+		}
+		if ok {
+			streams = append(streams, s)
+			prices = append(prices, p)
+			r.PricedCalls += len(s)
+		} else {
+			r.Unpriced++
 		}
 	}
-	r.Curve = curve
-	return r
+	return streams, prices
+}
+
+// history is what the streams show about compaction: the prompt size at
+// each compaction (peaks) and just after it (afters), growth per call
+// between compactions, the context rebuilt in the ten calls after one
+// beyond normal growth (reworks), and each stream's first prompt (bases).
+type history struct {
+	peaks, afters, growths, reworks, bases []uint64
+}
+
+func observeHistory(streams [][]model.Turn) history {
+	var h history
+	for _, s := range streams {
+		h.bases = append(h.bases, prompt(s[0]))
+		var gs []uint64
+		for i := 1; i < len(s); i++ {
+			a, b := prompt(s[i-1]), prompt(s[i])
+			if !cut(a, b) {
+				gs = append(gs, sub(b, a))
+			}
+		}
+		g := median(gs)
+		for i := 1; i < len(s); i++ {
+			a, b := prompt(s[i-1]), prompt(s[i])
+			if !cut(a, b) {
+				h.growths = append(h.growths, sub(b, a))
+				continue
+			}
+			h.peaks = append(h.peaks, a)
+			h.afters = append(h.afters, b)
+			if i+10 < len(s) {
+				ok := true
+				for j := i + 1; j <= i+10; j++ {
+					ok = ok && !cut(prompt(s[j-1]), prompt(s[j]))
+				}
+				if ok {
+					h.reworks = append(h.reworks, sub(prompt(s[i+10]), b+10*g))
+				}
+			}
+		}
+	}
+	return h
+}
+
+// contextWindow is the smallest model context among the streams, raised to
+// the largest prompt a stream actually reached and capped at hard.
+func contextWindow(streams [][]model.Turn, prices []pricing.Price, baseWindow, hard uint64) uint64 {
+	window := hard
+	for i, s := range streams {
+		reached := uint64(0)
+		for _, t := range s {
+			reached = max(reached, prompt(t))
+		}
+		w := prices[i].Context
+		if w == 0 {
+			w = baseWindow
+		}
+		window = min(window, max(w, reached))
+	}
+	return window
+}
+
+// cheapestWithinLimit picks the highest threshold within 1% of the lowest
+// cost and the compaction limit; failing that the cheapest within the
+// limit, and failing that the cheapest overall.
+func cheapestWithinLimit(curve []Point, limit int) int {
+	low := math.Inf(1)
+	for _, p := range curve {
+		low = math.Min(low, p.Cost)
+	}
+	best := -1
+	for i, p := range curve {
+		if p.Cost <= low*1.01 && p.Compactions <= limit && (best < 0 || p.Threshold > curve[best].Threshold) {
+			best = i
+		}
+	}
+	if best < 0 {
+		for i, p := range curve {
+			if p.Compactions <= limit && (best < 0 || p.Cost < curve[best].Cost) {
+				best = i
+			}
+		}
+	}
+	if best < 0 {
+		for i, p := range curve {
+			if best < 0 || p.Cost < curve[best].Cost {
+				best = i
+			}
+		}
+	}
+	return best
+}
+
+// driftAdjustedOptimum minimises cost plus CompactionDrift of the baseline
+// cost for every compaction beyond the baseline, within the limit; ties go
+// to the higher threshold. It returns -1 when no point is within the limit.
+func driftAdjustedOptimum(curve []Point, limit, baselineCompactions int, baselineCost float64) int {
+	optimal, adjusted := -1, 0.
+	for i, p := range curve {
+		if p.Compactions > limit {
+			continue
+		}
+		cost := p.Cost + float64(max(0, p.Compactions-baselineCompactions))*CompactionDrift*baselineCost
+		if optimal < 0 || cost < adjusted-1e-9 || (math.Abs(cost-adjusted) <= 1e-9 && p.Threshold > curve[optimal].Threshold) {
+			optimal, adjusted = i, cost
+		}
+	}
+	return optimal
+}
+
+// uniqueThresholds sorts the curve and keeps the first point per threshold.
+func uniqueThresholds(curve []Point) []Point {
+	sort.Slice(curve, func(i, j int) bool { return curve[i].Threshold < curve[j].Threshold })
+	out := curve[:0]
+	for _, p := range curve {
+		if len(out) == 0 || out[len(out)-1].Threshold != p.Threshold {
+			out = append(out, p)
+		}
+	}
+	return out
 }
