@@ -49,7 +49,10 @@ func (t transport) request(ctx context.Context, method, p string, b []byte, h ma
 	for retry := 0; ; retry++ {
 		started := time.Now()
 		body, headers, status, err := t.requestOnce(ctx, method, p, b, h)
-		if err != nil || (status >= 400 && status != 404) || time.Since(started) >= 2*time.Second {
+		// A 412 to If-None-Match: * only says an immutable object already
+		// exists, the expected answer when re-sending history.
+		expected := status == 404 || (status == 412 && h["If-None-Match"] == "*")
+		if err != nil || (status >= 400 && !expected) || time.Since(started) >= 2*time.Second {
 			syncdiag.Log(ctx, "http_result", "method", method, "resource", resourceKind(p), "object", syncdiag.ID(strings.TrimPrefix(p, "/v1/objects/")), "attempt", retry+1, "status", status, "elapsed_ms", time.Since(started).Milliseconds(), "error", syncdiag.ErrorCode(err))
 		}
 		transient := err != nil || status == 408 || status == 425 || status == 429 || status == 500 || status == 502 || status == 503 || status == 504
