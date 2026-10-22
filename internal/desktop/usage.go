@@ -41,18 +41,7 @@ func (a *App) usageView(c *ui.Context) {
 		ui.Box(c).Size(6, 6).Radius(3).Background(c.Theme().Accent)
 		ui.Text(c, a.t("Period: ", "统计周期: ")+start.Format("01-02")+" ~ "+end.AddDate(0, 0, -1).Format("01-02")).FontSize(12).TextColor(c.Theme().TextMuted)
 	})
-	ui.Row(c).Wrap().Gap(8).AlignItems(ui.Stretch).Children(func() {
-		costLabel := a.t("Cost (USD)", "费用 (USD)")
-		if a.agent == model.Devin {
-			costLabel = a.t("Period Cost (USD · Pro)", "本期费用 (USD · Pro)")
-		}
-		for _, v := range []struct{ label, value, color string }{{a.t("Total Tokens", "总 Tokens"), formatTokens(total.Total()), "#e6e6ee"}, {a.t("Input (new)", "输入（新）"), formatTokens(total.Input), "#4cc2ff"}, {a.t("Output", "输出"), formatTokens(total.Output), "#3ddc97"}, {a.t("Cache Write", "缓存写入"), formatTokens(total.CacheWrite), "#c4b5fd"}, {a.t("Cache Read", "缓存读取"), formatTokens(total.Cached), "#8b7cf6"}, {costLabel, usageMoney(total.Cost), "#fbbf24"}, {a.t("Turns / Sessions", "轮次 / 会话"), fmt.Sprintf("%d / %d", total.Turns, len(sessions)), "#8f8fa3"}} {
-			ui.Column(c).Grow(1).Basis(120).MinWidth(120).Padding(12).Gap(4).Radius(6).Background(c.Theme().Surface).Border(1, c.Theme().Border).Children(func() {
-				ui.Text(c, v.label).FontSize(12).FixedLineHeight(20).TextColor(c.Theme().TextMuted)
-				ui.Text(c, v.value).FontSize(18).FixedLineHeight(28).Bold().TextColor(ui.Hex(v.color))
-			})
-		}
-	})
+	a.usageSummary(c, total, len(sessions))
 	if total.Turns == 0 {
 		ui.Text(c, a.t("No usage in this period. Select another agent or previous period.", "此周期没有用量，请切换 Agent 或查看上一周期。")).FontSize(12).TextColor(c.Theme().TextMuted).Padding(8, 12).Background(c.Theme().Surface).Border(1, c.Theme().Border).Radius(6)
 	}
@@ -116,44 +105,162 @@ func usageMoney(cost float64) string {
 	return trayMoney(cost)
 }
 
-func (a *App) usageChart(c *ui.Context, bs []analytics.Bucket) {
-	hi := 1.0
-	for _, b := range bs {
-		hi = math.Max(hi, b.Total())
+// Series colors shared by the summary cards and the chart. Cache writes are
+// pink so they stand apart from cache reads on the stacked bars.
+var (
+	inputColor      = ui.Hex("#4cc2ff")
+	outputColor     = ui.Hex("#3ddc97")
+	cacheWriteColor = ui.Hex("#f472b6")
+	cacheReadColor  = ui.Hex("#8b7cf6")
+	costColor       = ui.Hex("#fbbf24")
+)
+
+type summaryCard struct {
+	label, value, note string
+	color              ui.Color
+	primary            bool
+}
+
+// usageSummary leads with cost and volume, the figures people act on; the
+// token breakdown follows in smaller cards whose notes give each number a
+// meaning (its share, the cache hit rate, turns per session).
+func (a *App) usageSummary(c *ui.Context, total analytics.Bucket, sessions int) {
+	t := c.Theme()
+	share := func(v float64) string {
+		if total.Total() <= 0 {
+			return ""
+		}
+		return fmt.Sprintf(a.t("%.1f%% of total", "占总量 %.1f%%"), v/total.Total()*100)
 	}
-	ui.Column(c).Padding(12).Gap(8).Radius(6).Shrink(0).Background(c.Theme().Surface).Border(1, c.Theme().Border).Label(a.t("Stacked token usage chart", "Token 用量堆叠图")).Children(func() {
-		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, a.t("Token Usage Trend", "Token 用量趋势")).FontSize(14).FixedLineHeight(24).FontWeight(600)
-			for _, v := range []struct{ en, zh, color string }{{"Cache Write", "缓存写入", "#c4b5fd"}, {"Cache Read", "缓存读取", "#8b7cf6"}, {"In", "输入", "#4cc2ff"}, {"Out", "输出", "#3ddc97"}} {
-				ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
-					ui.Box(c).Size(7, 7).Radius(4).Background(ui.Hex(v.color))
-					ui.Text(c, a.t(v.en, v.zh)).FontSize(12).TextColor(c.Theme().TextMuted)
-				})
+	hitRate := ""
+	if prompt := total.Input + total.Cached + total.CacheWrite; prompt > 0 {
+		hitRate = fmt.Sprintf(a.t("%.0f%% hit rate", "命中率 %.0f%%"), total.Cached/prompt*100)
+	}
+	costNote := a.t("USD · API estimate", "USD · 按 API 价格估算")
+	if a.agent == model.Devin {
+		costNote = a.t("USD · Pro quote", "USD · 按 Pro 报价估算")
+	}
+	perSession := ""
+	if sessions > 0 {
+		perSession = fmt.Sprintf(a.t("%.0f turns per session", "平均每会话 %.0f 轮"), float64(total.Turns)/float64(sessions))
+	}
+	cards := []summaryCard{
+		{a.t("Cost", "费用"), usageMoney(total.Cost), costNote, costColor, true},
+		{a.t("Total Tokens", "总 Tokens"), formatTokens(total.Total()), fmt.Sprintf(a.t("%s without cache reads", "不含缓存读取 %s"), formatTokens(total.Total()-total.Cached)), t.Text, true},
+		{a.t("Input (new)", "输入（新）"), formatTokens(total.Input), share(total.Input), inputColor, false},
+		{a.t("Output", "输出"), formatTokens(total.Output), share(total.Output), outputColor, false},
+		{a.t("Cache Write", "缓存写入"), formatTokens(total.CacheWrite), share(total.CacheWrite), cacheWriteColor, false},
+		{a.t("Cache Read", "缓存读取"), formatTokens(total.Cached), hitRate, cacheReadColor, false},
+		{a.t("Turns / Sessions", "轮次 / 会话"), fmt.Sprintf("%d / %d", total.Turns, sessions), perSession, t.Text, false},
+	}
+	ui.Row(c).Wrap().Gap(8).AlignItems(ui.Stretch).Label(a.t("Usage summary", "用量概览")).Children(func() {
+		for _, v := range cards {
+			grow, basis, size := float32(1), float32(112), float32(18)
+			if v.primary {
+				grow, basis, size = 1.5, 150, 24
 			}
+			ui.Column(c).Grow(grow).Basis(basis).MinWidth(basis).Padding(10, 12).Gap(2).Radius(6).Background(t.Surface).Border(1, t.Border).Children(func() {
+				ui.Text(c, v.label).FontSize(12).FixedLineHeight(18).TextColor(t.TextMuted).NoWrap().Ellipsis("…")
+				ui.Text(c, v.value).FontSize(size).FixedLineHeight(size + 8).Bold().TextColor(v.color).NoWrap()
+				if v.note != "" {
+					ui.Text(c, v.note).FontSize(11).FixedLineHeight(16).TextColor(t.TextMuted).NoWrap().Ellipsis("…")
+				}
+			})
+		}
+	})
+}
+
+// Chart modes. Cost is the default: cache reads are most of the tokens, so a
+// token chart mostly shows them, while cost is what changes behaviour.
+const (
+	chartCost = iota
+	chartTokens
+	chartNewTokens
+)
+
+type chartSeries struct {
+	en, zh string
+	color  ui.Color
+	value  func(analytics.Bucket) float64
+}
+
+func (a *App) usageChart(c *ui.Context, bs []analytics.Bucket) {
+	t := c.Theme()
+	// Listed top to bottom, the order the segments stack in each bar.
+	var series []chartSeries
+	switch a.chartMode {
+	case chartCost:
+		series = []chartSeries{{"Cost", "费用", costColor, func(b analytics.Bucket) float64 { return b.Cost }}}
+	default:
+		series = []chartSeries{{"Cache Write", "缓存写入", cacheWriteColor, func(b analytics.Bucket) float64 { return b.CacheWrite }}}
+		if a.chartMode == chartTokens {
+			series = append(series, chartSeries{"Cache Read", "缓存读取", cacheReadColor, func(b analytics.Bucket) float64 { return b.Cached }})
+		}
+		series = append(series,
+			chartSeries{"Input", "输入", inputColor, func(b analytics.Bucket) float64 { return b.Input }},
+			chartSeries{"Output", "输出", outputColor, func(b analytics.Bucket) float64 { return b.Output }})
+	}
+	sum := func(b analytics.Bucket) float64 {
+		v := 0.0
+		for _, s := range series {
+			v += s.value(b)
+		}
+		return v
+	}
+	label := formatTokens
+	if a.chartMode == chartCost {
+		label = usageMoney
+	}
+	hi := 0.0
+	for _, b := range bs {
+		hi = math.Max(hi, sum(b))
+	}
+	const barHeight = 140
+	ui.Column(c).Padding(12).Gap(8).Radius(6).Shrink(0).Background(t.Surface).Border(1, t.Border).Label(a.t("Stacked token usage chart", "Token 用量堆叠图")).Children(func() {
+		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+			title := a.t("Daily Cost", "费用趋势")
+			if a.chartMode != chartCost {
+				title = a.t("Token Usage Trend", "Token 用量趋势")
+			}
+			ui.Text(c, title).FontSize(14).FixedLineHeight(24).FontWeight(600)
+			if len(series) > 1 {
+				for _, s := range series {
+					ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+						ui.Box(c).Size(7, 7).Radius(4).Background(s.color)
+						ui.Text(c, a.t(s.en, s.zh)).FontSize(12).TextColor(t.TextMuted)
+					})
+				}
+			}
+			ui.Spacer(c)
+			ui.Segmented(c, &a.chartMode, a.t("Cost", "费用"), "Tokens", a.t("Without cache reads", "不含缓存读取")).FontSize(12).Label(a.t("Chart metric", "图表指标"))
 		})
+		if hi <= 0 {
+			msg := a.t("No usage in this period", "此周期没有用量")
+			if a.chartMode == chartCost {
+				msg = a.t("No priced usage in this period; switch to Tokens", "此周期没有可计价的用量，可切换到 Tokens 查看")
+			}
+			ui.Text(c, msg).FontSize(12).TextColor(t.TextMuted).FillWidth().TextAlign(ui.Center).Padding(barHeight/2-10, 0)
+			return
+		}
 		ui.Row(c).Gap(4).Children(func() {
 			for _, b := range bs {
+				total := sum(b)
 				ui.Column(c).Grow(1).Basis(0).MinWidth(0).Gap(4).AlignItems(ui.Center).Children(func() {
-					label := "·"
-					if b.Total() > 0 {
-						label = formatTokens(b.Total())
-					}
-					color := c.Theme().Text
-					if b.Total() == 0 {
-						color = c.Theme().TextMuted
-					}
-					ui.Text(c, label).FontSize(12).FixedLineHeight(20).TextColor(color).TextAlign(ui.Center).FillWidth().NoWrap()
-					ui.Column(c).Width(26).Height(140).Gap(0).Justify(ui.End).Children(func() {
-						for j, v := range []float64{b.CacheWrite, b.Cached, b.Input, b.Output} {
-							height := float32(0)
-							if v > 0 {
-								height = float32(math.Max(2, v/hi*140))
-							}
-							colors := []string{"#c4b5fd", "#8b7cf6", "#4cc2ff", "#3ddc97"}
-							ui.Box(c).FillWidth().Height(height).Shrink(0).Background(ui.Hex(colors[j]).Alpha(.9))
+					// The value sits on top of its own bar, not on a shared row.
+					ui.Column(c).Height(barHeight + 24).FillWidth().Gap(4).AlignItems(ui.Center).Justify(ui.End).Children(func() {
+						if total <= 0 {
+							return
 						}
+						ui.Text(c, label(total)).FontSize(11).FixedLineHeight(16).TextColor(t.Text).TextAlign(ui.Center).FillWidth().NoWrap()
+						ui.Column(c).Width(26).Gap(0).Children(func() {
+							for _, s := range series {
+								if v := s.value(b); v > 0 {
+									ui.Box(c).FillWidth().Height(float32(math.Max(2, v/hi*barHeight))).Shrink(0).Background(s.color.Alpha(.9))
+								}
+							}
+						})
 					})
-					ui.Text(c, b.Label).FontSize(12).TextColor(c.Theme().TextMuted).FillWidth().TextAlign(ui.Center).NoWrap()
+					ui.Text(c, b.Label).FontSize(12).TextColor(t.TextMuted).FillWidth().TextAlign(ui.Center).NoWrap()
 				})
 			}
 		})

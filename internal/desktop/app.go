@@ -68,6 +68,7 @@ type App struct {
 	cachedData                                 *model.Data
 	cachedKey                                  dataKey
 	compactionUI                               compactionState
+	chartMode                                  int
 	sessionCosts                               map[sessionIdentity]sessionUsage
 	usageCache                                 struct {
 		period  analytics.Period
