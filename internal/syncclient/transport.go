@@ -49,9 +49,10 @@ func (t transport) request(ctx context.Context, method, p string, b []byte, h ma
 	for retry := 0; ; retry++ {
 		started := time.Now()
 		body, headers, status, err := t.requestOnce(ctx, method, p, b, h)
-		// A 412 to If-None-Match: * only says an immutable object already
-		// exists, the expected answer when re-sending history.
-		expected := status == 404 || (status == 412 && h["If-None-Match"] == "*")
+		// For an immutable upload a 412 only says the object already exists,
+		// the expected answer when re-sending history. Head creation sends the
+		// same precondition, but there a 412 is a real CAS conflict.
+		expected := status == 404 || (status == 412 && ctx.Value(existingObjectOK{}) != nil)
 		if err != nil || (status >= 400 && !expected) || time.Since(started) >= 2*time.Second {
 			syncdiag.Log(ctx, "http_result", "method", method, "resource", resourceKind(p), "object", syncdiag.ID(strings.TrimPrefix(p, "/v1/objects/")), "attempt", retry+1, "status", status, "elapsed_ms", time.Since(started).Milliseconds(), "error", syncdiag.ErrorCode(err))
 		}
@@ -200,7 +201,11 @@ func (t transport) list(ctx context.Context, prefixes ...string) ([]string, erro
 // putImmutable stores a content-addressed object in one request. A 412 means
 // it exists; servers that report the stored ETag prove it intact without a
 // download. Otherwise the stored copy is read back, and a damaged one replaced.
+// existingObjectOK marks requests of putImmutable, where a 412 is expected.
+type existingObjectOK struct{}
+
 func (t transport) putImmutable(ctx context.Context, name string, z []byte) (uploaded bool, err error) {
+	ctx = context.WithValue(ctx, existingObjectOK{}, true)
 	p := "/v1/objects/" + url.PathEscape(name)
 	want := `"` + hash(z) + `"`
 	_, h, s, e := t.request(ctx, "PUT", p, z, map[string]string{"If-None-Match": "*"})

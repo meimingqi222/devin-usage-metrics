@@ -358,3 +358,65 @@ func TestPublishedPackageIsCachedForTheNextCycle(t *testing.T) {
 		t.Fatalf("cached package differs from the manifest: %+v vs %+v (%v)", p, read, err)
 	}
 }
+
+// Head creation sends If-None-Match: * like immutable uploads, but its 412 is a
+// real CAS conflict between two first publishers and must stay in the log.
+func TestInitialHeadConflictIsLogged(t *testing.T) {
+	setup(t)
+	resetMemoryCaches()
+	s := &objectServer{objects: map[string][]byte{}}
+	var conflicted bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "PUT" && strings.HasSuffix(r.URL.Path, "v3-head-local.json") && !conflicted {
+			conflicted = true // another publisher won the first head
+			w.WriteHeader(http.StatusPreconditionFailed)
+			return
+		}
+		s.serve(w, r)
+	}))
+	defer server.Close()
+	syncTo(t, server.URL)
+	if _, err := Cycle(context.Background(), days(time.Now().Unix(), 2, model.Claude)); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(syncdiag.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !conflicted || !strings.Contains(string(b), `"resource":"v3-head"`) || !strings.Contains(string(b), `"status":412`) {
+		t.Fatal("the initial head CAS conflict left no http_result record")
+	}
+}
+
+// A read skips session shards dated before the cutoff, so the package cached
+// after publishing must skip them too, even when a recent turn kept one.
+func TestPublishedPackageSkipsSessionsBeforeCutoff(t *testing.T) {
+	setup(t)
+	resetMemoryCaches()
+	s := &objectServer{objects: map[string][]byte{}}
+	server := httptest.NewServer(http.HandlerFunc(s.serve))
+	defer server.Close()
+	syncTo(t, server.URL)
+	now := time.Now().Unix()
+	old := now - 400*86400
+	local := model.Data{TurnsStart: old, TurnsEnd: now,
+		Sessions: []model.Session{{Agent: model.Claude, Key: "ancient", CreatedAt: old, LastActivityAt: old}, {Agent: model.Claude, Key: "fresh", CreatedAt: now, LastActivityAt: now}},
+		Turns:    []model.Turn{{Agent: model.Claude, SessionKey: "ancient", CreatedAt: now - 86400, InputTokens: 1}, {Agent: model.Claude, SessionKey: "fresh", CreatedAt: now, InputTokens: 2}}}
+	if _, err := Cycle(context.Background(), local); err != nil {
+		t.Fatal(err)
+	}
+	var h head
+	s.mu.Lock()
+	unmarshal(t, s.objects["v3-head-local.json"], &h)
+	s.mu.Unlock()
+	tr := transport{server.URL, "token"}
+	cached, ok := cachedPackage(tr.packageKey("local", "v3-manifest-"+h.Manifest, day(now-366*86400)))
+	packageCache = newLRU[devicePackage](64<<20, 256)
+	read, err := tr.loadManifestFresh(context.Background(), "local", 3, h.Manifest)
+	if err != nil || !ok {
+		t.Fatalf("cached=%v err=%v", ok, err)
+	}
+	if len(cached.Sessions) != len(read.Sessions) || len(cached.Turns) != len(read.Turns) {
+		t.Fatalf("cache holds %d sessions/%d turns, a read %d/%d", len(cached.Sessions), len(cached.Turns), len(read.Sessions), len(read.Turns))
+	}
+}
