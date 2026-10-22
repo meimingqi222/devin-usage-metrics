@@ -142,7 +142,7 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 	}
 	syncdiag.Log(ctx, "encode_start")
 	encodeStarted := time.Now()
-	turns := map[string]model.Turn{}
+	turns := map[turnIdentity]model.Turn{}
 	sessions := map[string]model.Session{}
 	add := func(ss []model.Session, ts []model.Turn) {
 		for _, v := range ts {
@@ -151,7 +151,7 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 			}
 			v.DeviceID = id
 			if v.CreatedAt >= retained {
-				turns[turnID(v)] = v
+				turns[identityOf(v)] = v
 			}
 		}
 		for _, v := range ss {
@@ -414,5 +414,16 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 	}
 	syncdiag.Log(ctx, "head_cas_committed", "sequence", newHead.Sequence)
 	remember(digest)
+	// The next cycle re-reads this head under its CAS base. The package is the
+	// data just written, so keep it under the key a read of this manifest
+	// uses instead of decoding every block again.
+	published := devicePackage{Schema: 1, DeviceID: id, DeviceName: host, Start: start, End: end, Exported: now}
+	for _, v := range sessions {
+		published.Sessions = append(published.Sessions, v)
+	}
+	for _, v := range turns {
+		published.Turns = append(published.Turns, v)
+	}
+	rememberPackage(t.packageKey(id, "v3-manifest-"+digest, day(time.Now().Unix()-366*86400)), published)
 	return nil
 }

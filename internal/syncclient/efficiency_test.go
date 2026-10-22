@@ -326,3 +326,35 @@ func TestExistingImmutableObjectsAreNotLoggedAsFailures(t *testing.T) {
 		t.Fatal("expected 412 answers to immutable uploads were logged as failures")
 	}
 }
+
+// The next cycle re-reads this device's head; the package it would assemble is
+// the data just published, so it must already be cached under that manifest.
+func TestPublishedPackageIsCachedForTheNextCycle(t *testing.T) {
+	setup(t)
+	resetMemoryCaches()
+	s := &countingServer{objectServer: &objectServer{objects: map[string][]byte{}}}
+	server := httptest.NewServer(s.handler())
+	defer server.Close()
+	syncTo(t, server.URL)
+	now := time.Now().Unix()
+	local := days(now, 5, model.Claude)
+	local.Sessions = []model.Session{{Agent: model.Claude, Key: "s", CreatedAt: now - 5*86400, LastActivityAt: now}}
+	if _, err := Cycle(context.Background(), local); err != nil {
+		t.Fatal(err)
+	}
+	var h head
+	s.mu.Lock()
+	unmarshal(t, s.objects["v3-head-local.json"], &h)
+	s.mu.Unlock()
+	tr := transport{server.URL, "token"}
+	p, ok := cachedPackage(tr.packageKey("local", "v3-manifest-"+h.Manifest, day(time.Now().Unix()-366*86400)))
+	if !ok || len(p.Turns) != 5 || len(p.Sessions) != 1 || p.DeviceID != "local" {
+		t.Fatalf("published package not cached: ok=%v turns=%d sessions=%d", ok, len(p.Turns), len(p.Sessions))
+	}
+	// The cached package must equal what reading the manifest assembles.
+	packageCache = newLRU[devicePackage](64<<20, 256)
+	read, err := tr.loadManifestFresh(context.Background(), "local", 3, h.Manifest)
+	if err != nil || len(read.Turns) != len(p.Turns) || len(read.Sessions) != len(p.Sessions) || read.Start != p.Start || read.End != p.End || read.DeviceName != p.DeviceName {
+		t.Fatalf("cached package differs from the manifest: %+v vs %+v (%v)", p, read, err)
+	}
+}
