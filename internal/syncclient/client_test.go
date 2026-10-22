@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -547,5 +548,50 @@ func BenchmarkUnchangedCycle(b *testing.B) {
 			b.ReportMetric(float64(requests.Load())/float64(b.N), "GET/op")
 			b.ReportMetric(float64(blocks.Load())/float64(b.N), "blockGET/op")
 		})
+	}
+}
+
+// identityOf replaces turnID as the publication merge key; both must agree on
+// which turns are the same record, field by field.
+func TestTurnIdentityMatchesTurnID(t *testing.T) {
+	cost, other, zero, negZero := 1.5, 2.5, 0.0, math.Copysign(0, -1)
+	base := model.Turn{DeviceID: "d", Agent: model.Claude, SessionKey: "s", CreatedAt: 10, Model: "m", InputTokens: 1, OutputTokens: 2, CacheReadTokens: 3, CacheCreationTokens: 4, CacheCreation5mTokens: 5, CacheCreation1hTokens: 6, TTFTMs: 7, TotalTimeMs: 8, RecordedCost: &cost}
+	variants := []func(*model.Turn){
+		func(*model.Turn) {},
+		func(t *model.Turn) { t.DeviceID = "e" },
+		func(t *model.Turn) { t.Agent = model.Codex },
+		func(t *model.Turn) { t.SessionKey = "s2" },
+		func(t *model.Turn) { t.CreatedAt++ },
+		func(t *model.Turn) { t.Model = "m2" },
+		func(t *model.Turn) { t.InputTokens = 9 },
+		func(t *model.Turn) { t.OutputTokens = 9 },
+		func(t *model.Turn) { t.CacheReadTokens = 9 },
+		func(t *model.Turn) { t.CacheCreationTokens = 9 },
+		func(t *model.Turn) { t.CacheCreation5mTokens = 9 },
+		func(t *model.Turn) { t.CacheCreation1hTokens = 9 },
+		func(t *model.Turn) { t.TTFTMs = 9 },
+		func(t *model.Turn) { t.TotalTimeMs = 9 },
+		func(t *model.Turn) { t.RecordedCost = nil },
+		func(t *model.Turn) { t.RecordedCost = &other },
+		func(t *model.Turn) { t.RecordedCost = &zero },
+		func(t *model.Turn) { t.RecordedCost = &negZero },
+		func(t *model.Turn) { t.InputTokens = negZero },
+		func(t *model.Turn) { t.TTFTMs = 0 },
+		// Fields outside the identity must not split a record.
+		func(t *model.Turn) { t.DeviceName = "renamed"; t.DedupKey = "k"; t.ContextStream = "c" },
+	}
+	turns := make([]model.Turn, len(variants))
+	for i, change := range variants {
+		turns[i] = base
+		c := cost
+		turns[i].RecordedCost = &c
+		change(&turns[i])
+	}
+	for i := range turns {
+		for j := range turns {
+			if (identityOf(turns[i]) == identityOf(turns[j])) != (turnID(turns[i]) == turnID(turns[j])) {
+				t.Fatalf("variants %d and %d: identity and turnID disagree", i, j)
+			}
+		}
 	}
 }

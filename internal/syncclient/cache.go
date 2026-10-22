@@ -190,13 +190,24 @@ func cachedPackage(key string) (devicePackage, bool) {
 }
 
 func rememberPackage(key string, p devicePackage) {
-	// JSON length accounts for variable strings, plus conservative per-record
-	// overhead. Bound entries too, including empty packages.
-	b, err := json.Marshal(p)
-	if err != nil {
-		return
+	packageCache.put(key, clonePackage(p), packageCost(p))
+}
+
+// packageCost estimates a package's memory from its variable-length strings
+// plus a per-record overhead. Marshaling it to measure cost as much as the
+// work the cache saves.
+func packageCost(p devicePackage) int {
+	n := 1024 + len(p.DeviceName)
+	for _, s := range p.Sessions {
+		n += 512 + len(s.DeviceID) + len(s.DeviceName) + len(s.Key) + len(s.Source) + len(s.ID) + len(s.Title) + len(s.WorkingDirectory) + len(s.SelectedModel) + len(s.AgentMode)
+		if s.RealModel != nil {
+			n += len(*s.RealModel)
+		}
 	}
-	packageCache.put(key, clonePackage(p), len(b)+len(p.Sessions)*512+len(p.Turns)*512+1024)
+	for _, t := range p.Turns {
+		n += 512 + len(t.DeviceID) + len(t.DeviceName) + len(t.SessionKey) + len(t.Model) + len(t.ContextStream) + len(t.DedupKey)
+	}
+	return n
 }
 
 // lastGood keeps each remote device's newest valid package, protected by

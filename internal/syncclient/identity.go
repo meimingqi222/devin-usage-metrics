@@ -25,6 +25,42 @@ func v3SessionID(s model.Session) string {
 	names := map[model.Agent]string{model.Devin: "Devin", "amp": "Amp", model.Claude: "Claude", model.Codex: "Codex", model.Antigravity: "Antigravity", model.Grok: "Grok", model.ZCode: "ZCode", model.OpenCode: "OpenCode", model.Pi: "Pi", model.MimoCode: "MimoCode", model.WorkBuddy: "WorkBuddy"}
 	return hash([]byte("session-v1\x00" + s.DeviceID + "\x00" + names[s.Agent] + "\x00" + s.Key))
 }
+
+// turnIdentity holds exactly the fields turnID encodes, so two turns have
+// equal identities if and only if they have equal turnIDs. Publication merges
+// about two turns per record every cycle; hashing canonical JSON for each was
+// over half of its CPU time.
+type turnIdentity struct {
+	device, session, model                        string
+	agent                                         model.Agent
+	created                                       int64
+	input, output, read, create, five, hour, ttft uint64
+	total, cost                                   uint64
+	hasCost                                       bool
+}
+
+func identityOf(t model.Turn) turnIdentity {
+	id := turnIdentity{
+		device:  t.DeviceID,
+		session: t.SessionKey,
+		model:   t.Model,
+		agent:   t.Agent,
+		created: t.CreatedAt,
+		input:   math.Float64bits(t.InputTokens),
+		output:  math.Float64bits(t.OutputTokens),
+		read:    math.Float64bits(t.CacheReadTokens),
+		create:  math.Float64bits(t.CacheCreationTokens),
+		five:    math.Float64bits(t.CacheCreation5mTokens),
+		hour:    math.Float64bits(t.CacheCreation1hTokens),
+		ttft:    math.Float64bits(t.TTFTMs),
+		total:   math.Float64bits(t.TotalTimeMs),
+	}
+	if t.RecordedCost != nil {
+		id.cost, id.hasCost = math.Float64bits(*t.RecordedCost), true
+	}
+	return id
+}
+
 func turnID(t model.Turn) string {
 	var cost *uint64
 	if t.RecordedCost != nil {

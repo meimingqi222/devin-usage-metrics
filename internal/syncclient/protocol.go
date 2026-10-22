@@ -132,7 +132,7 @@ func (t transport) readManifest(ctx context.Context, id string, protocol int, di
 	// The head names the manifest by its hash, so an unchanged head needs no
 	// download: the package assembled from that exact manifest is still valid.
 	cutoff := day(time.Now().Unix() - 366*86400)
-	cacheKey := t.account() + "/" + id + "/" + prefix + digest + "/" + cutoff
+	cacheKey := t.packageKey(id, prefix+digest, cutoff)
 	if useCache {
 		if cached, ok := cachedPackage(cacheKey); ok {
 			syncdiag.Log(ctx, "package_cache_hit", "protocol", protocol, "sessions", len(cached.Sessions), "turns", len(cached.Turns))
@@ -197,6 +197,12 @@ func (t transport) readManifest(ctx context.Context, id string, protocol int, di
 	}
 	// Parts share records with the block cache; hand the caller its own copy.
 	return clonePackage(p), nil
+}
+
+// packageKey names a device package assembled from one manifest. The cutoff
+// day is part of it because references older than it are skipped.
+func (t transport) packageKey(id, manifest, cutoff string) string {
+	return t.account() + "/" + id + "/" + manifest + "/" + cutoff
 }
 
 // manifestBytes returns an immutable manifest, verified against its name.
