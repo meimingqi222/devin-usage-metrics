@@ -60,12 +60,31 @@ macOS arm64 已通过本地原生打包、codesign 校验、启动和配额页�
 
 CI 与 Release 共用 `scripts/package-release.py`。Windows ZIP 内仅有 `devin-usage-metrics.exe`；macOS ZIP 保留完整 `.app`、权限和签名资源。CI 上传 ZIP 和 SHA-256，14 天保留，提交和运行可追溯；Release 流程仍只应在正式验收后触发。macOS 当前为 ad-hoc 签名，codesign 通过不等于 Developer ID 公证或 Gatekeeper 首装通过。
 
+### macOS arm64 本机验收（第二轮）
+
+使用 CI 产出的 0.2.12 / 0.2.13 验收包（`5ae9bc3`），均通过 SHA-256 校验；包内无 SQLite 动态库；ad-hoc 签名，`codesign --verify --deep --strict` 通过。加上下载隔离属性后 Gatekeeper 评估为 rejected，与已安装的 Rust 0.2.11 一致（同为 ad-hoc），首次打开仍需用户放行。
+
+测试实例以环境变量指向隔离 HOME（复制真实配置但关闭同步、不含同步与 Antigravity 凭证），直接执行包内程序。`LSEnvironment` 不能改写 HOME：经 `open` 启动的实例会读取真实配置。
+
+| 项目 | 结果 |
+| --- | --- |
+| 配置与设备 ID | Rust 写入的 `device.json` 未改变；语言、会话偏好、自动更新偏好原样沿用 |
+| 自动检查更新 | 打包路径启动约 10 秒后检查并写入 `last_update_check_at`；线上最新为 0.2.11，未误报更新 |
+| 第二实例 | 第二个进程立即退出（rc=0），首个实例继续运行 |
+| 更新替换脚本 | 原样取自 `internal/updater/apply.go`（仅把重启的 `open` 换成输出）：0.2.12→0.2.13 成功，旧包保留为 `.old`、签名完整、暂存目录清除；替换失败时回滚到 0.2.12 并重启旧版；已有 `.old` 时拒绝执行 |
+| 启动清理 | 更新后的 0.2.13 启动时删除上次留下的 `.old` |
+| 内存 | 全部 Agent 加同步收集后：修复前常驻约 2.3 GB（真实配置峰值约 4 GB），修复后约 0.42 GB（峰值 0.65 GB）；Rust 0.2.11 约 0.28 GB（峰值 0.39 GB）。见 `docs/agent-notes/implemented/bug-fix/2026-10-22-go-importer-memory.md` |
+
+另用已安装的 Rust 0.2.11 CLI 对比 2026-09-01 至 2026-10-21：十个 Agent 的 token 全部一致；Devin 费用差异来自 0.2.11 之后修复的 SWE-2 Pro 免费定价（Go 符合修复后的规则），Antigravity 仅末位 1e-8 舍入。线上同步日志显示 Rust 0.2.11 持续正常读取 Go 发布的 head 与 manifest。
+
+验收中一个经 `open` 启动的实例读取了真实配置并开始同步，在 head CAS 之前被终止：未提交 head，仅留下 4 个未被引用的不可变块，由 GC 在宽限期后清理。
+
 以下各项仍需真实打包版本完成，不能由交叉编译或单元测试替代：
 
 | 平台 | 待验收 |
 | --- | --- |
 | Windows x64 | 全新安装/解压启动，Antigravity 真实账号发现，旧版 Rust 0.2.11 更新到 Go，Go 更新到下一候选版本，退出替换与重启，失败恢复，凭证文件 ACL |
-| macOS arm64 | 从下载包安装并启动，首次钥匙串允许/拒绝，Rust 0.2.11→Go、Go→下一候选版本的下载/校验/替换/重启，失败恢复，设备 ID/配置保留 |
+| macOS arm64 | 首次钥匙串允许/拒绝（需人工点击），Rust 0.2.11 更新器实际替换为 Go 包，经发布元数据的端到端下载/校验/重启；托盘与 Dock 重新激活的人工目测 |
 | 两平台 | 托盘驻留/重新激活、第二实例、跳过版本及自动检查偏好；每项记录 OS、旧/新版本、包 SHA-256 和结果 |
 
 PR 验收 ZIP 沿用仓库版本 0.2.11，不能因此声称测试过 0.2.11 的“发现新版本”路径。CI 支持手动 `workflow_dispatch`，通过 `package_version` 构建具有更高版本号的候选包（例如 0.2.12 / 0.2.13），只上传 Actions artifact，不创建 Release。跨版本测试仍需要隔离的更新元数据/测试环境。不要为了让旧更新器发现候选包而把未经验收的版本发布到稳定 `/releases/latest`。
