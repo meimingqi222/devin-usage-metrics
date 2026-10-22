@@ -56,13 +56,65 @@ func TestClaudeResetGrantsParse(t *testing.T) {
 			t.Errorf("%s: clears %v", c.name, r.Clears)
 		}
 	}
-	// The usage parser attaches grants to Claude results only when present.
-	usage := cedar(t, `{"five_hour":{"utilization":100},"cedar_ember":{"eligible":true,"at_limit":true,"grants":[{"id":"g","resets_total":3,"resets_left":2,"usable_now":true}]}}`)
-	if r := ParseClaudeUsage(usage, "Max"); r.Reset == nil || r.Reset.Left != 2 || r.Reset.Blocker != "" {
-		t.Fatalf("usage without grants: %+v", r.Reset)
+}
+
+// Grants come from their own cedar_ember read, at most hourly per login:
+// polling it drew hour-long 429s on Claude's usage endpoint. A failed read
+// keeps the last status and still counts as the hour's check.
+func TestClaudeGrantsReadAtMostHourly(t *testing.T) {
+	fixtureHome(t)
+	fixture(t, ".claude/.credentials.json", `{"claudeAiOauth":{"accessToken":"tok"}}`)
+	a := Account{Provider: "claude", source: homePath(".claude/.credentials.json")}
+	usage, grants := 0, 0
+	grantStatus := 200
+	localServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/oauth/usage" && r.URL.Query().Get("cedar_ember") == "":
+			usage++
+			fmt.Fprint(w, `{"five_hour":{"utilization":100}}`)
+		case r.URL.Path == "/api/oauth/usage":
+			grants++
+			if grantStatus != 200 {
+				w.WriteHeader(grantStatus)
+				return
+			}
+			fmt.Fprint(w, `{"cedar_ember":{"eligible":true,"at_limit":true,"grants":[{"id":"g","resets_total":3,"resets_left":2,"usable_now":true}]}}`)
+		default:
+			fmt.Fprint(w, `{}`)
+		}
+	})
+	get := func() *ClaudeReset {
+		t.Helper()
+		r, err := fetch(context.Background(), a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.Reset
 	}
-	if r := ParseClaudeUsage(cedar(t, `{"five_hour":{"utilization":1}}`), ""); r.Reset != nil {
-		t.Fatal("grants invented for an account without them")
+	if r := get(); r == nil || r.Left != 2 || usage != 1 || grants != 1 {
+		t.Fatalf("first refresh: %+v usage=%d grants=%d", r, usage, grants)
+	}
+	if r := get(); r == nil || r.Left != 2 || usage != 2 || grants != 1 {
+		t.Fatalf("grants re-read within the hour: usage=%d grants=%d", usage, grants)
+	}
+	// An hour on, a 429 keeps the last status and resets the hour.
+	claudeGrants.Lock()
+	check := claudeGrants.m[a.source]
+	check.at = check.at.Add(-claudeGrantsInterval)
+	claudeGrants.m[a.source] = check
+	claudeGrants.Unlock()
+	grantStatus = 429
+	if r := get(); r == nil || r.Left != 2 || grants != 2 {
+		t.Fatalf("failed read lost the status: %+v grants=%d", r, grants)
+	}
+	if get(); grants != 2 {
+		t.Fatal("a failed read was retried on the next refresh")
+	}
+	// A claim makes the next refresh read again.
+	forgetClaudeResetGrants(a.source)
+	grantStatus = 200
+	if get(); grants != 3 {
+		t.Fatal("grants not re-read after a claim")
 	}
 }
 

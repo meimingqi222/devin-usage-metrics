@@ -168,11 +168,7 @@ var registry = struct {
 
 func clone(r Result) Result {
 	r.Windows = append([]Window(nil), r.Windows...)
-	if r.Reset != nil {
-		x := *r.Reset
-		x.Clears = append([]string(nil), x.Clears...)
-		r.Reset = &x
-	}
+	r.Reset = cloneReset(r.Reset)
 	return r
 }
 

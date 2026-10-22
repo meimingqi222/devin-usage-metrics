@@ -260,7 +260,7 @@ func (a *App) quotaCard(c *ui.Context, ar accountResult) {
 		ui.Spacer(c)
 		ui.Column(c).Gap(4).Padding(8, 0, 0, 0).BorderWidth(1, 0, 0, 0).BorderColor(ui.Hex("#1a1e2a")).Children(func() {
 			if r.Reset != nil {
-				a.claudeResetBar(c, ar.account, *r.Reset)
+				a.claudeResetBar(c, ar.account, *r.Reset, r.Windows)
 			}
 			if r.Extra != "" {
 				ui.Text(c, fmt.Sprintf(a.t("Extra: %s", "附加：%s"), r.Extra)).FontSize(11).MinWidth(0).TextColor(faintText)
@@ -328,7 +328,7 @@ func (a *App) resetBlocker(r quota.ClaudeReset) string {
 
 // claudeResetBar shows the account's reset grants and spends one after a
 // confirmation; it stays disabled with the reason while none can be spent.
-func (a *App) claudeResetBar(c *ui.Context, account quota.Account, r quota.ClaudeReset) {
+func (a *App) claudeResetBar(c *ui.Context, account quota.Account, r quota.ClaudeReset, windows []quota.Window) {
 	t := c.Theme()
 	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 		// Count and expiry take a line each, so neither is cut at any
@@ -347,6 +347,11 @@ func (a *App) claudeResetBar(c *ui.Context, account quota.Account, r quota.Claud
 		busy := a.busy["claude-reset"]
 		if busy {
 			label = a.t("Resetting…", "正在重置…")
+		}
+		// Grant status is read at most hourly, so "not at the limit" may be
+		// stale once a window it clears is full; the claim re-checks live.
+		if r.Blocker == "not_limited" && resetWindowFull(r.Clears, windows) {
+			r.Blocker = ""
 		}
 		disabled := busy || r.Blocker != "" || r.GrantID == ""
 		b := ui.ButtonBase(c).Label(label).FontSize(11).FontWeight(500).Padding(3, 8).Radius(4).Background(t.Accent.Alpha(.08)).Border(1, t.Accent.Alpha(.25)).TextColor(t.Accent).Disabled(disabled)
@@ -420,4 +425,18 @@ func (a *App) claimClaudeReset(account quota.Account) {
 			a.refreshQuota(true)
 		}
 	})
+}
+
+// resetWindowFull reports whether a window a Claude reset clears is at its
+// limit in the latest usage read.
+func resetWindowFull(clears []string, windows []quota.Window) bool {
+	labels := map[string]string{"five_hour": "5h", "seven_day": "7d", "seven_day_overage_included": "7d"}
+	for _, w := range windows {
+		for _, c := range clears {
+			if labels[c] == w.Label && w.UsedPercent >= 100 {
+				return true
+			}
+		}
+	}
+	return false
 }

@@ -12,15 +12,79 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Claude offers some subscriptions a few "reset grants" (the cedar_ember
 // program): spending one clears the listed usage windows early. The usage
-// endpoint reports them when asked; skip_spend keeps the read side-effect
-// free. The contract follows Claude Code and the CLIProxyAPI management
-// center, which refuse anything they cannot validate.
-const claudeUsagePath = "/api/oauth/usage?cedar_ember=1&skip_spend=1"
+// endpoint reports them only when asked with cedar_ember=1; skip_spend
+// drops spend figures. The contract follows Claude Code, openusage and the
+// CLIProxyAPI management center, which refuse anything they cannot validate.
+const (
+	claudeUsagePath  = "/api/oauth/usage"
+	claudeGrantsPath = "/api/oauth/usage?cedar_ember=1&skip_spend=1"
+)
+
+// claudeGrantsInterval spaces grant reads per login. Anthropic rate-limits
+// the cedar_ember read hard when polled: sending it on every quota refresh
+// drew hour-long 429s on the usage endpoint itself (openusage #1355).
+const claudeGrantsInterval = time.Hour
+
+type claudeGrantsCheck struct {
+	at    time.Time
+	reset *ClaudeReset
+}
+
+var claudeGrants = struct {
+	sync.Mutex
+	m map[string]claudeGrantsCheck
+}{m: map[string]claudeGrantsCheck{}}
+
+// claudeResetGrants returns the login's reset grants, asking Anthropic at
+// most once per claudeGrantsInterval. A failed read keeps the previous
+// status and still counts as the check, so a 429 is retried an hour later
+// rather than on every refresh; a cancelled read is not a verdict.
+func claudeResetGrants(ctx context.Context, login string, h map[string]string) *ClaudeReset {
+	claudeGrants.Lock()
+	prev, seen := claudeGrants.m[login]
+	claudeGrants.Unlock()
+	if seen && time.Since(prev.at) < claudeGrantsInterval {
+		return cloneReset(prev.reset)
+	}
+	v, e := jsonRequest(ctx, "GET", anthropicOrigin+claudeGrantsPath, "", h, false)
+	if ctx.Err() != nil {
+		return cloneReset(prev.reset)
+	}
+	check := claudeGrantsCheck{at: time.Now(), reset: prev.reset}
+	if e == nil {
+		check.reset = nil
+		if r, ok := parseClaudeReset(obj(v["cedar_ember"]), time.Now().Unix()); ok {
+			check.reset = &r
+		}
+	}
+	claudeGrants.Lock()
+	claudeGrants.m[login] = check
+	claudeGrants.Unlock()
+	return cloneReset(check.reset)
+}
+
+// forgetClaudeResetGrants makes the next refresh re-read a login's grants,
+// after a claim changed them.
+func forgetClaudeResetGrants(login string) {
+	claudeGrants.Lock()
+	delete(claudeGrants.m, login)
+	claudeGrants.Unlock()
+}
+
+func cloneReset(r *ClaudeReset) *ClaudeReset {
+	if r == nil {
+		return nil
+	}
+	x := *r
+	x.Clears = slices.Clone(x.Clears)
+	return &x
+}
 
 // anthropicOrigin is a variable only so tests can point it elsewhere.
 var anthropicOrigin = "https://api.anthropic.com"
@@ -182,7 +246,7 @@ func ClaimClaudeReset(ctx context.Context, a Account) (string, error) {
 	if !claudeOrgID.MatchString(org) {
 		return "", errors.New("Claude organization unavailable")
 	}
-	usage, e := jsonRequest(ctx, "GET", anthropicOrigin+claudeUsagePath, "", h, false)
+	usage, e := jsonRequest(ctx, "GET", anthropicOrigin+claudeGrantsPath, "", h, false)
 	if e != nil {
 		return "", e
 	}
@@ -190,9 +254,15 @@ func ClaimClaudeReset(ctx context.Context, a Account) (string, error) {
 	if !ok || r.GrantID == "" {
 		return "", errors.New("no Claude reset grant")
 	}
+	// This read is fresh: it is the hour's check. Once a claim is sent,
+	// whatever its answer, the next refresh must read the grants again.
+	claudeGrants.Lock()
+	claudeGrants.m[a.source] = claudeGrantsCheck{at: time.Now(), reset: cloneReset(&r)}
+	claudeGrants.Unlock()
 	if r.Blocker != "" {
 		return r.Blocker, nil
 	}
+	defer forgetClaudeResetGrants(a.source)
 	id := make([]byte, 16)
 	if _, e := rand.Read(id); e != nil {
 		return "", e

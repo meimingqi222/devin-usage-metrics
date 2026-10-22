@@ -37,6 +37,9 @@ func fixtureHome(t *testing.T) {
 	registry.Lock()
 	registry.m = map[string]*entry{}
 	registry.Unlock()
+	claudeGrants.Lock()
+	claudeGrants.m = map[string]claudeGrantsCheck{}
+	claudeGrants.Unlock()
 }
 func fixture(t *testing.T, p, data string) {
 	t.Helper()

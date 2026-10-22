@@ -113,3 +113,15 @@ func TestKeychainBannerOnlyWhereLikely(t *testing.T) {
 		t.Fatalf("banner state wrong: allowed=%v", quota.KeychainAllowed())
 	}
 }
+
+// Grant status is read hourly; a full window it clears overrides a stale
+// "not at the limit" so the reset can be offered (the claim re-checks).
+func TestStaleNotLimitedYieldsToFullWindow(t *testing.T) {
+	five := []string{"five_hour"}
+	if !resetWindowFull(five, []quota.Window{{Label: "5h", UsedPercent: 100}}) {
+		t.Fatal("full 5h window not seen")
+	}
+	if resetWindowFull(five, []quota.Window{{Label: "5h", UsedPercent: 99}, {Label: "7d", UsedPercent: 100}}) {
+		t.Fatal("a window the grant does not clear enabled it")
+	}
+}

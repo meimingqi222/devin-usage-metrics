@@ -42,7 +42,7 @@ func TestClaude401RereadsWithoutRefreshToken(t *testing.T) {
 	fixture(t, ".claude/.credentials.json", `{"claudeAiOauth":{"accessToken":"old"}}`)
 	calls := 0
 	localServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/oauth/usage" {
+		if r.URL.Path == "/api/oauth/usage" && r.URL.RawQuery == "" { // not the hourly grants read
 			calls++
 			if calls == 1 {
 				fixture(t, ".claude/.credentials.json", `{"claudeAiOauth":{"accessToken":"rotated"}}`)
@@ -109,6 +109,10 @@ func TestClaude401RereadsAfterProactiveRefresh(t *testing.T) {
 			refreshes++
 			fmt.Fprint(w, `{"access_token":"new","refresh_token":"r2","expires_in":3600}`)
 		case "/api/oauth/usage":
+			if r.URL.RawQuery != "" { // the hourly grants read
+				fmt.Fprint(w, `{}`)
+				return
+			}
 			uses++
 			if uses == 1 {
 				fixture(t, ".claude/.credentials.json", `{"claudeAiOauth":{"accessToken":"cli-rotated"}}`)

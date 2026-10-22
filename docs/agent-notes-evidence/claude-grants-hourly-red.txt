@@ -1,0 +1,5 @@
+--- FAIL: TestClaudeGrantsReadAtMostHourly (0.01s)
+    claude_reset_test.go:98: grants re-read within the hour: usage=2 grants=2
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/quota	0.412s
+FAIL

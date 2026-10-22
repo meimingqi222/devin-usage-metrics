@@ -235,7 +235,9 @@ func fetch(ctx context.Context, a Account) (Result, error) {
 			} else if strings.EqualFold(str(at(p, "organization", "organization_type")), "claude_team") && strings.EqualFold(str(at(p, "organization", "subscription_status")), "active") {
 				plan = "Team"
 			}
-			return ParseClaudeUsage(usage, plan), nil
+			r := ParseClaudeUsage(usage, plan)
+			r.Reset = claudeResetGrants(ctx, a.source, h)
+			return r, nil
 		case "codex":
 			return ParseCodexUsage(usage, str(usage["plan_type"])), nil
 		case "grok":
@@ -360,9 +362,6 @@ func ParseClaudeUsage(v object, plan string) Result {
 			reset = time.Now().Unix() + delta
 		}
 		r.Windows = append(r.Windows, Window{label, num(w["utilization"]), reset})
-	}
-	if reset, ok := parseClaudeReset(obj(v["cedar_ember"]), time.Now().Unix()); ok {
-		r.Reset = &reset
 	}
 	x := obj(v["extra_usage"])
 	if x["is_enabled"] == true {
