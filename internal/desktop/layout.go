@@ -395,9 +395,8 @@ func control(c *ui.Context, radius float32) ui.Element {
 func (a *App) header(c *ui.Context) {
 	t := c.Theme()
 	ui.Row(c).Height(toolbarHeight).Shrink(0).Padding(0, max(20, c.TitleBar().Right), 0, 20).Gap(16).AlignItems(ui.Center).Background(toolbarColor).BorderWidth(0, 0, 1, 0).BorderColor(t.Border).Label("Toolbar").DragWindow().Children(func() {
-		if a.screen == "quota" {
-			ui.Text(c, a.t("Live quotas", "实时配额")).FontSize(14).Bold()
-		} else {
+		// The quota page titles itself; its toolbar keeps only reload.
+		if a.screen != "quota" {
 			control(c, 6).Children(func() {
 				for _, tab := range []struct{ key, en, zh string }{{"usage", "Usage", "用量"}, {"sessions", "Sessions", "会话"}, {"compaction", "Compaction", "压缩建议"}} {
 					if tab.key == "compaction" && a.agent != model.Claude && a.agent != model.Codex {

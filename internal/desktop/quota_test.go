@@ -15,18 +15,18 @@ func quotaFixture(t *testing.T) *App {
 	now := time.Now()
 	h := func(d time.Duration) int64 { return now.Add(d).Unix() }
 	a.accounts = []accountResult{
-		{account: quota.Account{Key: "claude-1", Provider: "claude", Label: "work@example.com"}, result: quota.Result{Plan: "Max", Windows: []quota.Window{{Label: "5h", UsedPercent: 37.5, ResetsAt: h(2 * time.Hour)}, {Label: "7d", UsedPercent: 82, ResetsAt: h(75 * time.Hour)}, {Label: "7d Opus", UsedPercent: 12, ResetsAt: h(75 * time.Hour)}}}},
+		{account: quota.Account{Key: "claude-1", Provider: "claude", Label: "work@example.com"}, result: quota.Result{Plan: "Max", Windows: []quota.Window{{Label: "5h", UsedPercent: 37.5, ResetsAt: h(2 * time.Hour)}, {Label: "7d", UsedPercent: 82, ResetsAt: h(75 * time.Hour)}, {Label: "7d Opus", UsedPercent: 12, ResetsAt: h(75 * time.Hour)}}, Reset: &quota.ClaudeReset{Left: 2, Total: 3, EndsAt: h(24 * 24 * time.Hour), GrantID: "g", Clears: []string{"five_hour"}}}},
 		{account: quota.Account{Key: "codex-1", Provider: "codex", Label: "a-very-long-account-label-that-must-ellipsize@example.com"}, result: quota.Result{Plan: "Plus", Windows: []quota.Window{{Label: "5h", UsedPercent: 5, ResetsAt: h(30 * time.Minute)}, {Label: "7d", UsedPercent: 64, ResetsAt: h(100 * time.Hour)}}}},
 		{account: quota.Account{Key: "devin-0", Provider: "devin", Label: "team"}, result: quota.Result{Plan: "Teams", Extra: "120 ACUs left", Windows: []quota.Window{{Label: "Monthly", UsedPercent: 48, ResetsAt: h(240 * time.Hour)}}}},
 		{account: quota.Account{Key: "grok-1", Provider: "grok", Label: "me"}, err: errors.New("HTTP 401")},
 		{account: quota.Account{Key: "ag-1", Provider: "antigravity", Label: "g@example.com"}, result: quota.Result{Windows: []quota.Window{{Label: "Gemini 3 Pro – 5h", UsedPercent: 90, ResetsAt: h(time.Hour)}, {Label: "Claude Sonnet – 5h", UsedPercent: 0, ResetsAt: h(time.Hour)}}}},
 		{account: quota.Account{Key: "devin-cli", Provider: "devin", Label: "cli"}, result: quota.Result{}},
-		{account: quota.Account{Key: "claude-2", Provider: "claude", Label: "home@example.com"}, result: quota.Result{Windows: []quota.Window{{Label: "5h", UsedPercent: 100, ResetsAt: h(10 * time.Minute)}}, Stale: "HTTP 429", StaleAge: 300, RetryIn: 120}},
+		{account: quota.Account{Key: "claude-2", Provider: "claude", Label: "home@example.com"}, result: quota.Result{Windows: []quota.Window{{Label: "5h", UsedPercent: 100, ResetsAt: h(10 * time.Minute)}}, Stale: "HTTP 429", StaleAge: 300, RetryIn: 120, Reset: &quota.ClaudeReset{Left: 1, Total: 1, GrantID: "g", Blocker: "cooldown", CooldownUntil: h(30 * time.Minute)}}},
 	}
 	return a
 }
 
-func TestQuotaCardsShareRowHeightLikeRust(t *testing.T) {
+func TestQuotaCardsFormAUniformGrid(t *testing.T) {
 	a := quotaFixture(t)
 	tt := ui.NewTester(a.View, 1240, 780)
 	tt.SetScale(2)
@@ -39,13 +39,21 @@ func TestQuotaCardsShareRowHeightLikeRust(t *testing.T) {
 		}
 		return r
 	}
-	// The first row holds three cards of different content; Rust stretches
-	// them to one height, so a short card must not end above a tall one.
+	// Two columns of one width; cards in a row share its height even when
+	// their content differs, and the next row starts below both.
 	claude, codex, devin := rect("Claude · work@example.com"), rect("Codex · a-very-long-account-label-that-must-ellipsize@example.com"), rect("Devin · team")
-	for _, r := range []ui.Rect{codex, devin} {
-		if r.Y != claude.Y || r.H != claude.H || r.W != 320 {
-			t.Fatalf("cards in one row differ: %+v vs %+v", r, claude)
-		}
+	if codex.Y != claude.Y || codex.H != claude.H || codex.W != claude.W || codex.X <= claude.X {
+		t.Fatalf("cards in one row differ: %+v vs %+v", codex, claude)
+	}
+	if devin.W != claude.W || devin.X != claude.X || devin.Y < claude.Y+claude.H {
+		t.Fatalf("second row breaks the grid: %+v under %+v", devin, claude)
+	}
+	// The odd card out keeps the column width instead of filling the row.
+	if last := rect("Claude · home@example.com"); last.W != claude.W {
+		t.Fatalf("last card left the grid: %+v vs %+v", last, claude)
+	}
+	if !tt.HasText("7 accounts · 3 high-usage alerts") {
+		t.Fatalf("missing summary: %q", tt.Texts())
 	}
 	if label, ok := tt.Find("a-very-long-account-label-that-must-ellipsize@example.com"); ok && label.X+label.W > codex.X+codex.W {
 		t.Fatalf("account label overflows its card: %+v in %+v", label, codex)
@@ -57,5 +65,31 @@ func TestQuotaCardsShareRowHeightLikeRust(t *testing.T) {
 	}
 	if remove, ok := tt.Find("Remove"); !ok || remove.H > 24 {
 		t.Fatalf("remove must be a compact link, not a button: %+v", remove)
+	}
+}
+
+// Claude reset grants show their count and expiry; the reset button asks
+// before spending one, and a blocked grant shows why instead.
+func TestClaudeResetGrantNeedsConfirmation(t *testing.T) {
+	a := quotaFixture(t)
+	tt := ui.NewTester(a.View, 1240, 780)
+	tt.SetScale(2)
+	expires := time.Now().Add(24 * 24 * time.Hour).Format("01-02")
+	if !tt.HasText("Reset grants: 2 of 3 left · expires " + expires) {
+		t.Fatalf("missing grant summary: %q", tt.Texts())
+	}
+	tt.Scroll(600, 400, 0, 400)
+	if !tt.HasText("Reset grants: 1 of 1 left") {
+		t.Fatalf("missing blocked grant: %q", tt.Texts())
+	}
+	tt.Scroll(600, 400, 0, -400)
+	click(t, tt, "Reset 5h")
+	if !tt.HasText("Spend one Claude reset grant for work@example.com? This clears its usage window now and cannot be undone.") {
+		t.Fatalf("reset did not ask first: %q", tt.Texts())
+	}
+	capture(t, tt, "go-claude-reset-confirm")
+	click(t, tt, "Cancel")
+	if a.resetAccount != nil || a.busy["claude-reset"] {
+		t.Fatal("cancelling still spent a reset")
 	}
 }

@@ -186,7 +186,7 @@ func fetch(ctx context.Context, a Account) (Result, error) {
 		case "claude":
 			h["anthropic-beta"] = "oauth-2025-04-20"
 			h["User-Agent"] = "claude-cli/2.1.294 (external, cli)"
-			usage, e = jsonRequest(ctx, "GET", "https://api.anthropic.com/api/oauth/usage", "", h, false)
+			usage, e = jsonRequest(ctx, "GET", anthropicOrigin+claudeUsagePath, "", h, false)
 		case "codex":
 			h["User-Agent"] = "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)"
 			usage, e = jsonRequest(ctx, "GET", "https://chatgpt.com/backend-api/wham/usage", "", h, false)
@@ -227,7 +227,7 @@ func fetch(ctx context.Context, a Account) (Result, error) {
 		switch a.Provider {
 		case "claude":
 			plan := ""
-			p, _ := jsonRequest(ctx, "GET", "https://api.anthropic.com/api/oauth/profile", "", h, false)
+			p, _ := jsonRequest(ctx, "GET", anthropicOrigin+"/api/oauth/profile", "", h, false)
 			if at(p, "account", "has_claude_max") == true {
 				plan = "Max"
 			} else if at(p, "account", "has_claude_pro") == true {
@@ -375,6 +375,9 @@ func ParseClaudeUsage(v object, plan string) Result {
 			reset = time.Now().Unix() + delta
 		}
 		r.Windows = append(r.Windows, Window{label, num(w["utilization"]), reset})
+	}
+	if reset, ok := parseClaudeReset(obj(v["cedar_ember"]), time.Now().Unix()); ok {
+		r.Reset = &reset
 	}
 	x := obj(v["extra_usage"])
 	if x["is_enabled"] == true {

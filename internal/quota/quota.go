@@ -41,6 +41,8 @@ type Result struct {
 	// rate-limit cooldown, zero when the refresh failed otherwise.
 	StaleAge int64 `json:"stale_age_secs,omitempty"`
 	RetryIn  int64 `json:"retry_in_secs,omitempty"`
+	// Reset is Claude's reset grants, when the account has any.
+	Reset *ClaudeReset `json:"reset,omitempty"`
 }
 type object = map[string]any
 
@@ -164,7 +166,15 @@ var registry = struct {
 	m map[string]*entry
 }{m: map[string]*entry{}}
 
-func clone(r Result) Result { r.Windows = append([]Window(nil), r.Windows...); return r }
+func clone(r Result) Result {
+	r.Windows = append([]Window(nil), r.Windows...)
+	if r.Reset != nil {
+		x := *r.Reset
+		x.Clears = append([]string(nil), x.Clears...)
+		r.Reset = &x
+	}
+	return r
+}
 
 // Fetch respects cancellation even while waiting for another query of the account.
 // force bypasses the five-minute TTL and failure backoff, never a 429 cooldown.

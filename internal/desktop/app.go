@@ -44,6 +44,8 @@ type App struct {
 	loginCancel                                context.CancelFunc
 	confirm                                    bool
 	pending                                    *compaction.Recommendation
+	resetConfirm                               bool
+	resetAccount                               *quota.Account
 	release                                    updater.Release
 	payload                                    string
 	quit                                       func()

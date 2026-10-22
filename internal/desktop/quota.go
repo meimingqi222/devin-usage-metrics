@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"runtime"
@@ -43,16 +44,32 @@ func providerColor(provider string) ui.Color {
 	return ui.Hex("#e6e6ee")
 }
 
-// quotaColor colours by remaining share, like Rust's pct_color.
+// Quota status colors by remaining share, the thresholds of Rust's pct_color.
+var (
+	quotaGreen = ui.Hex("#10b981")
+	quotaAmber = ui.Hex("#f59e0b")
+	quotaRose  = ui.Hex("#f43f5e")
+)
+
 func quotaColor(used float64) ui.Color {
 	switch remaining := 100 - used; {
 	case remaining >= 66:
-		return ui.Hex("#34d399")
+		return quotaGreen
 	case remaining >= 33:
-		return ui.Hex("#fbbf24")
+		return quotaAmber
 	default:
-		return ui.Hex("#f87171")
+		return quotaRose
 	}
+}
+
+// quotaAlert reports a window with under a third left.
+func quotaAlert(r quota.Result) bool {
+	for _, w := range r.Windows {
+		if 100-w.UsedPercent < 33 {
+			return true
+		}
+	}
+	return false
 }
 
 // windowLabel localizes the provider-neutral window names; model-specific
@@ -108,12 +125,30 @@ func (a *App) quotaView(c *ui.Context) {
 		ui.Text(c, a.t("No logged-in accounts detected. Log in via the agent CLI first.", "未检测到已登录账号。请先在对应 Agent 的 CLI 中登录。")).FontSize(14).TextColor(t.TextMuted).Padding(16)
 		return
 	}
-	// Cards in a row share its height, as with Rust's default flex stretch.
-	ui.Row(c).Wrap().Gap(12).AlignItems(ui.Stretch).Children(func() {
+	alerts := 0
+	for _, ar := range a.accounts {
+		if ar.err == nil && quotaAlert(ar.result) {
+			alerts++
+		}
+	}
+	ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Box(c).Size(7, 7).Radius(4).Background(quotaGreen)
+			ui.Text(c, a.t("Live subscription quotas", "实时订阅配额")).FontSize(15).Bold()
+		})
+		summary := fmt.Sprintf(a.t("%d accounts", "%d 个已授权账号"), len(a.accounts))
+		if alerts > 0 {
+			summary += fmt.Sprintf(a.t(" · %d high-usage alerts", " · %d 个高用量告警"), alerts)
+		}
+		ui.Text(c, summary).FontSize(11).Padding(3, 8).Radius(4).Background(ui.Hex("#161a23")).Border(1, t.Border).TextColor(t.TextMuted).NoWrap()
+	})
+	// A uniform two-column grid: cards in a row share its height.
+	ui.Grid(c).Columns(2).Gap(12).Children(func() {
 		for _, ar := range a.accounts {
 			a.quotaCard(c.Key(ar.account.Key), ar)
 		}
 	})
+	a.claudeResetDialog(c)
 }
 
 func (a *App) keychainBanner(c *ui.Context) {
@@ -141,20 +176,36 @@ func (a *App) keychainBanner(c *ui.Context) {
 
 func (a *App) quotaCard(c *ui.Context, ar accountResult) {
 	t := c.Theme()
-	muted := func(s string) { ui.Text(c, s).FontSize(12).TextColor(t.TextMuted) }
-	card := ui.Column(c).Width(320).Shrink(0).Padding(12).Gap(8).Radius(6).Background(t.Surface).Border(1, t.Border)
+	faintText := faint(t)
+	r := ar.result
+	card := ui.Column(c).MinWidth(0).Padding(14, 16).Gap(12).Radius(6).Background(t.Surface).Border(1, t.Border).Shadow(0, 1, 3, 0, ui.Hex("#000000").Alpha(.2))
+	switch {
+	case ar.err == nil && quotaAlert(r):
+		card.Border(1, quotaRose.Alpha(.4))
+	case card.Hovered():
+		card.Border(1, strongBorder)
+	}
+	brand := providerColor(ar.account.Provider)
 	card.Label(providerName(ar.account.Provider) + " · " + ar.account.Label).Children(func() {
-		ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Box(c).Size(7, 7).Radius(4).Background(providerColor(ar.account.Provider))
-			ui.Text(c, providerName(ar.account.Provider)).FontSize(14).Bold().NoWrap()
-			ui.Text(c, ar.account.Label).FontSize(12).Grow(1).MinWidth(0).SingleLine().TextColor(t.TextMuted)
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Column(c).Size(20, 20).Shrink(0).Radius(4).Background(ui.Hex("#1a202c")).Border(1, brand.Alpha(.3)).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+				ui.Text(c, strings.ToUpper(providerName(ar.account.Provider)[:1])).FontSize(10).FixedLineHeight(12).Bold().TextColor(brand)
+			})
+			ui.Text(c, providerName(ar.account.Provider)).FontSize(13).FontWeight(600).NoWrap()
+			ui.Text(c, ar.account.Label).FontSize(11).Grow(1).MinWidth(0).SingleLine().TextColor(faintText)
+			if r.Plan != "" && ar.err == nil {
+				tag := ui.Text(c, strings.ToUpper(r.Plan)).FontSize(10).FontWeight(600).Padding(1, 6).Radius(3).Background(controlColor).Border(1, ui.Hex("#242c3d")).TextColor(faintText).NoWrap()
+				if r.Plan != "API MODE" {
+					tag.Background(t.Accent.Alpha(.08)).Border(1, t.Accent.Alpha(.25)).TextColor(t.Accent)
+				}
+			}
 			// Saved Devin cookies are removable; the CLI login is not.
 			if index, err := strconv.Atoi(strings.TrimPrefix(ar.account.Key, "devin-")); strings.HasPrefix(ar.account.Key, "devin-") && err == nil {
-				remove := ui.ButtonBase(c).Padding(0, 4).Border(0, ui.Color{}).Background(ui.Color{}).TextColor(t.TextMuted)
+				remove := ui.ButtonBase(c).Padding(0, 4).Border(0, ui.Color{}).Background(ui.Color{}).TextColor(faintText)
 				if remove.Hovered() {
-					remove.TextColor(ui.Hex("#f87171"))
+					remove.TextColor(quotaRose)
 				}
-				remove.Children(func() { ui.Text(c, a.t("Remove", "移除")).FontSize(12).NoWrap() })
+				remove.Children(func() { ui.Text(c, a.t("Remove", "移除")).FontSize(11).NoWrap() })
 				if remove.Clicked() {
 					if err := quota.RemoveDevinAccount(index); err != nil {
 						a.message = err.Error()
@@ -165,46 +216,172 @@ func (a *App) quotaCard(c *ui.Context, ar accountResult) {
 			}
 		})
 		if ar.err != nil {
-			ui.Text(c, fmt.Sprintf(a.t("Query failed: %s", "查询失败：%s"), ar.err)).FontSize(12).TextColor(ui.Hex("#f87171"))
+			ui.Text(c, fmt.Sprintf(a.t("Query failed: %s", "查询失败：%s"), ar.err)).FontSize(11.5).TextColor(quotaRose)
 			return
 		}
-		r := ar.result
-		if r.Plan != "" {
-			color := t.Accent
-			if r.Plan == "API MODE" {
-				color = ui.Hex("#34d399")
+		ui.Column(c).Gap(8).Children(func() {
+			for _, w := range r.Windows {
+				a.quotaWindow(c, w)
 			}
-			ui.Text(c, r.Plan).FontSize(12).Padding(1, 8).Radius(4).AlignSelf(ui.Start).Background(t.SurfaceHover).TextColor(color)
+			switch {
+			case len(r.Windows) == 0 && r.Plan == "API MODE":
+				ui.Row(c).Gap(6).Padding(4, 0).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "✓").FontSize(11.5).Bold().TextColor(quotaGreen)
+					ui.Text(c, a.t("Pay-as-you-go API · no window limits", "按量直连模式 · 无窗口速率限制")).FontSize(11.5).TextColor(t.TextMuted)
+				})
+			case len(r.Windows) == 0:
+				ui.Text(c, a.t("No record", "无记录")).FontSize(11.5).TextColor(faintText)
+			}
+		})
+		if r.Extra == "" && r.Stale == "" && r.Reset == nil {
+			return
 		}
-		for _, w := range r.Windows {
-			color := quotaColor(w.UsedPercent)
-			ui.Column(c).Gap(4).Children(func() {
-				ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, a.windowLabel(w.Label)).FontSize(12).Grow(1).MinWidth(0).SingleLine()
-					ui.Text(c, fmt.Sprintf("%.0f%%", w.UsedPercent)).FontSize(12).Bold().TextColor(color)
-				})
-				ui.Box(c).FillWidth().Height(6).Radius(3).Background(t.SurfaceHover).Draw(func(p *ui.Painter, r ui.Rect) {
-					r.W *= float32(math.Max(0, math.Min(1, w.UsedPercent/100)))
-					p.Fill(r, color, 3)
-				})
-				if left := w.ResetsAt - time.Now().Unix(); left > 0 {
-					muted(fmt.Sprintf(a.t("resets in %s", "%s 后重置"), a.duration(left)))
+		ui.Spacer(c)
+		ui.Column(c).Gap(4).Padding(8, 0, 0, 0).BorderWidth(1, 0, 0, 0).BorderColor(ui.Hex("#1a1e2a")).Children(func() {
+			if r.Reset != nil {
+				a.claudeResetBar(c, ar.account, *r.Reset)
+			}
+			if r.Extra != "" {
+				ui.Text(c, fmt.Sprintf(a.t("Extra: %s", "附加：%s"), r.Extra)).FontSize(11).MinWidth(0).TextColor(faintText)
+			}
+			if r.Stale != "" {
+				age := a.duration(max(r.StaleAge, 60))
+				text := fmt.Sprintf(a.t("Cached data (%s ago) - refresh failed: %s", "缓存数据（%s前），本次查询失败：%s"), age, r.Stale)
+				if r.RetryIn > 0 {
+					text = fmt.Sprintf(a.t("Cached data (%s ago) - rate limited, retry in %s", "缓存数据（%s前），被限流，%s后重试"), age, a.duration(max(r.RetryIn, 60)))
 				}
-			})
-		}
-		if len(r.Windows) == 0 && r.Plan != "API MODE" {
-			muted(a.t("No record", "无记录"))
-		}
-		if r.Extra != "" {
-			muted(fmt.Sprintf(a.t("Extra: %s", "附加：%s"), r.Extra))
-		}
-		if r.Stale != "" {
-			age := a.duration(max(r.StaleAge, 60))
-			text := fmt.Sprintf(a.t("Cached data (%s ago) - refresh failed: %s", "缓存数据（%s前），本次查询失败：%s"), age, r.Stale)
-			if r.RetryIn > 0 {
-				text = fmt.Sprintf(a.t("Cached data (%s ago) - rate limited, retry in %s", "缓存数据（%s前），被限流，%s后重试"), age, a.duration(max(r.RetryIn, 60)))
+				ui.Text(c, text).FontSize(11).MinWidth(0).TextColor(quotaAmber)
 			}
-			ui.Text(c, text).FontSize(12).TextColor(ui.Hex("#fbbf24"))
+		})
+	})
+}
+
+// quotaWindow is one window: its name, the share used and the time to
+// reset on one line, over a thin rail.
+func (a *App) quotaWindow(c *ui.Context, w quota.Window) {
+	t := c.Theme()
+	color := quotaColor(w.UsedPercent)
+	pct := color
+	if w.UsedPercent <= 0 {
+		pct = faint(t)
+	}
+	ui.Column(c).Gap(3).Children(func() {
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, a.windowLabel(w.Label)).FontSize(11.5).FontWeight(500).TextColor(t.Text.Alpha(.85)).Grow(1).MinWidth(0).SingleLine()
+			ui.Text(c, fmt.Sprintf("%.0f%%", w.UsedPercent)).FontSize(11.5).FontWeight(600).FontFeatures("tnum").TextColor(pct)
+			if left := w.ResetsAt - time.Now().Unix(); left > 0 {
+				ui.Text(c, fmt.Sprintf(a.t("resets in %s", "%s 后重置"), a.duration(left))).FontSize(10.5).FontFeatures("tnum").TextColor(faint(t)).NoWrap()
+			}
+		})
+		ui.Box(c).FillWidth().Height(3).Radius(1.5).Background(ui.Hex("#1c212c")).Draw(func(p *ui.Painter, r ui.Rect) {
+			r.W *= float32(math.Max(0, math.Min(1, w.UsedPercent/100)))
+			p.Fill(r, color, 1.5)
+		})
+	})
+}
+
+// resetWindows names the windows a Claude reset clears.
+func (a *App) resetWindows(clears []string) string {
+	var names []string
+	for _, w := range clears {
+		names = append(names, map[string]string{"five_hour": "5h", "seven_day": a.t("7d", "7 天"), "seven_day_overage_included": a.t("7d incl. extra", "7 天（含附加）")}[w])
+	}
+	return strings.Join(names, " / ")
+}
+
+func (a *App) resetBlocker(r quota.ClaudeReset) string {
+	switch r.Blocker {
+	case "not_limited":
+		return a.t("Available once a window reaches its limit", "窗口达到上限后才可使用")
+	case "cooldown":
+		return fmt.Sprintf(a.t("Cooling down, available in %s", "冷却中，%s 后可用"), a.duration(max(r.CooldownUntil-time.Now().Unix(), 60)))
+	case "exhausted":
+		return a.t("No resets left", "重置次数已用完")
+	case "ineligible":
+		return a.t("This account is not eligible", "此账号暂不符合条件")
+	case "paused":
+		return a.t("Resets are paused", "重置已暂停")
+	}
+	return a.t("Not available right now", "当前不可用")
+}
+
+// claudeResetBar shows the account's reset grants and spends one after a
+// confirmation; it stays disabled with the reason while none can be spent.
+func (a *App) claudeResetBar(c *ui.Context, account quota.Account, r quota.ClaudeReset) {
+	t := c.Theme()
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		info := fmt.Sprintf(a.t("Reset grants: %d of %d left", "储备权益：剩余 %d / %d 次"), r.Left, r.Total)
+		if r.EndsAt > 0 {
+			info += fmt.Sprintf(a.t(" · expires %s", " · %s 到期"), time.Unix(r.EndsAt, 0).Format("01-02"))
+		}
+		ui.Text(c, info).FontSize(11).TextColor(faint(t)).Grow(1).MinWidth(0).SingleLine()
+		label := a.t("Reset now", "立即重置")
+		if w := a.resetWindows(r.Clears); w != "" {
+			label = fmt.Sprintf(a.t("Reset %s", "重置 %s"), w)
+		}
+		busy := a.busy["claude-reset"]
+		if busy {
+			label = a.t("Resetting…", "正在重置…")
+		}
+		disabled := busy || r.Blocker != "" || r.GrantID == ""
+		b := ui.ButtonBase(c).Label(label).FontSize(11).FontWeight(500).Padding(3, 8).Radius(4).Background(t.Accent.Alpha(.08)).Border(1, t.Accent.Alpha(.25)).TextColor(t.Accent).Disabled(disabled)
+		switch {
+		case disabled:
+			b.Background(controlColor).Border(1, t.Border).TextColor(faint(t))
+		case b.Hovered():
+			b.Background(t.Accent.Alpha(.18)).Border(1, t.Accent.Alpha(.45))
+		}
+		b.Children(func() { ui.Text(c, "⚡ "+label).NoWrap() })
+		if r.Blocker != "" {
+			b.Tooltip(a.resetBlocker(r))
+		}
+		if b.Clicked() && !disabled {
+			account := account
+			a.resetAccount, a.resetConfirm = &account, true
+		}
+	})
+}
+
+func (a *App) claudeResetDialog(c *ui.Context) {
+	if a.resetAccount == nil {
+		return
+	}
+	account := *a.resetAccount
+	text := fmt.Sprintf(a.t("Spend one Claude reset grant for %s? This clears its usage window now and cannot be undone.", "为 %s 消耗 1 次 Claude 重置权益？用量窗口会立即清空，且无法撤销。"), account.Label)
+	if ui.AlertDialog(c, &a.resetConfirm, a.t("Reset Claude usage", "重置 Claude 用量"), text, a.t("Cancel", "取消"), a.t("Reset", "重置")) == 1 {
+		a.resetAccount = nil
+		a.claimClaudeReset(account)
+	}
+	if !a.resetConfirm {
+		a.resetAccount = nil
+	}
+}
+
+func (a *App) claimClaudeReset(account quota.Account) {
+	a.work("claude-reset", func() func() {
+		code, err := quota.ClaimClaudeReset(a.ctx, account)
+		return func() {
+			messages := map[string][2]string{
+				"reset":        {"Claude usage reset.", "已重置 Claude 用量窗口。"},
+				"already_used": {"This reset was already applied.", "这次重置已生效。"},
+				"not_limited":  {"Not at a limit yet; no reset was spent.", "尚未达到上限，未消耗次数。"},
+				"cooldown":     {"Resets are cooling down; none was spent.", "重置冷却中，未消耗次数。"},
+				"ineligible":   {"This account is not eligible; none was spent.", "此账号暂不符合条件，未消耗次数。"},
+				"unavailable":  {"Resets are unavailable; none was spent.", "重置暂不可用，未消耗次数。"},
+				"rate_limited": {"Rate limited; no reset was spent.", "请求被限流，未消耗次数。"},
+				"auth_error":   {"Claude rejected the login; no reset was spent.", "Claude 登录无效，未消耗次数。"},
+			}
+			switch m, ok := messages[code]; {
+			case errors.Is(err, quota.ErrClaudeResetUnknown):
+				a.message = a.t("The reset outcome is unknown; quotas were re-read, check them before trying again.", "重置结果未知，已重新查询配额，请确认后再操作。")
+			case err != nil:
+				a.message = fmt.Sprintf(a.t("Reset failed: %s", "重置失败：%s"), err)
+			case ok:
+				a.message = a.t(m[0], m[1])
+			default:
+				a.message = a.resetBlocker(quota.ClaudeReset{Blocker: code})
+			}
+			a.refreshQuota(true)
 		}
 	})
 }
