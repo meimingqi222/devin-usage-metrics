@@ -1,7 +1,7 @@
 {
   "since": "2020-01-01",
   "until": "2026-10-21",
-  "timezone": "Asia/Taipei",
+  "timezone": "<redacted>",
   "offline_pricing": true,
   "binary_sha256": {
     "rust": "1b09408f3adb4b8af53ade95e60dd3aacb8e06178fb133ca91af345a7a1d7018",

@@ -61,11 +61,11 @@ def snapshot(source, root):
     print(json.dumps({"snapshot_files": len(manifest), "snapshot_bytes": sum(p["bytes"] for p in manifest)}), flush=True)
 
 
-def environment(root):
+def environment(root, timezone):
     env = os.environ.copy()
     for key in ["CODEX_HOME", "WORKBUDDY_CONFIG_DIR", "CODEBUDDY_CONFIG_DIR", "WORKBUDDY_DIR", "DEVIN_USAGE_MODELS_PATH", "DEVIN_USAGE_PRO_PRICING_PATH", "XDG_DATA_HOME"]:
         env.pop(key, None)
-    env.update(XDG_CONFIG_HOME=str(root / "home/.config"), APPDATA=str(root / "home/AppData/Roaming"), LOCALAPPDATA=str(root / "home/AppData/Local"), HOME=str(root / "home"), USERPROFILE=str(root / "home"), XDG_CACHE_HOME=str(root / "home/Library/Caches"), DEVIN_USAGE_DISABLE_MODELS_FETCH="1", TZ="Asia/Taipei", LANG="en_US.UTF-8")
+    env.update(XDG_CONFIG_HOME=str(root / "home/.config"), APPDATA=str(root / "home/AppData/Roaming"), LOCALAPPDATA=str(root / "home/AppData/Local"), HOME=str(root / "home"), USERPROFILE=str(root / "home"), XDG_CACHE_HOME=str(root / "home/Library/Caches"), DEVIN_USAGE_DISABLE_MODELS_FETCH="1", TZ=timezone, LANG="en_US.UTF-8")
     return env
 
 
@@ -135,6 +135,9 @@ def main():
     parser.add_argument("--since", default="2020-01-01")
     parser.add_argument("--until", required=True)
     parser.add_argument("--agents", nargs="+", choices=AGENTS, default=AGENTS)
+    # Both binaries bucket days in one fixed zone; UTC keeps reports free of
+    # the operator's location.
+    parser.add_argument("--timezone", default="UTC")
     parser.add_argument("--timeout", type=int, default=1800)
     args = parser.parse_args()
     if sys.platform != "darwin":
@@ -144,7 +147,7 @@ def main():
         snapshot(args.source_home.resolve(), root)
     if not (root / "snapshot.json").is_file():
         parser.error("Create a frozen snapshot first with --snapshot")
-    env = environment(root)
+    env = environment(root, args.timezone)
     output = root / "reports"
     output.mkdir(exist_ok=True)
     binaries = {}
