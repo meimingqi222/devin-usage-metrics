@@ -19,13 +19,8 @@ type trayUIState struct {
 	period                          int // 0: 30 days, 1: today, 2: yesterday
 	otherAccountsExpanded           bool
 	openDashboard, closePopup, quit func()
-	// setTitle shows trayTitle by the tray icon: its title on macOS, its
-	// tooltip on Windows and Linux. Nil without a tray. title is the last
-	// text shown, so unchanged text is not sent again.
-	setTitle   func(string)
-	title      string
-	updatedAt  string
-	wasLoading bool
+	updatedAt                       string
+	wasLoading                      bool
 }
 
 // trayWidth is the popover's width; the host sizes its window to match.
@@ -404,49 +399,4 @@ func (a *App) trayDenseCard(c *ui.Context, ar accountResult) {
 			}
 		}
 	})
-}
-
-// trayAlertTitle names the window with the least quota left once it is
-// under a third, for the tray icon's title or tooltip; empty otherwise.
-func (a *App) trayAlertTitle() string {
-	least, name := 100.0, ""
-	for _, ar := range a.accounts {
-		if ar.err != nil {
-			continue
-		}
-		for _, w := range ar.result.Windows {
-			if left := 100 - w.UsedPercent; left < least {
-				least, name = left, providerName(ar.account.Provider)
-			}
-		}
-	}
-	if name == "" || least >= 33 {
-		return ""
-	}
-	return fmt.Sprintf(a.t("%s %.0f%% left", "%s 剩 %.0f%%"), name, math.Max(0, least))
-}
-
-// trayTitle is the status-bar text beside the tray icon: the dashboard
-// agent's cost over the last 30 days, then any quota under a third left.
-func (a *App) trayTitle(now time.Time) string {
-	var parts []string
-	if cost, _ := a.localUsage(a.agent, now.Add(-30*24*time.Hour), now); cost > 0 {
-		parts = append(parts, a.agent.Label()+": "+trayMoney(cost))
-	}
-	if alert := a.trayAlertTitle(); alert != "" {
-		parts = append(parts, alert)
-	}
-	return strings.Join(parts, " · ")
-}
-
-// updateTrayTitle shows trayTitle by the tray icon when it changed. It runs
-// on the main thread after loads, quota refreshes and agent switches.
-func (a *App) updateTrayTitle() {
-	if a.trayUI.setTitle == nil {
-		return
-	}
-	if title := a.trayTitle(time.Now()); title != a.trayUI.title {
-		a.trayUI.title = title
-		a.trayUI.setTitle(title)
-	}
 }

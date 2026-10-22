@@ -285,7 +285,6 @@ func (a *App) agentItem(c *ui.Context, agent model.Agent) {
 	}
 	if r.Clicked() {
 		a.agent = agent
-		a.updateTrayTitle()
 		a.screen = "history"
 		a.page = 0
 		a.selected = nil

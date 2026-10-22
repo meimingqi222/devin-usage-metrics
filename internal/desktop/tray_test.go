@@ -41,9 +41,6 @@ func TestTrayChinesePopulatedVisual(t *testing.T) {
 	if got := tt.Image().Bounds().Size(); got.X != 2*trayWidth || got.Y != 1040 {
 		t.Fatalf("expected %dx520 logical at 2x, got %v", trayWidth, got)
 	}
-	if got := a.trayAlertTitle(); got != "Antigravity 剩 15%" {
-		t.Fatalf("menubar alert %q", got)
-	}
 	capture(t, tt, "go-tray-zh-populated")
 	click(t, tt, "昨天")
 	if !tt.HasText("此周期内暂无会话记录") {
@@ -126,24 +123,5 @@ func TestTrayClaudeResetConfirmsInTray(t *testing.T) {
 	click(t, tt, "Cancel")
 	if a.quotaUI.resetAccount != nil || a.quotaUI.resetFromTray || a.busy["claude-reset"] {
 		t.Fatal("cancelling left reset state or spent a grant")
-	}
-}
-
-// The status bar shows the dashboard agent's 30-day cost, then any quota
-// under a third left, and is pushed only when it changes.
-func TestTrayStatusTitle(t *testing.T) {
-	a := fixture(t)
-	a.lang = "zh"
-	price := 28.32
-	a.agent = model.Devin
-	a.loaded[model.Devin] = model.Data{Turns: []model.Turn{{Agent: model.Devin, CreatedAt: time.Now().Unix(), RecordedCost: &price}}}
-	var shown []string
-	a.trayUI.setTitle = func(title string) { shown = append(shown, title) }
-	a.updateTrayTitle()
-	a.accounts = []accountResult{{account: quota.Account{Key: "claude", Provider: "claude"}, result: quota.Result{Windows: []quota.Window{{Label: "5h", UsedPercent: 74}}}}}
-	a.updateTrayTitle()
-	a.updateTrayTitle()
-	if len(shown) != 2 || shown[0] != "Devin: $28.32" || shown[1] != "Devin: $28.32 · Claude 剩 26%" {
-		t.Fatalf("status titles %q", shown)
 	}
 }

@@ -132,24 +132,11 @@ func Run(icon []byte) error {
 			})
 		}
 		var err error
-		tray, err = mygo.NewTray(mygo.TrayOptions{Icon: icon, IconIsTemplate: runtime.GOOS == "darwin", ToolTip: "Agent Usage Metrics"})
+		// The tray shows the app icon itself, in color, on every platform.
+		tray, err = mygo.NewTray(mygo.TrayOptions{Icon: icon, ToolTip: "Agent Usage Metrics"})
 		if err != nil {
 			a.message = fmt.Sprintf("Tray unavailable: %v", err)
 		} else {
-			// The status text shows beside the icon on macOS. The Windows and
-			// Linux trays have no title, so it joins the tooltip there.
-			a.trayUI.setTitle = func(title string) {
-				if runtime.GOOS == "darwin" {
-					tray.SetTitle(title)
-					return
-				}
-				tip := "Agent Usage Metrics"
-				if title != "" {
-					tip += " · " + title
-				}
-				tray.SetToolTip(tip)
-			}
-			a.updateTrayTitle()
 			if runtime.GOOS == "linux" {
 				tray.SetMenu(trayMenu())
 				a.languageChanged = func() { tray.SetMenu(trayMenu()) }
