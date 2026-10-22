@@ -37,6 +37,10 @@ func fixture(t testing.TB) *App {
 		t.Setenv(k, v)
 	}
 	a := New(context.Background())
+	if a.device != a.localID || a.localID == "" {
+		t.Fatalf("the app must start on this device's data: %q, local %q", a.device, a.localID)
+	}
+	a.device = "" // fixtures compare all devices against filtered views
 	a.lang = "en"
 	a.agent = model.Claude
 	a.hasLoaded = true // the fixture stands in for a finished first read

@@ -80,7 +80,9 @@ type App struct {
 }
 
 func New(ctx context.Context) *App {
-	return &App{ctx: ctx, events: make(chan func(), 64), agent: model.Devin, period: analytics.Day, tab: "usage", screen: "history", lang: language(), loaded: map[model.Agent]model.Data{}, busy: map[string]bool{}, apiURL: syncclient.ReadConfig().APIURL, deviceName: data.DeviceName(), localID: data.DeviceID(), expandedBuckets: map[int64]bool{}, sessionsUI: loadSessionUI(), installed: installedAgents(), updatePrefs: loadUpdatePrefs()}
+	// Like Rust, start on this device's data; All devices is one click away.
+	id := data.DeviceID()
+	return &App{ctx: ctx, events: make(chan func(), 64), agent: model.Devin, period: analytics.Day, tab: "usage", screen: "history", lang: language(), loaded: map[model.Agent]model.Data{}, busy: map[string]bool{}, apiURL: syncclient.ReadConfig().APIURL, deviceName: data.DeviceName(), localID: id, device: id, expandedBuckets: map[int64]bool{}, sessionsUI: loadSessionUI(), installed: installedAgents(), updatePrefs: loadUpdatePrefs()}
 }
 
 func (a *App) t(en, zh string) string {
