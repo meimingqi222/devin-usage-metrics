@@ -20,7 +20,7 @@ Ordering providers or choosing the cheapest reseller still conflates billing cha
 
 ## Consequences
 
-More models correctly appear unpriced when their channel or cache rate cannot be established. Explicit channels retain their quotes, including valid zero prices. Public current prices remain API-equivalent estimates rather than account invoices or a historical price ledger. The complete offline snapshot is larger but preserves provider identity. API context tiers now apply to API aggregation instead of being limited to Devin's separately published rules. Synthetic Codex replay fixtures use ordinary input/cache reads rather than fictional Claude TTL writes, preserving their total prompts. See docs/pricing-audit-2026-10-13.md for catalog counts, policy and billing limits.
+More models correctly appear unpriced when their channel or cache rate cannot be established. Explicit channels retain their quotes, including valid zero prices. Public current prices remain API-equivalent estimates rather than account invoices or a historical price ledger. The complete offline snapshot is larger but preserves provider identity. API context tiers now apply to API aggregation instead of being limited to Devin's separately published rules. Synthetic Codex replay fixtures use ordinary input/cache reads rather than fictional Claude TTL writes, preserving their total prompts. See docs/reports/pricing-audit-2026-10-13.md for catalog counts, policy and billing limits.
 
 ## Verification
 
