@@ -420,3 +420,49 @@ func TestPublishedPackageSkipsSessionsBeforeCutoff(t *testing.T) {
 		t.Fatalf("cache holds %d sessions/%d turns, a read %d/%d", len(cached.Sessions), len(cached.Turns), len(read.Sessions), len(read.Turns))
 	}
 }
+
+// Repairing a damaged object uses If-Match; its 412 means another writer
+// changed it and must stay in the log, unlike the first upload's expected 412.
+func TestRepairConflictIsLogged(t *testing.T) {
+	setup(t)
+	resetMemoryCaches()
+	s := &objectServer{objects: map[string][]byte{}}
+	var repairs int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "PUT" && r.Header.Get("If-Match") != "" && strings.Contains(r.URL.Path, "v3-block-") {
+			repairs++
+			w.WriteHeader(http.StatusPreconditionFailed)
+			return
+		}
+		s.serve(w, r)
+	}))
+	defer server.Close()
+	syncTo(t, server.URL)
+	local := days(time.Now().Unix(), 3, model.Claude)
+	if _, err := Cycle(context.Background(), local); err != nil {
+		t.Fatal(err)
+	}
+	// Damage a block the parent no longer holds, so the next publish re-sends
+	// it, finds the stored copy wrong and attempts a repair.
+	s.mu.Lock()
+	var h head
+	unmarshal(t, s.objects["v3-head-local.json"], &h)
+	var m manifest
+	unmarshal(t, s.objects["v3-manifest-"+h.Manifest+".json"], &m)
+	s.objects[m.Blocks[0].File] = []byte("damaged")
+	m.Blocks = []reference{}
+	s.mu.Unlock()
+	rewriteHead(t, s, m, h)
+	resetMemoryCaches()
+	// A turn on a new day changes the input without changing existing blocks,
+	// so every one of them, the damaged one included, is sent again.
+	local.Turns = append(local.Turns, model.Turn{Agent: model.Claude, SessionKey: "s", CreatedAt: time.Now().Unix() - 5*86400, InputTokens: 1})
+	Cycle(context.Background(), local) // the repair conflict fails publication
+	b, err := os.ReadFile(syncdiag.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repairs == 0 || !strings.Contains(string(b), `"status":412`) {
+		t.Fatalf("repair conflict not logged (repairs=%d)", repairs)
+	}
+}

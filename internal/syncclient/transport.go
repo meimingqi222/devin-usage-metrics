@@ -205,10 +205,12 @@ func (t transport) list(ctx context.Context, prefixes ...string) ([]string, erro
 type existingObjectOK struct{}
 
 func (t transport) putImmutable(ctx context.Context, name string, z []byte) (uploaded bool, err error) {
-	ctx = context.WithValue(ctx, existingObjectOK{}, true)
 	p := "/v1/objects/" + url.PathEscape(name)
 	want := `"` + hash(z) + `"`
-	_, h, s, e := t.request(ctx, "PUT", p, z, map[string]string{"If-None-Match": "*"})
+	// Only this first upload expects a 412; the read-back and repair below
+	// use the caller's context, so a repair conflict is still logged.
+	upload := context.WithValue(ctx, existingObjectOK{}, true)
+	_, h, s, e := t.request(upload, "PUT", p, z, map[string]string{"If-None-Match": "*"})
 	if e != nil {
 		return false, e
 	}
