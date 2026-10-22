@@ -52,7 +52,8 @@ Icon?
 *.p12
 *.mobileprovision
 
-# 本地数据库与应用缓存
+# 本地数据库与应用缓存（含 Agent 原始对话记录，切勿提交）
+*.jsonl
 *.db
 *.db-shm
 *.db-wal

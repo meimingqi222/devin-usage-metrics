@@ -143,6 +143,15 @@ def main():
     if sys.platform != "darwin":
         parser.error("This snapshot runner currently targets macOS source paths and cache layouts")
     root = args.root.resolve()
+    # The snapshot copies raw transcripts; inside the repository a later
+    # `git add` could publish them, and the source HOME would mix copies
+    # with the real files.
+    repo = Path(__file__).resolve().parents[1]
+    home = args.source_home.resolve()
+    if root == repo or repo in root.parents:
+        parser.error("--root must be outside the repository: the snapshot holds raw transcripts")
+    if root == home or root in home.parents:
+        parser.error("--root must not be the source home or one of its parents")
     if args.snapshot:
         snapshot(args.source_home.resolve(), root)
     if not (root / "snapshot.json").is_file():
