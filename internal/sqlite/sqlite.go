@@ -10,10 +10,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/ncruces/go-sqlite3"
+	"github.com/ncruces/go-sqlite3/util/vfsutil"
+	"github.com/ncruces/go-sqlite3/vfs"
 )
 
 type OpenOptions struct {
@@ -30,12 +35,15 @@ type Rows struct {
 
 // DB is safe for use from several goroutines; calls serialize on the connection.
 type DB struct {
-	mu   sync.Mutex
-	conn *sqlite3.Conn
+	mu     sync.Mutex
+	conn   *sqlite3.Conn
+	reader *readFile
 }
 
 // Open opens path as a plain filename, not a URI. ReadOnly never creates or
-// writes the file; otherwise a missing file is created.
+// writes the file; otherwise a missing file is created. Read-only connections
+// go through readVFSName so overflow-page reads are coalesced; the path is
+// therefore converted to a file: URI internally.
 func Open(ctx context.Context, path string, opts OpenOptions) (*DB, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -46,6 +54,12 @@ func Open(ctx context.Context, path string, opts OpenOptions) (*DB, error) {
 	flags := sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE
 	if opts.ReadOnly {
 		flags = sqlite3.OPEN_READONLY
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return nil, err
+		}
+		path = readOnlyURI(filepath.ToSlash(abs))
+		flags |= sqlite3.OPEN_URI
 	}
 	conn, err := sqlite3.OpenFlags(path, flags)
 	if err != nil {
@@ -59,7 +73,30 @@ func Open(ctx context.Context, path string, opts OpenOptions) (*DB, error) {
 		conn.Close()
 		return nil, err
 	}
-	return &DB{conn: conn}, nil
+	db := &DB{conn: conn}
+	if opts.ReadOnly {
+		// Best effort: a connection whose file was not wrapped still works, it
+		// just reads pages one at a time instead of in blocks.
+		if file, err := conn.FileControl("main", sqlite3.FCNTL_FILE_POINTER); err == nil {
+			if f, ok := file.(vfs.File); ok {
+				db.reader, _ = vfsutil.UnwrapFile[*readFile](f)
+			}
+		}
+	}
+	return db, nil
+}
+
+// readOnlyURI builds the file: URI handed to SQLite for a slash-separated
+// absolute path. SQLite passes the text after "file:" to the VFS, so its shape
+// matters: a drive letter must not gain a leading slash ("file:C:/x", not
+// "file:///C:/x", whose VFS path is "/C:/x"), while a UNC path keeps its two
+// slashes after an empty authority ("file:////server/share/x").
+func readOnlyURI(slashAbs string) string {
+	escaped := (&url.URL{Path: slashAbs}).EscapedPath()
+	if strings.HasPrefix(escaped, "//") {
+		escaped = "//" + escaped
+	}
+	return "file:" + escaped + "?mode=ro&vfs=" + readVFSName
 }
 
 func (d *DB) Close() error {
@@ -70,13 +107,14 @@ func (d *DB) Close() error {
 	}
 	err := d.conn.Close()
 	d.conn = nil
+	d.reader = nil
 	return err
 }
 
 // Query runs one statement and reads every row. ctx interrupts it.
 func (d *DB) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
 	rows := Rows{Columns: []string{}, Values: [][]any{}}
-	err := d.run(ctx, sql, args, func(s *sqlite3.Stmt) {
+	err := d.run(ctx, sql, args, func(s *sqlite3.Stmt) error {
 		if len(rows.Columns) == 0 {
 			for i := range s.ColumnCount() {
 				rows.Columns = append(rows.Columns, s.ColumnName(i))
@@ -87,20 +125,17 @@ func (d *DB) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
 			row[i] = column(s, i)
 		}
 		rows.Values = append(rows.Values, row)
+		return nil
 	})
 	return rows, err
 }
 
 // Each runs one statement and calls fn for every row as it is read, so large
-// result sets never sit in memory at once. fn must not keep row; an error
-// from fn stops the query and is returned.
+// result sets never sit in memory at once. fn must not keep row; an error from
+// fn aborts the statement and is returned.
 func (d *DB) Each(ctx context.Context, sql string, fn func(columns []string, row []any) error, args ...any) error {
 	var columns []string
-	var stop error
-	err := d.run(ctx, sql, args, func(s *sqlite3.Stmt) {
-		if stop != nil {
-			return
-		}
+	return d.run(ctx, sql, args, func(s *sqlite3.Stmt) error {
 		if columns == nil {
 			columns = make([]string, s.ColumnCount())
 			for i := range columns {
@@ -111,12 +146,8 @@ func (d *DB) Each(ctx context.Context, sql string, fn func(columns []string, row
 		for i := range row {
 			row[i] = column(s, i)
 		}
-		stop = fn(columns, row)
+		return fn(columns, row)
 	})
-	if stop != nil {
-		return stop
-	}
-	return err
 }
 
 // Result reports what a statement changed.
@@ -128,7 +159,7 @@ type Result struct {
 // Execute runs one statement and discards any rows.
 func (d *DB) Execute(ctx context.Context, sql string, args ...any) (Result, error) {
 	var r Result
-	err := d.run(ctx, sql, args, func(*sqlite3.Stmt) {})
+	err := d.run(ctx, sql, args, func(*sqlite3.Stmt) error { return nil })
 	if err == nil {
 		d.mu.Lock()
 		if d.conn != nil {
@@ -139,7 +170,7 @@ func (d *DB) Execute(ctx context.Context, sql string, args ...any) (Result, erro
 	return r, err
 }
 
-func (d *DB) run(ctx context.Context, sql string, args []any, row func(*sqlite3.Stmt)) error {
+func (d *DB) run(ctx context.Context, sql string, args []any, row func(*sqlite3.Stmt) error) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.conn == nil {
@@ -160,8 +191,21 @@ func (d *DB) run(ctx context.Context, sql string, args []any, row func(*sqlite3.
 			return err
 		}
 	}
+	if d.reader != nil {
+		// The cache lives for exactly one statement, and WAL files keep the
+		// original VFS and are never cached here. In rollback-journal mode the
+		// pager holds LOCK_SHARED for the whole statement, so main-file pages
+		// cannot change underneath it. In WAL mode the reader holds no DB-file
+		// lock, so correctness rests on this reset plus SQLite's read mark,
+		// which stops a checkpoint from backfilling frames the snapshot needs.
+		// Do not move this reset past the step loop.
+		d.reader.active = true
+		defer func() { d.reader.active = false; d.reader.reset() }()
+	}
 	for s.Step() {
-		row(s)
+		if err := row(s); err != nil {
+			return err
+		}
 	}
 	return s.Err()
 }
