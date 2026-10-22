@@ -19,9 +19,11 @@ type trayUIState struct {
 	period                          int // 0: 30 days, 1: today, 2: yesterday
 	otherAccountsExpanded           bool
 	openDashboard, closePopup, quit func()
-	// setTitle shows a low-quota alert by the tray icon: its title on macOS,
-	// its tooltip on Windows and Linux. Nil without a tray.
+	// setTitle shows trayTitle by the tray icon: its title on macOS, its
+	// tooltip on Windows and Linux. Nil without a tray. title is the last
+	// text shown, so unchanged text is not sent again.
 	setTitle   func(string)
+	title      string
 	updatedAt  string
 	wasLoading bool
 }
@@ -94,6 +96,20 @@ func trayMoney(cost float64) string {
 
 // Like compute_cost_overview, aggregate local turns by agent, not by model,
 // dashboard selection, or synced device. Never perform disk/network IO in a view.
+// localUsage sums an agent's cost and tokens on this device between start
+// and end, from loaded history only.
+func (a *App) localUsage(agent model.Agent, start, end time.Time) (cost, tokens float64) {
+	for _, turn := range a.loaded[agent].Turns {
+		if turn.CreatedAt < start.Unix() || turn.CreatedAt > end.Unix() || (turn.DeviceID != "" && a.localID != "" && turn.DeviceID != a.localID) {
+			continue
+		}
+		v, _ := pricing.Cost(turn, turn.Model)
+		cost += v
+		tokens += turn.InputTokens + turn.OutputTokens + turn.CacheReadTokens + turn.CacheCreationTokens
+	}
+	return cost, tokens
+}
+
 func (a *App) trayOverview(now time.Time) ([]trayCostItem, float64, float64) {
 	start, end := now.Add(-30*24*time.Hour), now
 	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
@@ -107,14 +123,7 @@ func (a *App) trayOverview(now time.Time) ([]trayCostItem, float64, float64) {
 	var cost, tokens float64
 	for _, agent := range []model.Agent{model.Claude, model.Codex, model.Devin, model.Antigravity, model.OpenCode} {
 		item := trayCostItem{name: agent.Label(), color: trayAgentColor(agent)}
-		for _, turn := range a.loaded[agent].Turns {
-			if turn.CreatedAt < start.Unix() || turn.CreatedAt > end.Unix() || (turn.DeviceID != "" && a.localID != "" && turn.DeviceID != a.localID) {
-				continue
-			}
-			v, _ := pricing.Cost(turn, turn.Model)
-			item.cost += v
-			item.tokens += turn.InputTokens + turn.OutputTokens + turn.CacheReadTokens + turn.CacheCreationTokens
-		}
+		item.cost, item.tokens = a.localUsage(agent, start, end)
 		if item.cost > 0 || item.tokens > 0 {
 			items = append(items, item)
 			cost += item.cost
@@ -415,4 +424,29 @@ func (a *App) trayAlertTitle() string {
 		return ""
 	}
 	return fmt.Sprintf(a.t("%s %.0f%% left", "%s 剩 %.0f%%"), name, math.Max(0, least))
+}
+
+// trayTitle is the status-bar text beside the tray icon: the dashboard
+// agent's cost over the last 30 days, then any quota under a third left.
+func (a *App) trayTitle(now time.Time) string {
+	var parts []string
+	if cost, _ := a.localUsage(a.agent, now.Add(-30*24*time.Hour), now); cost > 0 {
+		parts = append(parts, a.agent.Label()+": "+trayMoney(cost))
+	}
+	if alert := a.trayAlertTitle(); alert != "" {
+		parts = append(parts, alert)
+	}
+	return strings.Join(parts, " · ")
+}
+
+// updateTrayTitle shows trayTitle by the tray icon when it changed. It runs
+// on the main thread after loads, quota refreshes and agent switches.
+func (a *App) updateTrayTitle() {
+	if a.trayUI.setTitle == nil {
+		return
+	}
+	if title := a.trayTitle(time.Now()); title != a.trayUI.title {
+		a.trayUI.title = title
+		a.trayUI.setTitle(title)
+	}
 }

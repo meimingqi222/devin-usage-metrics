@@ -136,19 +136,20 @@ func Run(icon []byte) error {
 		if err != nil {
 			a.message = fmt.Sprintf("Tray unavailable: %v", err)
 		} else {
-			// A quota under a third left shows beside the icon on macOS. The
-			// Windows and Linux trays have no title, so it joins the tooltip.
-			a.trayUI.setTitle = func(alert string) {
+			// The status text shows beside the icon on macOS. The Windows and
+			// Linux trays have no title, so it joins the tooltip there.
+			a.trayUI.setTitle = func(title string) {
 				if runtime.GOOS == "darwin" {
-					tray.SetTitle(alert)
+					tray.SetTitle(title)
 					return
 				}
 				tip := "Agent Usage Metrics"
-				if alert != "" {
-					tip += " · " + alert
+				if title != "" {
+					tip += " · " + title
 				}
 				tray.SetToolTip(tip)
 			}
+			a.updateTrayTitle()
 			if runtime.GOOS == "linux" {
 				tray.SetMenu(trayMenu())
 				a.languageChanged = func() { tray.SetMenu(trayMenu()) }

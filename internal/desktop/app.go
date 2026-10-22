@@ -143,6 +143,7 @@ func (a *App) load(agent model.Agent, refresh bool) {
 			a.loaded[agent] = d
 			a.loadedAt = time.Now().Format("15:04:05")
 			a.hasLoaded = true
+			a.updateTrayTitle()
 			if refresh && a.syncDue(time.Now()) {
 				a.sync()
 			}
@@ -214,9 +215,7 @@ func (a *App) refreshQuota(force bool) {
 		wg.Wait()
 		return func() {
 			a.accounts, a.quotaUI.queriedAt = out, time.Now().Format("15:04:05")
-			if a.trayUI.setTitle != nil {
-				a.trayUI.setTitle(a.trayAlertTitle())
-			}
+			a.updateTrayTitle()
 		}
 	})
 }
