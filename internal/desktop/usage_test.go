@@ -1,7 +1,9 @@
 package desktop
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 )
@@ -14,7 +16,9 @@ func TestUsageOverviewAndChartModes(t *testing.T) {
 	tt.SetScale(2)
 	// 197K in total, of which 140K are cache reads: 140K of 188K prompt
 	// tokens. Model I/O is 45K new input plus 9K output.
-	for _, want := range []string{"Period: 10-08 ~ 10-22 (last 15 days)", "API list pricing", "Total cost", "197.0", "K Tokens", "2 sessions · 3 turns", "74.5%", "140.0K", "54.0", "45.0K", "9.0K", "Token Usage Trend", "Daily avg 13.1K Tokens"} {
+	// The window is the 15 days ending today.
+	period := fmt.Sprintf("Period: %s ~ %s (last 15 days)", time.Now().AddDate(0, 0, -14).Format("01-02"), time.Now().Format("01-02"))
+	for _, want := range []string{period, "API list pricing", "Total cost", "197.0", "K Tokens", "2 sessions · 3 turns", "74.5%", "140.0K", "54.0", "45.0K", "9.0K", "Token Usage Trend", "Daily avg 13.1K Tokens"} {
 		if !tt.HasText(want) {
 			t.Fatalf("overview missing %q: %q", want, tt.Texts())
 		}
