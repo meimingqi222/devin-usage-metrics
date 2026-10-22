@@ -172,10 +172,7 @@ func roots(a model.Agent) []string {
 	case model.Claude:
 		return []string{home(".claude/projects")}
 	case model.Codex:
-		b := os.Getenv("CODEX_HOME")
-		if b == "" {
-			b = home(".codex")
-		}
+		b := codexHome()
 		return []string{filepath.Join(b, "sessions"), filepath.Join(b, "archived_sessions")}
 	case model.Pi:
 		return []string{home(".pi/agent/sessions")}
@@ -516,23 +513,7 @@ func loadFiles(ctx context.Context, d *model.Data, a model.Agent, refresh bool, 
 	ctx, finish := syncdiag.Watch(ctx, "file_sources")
 	defer func() { finish(sourceResultError(*d)) }()
 	_, discovered := syncdiag.Watch(ctx, "discover_files")
-	paths := files(d, a, roots(a), ".jsonl")
-	if a == model.Grok {
-		paths = files(d, a, roots(a), "summary.json")
-	}
-	tracked := append([]string(nil), paths...)
-	if a == model.Grok {
-		for _, p := range paths {
-			tracked = append(tracked, filepath.Join(filepath.Dir(p), "updates.jsonl"))
-		}
-	}
-	if a == model.Codex {
-		base := os.Getenv("CODEX_HOME")
-		if base == "" {
-			base = home(".codex")
-		}
-		tracked = append(tracked, filepath.Join(base, "session_index.jsonl"))
-	}
+	paths, tracked := fileSources(d, a)
 	current := map[string]string{}
 	for _, p := range tracked {
 		if info, err := os.Stat(p); err == nil {
@@ -566,7 +547,7 @@ func loadFiles(ctx context.Context, d *model.Data, a model.Agent, refresh bool, 
 	if a == model.Grok {
 		sources = make([]string, len(paths))
 		for i, p := range paths {
-			sources[i] = filepath.Join(filepath.Dir(p), "updates.jsonl")
+			sources[i] = grokUpdates(p)
 		}
 	}
 	take := decodeAhead(ctx, a, sources, d.TurnsStart, d.TurnsEnd, refresh)
@@ -582,226 +563,20 @@ func loadFiles(ctx context.Context, d *model.Data, a model.Agent, refresh bool, 
 	sessions := map[string]*model.Session{}
 	seen := map[string]bool{}
 	for i, p := range paths {
-		id := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
-		stream := "main"
-		if a == model.Claude && filepath.Base(filepath.Dir(p)) == "subagents" {
-			id = filepath.Base(filepath.Dir(filepath.Dir(p)))
-			stream = "subagent/" + strings.TrimSuffix(filepath.Base(p), ".jsonl")
-		}
 		if a == model.Grok {
 			r := take(i)
 			parseGrok(d, p, sessions, r.missing, func() []obj { return merge(r) })
 			continue
 		}
-		latest := map[string]model.Turn{}
-		var ordered []model.Turn
-		activeModel := ""
-		order := uint64(0)
+		f := newFileParser(a, p, sessions)
 		for _, v := range merge(take(i)) {
-			order++
-			if v == nil {
-				continue
-			}
-			kind := str(v["type"])
-			m := v["message"]
-			payload := v["payload"]
-			if a == model.WorkBuddy {
-				// Rust resolves missing IDs per record, not from the previous line.
-				id = strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
-			}
-			if a == model.Codex && kind == "session_meta" {
-				if s := str(first(get(payload, "id"), get(payload, "session_id"))); s != "" {
-					id = s
-				}
-			} else if a == model.Pi && kind == "session" {
-				if s := str(v["id"]); s != "" {
-					id = s
-				}
-			} else if s := str(first(v["sessionId"], v["session_id"])); s != "" {
-				id = s
-			}
-			s := sessions[id]
-			if s == nil {
-				s = session(a, id)
-				sessions[id] = s
-			}
-			at := ts(v["timestamp"])
-			observe(s, at)
-			if cwd := str(v["cwd"]); cwd != "" {
-				s.WorkingDirectory = cwd
-			}
-			if s.Title == "" && (kind == "user" || str(get(m, "role")) == "user") {
-				s.Title = text(get(m, "content"))
-			}
-			if kind == "ai-title" {
-				s.Title = compact(str(v["aiTitle"]))
-			}
-			if kind == "custom-title" {
-				s.Title = compact(str(v["customTitle"]))
-			}
-			t := model.Turn{Agent: a, SessionKey: s.Key, CreatedAt: at, ContextStream: stream, ContextOrder: order - 1}
-			valid := false
-			switch a {
-			case model.Claude:
-				if x := str(v["entrypoint"]); x != "" {
-					s.Source = x
-				}
-				if x := str(v["effort"]); x != "" {
-					s.AgentMode = x
-				}
-				if kind != "assistant" {
-					continue
-				}
-				if x := str(get(m, "model")); x != "" {
-					s.SelectedModel = x
-				}
-				u := get(m, "usage")
-				if u == nil {
-					continue
-				}
-				t.Model = str(get(m, "model"))
-				t.InputTokens = num(get(u, "input_tokens"))
-				t.OutputTokens = num(get(u, "output_tokens"))
-				t.CacheReadTokens = num(get(u, "cache_read_input_tokens"))
-				t.CacheCreation5mTokens = num(get(u, "cache_creation", "ephemeral_5m_input_tokens"))
-				t.CacheCreation1hTokens = num(get(u, "cache_creation", "ephemeral_1h_input_tokens"))
-				t.CacheCreation5mTokens += max(0, num(get(u, "cache_creation_input_tokens"))-t.CacheCreation5mTokens-t.CacheCreation1hTokens)
-				t.CacheCreationTokens = t.CacheCreation5mTokens + t.CacheCreation1hTokens
-				t.DedupKey = str(first(get(m, "id"), v["requestId"]))
-				if t.DedupKey == "" {
-					t.DedupKey = fmt.Sprintf("anon:%s:%d", p, order)
-				}
-				latest[t.DedupKey] = t
-			case model.Codex:
-				s.WorkingDirectory = str(first(get(payload, "cwd"), s.WorkingDirectory))
-				switch kind {
-				case "session_meta":
-					if x := get(payload, "source"); x != nil {
-						if st, ok := x.(string); ok {
-							s.Source = st
-						} else {
-							b, _ := json.Marshal(x)
-							s.Source = "subagent"
-							if strings.Contains(string(b), "guardian") {
-								s.Source = "guardian"
-							}
-						}
-					}
-				case "turn_context":
-					activeModel = str(get(payload, "model"))
-					s.SelectedModel = activeModel
-					s.AgentMode = str(first(get(payload, "collaboration_mode", "kind"), get(payload, "collaboration_mode")))
-				case "response_item":
-					if s.Title == "" && str(get(payload, "role")) == "user" {
-						s.Title = text(get(payload, "content"))
-					}
-				case "event_msg":
-					if str(get(payload, "type")) == "user_message" && s.Title == "" {
-						s.Title = compact(str(get(payload, "message")))
-					}
-					if str(get(payload, "type")) != "token_count" {
-						continue
-					}
-					u := get(payload, "info", "last_token_usage")
-					if u == nil {
-						continue
-					}
-					total := first(get(payload, "info", "total_token_usage"), u)
-					t.DedupKey = fmt.Sprintf("%s#%g:%g:%g:%g", id, num(get(total, "input_tokens")), num(get(total, "cached_input_tokens")), num(get(total, "cache_write_input_tokens")), num(get(total, "output_tokens")))
-					t.CacheReadTokens = num(get(u, "cached_input_tokens"))
-					t.InputTokens = max(0, num(get(u, "input_tokens"))-t.CacheReadTokens)
-					t.OutputTokens = num(get(u, "output_tokens"))
-					t.CacheCreationTokens = num(get(u, "cache_write_input_tokens"))
-					t.Model = activeModel
-					valid = true
-				}
-			case model.Pi:
-				if kind == "thinking_level_change" {
-					s.AgentMode = str(v["thinkingLevel"])
-				}
-				if kind != "message" || str(get(m, "role")) != "assistant" || get(m, "usage") == nil {
-					continue
-				}
-				u := get(m, "usage")
-				t.InputTokens = num(get(u, "input"))
-				t.OutputTokens = num(get(u, "output"))
-				t.CacheReadTokens = num(get(u, "cacheRead"))
-				t.CacheCreationTokens = num(get(u, "cacheWrite"))
-				if c := get(u, "cost", "total"); c != nil && num(c) >= 0 {
-					v := num(c)
-					t.RecordedCost = &v
-				}
-				t.Model = modelName(str(get(m, "provider")), str(get(m, "model")))
-				s.SelectedModel = t.Model
-				valid = true
-			case model.WorkBuddy:
-				pr := v["providerData"]
-				u := get(pr, "usage")
-				raw := get(pr, "rawUsage")
-				if s.AgentMode == "" {
-					s.AgentMode = str(get(pr, "agent"))
-				}
-				if u == nil {
-					continue
-				}
-				t.DedupKey = str(first(get(pr, "messageId"), v["id"]))
-				if t.DedupKey == "" {
-					t.DedupKey = fmt.Sprintf("anon:%s:%d", p, order)
-				}
-				t.InputTokens, t.OutputTokens, t.CacheReadTokens, t.CacheCreationTokens = buddyUsage(u, raw)
-				if t.InputTokens+t.OutputTokens+t.CacheReadTokens+t.CacheCreationTokens == 0 {
-					continue
-				}
-				for _, k := range []string{"model", "requestModelId", "requestModelName"} {
-					if x := strings.TrimSpace(str(get(pr, k))); x != "" {
-						t.Model = x
-						break
-					}
-				}
-				if t.Model == "" {
-					t.Model = "unknown"
-				}
-				if s.SelectedModel == "" || s.SelectedModel == "unknown" {
-					s.SelectedModel = t.Model
-				}
-				valid = true
-			}
-			if valid {
-				ordered = append(ordered, t)
-			}
+			f.line(v)
 		}
-		if a == model.Claude {
-			for _, t := range latest {
-				ordered = append(ordered, t)
-			}
-			sort.Slice(ordered, func(i, j int) bool { return ordered[i].ContextOrder < ordered[j].ContextOrder })
-		}
-		d.FileSessions[p] = prefix(a) + "/" + id
-		for _, t := range ordered {
-			key := t.SessionKey + "\x00" + t.DedupKey
-			if a == model.Claude {
-				key = t.DedupKey
-			}
-			if t.DedupKey != "" && seen[key] {
-				continue
-			}
-			seen[key] = true
-			s := sessions[strings.TrimPrefix(t.SessionKey, prefix(a)+"/")]
-			if a == model.Claude && (t.CreatedAt < d.TurnsStart || t.CreatedAt >= d.TurnsEnd) {
-				continue
-			}
-			add(s, t)
-			if t.CreatedAt >= d.TurnsStart && t.CreatedAt < d.TurnsEnd {
-				d.Turns = append(d.Turns, t)
-			}
-		}
+		d.FileSessions[p] = prefix(a) + "/" + f.id
+		f.account(d, seen)
 	}
 	if a == model.Codex {
-		base := os.Getenv("CODEX_HOME")
-		if base == "" {
-			base = home(".codex")
-		}
-		index := filepath.Join(base, "session_index.jsonl")
+		index := filepath.Join(codexHome(), "session_index.jsonl")
 		if _, e := os.Stat(index); e == nil {
 			for _, v := range readLinesContext(ctx, d, a, index, refresh) {
 				if s := sessions[str(v["id"])]; s != nil {
@@ -828,6 +603,290 @@ func loadFiles(ctx context.Context, d *model.Data, a model.Agent, refresh bool, 
 	}
 	return current
 }
+
+// fileSources lists an agent's transcripts in accounting order, and every
+// file whose change must trigger a reparse.
+func fileSources(d *model.Data, a model.Agent) (paths, tracked []string) {
+	if a == model.Grok {
+		paths = files(d, a, roots(a), "summary.json")
+	} else {
+		paths = files(d, a, roots(a), ".jsonl")
+	}
+	tracked = append([]string(nil), paths...)
+	switch a {
+	case model.Grok:
+		for _, p := range paths {
+			tracked = append(tracked, grokUpdates(p))
+		}
+	case model.Codex:
+		tracked = append(tracked, filepath.Join(codexHome(), "session_index.jsonl"))
+	}
+	return paths, tracked
+}
+
+func grokUpdates(summary string) string { return filepath.Join(filepath.Dir(summary), "updates.jsonl") }
+
+func codexHome() string {
+	if base := os.Getenv("CODEX_HOME"); base != "" {
+		return base
+	}
+	return home(".codex")
+}
+
+// fileParser accounts one JSONL transcript. Sessions span files, since a
+// resumed session continues in a new one; id, the active model and order
+// are the file's own, and records may switch id mid-file.
+type fileParser struct {
+	a           model.Agent
+	p           string
+	id, stream  string
+	activeModel string
+	order       uint64
+	sessions    map[string]*model.Session
+	// latest keeps Claude's last record of each message; ordered holds the
+	// other agents' turns as they appear.
+	latest  map[string]model.Turn
+	ordered []model.Turn
+}
+
+func newFileParser(a model.Agent, p string, sessions map[string]*model.Session) *fileParser {
+	f := &fileParser{a: a, p: p, id: fileID(p), stream: "main", sessions: sessions, latest: map[string]model.Turn{}}
+	if a == model.Claude && filepath.Base(filepath.Dir(p)) == "subagents" {
+		f.id = filepath.Base(filepath.Dir(filepath.Dir(p)))
+		f.stream = "subagent/" + strings.TrimSuffix(filepath.Base(p), ".jsonl")
+	}
+	return f
+}
+
+func fileID(p string) string { return strings.TrimSuffix(filepath.Base(p), filepath.Ext(p)) }
+
+// line applies one decoded record: the session fields every agent shares,
+// then the agent's own turn rules.
+func (f *fileParser) line(v obj) {
+	f.order++
+	if v == nil {
+		return
+	}
+	kind := str(v["type"])
+	m := v["message"]
+	payload := v["payload"]
+	if f.a == model.WorkBuddy {
+		// Rust resolves missing IDs per record, not from the previous line.
+		f.id = fileID(f.p)
+	}
+	if f.a == model.Codex && kind == "session_meta" {
+		if s := str(first(get(payload, "id"), get(payload, "session_id"))); s != "" {
+			f.id = s
+		}
+	} else if f.a == model.Pi && kind == "session" {
+		if s := str(v["id"]); s != "" {
+			f.id = s
+		}
+	} else if s := str(first(v["sessionId"], v["session_id"])); s != "" {
+		f.id = s
+	}
+	s := f.sessions[f.id]
+	if s == nil {
+		s = session(f.a, f.id)
+		f.sessions[f.id] = s
+	}
+	at := ts(v["timestamp"])
+	observe(s, at)
+	if cwd := str(v["cwd"]); cwd != "" {
+		s.WorkingDirectory = cwd
+	}
+	if s.Title == "" && (kind == "user" || str(get(m, "role")) == "user") {
+		s.Title = text(get(m, "content"))
+	}
+	if kind == "ai-title" {
+		s.Title = compact(str(v["aiTitle"]))
+	}
+	if kind == "custom-title" {
+		s.Title = compact(str(v["customTitle"]))
+	}
+	t := model.Turn{Agent: f.a, SessionKey: s.Key, CreatedAt: at, ContextStream: f.stream, ContextOrder: f.order - 1}
+	valid := false
+	switch f.a {
+	case model.Claude:
+		f.claude(v, s, t, kind, m)
+	case model.Codex:
+		t, valid = f.codex(s, t, kind, payload)
+	case model.Pi:
+		t, valid = pi(v, s, t, kind, m)
+	case model.WorkBuddy:
+		t, valid = f.workBuddy(v, s, t)
+	}
+	if valid {
+		f.ordered = append(f.ordered, t)
+	}
+}
+
+// claude keeps the last record of each message: streaming writes the same
+// message id several times with growing usage.
+func (f *fileParser) claude(v obj, s *model.Session, t model.Turn, kind string, m any) {
+	if x := str(v["entrypoint"]); x != "" {
+		s.Source = x
+	}
+	if x := str(v["effort"]); x != "" {
+		s.AgentMode = x
+	}
+	if kind != "assistant" {
+		return
+	}
+	if x := str(get(m, "model")); x != "" {
+		s.SelectedModel = x
+	}
+	u := get(m, "usage")
+	if u == nil {
+		return
+	}
+	t.Model = str(get(m, "model"))
+	t.InputTokens = num(get(u, "input_tokens"))
+	t.OutputTokens = num(get(u, "output_tokens"))
+	t.CacheReadTokens = num(get(u, "cache_read_input_tokens"))
+	t.CacheCreation5mTokens = num(get(u, "cache_creation", "ephemeral_5m_input_tokens"))
+	t.CacheCreation1hTokens = num(get(u, "cache_creation", "ephemeral_1h_input_tokens"))
+	t.CacheCreation5mTokens += max(0, num(get(u, "cache_creation_input_tokens"))-t.CacheCreation5mTokens-t.CacheCreation1hTokens)
+	t.CacheCreationTokens = t.CacheCreation5mTokens + t.CacheCreation1hTokens
+	t.DedupKey = str(first(get(m, "id"), v["requestId"]))
+	if t.DedupKey == "" {
+		t.DedupKey = fmt.Sprintf("anon:%s:%d", f.p, f.order)
+	}
+	f.latest[t.DedupKey] = t
+}
+
+func (f *fileParser) codex(s *model.Session, t model.Turn, kind string, payload any) (model.Turn, bool) {
+	s.WorkingDirectory = str(first(get(payload, "cwd"), s.WorkingDirectory))
+	switch kind {
+	case "session_meta":
+		if x := get(payload, "source"); x != nil {
+			if st, ok := x.(string); ok {
+				s.Source = st
+			} else {
+				b, _ := json.Marshal(x)
+				s.Source = "subagent"
+				if strings.Contains(string(b), "guardian") {
+					s.Source = "guardian"
+				}
+			}
+		}
+	case "turn_context":
+		f.activeModel = str(get(payload, "model"))
+		s.SelectedModel = f.activeModel
+		s.AgentMode = str(first(get(payload, "collaboration_mode", "kind"), get(payload, "collaboration_mode")))
+	case "response_item":
+		if s.Title == "" && str(get(payload, "role")) == "user" {
+			s.Title = text(get(payload, "content"))
+		}
+	case "event_msg":
+		if str(get(payload, "type")) == "user_message" && s.Title == "" {
+			s.Title = compact(str(get(payload, "message")))
+		}
+		if str(get(payload, "type")) != "token_count" {
+			return t, false
+		}
+		u := get(payload, "info", "last_token_usage")
+		if u == nil {
+			return t, false
+		}
+		// Codex repeats a token count when it re-emits events; the running
+		// total identifies the turn.
+		total := first(get(payload, "info", "total_token_usage"), u)
+		t.DedupKey = fmt.Sprintf("%s#%g:%g:%g:%g", f.id, num(get(total, "input_tokens")), num(get(total, "cached_input_tokens")), num(get(total, "cache_write_input_tokens")), num(get(total, "output_tokens")))
+		t.CacheReadTokens = num(get(u, "cached_input_tokens"))
+		t.InputTokens = max(0, num(get(u, "input_tokens"))-t.CacheReadTokens)
+		t.OutputTokens = num(get(u, "output_tokens"))
+		t.CacheCreationTokens = num(get(u, "cache_write_input_tokens"))
+		t.Model = f.activeModel
+		return t, true
+	}
+	return t, false
+}
+
+func pi(v obj, s *model.Session, t model.Turn, kind string, m any) (model.Turn, bool) {
+	if kind == "thinking_level_change" {
+		s.AgentMode = str(v["thinkingLevel"])
+	}
+	if kind != "message" || str(get(m, "role")) != "assistant" || get(m, "usage") == nil {
+		return t, false
+	}
+	u := get(m, "usage")
+	t.InputTokens = num(get(u, "input"))
+	t.OutputTokens = num(get(u, "output"))
+	t.CacheReadTokens = num(get(u, "cacheRead"))
+	t.CacheCreationTokens = num(get(u, "cacheWrite"))
+	if c := get(u, "cost", "total"); c != nil && num(c) >= 0 {
+		cost := num(c)
+		t.RecordedCost = &cost
+	}
+	t.Model = modelName(str(get(m, "provider")), str(get(m, "model")))
+	s.SelectedModel = t.Model
+	return t, true
+}
+
+func (f *fileParser) workBuddy(v obj, s *model.Session, t model.Turn) (model.Turn, bool) {
+	pr := v["providerData"]
+	u := get(pr, "usage")
+	raw := get(pr, "rawUsage")
+	if s.AgentMode == "" {
+		s.AgentMode = str(get(pr, "agent"))
+	}
+	if u == nil {
+		return t, false
+	}
+	t.DedupKey = str(first(get(pr, "messageId"), v["id"]))
+	if t.DedupKey == "" {
+		t.DedupKey = fmt.Sprintf("anon:%s:%d", f.p, f.order)
+	}
+	t.InputTokens, t.OutputTokens, t.CacheReadTokens, t.CacheCreationTokens = buddyUsage(u, raw)
+	if t.InputTokens+t.OutputTokens+t.CacheReadTokens+t.CacheCreationTokens == 0 {
+		return t, false
+	}
+	for _, k := range []string{"model", "requestModelId", "requestModelName"} {
+		if x := strings.TrimSpace(str(get(pr, k))); x != "" {
+			t.Model = x
+			break
+		}
+	}
+	if t.Model == "" {
+		t.Model = "unknown"
+	}
+	if s.SelectedModel == "" || s.SelectedModel == "unknown" {
+		s.SelectedModel = t.Model
+	}
+	return t, true
+}
+
+// account adds the file's turns to d, dropping any already counted: Claude
+// dedups globally by message (a resumed session copies earlier messages),
+// the others per session.
+func (f *fileParser) account(d *model.Data, seen map[string]bool) {
+	if f.a == model.Claude {
+		for _, t := range f.latest {
+			f.ordered = append(f.ordered, t)
+		}
+		sort.Slice(f.ordered, func(i, j int) bool { return f.ordered[i].ContextOrder < f.ordered[j].ContextOrder })
+	}
+	for _, t := range f.ordered {
+		key := t.SessionKey + "\x00" + t.DedupKey
+		if f.a == model.Claude {
+			key = t.DedupKey
+		}
+		if t.DedupKey != "" && seen[key] {
+			continue
+		}
+		seen[key] = true
+		s := f.sessions[strings.TrimPrefix(t.SessionKey, prefix(f.a)+"/")]
+		if f.a == model.Claude && (t.CreatedAt < d.TurnsStart || t.CreatedAt >= d.TurnsEnd) {
+			continue
+		}
+		add(s, t)
+		if t.CreatedAt >= d.TurnsStart && t.CreatedAt < d.TurnsEnd {
+			d.Turns = append(d.Turns, t)
+		}
+	}
+}
+
 func modelName(provider, id string) string {
 	id = strings.TrimSpace(strings.SplitN(id, "(", 2)[0])
 	if id == "" {
