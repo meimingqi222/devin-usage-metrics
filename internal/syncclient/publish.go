@@ -86,54 +86,11 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 		return e
 	}
 	name := "v3-head-" + id + ".json"
-	raw, h, status, e := t.request(ctx, "GET", "/v1/objects/"+url.PathEscape(name), nil, nil)
+	base, e := t.readPublishBase(ctx, id, name, previous)
 	if e != nil {
 		return e
 	}
-	var old head
-	var prior manifest
-	var parent *string
-	condition := map[string]string{"If-None-Match": "*"}
-	if status == 200 {
-		if e = json.Unmarshal(raw, &old); e != nil {
-			return e
-		}
-		if old.Protocol != 3 || old.DeviceID != id || !validHash(old.Manifest) {
-			return errors.New("invalid existing head")
-		}
-		revision := h.Get("ETag")
-		if revision == "" || strings.HasPrefix(strings.TrimSpace(revision), "W/") {
-			return errors.New("strong head ETag required for safe publication")
-		}
-		condition = map[string]string{"If-Match": revision}
-		parent = &old.Manifest
-		// Re-read under the CAS base, so a concurrent publish cannot lose history.
-		load := t.loadManifestFresh
-		if t.verifyManifest(ctx, old.Manifest) {
-			load = t.loadManifest
-		}
-		p, e := load(ctx, id, 3, old.Manifest)
-		if e != nil && old.Previous != nil {
-			p, e = t.loadManifestFresh(ctx, id, 3, *old.Previous)
-			parent = old.Previous
-		}
-		if e != nil {
-			return e
-		}
-		previous = &p
-		b, e := t.manifestBytes(ctx, "v3-manifest-"+*parent+".json", *parent, *parent == old.Manifest)
-		if e != nil {
-			return e
-		}
-		if e = json.Unmarshal(b, &prior); e != nil {
-			return e
-		}
-		if e = t.auditPrior(ctx, &prior); e != nil {
-			return e
-		}
-	} else if status != 404 {
-		return statusError(status)
-	}
+	old, prior, parent, previous := base.old, base.prior, base.parent, base.previous
 	now := time.Now().Unix()
 	retained := now - 366*86400
 	if parent != nil && *parent == old.Manifest && lastExport.scope == t.scope() && lastExport.device == id && lastExport.head == old.Manifest && lastExport.input == input && retained < lastExport.expires && previous.Start <= max(data.TurnsStart, retained) && previous.End >= min(data.TurnsEnd, now) {
@@ -142,6 +99,153 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 	}
 	syncdiag.Log(ctx, "encode_start")
 	encodeStarted := time.Now()
+	turns, sessions := exportRecords(id, data, previous, retained)
+	if parent == nil && len(sessions)+len(turns) == 0 {
+		return nil
+	}
+	// Retention can change the export even when the input has not changed.
+	expires := int64(1<<63 - 1)
+	for _, v := range turns {
+		expires = min(expires, v.CreatedAt)
+	}
+	for _, v := range sessions {
+		expires = min(expires, max(v.CreatedAt, v.LastActivityAt))
+	}
+	remember := func(digest string) {
+		lastExport.scope, lastExport.device = t.scope(), id
+		lastExport.head, lastExport.input, lastExport.expires = digest, input, expires
+	}
+	host, _ := os.Hostname()
+	if previous != nil && previous.DeviceName != "" {
+		host = previous.DeviceName
+	}
+	start := max(data.TurnsStart, retained)
+	end := data.TurnsEnd
+	if previous != nil {
+		start = max(retained, min(start, previous.Start))
+		end = max(end, previous.End)
+	}
+	m := manifest{Protocol: 3, Schema: 1, DeviceID: id, DeviceName: host, Created: now, Parent: parent, Retained: retained, Start: start, End: end, Blocks: []reference{}, Sessions: []reference{}, SessionCount: len(sessions), TurnCount: len(turns)}
+	enc := blockEncoder{m: &m, objects: map[string][]byte{}}
+	defer enc.compressor.close()
+	if e = enc.groups(turns, sessions, prior); e != nil {
+		return e
+	}
+	sort.Slice(m.Blocks, func(i, j int) bool { return m.Blocks[i].File < m.Blocks[j].File })
+	sort.Slice(m.Sessions, func(i, j int) bool { return m.Sessions[i].File < m.Sessions[j].File })
+	source, e := json.Marshal([]any{id, host, start, end, m.Blocks, m.Sessions})
+	if e != nil {
+		return e
+	}
+	m.Source = hash(source)
+	syncdiag.Log(ctx, "encode_end", "elapsed_ms", time.Since(encodeStarted).Milliseconds(), "references", len(m.Blocks)+len(m.Sessions), "encoded_objects", len(enc.objects), "reused_references", len(m.Blocks)+len(m.Sessions)-len(enc.objects))
+	if e = t.uploadObjects(ctx, enc.objects, prior); e != nil {
+		return e
+	}
+	if parent != nil && *parent == old.Manifest && prior.Source == m.Source {
+		syncdiag.Log(ctx, "publish_unchanged", "reason", "source_hash")
+		remember(old.Manifest)
+		return nil
+	}
+	if len(m.Blocks)+len(m.Sessions) > 16384 {
+		return errors.New("too many blocks")
+	}
+	b, e := json.Marshal(m)
+	if e != nil {
+		return e
+	}
+	if len(b) > 8<<20 {
+		return errors.New("manifest exceeds limit")
+	}
+	digest := hash(b)
+	syncdiag.Log(ctx, "manifest_publish_start")
+	if _, e = t.putImmutable(ctx, "v3-manifest-"+digest+".json", b); e != nil {
+		return e
+	}
+	t.rememberManifest("v3-manifest-"+digest+".json", b)
+	newHead := head{Protocol: 3, Sequence: old.Sequence + 1, Manifest: digest, Previous: parent, Updated: now, DeviceID: id}
+	b, e = json.Marshal(newHead)
+	if e != nil {
+		return e
+	}
+	syncdiag.Log(ctx, "head_cas_start", "sequence", newHead.Sequence)
+	if e = t.put(ctx, name, b, base.condition); e != nil {
+		return e
+	}
+	syncdiag.Log(ctx, "head_cas_committed", "sequence", newHead.Sequence)
+	remember(digest)
+	// The next cycle re-reads this head under its CAS base. The package is the
+	// data just written, so keep it under the key a read of this manifest
+	// uses instead of decoding every block again.
+	cutoff := day(time.Now().Unix() - 366*86400)
+	rememberPackage(t.packageKey(id, "v3-manifest-"+digest, cutoff), publishedPackage(id, host, start, end, now, cutoff, turns, sessions))
+	return nil
+}
+
+// publishBase is what a publication extends: the device's head, the
+// condition its replacement must meet, and the parent manifest with its
+// package, read under that head's revision.
+type publishBase struct {
+	old       head
+	prior     manifest
+	parent    *string
+	condition map[string]string
+	previous  *devicePackage
+}
+
+func (t transport) readPublishBase(ctx context.Context, id, name string, previous *devicePackage) (publishBase, error) {
+	base := publishBase{condition: map[string]string{"If-None-Match": "*"}, previous: previous}
+	raw, h, status, e := t.request(ctx, "GET", "/v1/objects/"+url.PathEscape(name), nil, nil)
+	if e != nil {
+		return base, e
+	}
+	if status == 404 {
+		return base, nil
+	}
+	if status != 200 {
+		return base, statusError(status)
+	}
+	old := &base.old
+	if e = json.Unmarshal(raw, old); e != nil {
+		return base, e
+	}
+	if old.Protocol != 3 || old.DeviceID != id || !validHash(old.Manifest) {
+		return base, errors.New("invalid existing head")
+	}
+	revision := h.Get("ETag")
+	if revision == "" || strings.HasPrefix(strings.TrimSpace(revision), "W/") {
+		return base, errors.New("strong head ETag required for safe publication")
+	}
+	base.condition = map[string]string{"If-Match": revision}
+	base.parent = &old.Manifest
+	// Re-read under the CAS base, so a concurrent publish cannot lose history.
+	load := t.loadManifestFresh
+	if t.verifyManifest(ctx, old.Manifest) {
+		load = t.loadManifest
+	}
+	p, e := load(ctx, id, 3, old.Manifest)
+	if e != nil && old.Previous != nil {
+		p, e = t.loadManifestFresh(ctx, id, 3, *old.Previous)
+		base.parent = old.Previous
+	}
+	if e != nil {
+		return base, e
+	}
+	base.previous = &p
+	b, e := t.manifestBytes(ctx, "v3-manifest-"+*base.parent+".json", *base.parent, *base.parent == old.Manifest)
+	if e != nil {
+		return base, e
+	}
+	if e = json.Unmarshal(b, &base.prior); e != nil {
+		return base, e
+	}
+	return base, t.auditPrior(ctx, &base.prior)
+}
+
+// exportRecords merges the previous publication with the current data:
+// this device's records only, turns within retention, and sessions still
+// active then or still holding a retained turn.
+func exportRecords(id string, data model.Data, previous *devicePackage, retained int64) (map[turnIdentity]model.Turn, map[string]model.Session) {
 	turns := map[turnIdentity]model.Turn{}
 	sessions := map[string]model.Session{}
 	add := func(ss []model.Session, ts []model.Turn) {
@@ -175,21 +279,21 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 			delete(sessions, k)
 		}
 	}
-	if parent == nil && len(sessions)+len(turns) == 0 {
-		return nil
-	}
-	// Retention can change the export even when the input has not changed.
-	expires := int64(1<<63 - 1)
-	for _, v := range turns {
-		expires = min(expires, v.CreatedAt)
-	}
-	for _, v := range sessions {
-		expires = min(expires, max(v.CreatedAt, v.LastActivityAt))
-	}
-	remember := func(digest string) {
-		lastExport.scope, lastExport.device = t.scope(), id
-		lastExport.head, lastExport.input, lastExport.expires = digest, input, expires
-	}
+	return turns, sessions
+}
+
+// blockEncoder writes a manifest's blocks: a group whose content the parent
+// already holds is referenced again, others are compressed and split until
+// each block fits the protocol limits.
+type blockEncoder struct {
+	m          *manifest
+	objects    map[string][]byte
+	compressor blockCompressor
+}
+
+// groups encodes turns by agent and day, and sessions by day.
+func (enc *blockEncoder) groups(turns map[turnIdentity]model.Turn, sessions map[string]model.Session, prior manifest) error {
+	m := enc.m
 	groups := map[string][]model.Turn{}
 	sgroups := map[string][]model.Session{}
 	for _, v := range turns {
@@ -199,80 +303,6 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 	for _, v := range sessions {
 		k := string(v.Agent) + "/" + day(max(v.CreatedAt, v.LastActivityAt))
 		sgroups[k] = append(sgroups[k], v)
-	}
-	host, _ := os.Hostname()
-	if previous != nil && previous.DeviceName != "" {
-		host = previous.DeviceName
-	}
-	start := max(data.TurnsStart, retained)
-	end := data.TurnsEnd
-	if previous != nil {
-		start = max(retained, min(start, previous.Start))
-		end = max(end, previous.End)
-	}
-	m := manifest{Protocol: 3, Schema: 1, DeviceID: id, DeviceName: host, Created: now, Parent: parent, Retained: retained, Start: start, End: end, Blocks: []reference{}, Sessions: []reference{}, SessionCount: len(sessions), TurnCount: len(turns)}
-	objects := map[string][]byte{}
-	var compressor blockCompressor
-	defer compressor.close()
-	var encodeTurns func([]model.Turn, string, int) error
-	encodeTurns = func(values []model.Turn, fingerprint string, part int) error {
-		b, e := json.Marshal(struct {
-			Protocol int          `json:"protocol"`
-			Schema   int          `json:"data_schema"`
-			Turns    []model.Turn `json:"turns"`
-		}{3, 1, values})
-		if e != nil {
-			return e
-		}
-		z, e := compressor.compress(b)
-		if e != nil {
-			return e
-		}
-		if len(z) > 512<<10 || len(b) > 8<<20 {
-			if len(values) < 2 {
-				return errors.New("single turn exceeds protocol block limit")
-			}
-			mid := len(values) / 2
-			if e = encodeTurns(values[:mid], fingerprint, part); e != nil {
-				return e
-			}
-			return encodeTurns(values[mid:], fingerprint, part+mid)
-		}
-		digest := hash(z)
-		r := reference{File: "v3-block-" + digest + ".zst", Hash: digest, ContentHash: fingerprint, Agent: values[0].Agent, Day: day(values[0].CreatedAt), Part: part, Compressed: len(z), Raw: len(b), Turns: len(values)}
-		m.Blocks = append(m.Blocks, r)
-		objects[r.File] = z
-		return nil
-	}
-	var encodeSessions func([]model.Session, string) error
-	encodeSessions = func(values []model.Session, fingerprint string) error {
-		b, e := json.Marshal(struct {
-			Protocol int             `json:"protocol"`
-			Schema   int             `json:"data_schema"`
-			Sessions []model.Session `json:"sessions"`
-		}{3, 1, values})
-		if e != nil {
-			return e
-		}
-		z, e := compressor.compress(b)
-		if e != nil {
-			return e
-		}
-		if len(z) > 512<<10 || len(b) > 8<<20 {
-			if len(values) < 2 {
-				return errors.New("single session exceeds protocol block limit")
-			}
-			mid := len(values) / 2
-			if e = encodeSessions(values[:mid], fingerprint); e != nil {
-				return e
-			}
-			return encodeSessions(values[mid:], fingerprint)
-		}
-		digest := hash(z)
-		r := reference{File: "v3-session-" + digest + ".zst", Hash: digest, ContentHash: fingerprint, Day: day(max(values[0].CreatedAt, values[0].LastActivityAt)), Compressed: len(z), Raw: len(b), Sessions: len(values)}
-		m.Sessions = append(m.Sessions, r)
-		objects[r.File] = z
-		return nil
 	}
 	for _, v := range groups {
 		sort.Slice(v, func(i, j int) bool {
@@ -305,7 +335,7 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 			continue
 		}
 		first := len(m.Blocks)
-		if e = encodeTurns(v, fingerprint, 0); e != nil {
+		if e = enc.turns(v, fingerprint, 0); e != nil {
 			return e
 		}
 		for index := first; index < len(m.Blocks); index++ {
@@ -331,41 +361,94 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 			m.Sessions = append(m.Sessions, reused...)
 			continue
 		}
-		if e = encodeSessions(v, fingerprint); e != nil {
+		if e = enc.sessions(v, fingerprint); e != nil {
 			return e
 		}
 	}
-	sort.Slice(m.Blocks, func(i, j int) bool { return m.Blocks[i].File < m.Blocks[j].File })
-	sort.Slice(m.Sessions, func(i, j int) bool { return m.Sessions[i].File < m.Sessions[j].File })
-	source, e := json.Marshal([]any{id, host, start, end, m.Blocks, m.Sessions})
+	return nil
+}
+
+func (enc *blockEncoder) turns(values []model.Turn, fingerprint string, part int) error {
+	b, e := json.Marshal(struct {
+		Protocol int          `json:"protocol"`
+		Schema   int          `json:"data_schema"`
+		Turns    []model.Turn `json:"turns"`
+	}{3, 1, values})
 	if e != nil {
 		return e
 	}
-	m.Source = hash(source)
-	// Existing content-addressed objects are verified, not blindly overwritten.
-	files := make([]string, 0, len(objects))
-	for file := range objects {
-		files = append(files, file)
+	z, e := enc.compressor.compress(b)
+	if e != nil {
+		return e
 	}
-	syncdiag.Log(ctx, "encode_end", "elapsed_ms", time.Since(encodeStarted).Milliseconds(), "references", len(m.Blocks)+len(m.Sessions), "encoded_objects", len(files), "reused_references", len(m.Blocks)+len(m.Sessions)-len(files))
-	// Objects the parent manifest references are on the server: it roots them
-	// against GC, and auditPrior dropped any that went missing.
+	if len(z) > 512<<10 || len(b) > 8<<20 {
+		if len(values) < 2 {
+			return errors.New("single turn exceeds protocol block limit")
+		}
+		mid := len(values) / 2
+		if e = enc.turns(values[:mid], fingerprint, part); e != nil {
+			return e
+		}
+		return enc.turns(values[mid:], fingerprint, part+mid)
+	}
+	digest := hash(z)
+	r := reference{File: "v3-block-" + digest + ".zst", Hash: digest, ContentHash: fingerprint, Agent: values[0].Agent, Day: day(values[0].CreatedAt), Part: part, Compressed: len(z), Raw: len(b), Turns: len(values)}
+	enc.m.Blocks = append(enc.m.Blocks, r)
+	enc.objects[r.File] = z
+	return nil
+}
+
+func (enc *blockEncoder) sessions(values []model.Session, fingerprint string) error {
+	b, e := json.Marshal(struct {
+		Protocol int             `json:"protocol"`
+		Schema   int             `json:"data_schema"`
+		Sessions []model.Session `json:"sessions"`
+	}{3, 1, values})
+	if e != nil {
+		return e
+	}
+	z, e := enc.compressor.compress(b)
+	if e != nil {
+		return e
+	}
+	if len(z) > 512<<10 || len(b) > 8<<20 {
+		if len(values) < 2 {
+			return errors.New("single session exceeds protocol block limit")
+		}
+		mid := len(values) / 2
+		if e = enc.sessions(values[:mid], fingerprint); e != nil {
+			return e
+		}
+		return enc.sessions(values[mid:], fingerprint)
+	}
+	digest := hash(z)
+	r := reference{File: "v3-session-" + digest + ".zst", Hash: digest, ContentHash: fingerprint, Day: day(max(values[0].CreatedAt, values[0].LastActivityAt)), Compressed: len(z), Raw: len(b), Sessions: len(values)}
+	enc.m.Sessions = append(enc.m.Sessions, r)
+	enc.objects[r.File] = z
+	return nil
+}
+
+// uploadObjects sends encoded objects the server may lack. Objects the
+// parent manifest references are on the server: it roots them against GC,
+// and auditPrior dropped any that went missing. Existing content-addressed
+// objects are verified, not blindly overwritten.
+func (t transport) uploadObjects(ctx context.Context, objects map[string][]byte, prior manifest) error {
 	held := map[string]bool{}
 	for _, r := range append(append([]reference{}, prior.Blocks...), prior.Sessions...) {
 		held[r.File] = true
 	}
 	var uploaded, existing stdatomic.Int64
 	var pending []string
-	for _, file := range files {
+	for file, z := range objects {
 		if held[file] {
 			existing.Add(1)
-			t.rememberBlock(file, objects[file])
+			t.rememberBlock(file, z)
 		} else {
 			pending = append(pending, file)
 		}
 	}
 	uploadCtx, uploadedDone := syncdiag.Stage(ctx, "upload_blocks")
-	if e = parallelTransfers(uploadCtx, len(pending), func(ctx context.Context, index int) error {
+	e := parallelTransfers(uploadCtx, len(pending), func(ctx context.Context, index int) error {
 		file := pending[index]
 		z := objects[file]
 		sent, err := t.putImmutable(ctx, file, z)
@@ -379,60 +462,24 @@ func (t transport) publish(ctx context.Context, id string, data model.Data, prev
 		}
 		t.rememberBlock(file, z)
 		return nil
-	}); e != nil {
-		syncdiag.Log(uploadCtx, "upload_result", "uploaded", uploaded.Load(), "existing", existing.Load())
-		uploadedDone(e)
-		return e
-	}
+	})
 	syncdiag.Log(uploadCtx, "upload_result", "uploaded", uploaded.Load(), "existing", existing.Load())
-	uploadedDone(nil)
-	if parent != nil && *parent == old.Manifest && prior.Source == m.Source {
-		syncdiag.Log(ctx, "publish_unchanged", "reason", "source_hash")
-		remember(old.Manifest)
-		return nil
-	}
-	if len(m.Blocks)+len(m.Sessions) > 16384 {
-		return errors.New("too many blocks")
-	}
-	b, e := json.Marshal(m)
-	if e != nil {
-		return e
-	}
-	if len(b) > 8<<20 {
-		return errors.New("manifest exceeds limit")
-	}
-	digest := hash(b)
-	syncdiag.Log(ctx, "manifest_publish_start")
-	if _, e = t.putImmutable(ctx, "v3-manifest-"+digest+".json", b); e != nil {
-		return e
-	}
-	t.rememberManifest("v3-manifest-"+digest+".json", b)
-	newHead := head{Protocol: 3, Sequence: old.Sequence + 1, Manifest: digest, Previous: parent, Updated: now, DeviceID: id}
-	b, e = json.Marshal(newHead)
-	if e != nil {
-		return e
-	}
-	syncdiag.Log(ctx, "head_cas_start", "sequence", newHead.Sequence)
-	if e = t.put(ctx, name, b, condition); e != nil {
-		return e
-	}
-	syncdiag.Log(ctx, "head_cas_committed", "sequence", newHead.Sequence)
-	remember(digest)
-	// The next cycle re-reads this head under its CAS base. The package is the
-	// data just written, so keep it under the key a read of this manifest
-	// uses instead of decoding every block again.
-	published := devicePackage{Schema: 1, DeviceID: id, DeviceName: host, Start: start, End: end, Exported: now}
-	cutoff := day(time.Now().Unix() - 366*86400)
+	uploadedDone(e)
+	return e
+}
+
+// publishedPackage is the package a read of the new manifest would yield.
+// A read skips session shards dated before the cutoff, even when a recent
+// turn kept the session in this publication.
+func publishedPackage(id, host string, start, end, now int64, cutoff string, turns map[turnIdentity]model.Turn, sessions map[string]model.Session) devicePackage {
+	p := devicePackage{Schema: 1, DeviceID: id, DeviceName: host, Start: start, End: end, Exported: now}
 	for _, v := range sessions {
-		// A read skips session shards dated before the cutoff, even when a
-		// recent turn kept the session in this publication.
 		if day(max(v.CreatedAt, v.LastActivityAt)) >= cutoff {
-			published.Sessions = append(published.Sessions, v)
+			p.Sessions = append(p.Sessions, v)
 		}
 	}
 	for _, v := range turns {
-		published.Turns = append(published.Turns, v)
+		p.Turns = append(p.Turns, v)
 	}
-	rememberPackage(t.packageKey(id, "v3-manifest-"+digest, cutoff), published)
-	return nil
+	return p
 }
