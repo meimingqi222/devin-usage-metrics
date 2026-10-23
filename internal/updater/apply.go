@@ -73,7 +73,8 @@ func Apply(payload string) error {
 		cmd = exec.Command("/bin/sh", scriptPath, strconv.Itoa(os.Getpid()), current, resolved, stage)
 	} else {
 		// Values travel through the environment, never interpolated as script code.
-		cmd = exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath)
+		cmd = exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", scriptPath)
+		hideConsole(cmd)
 		cmd.Env = append(os.Environ(), "AUM_PID="+strconv.Itoa(os.Getpid()), "AUM_CURRENT="+current, "AUM_PAYLOAD="+resolved, "AUM_STAGE="+stage)
 	}
 	if err = cmd.Start(); err != nil {
