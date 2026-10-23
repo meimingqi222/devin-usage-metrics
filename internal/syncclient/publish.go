@@ -244,13 +244,29 @@ func (t transport) readPublishBase(ctx context.Context, id, name string, previou
 
 // exportRecords merges the previous publication with the current data:
 // this device's records only, turns within retention, and sessions still
-// active then or still holding a retained turn.
+// active then or still holding a retained turn. Inside the loaded window the
+// current data replaces the previous turns of each session it still holds;
+// turns are keyed by their values, so a re-parsed or updated turn would
+// otherwise be published beside its old version.
 func exportRecords(id string, data model.Data, previous *devicePackage, retained int64) (map[turnIdentity]model.Turn, map[string]model.Session) {
 	turns := map[turnIdentity]model.Turn{}
 	sessions := map[string]model.Session{}
-	add := func(ss []model.Session, ts []model.Turn) {
+	type sessionKey struct {
+		agent model.Agent
+		key   string
+	}
+	current := map[sessionKey]bool{}
+	for _, v := range data.Sessions {
+		if v.DeviceID == "" || v.DeviceID == id {
+			current[sessionKey{v.Agent, v.Key}] = true
+		}
+	}
+	replaced := func(v model.Turn) bool {
+		return v.CreatedAt >= data.TurnsStart && v.CreatedAt < data.TurnsEnd && current[sessionKey{v.Agent, v.SessionKey}]
+	}
+	add := func(ss []model.Session, ts []model.Turn, published bool) {
 		for _, v := range ts {
-			if v.DeviceID != "" && v.DeviceID != id {
+			if v.DeviceID != "" && v.DeviceID != id || published && replaced(v) {
 				continue
 			}
 			v.DeviceID = id
@@ -267,9 +283,9 @@ func exportRecords(id string, data model.Data, previous *devicePackage, retained
 		}
 	}
 	if previous != nil {
-		add(previous.Sessions, previous.Turns)
+		add(previous.Sessions, previous.Turns, true)
 	}
-	add(data.Sessions, data.Turns)
+	add(data.Sessions, data.Turns, false)
 	keys := map[string]bool{}
 	for _, v := range turns {
 		keys[v.SessionKey] = true

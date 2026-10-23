@@ -421,6 +421,49 @@ func TestPublishedPackageSkipsSessionsBeforeCutoff(t *testing.T) {
 	}
 }
 
+// A turn whose values change between publications (a parser fix, a turn still
+// streaming) is keyed by those values; its old version must not stay
+// published beside the new one. Sessions the local data no longer holds keep
+// their published turns.
+func TestPublishReplacesChangedTurnsOfLocalSessions(t *testing.T) {
+	setup(t)
+	resetMemoryCaches()
+	s := &objectServer{objects: map[string][]byte{}}
+	server := httptest.NewServer(http.HandlerFunc(s.serve))
+	defer server.Close()
+	syncTo(t, server.URL)
+	now := time.Now().Unix()
+	load := func(sessions []model.Session, turns []model.Turn) {
+		t.Helper()
+		if _, err := Cycle(context.Background(), model.Data{TurnsStart: now - 86400, TurnsEnd: now + 1, Sessions: sessions, Turns: turns}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	live := model.Session{Agent: model.Antigravity, Key: "live", CreatedAt: now, LastActivityAt: now}
+	gone := model.Session{Agent: model.Antigravity, Key: "gone", CreatedAt: now, LastActivityAt: now}
+	load([]model.Session{live, gone}, []model.Turn{
+		{Agent: model.Antigravity, SessionKey: "live", CreatedAt: now, InputTokens: 1, CacheCreationTokens: 5},
+		{Agent: model.Antigravity, SessionKey: "gone", CreatedAt: now, InputTokens: 7},
+	})
+	load([]model.Session{live}, []model.Turn{{Agent: model.Antigravity, SessionKey: "live", CreatedAt: now, InputTokens: 2}})
+	var h head
+	s.mu.Lock()
+	unmarshal(t, s.objects["v3-head-local.json"], &h)
+	s.mu.Unlock()
+	packageCache = newLRU[devicePackage](64<<20, 256)
+	read, err := transport{server.URL, "token"}.loadManifestFresh(context.Background(), "local", 3, h.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]float64{}
+	for _, v := range read.Turns {
+		got[v.SessionKey] += v.InputTokens + v.CacheCreationTokens
+	}
+	if len(read.Turns) != 2 || got["live"] != 2 || got["gone"] != 7 {
+		t.Fatalf("published turns %+v", read.Turns)
+	}
+}
+
 // Repairing a damaged object uses If-Match; its 412 means another writer
 // changed it and must stay in the log, unlike the first upload's expected 412.
 func TestRepairConflictIsLogged(t *testing.T) {
