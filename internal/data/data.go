@@ -146,7 +146,19 @@ func Load(a model.Agent, start, end int64, refresh bool) model.Data {
 
 // LoadContext preserves the caller's diagnostic run across source workers.
 func LoadContext(ctx context.Context, a model.Agent, start, end int64, refresh bool) model.Data {
-	return load(syncdiag.WithRun(ctx), a, start, end, refresh, false)
+	mode := cachedLoad
+	if refresh {
+		mode = rebuildLoad
+	}
+	return load(syncdiag.WithRun(ctx), a, start, end, mode)
+}
+
+// CheckContext checks sources immediately, bypassing the five-minute snapshot
+// TTL like Reload, but resumes Devin from its incremental watermark instead of
+// rebuilding changed databases. Historical edits outside the overlap are only
+// picked up by a later Reload.
+func CheckContext(ctx context.Context, a model.Agent, start, end int64) model.Data {
+	return load(syncdiag.WithRun(ctx), a, start, end, checkLoad)
 }
 
 // Reload checks sources immediately, bypassing the five-minute snapshot TTL.
@@ -157,11 +169,21 @@ func Reload(a model.Agent, start, end int64) model.Data {
 }
 
 func ReloadContext(ctx context.Context, a model.Agent, start, end int64) model.Data {
-	return load(syncdiag.WithRun(ctx), a, start, end, true, true)
+	return load(syncdiag.WithRun(ctx), a, start, end, reloadLoad)
 }
 
-func load(ctx context.Context, a model.Agent, start, end int64, refresh, reuseUnchanged bool) (result model.Data) {
-	ctx = syncdiag.WithFields(ctx, "agent", diagnosticAgent(a), "refresh", refresh, "reuse_unchanged", reuseUnchanged)
+type loadMode int
+
+const (
+	cachedLoad  loadMode = iota // serve a covering snapshot younger than five minutes
+	checkLoad                   // check sources now; Devin stays incremental
+	reloadLoad                  // check sources now; rebuild changed sources
+	rebuildLoad                 // rebuild every source
+)
+
+func load(ctx context.Context, a model.Agent, start, end int64, lm loadMode) (result model.Data) {
+	refresh, reuseUnchanged := lm >= reloadLoad, lm == reloadLoad
+	ctx = syncdiag.WithFields(ctx, "agent", diagnosticAgent(a), "refresh", refresh, "reuse_unchanged", reuseUnchanged, "check_now", lm == checkLoad)
 	ctx, finish := syncdiag.Watch(ctx, "agent_load")
 	started := time.Now()
 	stats := new(decodeStats)
@@ -209,8 +231,8 @@ func load(ctx context.Context, a model.Agent, start, end int64, refresh, reuseUn
 	if old.At > 0 {
 		age = max(0, now-old.At)
 	}
-	syncdiag.Log(ctx, "snapshot_result", "reason", snapshotReason(old, start, end, now, refresh, reuseUnchanged, readErr, decodeErr), "read_ms", readMS, "decode_ms", decodeMS, "bytes", len(b), "age_seconds", age, "covers_start", coversStart, "covers_end", covers, "fresh_sources", old.FreshSources, "read_error", syncdiag.ErrorCode(readErr), "decode_error", syncdiag.ErrorCode(decodeErr))
-	if !refresh && covers && now-old.At <= 300 {
+	syncdiag.Log(ctx, "snapshot_result", "reason", snapshotReason(old, start, end, now, lm, readErr, decodeErr), "read_ms", readMS, "decode_ms", decodeMS, "bytes", len(b), "age_seconds", age, "covers_start", coversStart, "covers_end", covers, "fresh_sources", old.FreshSources, "read_error", syncdiag.ErrorCode(readErr), "decode_error", syncdiag.ErrorCode(decodeErr))
+	if lm == cachedLoad && covers && now-old.At <= 300 {
 		mode = "snapshot"
 		return filter(old.Data, start, end)
 	}

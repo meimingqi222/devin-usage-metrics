@@ -1,6 +1,7 @@
 package data_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -267,14 +268,22 @@ func TestReloadRebuildsHistoricalDevinEdits(t *testing.T) {
 	check(t, data.Load(model.Devin, 0, now+3600, true), 2)
 	// The old session lies outside the ordinary incremental query overlap.
 	exec(t, c, "UPDATE message_nodes SET chat_message=? WHERE session_id='old'", msg("old", 99))
+	tokens := func(d model.Data) (n float64) {
+		for _, turn := range d.Turns {
+			n += turn.InputTokens
+		}
+		return n
+	}
+	// The desktop shows this incremental check before the rebuild finishes.
+	checked := data.CheckContext(context.Background(), model.Devin, 0, now+3600)
+	check(t, checked, 2)
+	if got := tokens(checked); got != 2 {
+		t.Fatalf("incremental check rescanned history: %v", got)
+	}
 	d := data.Reload(model.Devin, 0, now+3600)
 	check(t, d, 2)
-	var tokens float64
-	for _, turn := range d.Turns {
-		tokens += turn.InputTokens
-	}
-	if tokens != 100 {
-		t.Fatalf("manual reload kept old historical metrics: %v", tokens)
+	if got := tokens(d); got != 100 {
+		t.Fatalf("manual reload kept old historical metrics: %v", got)
 	}
 }
 

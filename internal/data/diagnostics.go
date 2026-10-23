@@ -51,7 +51,8 @@ func sourceResultError(d model.Data) error {
 	return nil
 }
 
-func snapshotReason(s snapshot, start, end, now int64, refresh, reuse bool, readErr, decodeErr error) string {
+func snapshotReason(s snapshot, start, end, now int64, lm loadMode, readErr, decodeErr error) string {
+	refresh, reuse := lm >= reloadLoad, lm == reloadLoad
 	switch {
 	case readErr != nil:
 		return "snapshot_unavailable"
@@ -69,6 +70,8 @@ func snapshotReason(s snapshot, start, end, now int64, refresh, reuse bool, read
 		return "range_end_not_covered"
 	case refresh:
 		return "manual_source_check"
+	case lm == checkLoad:
+		return "incremental_source_check"
 	case now-s.At > 300:
 		return "ttl_expired"
 	default:

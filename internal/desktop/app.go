@@ -131,18 +131,29 @@ func (a *App) load(agent model.Agent, refresh bool) {
 		ctx := syncdiag.WithFields(syncdiag.WithRun(a.ctx), "operation", "desktop_load", "agent", string(agent), "refresh", refresh)
 		syncdiag.Log(ctx, "desktop_load_start", syncdiag.BuildFields()...)
 		end := time.Now().Add(time.Hour).Unix()
+		apply := func(d model.Data, phase string) func() {
+			readyAt := time.Now()
+			return func() {
+				syncdiag.Log(ctx, "desktop_load_applied", "apply_wait_ms", time.Since(readyAt).Milliseconds(), "phase", phase)
+				a.loaded[agent] = d
+				a.loadedAt = time.Now().Format("15:04:05")
+				a.hasLoaded = true
+			}
+		}
 		var d model.Data
+		if refresh && agent == model.Devin {
+			// A changed Devin database takes seconds to rebuild in full; show
+			// the incremental result first while the rebuild stays busy.
+			a.post(apply(data.CheckContext(ctx, agent, 0, end), "incremental"))
+		}
 		if refresh {
 			d = data.ReloadContext(ctx, agent, 0, end)
 		} else {
 			d = data.LoadContext(ctx, agent, 0, end, false)
 		}
-		readyAt := time.Now()
+		applied := apply(d, "final")
 		return func() {
-			syncdiag.Log(ctx, "desktop_load_applied", "apply_wait_ms", time.Since(readyAt).Milliseconds())
-			a.loaded[agent] = d
-			a.loadedAt = time.Now().Format("15:04:05")
-			a.hasLoaded = true
+			applied()
 			if refresh && a.syncDue(time.Now()) {
 				a.sync()
 			}
