@@ -23,7 +23,7 @@ import (
 
 type OpenOptions struct {
 	ReadOnly bool
-	// InterleavedReads uses 64 KiB blocks with an 8 MiB budget for read-only
+	// InterleavedReads uses 64 KiB blocks with a 64 MiB budget for read-only
 	// scans alternating between distant index and payload pages.
 	InterleavedReads bool
 	// BusyTimeout bounds waits for a writer's lock (default 5s, like the plugin).

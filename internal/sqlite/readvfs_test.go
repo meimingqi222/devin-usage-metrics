@@ -341,7 +341,7 @@ func readAheadProfiles(t *testing.T, run func(*testing.T, bool)) {
 }
 
 func TestInterleavedReadAheadBoundsScatteredReads(t *testing.T) {
-	base := &countedFile{data: bytes.Repeat([]byte("abcd"), 2<<20)}
+	base := &countedFile{data: bytes.Repeat([]byte("abcd"), interleavedBudget/4)}
 	f := &readFile{File: base, active: true}
 	f.useInterleavedReadAhead()
 	page := make([]byte, 4096)
@@ -354,7 +354,7 @@ func TestInterleavedReadAheadBoundsScatteredReads(t *testing.T) {
 			}
 		}
 	}
-	if f.stats.FileBytes > 2<<20 || base.reads > 32 {
+	if f.stats.FileBytes > interleavedBudget/4 || base.reads > interleavedBudget/(256<<10) {
 		t.Fatalf("scattered pages amplified reads: bytes=%d calls=%d", f.stats.FileBytes, base.reads)
 	}
 	// Even after visiting every slot, buffers stay inside the per-connection budget.
@@ -367,7 +367,7 @@ func TestInterleavedReadAheadBoundsScatteredReads(t *testing.T) {
 	for _, b := range f.blocks {
 		capacity += cap(b.buffer)
 	}
-	if capacity > 8<<20 {
-		t.Fatalf("cache exceeded 8 MiB: %d", capacity)
+	if capacity > interleavedBudget {
+		t.Fatalf("cache exceeded %d bytes: %d", interleavedBudget, capacity)
 	}
 }

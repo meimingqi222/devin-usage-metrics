@@ -3,6 +3,7 @@ package data_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -195,6 +196,34 @@ func TestDevinHiddenDedupMetadataTimeAndNullTTFT(t *testing.T) {
 	check(t, d, 1)
 	if len(d.Sessions) != 0 || d.Turns[0].CreatedAt != 100 || d.Turns[0].CacheCreationTokens != 8 {
 		t.Fatal(d)
+	}
+}
+
+// Bodies decode in parallel batches; the first occurrence must still win, as
+// in a serial scan, and a malformed body must still surface as an error.
+func TestDevinParallelDecodeKeepsRowOrder(t *testing.T) {
+	h := env(t)
+	conn := db(t, h, ".local/share/devin/cli/sessions.db")
+	exec(t, conn, "CREATE TABLE sessions(id TEXT,title TEXT,created_at INTEGER,last_activity_at INTEGER,hidden INTEGER)")
+	exec(t, conn, "INSERT INTO sessions VALUES ('s','s',90,200,0)")
+	exec(t, conn, "CREATE TABLE message_nodes(session_id TEXT,created_at INTEGER,chat_message TEXT)")
+	exec(t, conn, "BEGIN")
+	for i := range 1000 {
+		exec(t, conn, "INSERT INTO message_nodes VALUES ('s',100,?)", fmt.Sprintf(`{"message_id":"m%d","content":%q,"metadata":{"metrics":{"ttft_ms":1,"input_tokens":%d}}}`, i%300, strings.Repeat("x", 8<<10), i))
+	}
+	exec(t, conn, "COMMIT")
+	d := data.Load(model.Devin, 0, 200, true)
+	check(t, d, 300)
+	var tokens float64
+	for _, turn := range d.Turns {
+		tokens += turn.InputTokens
+	}
+	if tokens != 299*300/2 {
+		t.Fatalf("later duplicates replaced first rows: %v", tokens)
+	}
+	exec(t, conn, "INSERT INTO message_nodes VALUES ('s',100,?)", `{"ttft_ms":`)
+	if d = data.Load(model.Devin, 0, 200, true); len(d.Errors) != 1 || len(d.Turns) != 300 {
+		t.Fatalf("errors=%v turns=%d", d.Errors, len(d.Turns))
 	}
 }
 func TestAntigravityFullUsageSuppressesEcho(t *testing.T) {

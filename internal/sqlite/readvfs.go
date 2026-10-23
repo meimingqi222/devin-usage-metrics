@@ -116,8 +116,13 @@ func (f *readFile) reset() {
 }
 
 // Smaller blocks avoid reading 256 KiB for scattered 4 KiB index pages. More
-// slots retain the alternating index/payload working set without whole-file caching.
+// slots retain the alternating index/payload working set without whole-file
+// caching. On a fragmented 2.4 GB Devin database, 8 MiB re-read every block
+// about 2.7 times (6.6 GB for 1.8 GB of rows); 64 MiB cut that to 2.8 GB and
+// the scan from ~5 s to ~3.3 s. Slots allocate lazily and live per connection.
+const interleavedBudget = 64 << 20
+
 func (f *readFile) useInterleavedReadAhead() {
 	f.blockSize = 64 << 10
-	f.blocks = make([]readBlock, 128)
+	f.blocks = make([]readBlock, interleavedBudget/f.blockSize)
 }

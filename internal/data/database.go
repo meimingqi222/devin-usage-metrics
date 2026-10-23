@@ -1,6 +1,7 @@
 package data
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -329,15 +330,42 @@ func parseDevin(ctx context.Context, d *model.Data, db *sqlite.DB, source string
 		queryStart = min(queryStart, floor)
 	}
 	syncdiag.Log(ctx, "devin_scan_plan", "sessions", len(rows), "active_sessions", len(active), "cached_turns", len(d.Turns), "batches", (len(active)+499)/500, "query_start", queryStart-86400, "query_end", d.TurnsEnd+7*86400, "incremental", previous != nil)
+	// Decoding validates every body in full, which costs about as much as
+	// SQLite reading it. Workers decode batches while the query streams on;
+	// one collector applies them in row order, so dedup matches a serial scan.
+	// Only the collector touches part until the query and collector finish.
+	part := model.Data{TurnsStart: d.TurnsStart, TurnsEnd: d.TurnsEnd}
+	workers := max(1, min(runtime.GOMAXPROCS(0)-1, 6))
+	pending := make(chan *devinBatch, 2*workers)
+	collected := make(chan struct{})
+	go func() {
+		defer close(collected)
+		for b := range pending {
+			<-b.done
+			for _, r := range b.rows {
+				applyDevinRow(&part, r, seen, source)
+			}
+		}
+	}()
+	batch := &devinBatch{done: make(chan struct{})}
+	flush := func() {
+		if len(batch.rows) == 0 {
+			return
+		}
+		b := batch
+		pending <- b
+		go b.decode()
+		batch = &devinBatch{done: make(chan struct{})}
+	}
 	// Chunk the IN list below SQLite's parameter limit. Filter like Rust on
 	// "ttft_ms": every node carries a "metrics" key (null without usage), so
 	// matching it selected all rows and decoded every message body in Go. On
 	// real histories "ttft_ms" occurs exactly on nodes whose metrics is an
 	// object; a body that merely mentions it is still rejected below.
 	for offset := 0; offset < len(active); offset += 500 {
-		batch := active[offset:min(offset+500, len(active))]
-		marks := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
-		args := append(append([]any{}, batch...), queryStart-86400, d.TurnsEnd+7*86400)
+		chunk := active[offset:min(offset+500, len(active))]
+		marks := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		args := append(append([]any{}, chunk...), queryStart-86400, d.TurnsEnd+7*86400)
 		sql := "SELECT rowid AS node_id, session_id, created_at, chat_message FROM message_nodes WHERE session_id IN (" + marks + ") AND created_at >= ? AND created_at < ? AND chat_message LIKE '%\"ttft_ms\"%'"
 		// Stream: each chat_message carries the whole message and tool output,
 		// so materializing the result set peaked at gigabytes.
@@ -346,37 +374,75 @@ func parseDevin(ctx context.Context, d *model.Data, db *sqlite.DB, source string
 			if !ids[id] {
 				return
 			}
-			v, e := decodeProjectedJSON(jsonColumnBytes(r["chat_message"]), devinMessageProjection)
-			if e != nil {
-				fail(d, a, e)
-				return
+			body := bytes.Clone(jsonColumnBytes(r["chat_message"]))
+			batch.rows = append(batch.rows, devinRow{session: id, nodeID: r["node_id"], createdAt: r["created_at"], body: body})
+			batch.bytes += len(body)
+			if batch.bytes >= 2<<20 || len(batch.rows) >= 256 {
+				flush()
 			}
-			m := v["metadata"]
-			u := get(m, "metrics")
-			if u == nil {
-				return
-			}
-			at := ts(first(get(m, "started_generation_at"), get(m, "created_at")))
-			if at <= 0 {
-				at = ts(r["created_at"])
-			}
-			key := str(first(v["message_id"], get(m, "request_id")))
-			if key == "" {
-				key = fmt.Sprint("row:", r["node_id"])
-			}
-			if key != "" {
-				key = id + "\x00" + key
-				if seen[key] {
-					return
-				}
-				seen[key] = true
-			}
-			if at < d.TurnsStart || at >= d.TurnsEnd {
-				return
-			}
-			d.Turns = append(d.Turns, model.Turn{Agent: a, SessionKey: source + "/" + id, CreatedAt: at, Model: str(get(m, "generation_model")), InputTokens: num(get(u, "input_tokens")), OutputTokens: num(get(u, "output_tokens")), CacheReadTokens: num(get(u, "cache_read_tokens")), CacheCreationTokens: num(get(u, "cache_creation_tokens")), TTFTMs: max(0, num(get(u, "ttft_ms"))), TotalTimeMs: num(get(u, "total_time_ms")), DedupKey: key})
 		}, args...)
 	}
+	flush()
+	close(pending)
+	<-collected
+	d.Turns = append(d.Turns, part.Turns...)
+	d.Errors = append(d.Errors, part.Errors...)
+}
+
+type devinRow struct {
+	session           string
+	nodeID, createdAt any
+	body              []byte
+	message           obj
+	err               error
+}
+
+type devinBatch struct {
+	rows  []devinRow
+	bytes int
+	done  chan struct{}
+}
+
+func (b *devinBatch) decode() {
+	for i := range b.rows {
+		r := &b.rows[i]
+		r.message, r.err = decodeProjectedJSON(r.body, devinMessageProjection)
+		r.body = nil
+	}
+	close(b.done)
+}
+
+func applyDevinRow(d *model.Data, r devinRow, seen map[string]bool, source string) {
+	a, id := model.Devin, r.session
+	v, e := r.message, r.err
+	if e != nil {
+		fail(d, a, e)
+		return
+	}
+	m := v["metadata"]
+	u := get(m, "metrics")
+	if u == nil {
+		return
+	}
+	at := ts(first(get(m, "started_generation_at"), get(m, "created_at")))
+	if at <= 0 {
+		at = ts(r.createdAt)
+	}
+	key := str(first(v["message_id"], get(m, "request_id")))
+	if key == "" {
+		key = fmt.Sprint("row:", r.nodeID)
+	}
+	if key != "" {
+		key = id + "\x00" + key
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+	}
+	if at < d.TurnsStart || at >= d.TurnsEnd {
+		return
+	}
+	d.Turns = append(d.Turns, model.Turn{Agent: a, SessionKey: source + "/" + id, CreatedAt: at, Model: str(get(m, "generation_model")), InputTokens: num(get(u, "input_tokens")), OutputTokens: num(get(u, "output_tokens")), CacheReadTokens: num(get(u, "cache_read_tokens")), CacheCreationTokens: num(get(u, "cache_creation_tokens")), TTFTMs: max(0, num(get(u, "ttft_ms"))), TotalTimeMs: num(get(u, "total_time_ms")), DedupKey: key})
 }
 func parseSQLAgent(ctx context.Context, d *model.Data, a model.Agent, db *sqlite.DB) {
 	st, mt := "session", "message"
