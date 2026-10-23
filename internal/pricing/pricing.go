@@ -218,6 +218,10 @@ func resolveLocked(agent model.Agent, name string) (Price, bool) {
 	} else {
 		p, ok = lookup(api, s)
 	}
+	if !ok && agent == model.Antigravity && strings.HasSuffix(s, "-trial") {
+		// Antigravity labels models in preview, e.g. gemini-4-argon-trial.
+		p, ok = lookup(api, strings.TrimSuffix(s, "-trial"))
+	}
 	if !ok && agent == model.Antigravity && strings.HasPrefix(s, "gemini-3.8-flash-") {
 		suffix := strings.TrimPrefix(s, "gemini-3.8-flash-")
 		restricted := suffix == ""

@@ -486,11 +486,24 @@ type field struct {
 	v uint64
 }
 
-func protoField(b []byte, want uint64) field {
+func protoField(b []byte, want uint64) (found field) {
+	protoWalk(b, func(f field) bool {
+		if f.n == want {
+			found = f
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// protoWalk calls fn with each top-level field until fn returns false or the
+// message ends or is malformed.
+func protoWalk(b []byte, fn func(field) bool) {
 	for len(b) > 0 {
 		k, n := binary.Uvarint(b)
 		if n <= 0 {
-			return field{}
+			return
 		}
 		b = b[n:]
 		f := field{n: k >> 3}
@@ -498,35 +511,34 @@ func protoField(b []byte, want uint64) field {
 		case 0:
 			v, n := binary.Uvarint(b)
 			if n <= 0 {
-				return field{}
+				return
 			}
 			f.v = v
 			b = b[n:]
 		case 2:
 			l, n := binary.Uvarint(b)
 			if n <= 0 || l > uint64(len(b)-n) {
-				return field{}
+				return
 			}
 			f.b = b[n : n+int(l)]
 			b = b[n+int(l):]
 		case 1:
 			if len(b) < 8 {
-				return field{}
+				return
 			}
 			b = b[8:]
 		case 5:
 			if len(b) < 4 {
-				return field{}
+				return
 			}
 			b = b[4:]
 		default:
-			return field{}
+			return
 		}
-		if f.n == want {
-			return f
+		if !fn(f) {
+			return
 		}
 	}
-	return field{}
 }
 func pb(b []byte, path ...uint64) field {
 	for i, n := range path {
@@ -569,17 +581,55 @@ func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id string) {
 		}
 	}
 	var full, fallback []model.Turn
+	// A response can be recorded on more than one step; keep it once.
+	byMessage := map[string]int{}
 	for _, r := range query(ctx, d, a, db, "step_usage", "SELECT metadata FROM steps ORDER BY idx") {
 		b := blob(r["metadata"])
-		t := model.Turn{Agent: a, SessionKey: s.Key, CreatedAt: int64(pb(b, 1, 1).v)}
-		observe(s, t.CreatedAt)
-		if u := pb(b, 9).b; u != nil {
-			t.InputTokens = float64(pb(u, 1).v)
-			t.OutputTokens = float64(pb(u, 2).v + pb(u, 10).v)
+		at := int64(pb(b, 1, 1).v)
+		observe(s, at)
+		// Field 9 is the step's usage and each field 28 a retried attempt,
+		// whose usage is its field 2: {1: model ID, 2: input, 3: output
+		// including thinking, 4: cache write, 5: cache read, 7: message ID,
+		// 9: thinking, 10: visible output, 11: response ID}.
+		var usages [][]byte
+		protoWalk(b, func(f field) bool {
+			if f.n == 9 && f.b != nil {
+				usages = append(usages, f.b)
+			} else if f.n == 28 && f.b != nil {
+				if u := pb(f.b, 2).b; u != nil {
+					usages = append(usages, u)
+				}
+			}
+			return true
+		})
+		for _, u := range usages {
+			t := model.Turn{Agent: a, SessionKey: s.Key, CreatedAt: at}
+			t.InputTokens = float64(pb(u, 2).v)
+			t.OutputTokens = float64(max(pb(u, 3).v, pb(u, 9).v+pb(u, 10).v))
+			t.CacheCreationTokens = float64(pb(u, 4).v)
 			t.CacheReadTokens = float64(pb(u, 5).v)
-			t.CacheCreationTokens = float64(pb(u, 3).v)
+			msg := string(pb(u, 7).b)
+			if msg == "" {
+				msg = string(pb(u, 11).b)
+			}
+			if i, ok := byMessage[msg]; ok {
+				f := &full[i]
+				f.InputTokens = max(f.InputTokens, t.InputTokens)
+				f.OutputTokens = max(f.OutputTokens, t.OutputTokens)
+				f.CacheCreationTokens = max(f.CacheCreationTokens, t.CacheCreationTokens)
+				f.CacheReadTokens = max(f.CacheReadTokens, t.CacheReadTokens)
+				continue
+			}
+			if msg != "" {
+				byMessage[msg] = len(full)
+			}
 			full = append(full, t)
-		} else if p := pb(b, 11); p.n != 0 {
+		}
+		if len(usages) > 0 {
+			continue
+		}
+		t := model.Turn{Agent: a, SessionKey: s.Key, CreatedAt: at}
+		if p := pb(b, 11); p.n != 0 {
 			t.InputTokens = float64(p.v)
 			fallback = append(fallback, t)
 		}

@@ -83,6 +83,15 @@ func TestRequestBillingRegressions(t *testing.T) {
 			t.Fatalf("restricted fallback %s: %v", name, ok)
 		}
 	}
+	// Antigravity's preview labels price as the model they preview.
+	trial, ok := pricing.Cost(model.Turn{Agent: model.Antigravity, Model: "gemini-2.5-pro-trial", InputTokens: 1}, "")
+	release, _ := pricing.Cost(model.Turn{Agent: model.Antigravity, Model: "gemini-2.5-pro", InputTokens: 1}, "")
+	if !ok || trial != release {
+		t.Fatalf("trial label priced %v, %v", trial, ok)
+	}
+	if _, ok := pricing.Cost(model.Turn{Agent: model.Claude, Model: "gemini-2.5-pro-trial", InputTokens: 1}, ""); ok {
+		t.Fatal("trial label priced outside Antigravity")
+	}
 }
 
 func TestRefreshPublicContract(t *testing.T) {

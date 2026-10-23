@@ -203,11 +203,22 @@ func TestAntigravityFullUsageSuppressesEcho(t *testing.T) {
 	exec(t, conn, "CREATE TABLE trajectory_metadata_blob(id TEXT,data BLOB)")
 	exec(t, conn, "CREATE TABLE gen_metadata(idx INTEGER,data BLOB)")
 	exec(t, conn, "CREATE TABLE steps(idx INTEGER,step_type INTEGER,step_payload BLOB,metadata BLOB)")
-	exec(t, conn, "INSERT INTO steps VALUES (1,0,NULL,?)", []byte{10, 2, 8, 100, 74, 10, 8, 3, 16, 4, 24, 5, 40, 6, 80, 7})
-	exec(t, conn, "INSERT INTO steps VALUES (2,0,NULL,?)", []byte{10, 2, 8, 100, 88, 3})
+	// Usage: {1: model ID, 2: input, 3: output with thinking, 4: cache
+	// write, 5: cache read, 7: message ID, 9: thinking, 10: visible output}.
+	usage := []byte{8, 3, 16, 4, 24, 7, 32, 1, 40, 6, 58, 1, 'a', 72, 2, 80, 5}
+	exec(t, conn, "INSERT INTO steps VALUES (1,0,NULL,?)", append([]byte{10, 2, 8, 100, 74, byte(len(usage))}, usage...))
+	// The same message on a later step counts once.
+	exec(t, conn, "INSERT INTO steps VALUES (2,0,NULL,?)", append([]byte{10, 2, 8, 101, 74, byte(len(usage))}, usage...))
+	exec(t, conn, "INSERT INTO steps VALUES (3,0,NULL,?)", []byte{10, 2, 8, 100, 88, 3})
+	// A retried attempt carries its usage in field 28's field 2.
+	retry := []byte{16, 9, 24, 2, 58, 1, 'b'}
+	exec(t, conn, "INSERT INTO steps VALUES (4,0,NULL,?)", append([]byte{10, 2, 8, 102, 226, 1, byte(len(retry) + 2), 18, byte(len(retry))}, retry...))
 	d := data.Load(model.Antigravity, 0, 200, true)
-	check(t, d, 1)
-	if d.Turns[0].InputTokens != 3 || d.Turns[0].OutputTokens != 11 || d.Turns[0].CacheReadTokens != 6 || d.Turns[0].CacheCreationTokens != 5 {
+	check(t, d, 2)
+	if d.Turns[0].InputTokens != 4 || d.Turns[0].OutputTokens != 7 || d.Turns[0].CacheReadTokens != 6 || d.Turns[0].CacheCreationTokens != 1 {
+		t.Fatal(d)
+	}
+	if d.Turns[1].InputTokens != 9 || d.Turns[1].OutputTokens != 2 || d.Turns[1].CreatedAt != 102 {
 		t.Fatal(d)
 	}
 }
