@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 type localTransport struct {
@@ -140,6 +141,140 @@ func TestFetchCacheForceCooldownAndClone(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+func TestClaudeCooldownSurvivesRestartAndBacksOff(t *testing.T) {
+	for _, tc := range []struct {
+		header  string
+		minimum int64
+	}{{"", 300}, {"0", 300}, {"invalid", 300}, {"-3", 300}, {time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat), 300}, {"7200", 7200}, {time.Now().Add(2 * time.Hour).UTC().Format(http.TimeFormat), 7200}} {
+		t.Run(tc.header, func(t *testing.T) {
+			fixtureHome(t)
+			fixture(t, ".claude/.credentials.json", `{"claudeAiOauth":{"accessToken":"private-fixture-token","refreshToken":"private-refresh"}}`)
+			a := Discover(false)[0]
+			limited, calls := false, 0
+			localServer(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/oauth/usage" && r.URL.RawQuery == "" {
+					calls++
+					if limited {
+						w.Header().Set("Retry-After", tc.header)
+						w.WriteHeader(429)
+						fmt.Fprint(w, `{"error":"private-upstream-body"}`)
+						return
+					}
+					fmt.Fprint(w, `{"five_hour":{"utilization":37}}`)
+					return
+				}
+				fmt.Fprint(w, `{}`)
+			})
+			ctx := context.Background()
+			if _, err := Fetch(ctx, a, false); err != nil {
+				t.Fatal(err)
+			}
+			limited = true
+			check := func(seconds int64) {
+				t.Helper()
+				r, err := Fetch(ctx, a, true)
+				if err != nil || len(r.Windows) != 1 || r.Windows[0].UsedPercent != 37 || r.Stale == "" || r.RetryIn < seconds-2 || r.RetryIn > seconds+1 {
+					t.Fatalf("cached windows/cooldown: %+v %v, need >= %ds", r, err, seconds)
+				}
+			}
+			check(tc.minimum)
+			b, err := os.ReadFile(quotaCachePath(quotaKey(a)))
+			if err != nil || strings.Contains(string(b), "private-") {
+				t.Fatal("quota cache missing or contains credentials/upstream error")
+			}
+			// Drop all process-local quota and grants state: the next Fetch can
+			// only recover the cooldown and last-good windows from disk.
+			registry.m = map[string]*entry{}
+			claudeGrants.m = map[string]claudeGrantsCheck{}
+			check(tc.minimum)
+			if calls != 2 {
+				t.Fatal("restart or forced refresh bypassed cooldown")
+			}
+			if tc.header == "0" {
+				for _, seconds := range []int64{600, 1200, 2400, 3600, 3600} {
+					registry.m[quotaKey(a)].until = time.Now().Add(-time.Second)
+					check(seconds)
+				}
+				registry.m[quotaKey(a)].until = time.Now().Add(-time.Second)
+				limited = false
+				if r, err := Fetch(ctx, a, true); err != nil || r.Stale != "" || r.RetryIn != 0 {
+					t.Fatalf("successful refresh did not recover: %+v %v", r, err)
+				}
+				limited = true
+				check(300)
+				if r, _ := Fetch(ctx, a, true); r.RetryIn > 301 {
+					t.Fatal("success did not reset exponential backoff")
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeAuxiliary429SharesCooldownAndKeepsFreshUsage(t *testing.T) {
+	for _, path := range []string{"profile", "grants"} {
+		t.Run(path, func(t *testing.T) {
+			fixtureHome(t)
+			fixture(t, ".claude/.credentials.json", `{"claudeAiOauth":{"accessToken":"first-login"}}`)
+			a := Discover(false)[0]
+			calls := 0
+			localServer(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if r.URL.RawQuery != "" || r.URL.Path == "/api/oauth/profile" && path == "profile" {
+					w.Header().Set("Retry-After", "0")
+					w.WriteHeader(429)
+					return
+				}
+				fmt.Fprint(w, `{"five_hour":{"utilization":61}}`)
+			})
+			r, err := Fetch(context.Background(), a, false)
+			if err != nil || len(r.Windows) != 1 || r.Windows[0].UsedPercent != 61 || r.RetryIn < 299 {
+				t.Fatalf("auxiliary 429 discarded fresh bars: %+v %v", r, err)
+			}
+			before := calls
+			registry.m = map[string]*entry{}
+			claudeGrants.m = map[string]claudeGrantsCheck{}
+			if _, err = Fetch(context.Background(), a, true); err != nil || calls != before {
+				t.Fatal("auxiliary 429 cooldown not restored")
+			}
+			if path == "grants" {
+				registry.m[quotaKey(a)].until = time.Now().Add(-time.Second)
+				r, err = Fetch(context.Background(), a, true)
+				if err != nil || r.Stale != "" || calls != before+2 {
+					t.Fatal("restart lost the hourly grants check")
+				}
+				before = calls
+			}
+			// A different login in the same file must not inherit the prior
+			// login's cooldown, bars or hourly grant status.
+			fixture(t, ".claude/.credentials.json", `{"claudeAiOauth":{"accessToken":"second-login"}}`)
+			if _, err = Fetch(context.Background(), a, false); err != nil || calls == before {
+				t.Fatal("new login inherited old quota cache")
+			}
+		})
+	}
+}
+
+func TestClaudeFirst429RestoresCooldownWithoutCachedUsage(t *testing.T) {
+	fixtureHome(t)
+	fixture(t, ".claude/.credentials.json", `{"claudeAiOauth":{"accessToken":"first-login"}}`)
+	a := Discover(false)[0]
+	calls := 0
+	localServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(429)
+	})
+	for i := 0; i < 2; i++ {
+		registry.m = map[string]*entry{}
+		if _, err := Fetch(context.Background(), a, true); err == nil || !strings.Contains(err.Error(), "429") {
+			t.Fatal("missing first-query rate limit")
+		}
+	}
+	if calls != 1 {
+		t.Fatal("cold 429 cooldown was lost on restart")
+	}
+}
+
 func TestRefreshPersistsWithoutDiscardingFields(t *testing.T) {
 	fixtureHome(t)
 	fixture(t, ".codex/auth.json", `{"access_token":"old","refresh_token":"refresh","other":42}`)

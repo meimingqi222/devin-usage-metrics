@@ -4,7 +4,6 @@ package quota
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -126,7 +125,7 @@ func request(ctx context.Context, method, url, body string, h map[string]string,
 		d := 5 * time.Minute
 		if s := resp.Header.Get("Retry-After"); s != "" {
 			if n, e := strconv.ParseInt(s, 10, 64); e == nil && n >= 0 {
-				d = time.Duration(min(n, 3600)) * time.Second
+				d = time.Duration(min(n, int64((1<<63-1)/time.Second))) * time.Second
 			} else if t, e := http.ParseTime(s); e == nil {
 				d = time.Until(t)
 			}
@@ -159,6 +158,7 @@ type entry struct {
 	result             Result
 	at, until, backoff time.Time
 	err                error
+	failures           int
 }
 
 var registry = struct {
@@ -181,12 +181,14 @@ func Fetch(ctx context.Context, a Account, force bool) (Result, error) {
 	if a.source == "" {
 		return Result{}, errors.New("account must come from Discover")
 	}
-	fingerprint := sha256.Sum256([]byte(a.source + credentialIdentity(a)))
-	key := fmt.Sprintf("%s:%x", a.Key, fingerprint)
+	key := quotaKey(a)
 	registry.Lock()
 	s := registry.m[key]
 	if s == nil {
 		s = &entry{gate: make(chan struct{}, 1)}
+		if a.Provider == "claude" {
+			restoreQuotaCache(a, key, s)
+		}
 		registry.m[key] = s
 	}
 	registry.Unlock()
@@ -219,14 +221,27 @@ func Fetch(ctx context.Context, a Account, force bool) (Result, error) {
 	if !force && now.Before(s.backoff) {
 		return fallback(s.err)
 	}
+	if a.Provider == "claude" {
+		defer saveQuotaCache(a, key, s)
+	}
 	r, e := fetch(ctx, a)
+	if a.Provider == "claude" && quotaKey(a) != key {
+		// A refresh or external CLI login changed credentials in flight. Do
+		// not associate the new login's answer with the original cache key.
+		return r, e
+	}
 	now = time.Now()
-	if e == nil {
+	// A grants lookup may be rate-limited after the ordinary usage read
+	// succeeded. Keep those fresh windows while cooling down both reads.
+	if e == nil || (status(e) == 429 && len(r.Windows) > 0) {
 		s.result = clone(r)
 		s.at = now
+	}
+	if e == nil {
 		s.until = time.Time{}
 		s.backoff = time.Time{}
 		s.err = nil
+		s.failures = 0
 		return r, nil
 	}
 	if ctx.Err() != nil {
@@ -236,7 +251,13 @@ func Fetch(ctx context.Context, a Account, force bool) (Result, error) {
 	if status(e) == 429 {
 		var h *httpError
 		errors.As(e, &h)
-		s.until = now.Add(max(time.Minute, min(time.Hour, h.retry)))
+		if a.Provider == "claude" {
+			s.failures = min(s.failures+1, 5)
+			delay := min(time.Hour, 5*time.Minute*time.Duration(1<<uint(s.failures-1)))
+			s.until = now.Add(max(delay, h.retry))
+		} else {
+			s.until = now.Add(max(time.Minute, min(time.Hour, h.retry)))
+		}
 	} else {
 		s.backoff = now.Add(time.Minute)
 	}

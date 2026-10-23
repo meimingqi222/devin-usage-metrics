@@ -3,12 +3,14 @@ package quota
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -32,8 +34,9 @@ const (
 const claudeGrantsInterval = time.Hour
 
 type claudeGrantsCheck struct {
-	at    time.Time
-	reset *ClaudeReset
+	at       time.Time
+	reset    *ClaudeReset
+	identity string
 }
 
 var claudeGrants = struct {
@@ -45,18 +48,22 @@ var claudeGrants = struct {
 // most once per claudeGrantsInterval. A failed read keeps the previous
 // status and still counts as the check, so a 429 is retried an hour later
 // rather than on every refresh; a cancelled read is not a verdict.
-func claudeResetGrants(ctx context.Context, login string, h map[string]string) *ClaudeReset {
+func claudeResetGrants(ctx context.Context, login string, h map[string]string) (*ClaudeReset, error) {
+	identity := fmt.Sprintf("%x", sha256.Sum256([]byte(h["Authorization"])))
 	claudeGrants.Lock()
 	prev, seen := claudeGrants.m[login]
 	claudeGrants.Unlock()
+	if prev.identity != identity {
+		prev, seen = claudeGrantsCheck{}, false
+	}
 	if seen && time.Since(prev.at) < claudeGrantsInterval {
-		return cloneReset(prev.reset)
+		return cloneReset(prev.reset), nil
 	}
 	v, e := jsonRequest(ctx, "GET", anthropicOrigin+claudeGrantsPath, "", h, false)
 	if ctx.Err() != nil {
-		return cloneReset(prev.reset)
+		return cloneReset(prev.reset), ctx.Err()
 	}
-	check := claudeGrantsCheck{at: time.Now(), reset: prev.reset}
+	check := claudeGrantsCheck{at: time.Now(), reset: prev.reset, identity: identity}
 	if e == nil {
 		check.reset = nil
 		if r, ok := parseClaudeReset(obj(v["cedar_ember"]), time.Now().Unix()); ok {
@@ -66,7 +73,10 @@ func claudeResetGrants(ctx context.Context, login string, h map[string]string) *
 	claudeGrants.Lock()
 	claudeGrants.m[login] = check
 	claudeGrants.Unlock()
-	return cloneReset(check.reset)
+	if status(e) == 429 {
+		return cloneReset(check.reset), e
+	}
+	return cloneReset(check.reset), nil
 }
 
 // forgetClaudeResetGrants makes the next refresh re-read a login's grants,
@@ -223,6 +233,9 @@ func ClaimClaudeReset(ctx context.Context, a Account) (string, error) {
 	if a.Provider != "claude" || a.source == "" {
 		return "", errors.New("not a Claude account")
 	}
+	// A claim changes the cached grant count and windows. Never restore the
+	// pre-claim snapshot after a restart, even if its response is lost.
+	defer os.Remove(quotaCachePath(quotaKey(a)))
 	d, e := loadAccount(a)
 	if e != nil {
 		return "", e
@@ -257,7 +270,7 @@ func ClaimClaudeReset(ctx context.Context, a Account) (string, error) {
 	// This read is fresh: it is the hour's check. Once a claim is sent,
 	// whatever its answer, the next refresh must read the grants again.
 	claudeGrants.Lock()
-	claudeGrants.m[a.source] = claudeGrantsCheck{at: time.Now(), reset: cloneReset(&r)}
+	claudeGrants.m[a.source] = claudeGrantsCheck{at: time.Now(), reset: cloneReset(&r), identity: fmt.Sprintf("%x", sha256.Sum256([]byte(h["Authorization"])))}
 	claudeGrants.Unlock()
 	if r.Blocker != "" {
 		return r.Blocker, nil

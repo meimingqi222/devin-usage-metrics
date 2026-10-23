@@ -86,7 +86,7 @@ func TestClaudeGrantsReadAtMostHourly(t *testing.T) {
 	get := func() *ClaudeReset {
 		t.Helper()
 		r, err := fetch(context.Background(), a)
-		if err != nil {
+		if err != nil && status(err) != 429 {
 			t.Fatal(err)
 		}
 		return r.Reset

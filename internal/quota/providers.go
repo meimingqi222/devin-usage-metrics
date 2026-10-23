@@ -76,7 +76,7 @@ func fetch(ctx context.Context, a Account) (Result, error) {
 			}
 			return Result{}, e
 		}
-		return finishUsage(ctx, a, usage, h), nil
+		return finishUsage(ctx, a, usage, h)
 	}
 }
 
@@ -249,11 +249,11 @@ func requestUsage(ctx context.Context, provider string, h map[string]string) (ob
 
 // finishUsage turns a provider's usage answer into a Result, with the
 // follow-up reads some providers need (plan, reset grants, billing).
-func finishUsage(ctx context.Context, a Account, usage object, h map[string]string) Result {
+func finishUsage(ctx context.Context, a Account, usage object, h map[string]string) (Result, error) {
 	switch a.Provider {
 	case "claude":
 		plan := ""
-		p, _ := jsonRequest(ctx, "GET", anthropicOrigin+"/api/oauth/profile", "", h, false)
+		p, profileErr := jsonRequest(ctx, "GET", anthropicOrigin+"/api/oauth/profile", "", h, false)
 		if at(p, "account", "has_claude_max") == true {
 			plan = "Max"
 		} else if at(p, "account", "has_claude_pro") == true {
@@ -262,15 +262,19 @@ func finishUsage(ctx context.Context, a Account, usage object, h map[string]stri
 			plan = "Team"
 		}
 		r := ParseClaudeUsage(usage, plan)
-		r.Reset = claudeResetGrants(ctx, a.source, h)
-		return r
+		if status(profileErr) == 429 {
+			return r, profileErr
+		}
+		var err error
+		r.Reset, err = claudeResetGrants(ctx, a.source, h)
+		return r, err
 	case "codex":
-		return ParseCodexUsage(usage, str(usage["plan_type"]))
+		return ParseCodexUsage(usage, str(usage["plan_type"])), nil
 	case "grok":
 		m, _ := jsonRequest(ctx, "GET", "https://cli-chat-proxy.grok.com/v1/billing", "", h, false)
-		return ParseGrokBilling(usage, m)
+		return ParseGrokBilling(usage, m), nil
 	}
-	return ParseAntigravityQuota(usage)
+	return ParseAntigravityQuota(usage), nil
 }
 func invalidGrant(body string) bool {
 	var v object
