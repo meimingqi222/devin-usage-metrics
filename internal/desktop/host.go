@@ -76,9 +76,21 @@ func Run(templateIcon, colorIcon []byte) error {
 			{Label: a.t("Window", "窗口"), Submenu: []*mygo.MenuItem{{Role: mygo.RoleClose, Label: a.t("Close Window", "关闭窗口")}}},
 		}))
 	}
+	if runtime.GOOS == "windows" {
+		// The UI is dark only. Windows paints the caption buttons in the
+		// system appearance's color, black under a light system theme,
+		// which vanishes against the dark toolbar.
+		mygo.Theme.SetSource(mygo.ThemeDark)
+	}
 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) { quitting = true; cancel() })
 	mygo.App.WhenReady(func() {
-		main = mygo.NewWindow(mygo.WindowOptions{Title: "Agent Usage Metrics", Width: 1240, Height: 780, MinWidth: 1000, MinHeight: 640, TitleBarStyle: mygo.TitleBarHidden, TitleBarHeight: 48, TrafficLightPosition: &mygo.Point{X: 16, Y: 16}, Content: ui.View(a.View)})
+		// Windows draws its caption buttons as tall as the title bar: keep
+		// them inside the toolbar instead of over its bottom border.
+		titleBarHeight := 48
+		if runtime.GOOS == "windows" {
+			titleBarHeight = toolbarHeight
+		}
+		main = mygo.NewWindow(mygo.WindowOptions{Title: "Agent Usage Metrics", Width: 1240, Height: 780, MinWidth: 1000, MinHeight: 640, TitleBarStyle: mygo.TitleBarHidden, TitleBarHeight: titleBarHeight, TrafficLightPosition: &mygo.Point{X: 16, Y: 16}, Content: ui.View(a.View)})
 		popup = mygo.NewWindow(mygo.WindowOptions{Title: "Agent Usage Metrics — Quotas", Width: trayWidth, Height: 520, Hidden: true, Frameless: true, DisableResize: true, AlwaysOnTop: true, SkipTaskbar: true, Content: ui.View(a.trayView)})
 		openDashboard := func() { popup.Hide(); main.Show(); main.Focus() }
 		a.trayUI.openDashboard = openDashboard

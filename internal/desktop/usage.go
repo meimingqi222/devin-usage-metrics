@@ -374,7 +374,7 @@ func (a *App) usageChart(c *ui.Context, bs []analytics.Bucket) {
 				if cost {
 					title = a.t("Cost Trend", "费用趋势")
 				}
-				ui.Text(c, title).FontSize(14).FixedLineHeight(24).FontWeight(600)
+				ui.Text(c, title).FontSize(14).FixedLineHeight(24).FontWeight(600).NoWrap()
 				if len(bs) > 0 && all > 0 {
 					avg := label(all / float64(len(bs)))
 					if !cost {

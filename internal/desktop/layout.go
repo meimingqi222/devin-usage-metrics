@@ -20,6 +20,9 @@ import (
 const (
 	sidebarWidth  = 200
 	toolbarHeight = 46
+	// compactToolbarRoom is the toolbar width, less the caption buttons,
+	// that fits every control and the load time at the default window width.
+	compactToolbarRoom = 900
 )
 
 func (a *App) theme(c *ui.Context) {
@@ -386,7 +389,12 @@ func control(c *ui.Context, radius float32) ui.Element {
 
 func (a *App) header(c *ui.Context) {
 	t := c.Theme()
-	ui.Row(c).Height(toolbarHeight).Shrink(0).Padding(0, max(20, c.TitleBar().Right), 0, 20).Gap(16).AlignItems(ui.Center).Background(toolbarColor).BorderWidth(0, 0, 1, 0).BorderColor(t.Border).Label("Toolbar").DragWindow().Children(func() {
+	bar := ui.Row(c).Height(toolbarHeight).Shrink(0).Padding(0, max(20, c.TitleBar().Right), 0, 20).Gap(16).AlignItems(ui.Center).Background(toolbarColor).BorderWidth(0, 0, 1, 0).BorderColor(t.Border).Label("Toolbar").DragWindow()
+	// Windows' caption buttons take 138px of the toolbar; below this width
+	// the load time moves into the reload button's tooltip.
+	room := bar.Bounds().W - max(20, c.TitleBar().Right)
+	compact := room > 0 && room < compactToolbarRoom
+	bar.Children(func() {
 		// The quota page titles itself; its toolbar keeps only reload.
 		if a.screen != "quota" {
 			control(c, 6).Children(func() {
@@ -425,14 +433,16 @@ func (a *App) header(c *ui.Context) {
 		if reload.Hovered() {
 			reload.TextColor(t.Text).Border(1, strongBorder)
 		}
-		reload.Children(func() { ui.Text(c, a.t("Reload", "重新加载")).NoWrap() })
+		reload.Shrink(0).Children(func() { ui.Text(c, a.t("Reload", "重新加载")).NoWrap() })
 		if reload.Clicked() {
 			a.load(a.agent, true)
 		}
 		if a.busy[string(a.agent)] {
 			ui.Text(c, a.t("Loading…", "加载中…")).FontSize(11).TextColor(faint(t)).NoWrap()
+		} else if a.loadedAt != "" && compact {
+			reload.Tooltip(a.t("Data as of ", "数据截至 ") + a.loadedAt)
 		} else if a.loadedAt != "" {
-			ui.Text(c, a.t("Data as of ", "数据截至 ")+a.loadedAt).FontSize(11).FontFeatures("tnum").TextColor(faint(t)).NoWrap()
+			ui.Text(c, a.t("Data as of ", "数据截至 ")+a.loadedAt).FontSize(11).FontFeatures("tnum").TextColor(faint(t)).NoWrap().Shrink(1).MinWidth(0).Ellipsis("…")
 		}
 	})
 }
@@ -463,7 +473,7 @@ func (a *App) deviceScope(c *ui.Context) {
 	}
 	// A row, not a button: the name must shrink to its ellipsis inside the
 	// pill's maximum width while the icon and arrow keep their size.
-	pill := ui.Row(c).MaxWidth(260).Gap(7).Padding(4, 10).Radius(6).AlignItems(ui.Center).Background(ui.Hex("#161b26")).Border(1, ui.Hex("#283347")).Label(a.t("Device scope", "设备范围")).Focusable()
+	pill := ui.Row(c).MaxWidth(260).Shrink(1).MinWidth(0).Gap(7).Padding(4, 10).Radius(6).AlignItems(ui.Center).Background(ui.Hex("#161b26")).Border(1, ui.Hex("#283347")).Label(a.t("Device scope", "设备范围")).Focusable()
 	if pill.Hovered() || a.deviceMenu {
 		pill.Background(ui.Hex("#1c2333")).Border(1, ui.Hex("#3b82f6"))
 	}
