@@ -1,7 +1,7 @@
 {
   "name": "Agent Usage Metrics",
   "identifier": "com.devin.usage-metrics",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "icon": "assets/icon.png",
   "out": "build",
   "main": ".",
