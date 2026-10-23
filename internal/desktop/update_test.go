@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/egoist/mygo/ui"
 	"github.com/meimingqi222/devin-usage-metrics/internal/updater"
 )
 
@@ -45,4 +46,33 @@ func TestAutomaticUpdateCheckNeedsPackagedInstall(t *testing.T) {
 	if a.busy["update"] {
 		t.Fatal("development build started an automatic update check")
 	}
+}
+
+// Install errors stay in the dialog: the ready message used to replace them,
+// so a failed install on Windows looked like a button that did nothing.
+func TestFailedInstallShowsItsError(t *testing.T) {
+	a := fixture(t)
+	quit := false
+	a.quit = func() { quit = true }
+	a.release = updater.Release{Version: "0.3.1"}
+	a.payload = filepath.Join(t.TempDir(), "devin-usage-metrics.exe")
+	a.settingsUI.updateOpen = true
+	tt := ui.NewTester(a.updateDialog, 800, 600)
+	click(t, tt, "Install and restart")
+	if quit || a.settingsUI.updateMessage == "" || !tt.HasText(a.settingsUI.updateMessage) || tt.HasText("Update ready. Restart to install.") || !tt.HasText("Update failed") || !tt.HasText("Retry") {
+		t.Fatalf("install error hidden: quit=%v message=%q texts=%v", quit, a.settingsUI.updateMessage, tt.Texts())
+	}
+	capture(t, tt, "update-install-failed")
+}
+
+// With nothing offered, the subtitle shows the installed version, not a bare "v".
+func TestUpToDateDialogShowsCurrentVersion(t *testing.T) {
+	a := fixture(t)
+	a.settingsUI.updateOpen = true
+	a.settingsUI.updateMessage = "Already up to date"
+	tt := ui.NewTester(a.updateDialog, 800, 600)
+	if !tt.HasText("v"+updater.CurrentVersion) || !tt.HasText("Later") || !tt.HasText("Check for updates") {
+		t.Fatalf("up-to-date dialog: %v", tt.Texts())
+	}
+	capture(t, tt, "update-up-to-date")
 }

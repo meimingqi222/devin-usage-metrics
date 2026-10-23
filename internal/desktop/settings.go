@@ -328,25 +328,37 @@ func (a *App) updateDialog(c *ui.Context) {
 	ui.DialogBase(c, &a.settingsUI.updateOpen, func(back, panel ui.Element) {
 		back.Background(ui.RGBA(0, 0, 0, .55))
 		panel.Width(420).Padding(16).Gap(16).Radius(8).Background(c.Theme().Surface).Border(1, c.Theme().Border)
+		// Like Rust: the subtitle names the offered version, or the failure.
+		subtitle := "v" + updater.CurrentVersion
+		if a.settingsUI.updateFailed {
+			subtitle = a.t("Update failed", "更新失败")
+		} else if a.release.Version != "" {
+			subtitle = "v" + a.release.Version
+		}
 		ui.Column(c).Children(func() {
 			ui.Text(c, a.t("Application update", "应用更新")).FontSize(14).Bold()
-			ui.Text(c, "v"+a.release.Version).FontSize(12).TextColor(c.Theme().TextMuted)
+			ui.Text(c, subtitle).FontSize(12).TextColor(c.Theme().TextMuted)
 		})
 		body := a.release.Notes
-		if a.settingsUI.updateMessage != "" {
-			body = a.settingsUI.updateMessage
-		}
 		if a.busy["download"] {
 			body = a.t("Downloading and verifying…", "正在下载并校验…")
 		}
 		if a.payload != "" {
 			body = a.t("Update ready. Restart to install.", "更新已就绪，重启以安装。")
 		}
+		// A failed install keeps the payload; its error must not be hidden
+		// behind the ready message, or the button seems to do nothing.
+		if a.settingsUI.updateMessage != "" {
+			body = a.settingsUI.updateMessage
+		}
 		if body != "" {
 			ui.Text(c, body).FontSize(12).TextColor(c.Theme().TextMuted).MaxHeight(120)
 		}
-		if a.release.Version != "" {
+		ui.Row(c).Gap(8).Justify(ui.SpaceBetween).AlignItems(ui.Center).FillWidth().Children(func() {
 			ui.Row(c).Gap(8).Children(func() {
+				if a.release.Version == "" || a.payload != "" {
+					return
+				}
 				if textButton(c, a.t("Skip this version", "跳过此版本"), false).Clicked() {
 					a.skipUpdate()
 				}
@@ -354,12 +366,14 @@ func (a *App) updateDialog(c *ui.Context) {
 					a.openURL(a.release.URL)
 				}
 			})
-		}
-		if ui.Button(c, a.t("Later", "稍后")).FontSize(12).Clicked() {
-			a.settingsUI.updateOpen = false
-		}
+			if textButton(c, a.t("Later", "稍后"), false).Clicked() {
+				a.settingsUI.updateOpen = false
+			}
+		})
 		label := a.t("Download verified update", "下载并校验更新")
-		if a.payload != "" {
+		if a.settingsUI.updateFailed {
+			label = a.t("Retry", "重试")
+		} else if a.payload != "" {
 			label = a.t("Install and restart", "安装并重启")
 		} else if a.release.Version == "" {
 			label = a.t("Check for updates", "检查更新")
@@ -367,7 +381,7 @@ func (a *App) updateDialog(c *ui.Context) {
 		if ui.PrimaryButton(c, label).FontSize(12).FillWidth().Disabled(a.busy["update"] || a.busy["download"]).Clicked() {
 			if a.payload != "" {
 				if err := updater.Apply(a.payload); err != nil {
-					a.settingsUI.updateMessage = err.Error()
+					a.settingsUI.updateMessage, a.settingsUI.updateFailed = err.Error(), true
 				} else if a.quit != nil {
 					a.quit()
 				}
