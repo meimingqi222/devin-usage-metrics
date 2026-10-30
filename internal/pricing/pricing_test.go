@@ -92,6 +92,17 @@ func TestRequestBillingRegressions(t *testing.T) {
 	if _, ok := pricing.Cost(model.Turn{Agent: model.Claude, Model: "gemini-2.5-pro-trial", InputTokens: 1}, ""); ok {
 		t.Fatal("trial label priced outside Antigravity")
 	}
+	// Rollout arms and -exp tags seen in Antigravity history bill as the base model.
+	for name, base := range map[string]string{"gemini-3-flash-a": "gemini-3-flash-preview", "gemini-3.7-flash-exp-a": "gemini-3.7-flash", "gemini-3.8-flash-n": "gemini-3.8-flash"} {
+		got, ok := pricing.Cost(model.Turn{Agent: model.Antigravity, Model: name, InputTokens: 1, OutputTokens: 1}, "")
+		want, _ := pricing.Cost(model.Turn{Agent: model.Antigravity, Model: base, InputTokens: 1, OutputTokens: 1}, "")
+		if !ok || got != want || want == 0 {
+			t.Fatalf("%s priced %v %v, want %v", name, got, ok, want)
+		}
+	}
+	if _, ok := pricing.Cost(model.Turn{Agent: model.Codex, Model: "gemini-3-flash-a", InputTokens: 1}, ""); ok {
+		t.Fatal("rollout arm priced outside Antigravity")
+	}
 }
 
 func TestRefreshPublicContract(t *testing.T) {
@@ -122,7 +133,7 @@ func TestRefreshPublicContract(t *testing.T) {
 	fb, _ := json.Marshal(families)
 	mb, _ := json.Marshal(modelFamilies)
 	originalDoc := "export const modelCostData = " + string(rb) + "; const longContextFamilies = " + string(fb) + "; const longContextModelFamilies = " + string(mb)
-	catalog := `{"google":{"models":{"gemini-3.8-flash":{"cost":{"input":2,"output":10,"cache_read":0.1}}}},"openai":{"models":{"gpt-test":{"cost":{"input":2,"output":10,"cache_read":0,"cache_write":0,"tiers":[{"tier":{"type":"context","size":100},"input":4,"output":15}]}}}},"reseller":{"models":{"gpt-test":{"cost":{"input":9,"output":90}},"novel":{"cost":{"input":1,"output":2}}}},"other":{"models":{"novel":{"cost":{"input":3,"output":6}}}}}`
+	catalog := `{"google":{"models":{"gemini-3.8-flash":{"cost":{"input":2,"output":10,"cache_read":0.1}},"gemini-4-argon":{"cost":{"input":4,"output":20,"cache_read":0.2}}}},"openai":{"models":{"gpt-test":{"cost":{"input":2,"output":10,"cache_read":0,"cache_write":0,"tiers":[{"tier":{"type":"context","size":100},"input":4,"output":15}]}}}},"reseller":{"models":{"gpt-test":{"cost":{"input":9,"output":90}},"novel":{"cost":{"input":1,"output":2}}}},"other":{"models":{"novel":{"cost":{"input":3,"output":6}}}}}`
 	doc := `export const modelCostData = [{"tier":"TEAMS_TIER_PRO","model_uid":"future-fast","label":"Future Fast","input_cost_per_million_usd":1,"output_cost_per_million_usd":2,"cache_read_cost_per_million_usd":0.1,"cache_write_cost_per_million_usd":3}];
  const longContextFamilies = {'Future': {threshold:'123K',input:'$7.00',output:'$9',cacheInput:'$0.7',},};
  const longContextModelFamilies = {'future-fast':'Future',};`
@@ -194,6 +205,14 @@ func TestRefreshPublicContract(t *testing.T) {
 		t.Fatal("Flash estimate missing")
 	}
 	near(t, c, 22e-6)
+	// Every Antigravity argon label bills as gemini-4-argon, cache writes at the input rate.
+	for _, name := range []string{"gemini-4-argon-c", "gemini-4-argon-abcd", "gemini-4-argon-trial", "gemini-4-argon-exp-b"} {
+		c, ok := pricing.Cost(model.Turn{Agent: model.Antigravity, Model: name, InputTokens: 1, CacheCreationTokens: 10, OutputTokens: 1}, "")
+		if !ok {
+			t.Fatalf("%s unpriced", name)
+		}
+		near(t, c, 64e-6)
+	}
 	for _, prompt := range []float64{123000, 123001} {
 		c, ok := pricing.Cost(model.Turn{Agent: model.Devin, Model: "Future Fast", CacheReadTokens: prompt, OutputTokens: 1}, "")
 		if !ok {

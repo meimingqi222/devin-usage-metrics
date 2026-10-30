@@ -218,21 +218,69 @@ func resolveLocked(agent model.Agent, name string) (Price, bool) {
 	} else {
 		p, ok = lookup(api, s)
 	}
-	if !ok && agent == model.Antigravity && strings.HasSuffix(s, "-trial") {
-		// Antigravity labels models in preview, e.g. gemini-4-argon-trial.
-		p, ok = lookup(api, strings.TrimSuffix(s, "-trial"))
-	}
-	if !ok && agent == model.Antigravity && strings.HasPrefix(s, "gemini-3.8-flash-") {
-		suffix := strings.TrimPrefix(s, "gemini-3.8-flash-")
-		restricted := suffix == ""
-		for _, f := range []string{"lite", "tts", "cyber"} {
-			restricted = restricted || suffix == f || strings.HasPrefix(suffix, f+"-")
-		}
-		if !restricted {
-			p, ok = lookup(api, "gemini-3.8-flash")
-		}
+	if !ok && agent == model.Antigravity {
+		p, ok = antigravityAlias(s)
 	}
 	return p, ok
+}
+
+// antigravityFamilies bill any unknown variant as the base model, except
+// variants that are separate products with their own prices.
+var antigravityFamilies = []struct {
+	base       string
+	restricted []string
+}{
+	{"gemini-3.8-flash", []string{"lite", "tts", "cyber"}},
+	{"gemini-4-argon", nil},
+}
+
+// antigravityAlias prices Antigravity's internal labels. It tags builds with
+// -trial / -exp and one-letter rollout arms (gemini-4-argon-c,
+// gemini-3-flash-a, gemini-3.7-flash-exp-a); those bill as the base model.
+// Google lists some of them only as -preview (gemini-3-flash-preview).
+// Caller holds mu.
+func antigravityAlias(s string) (Price, bool) {
+	find := func(base string) (Price, bool) {
+		if p, ok := lookup(api, base); ok {
+			return p, true
+		}
+		return lookup(api, base+"-preview")
+	}
+	if p, ok := find(s); ok {
+		return p, true
+	}
+	for base := s; ; {
+		i := strings.LastIndexByte(base, '-')
+		if i <= 0 || !antigravityTag(base[i+1:]) {
+			break
+		}
+		base = base[:i]
+		if p, ok := find(base); ok {
+			return p, true
+		}
+	}
+	for _, f := range antigravityFamilies {
+		suffix, ok := strings.CutPrefix(s, f.base+"-")
+		if !ok || suffix == "" {
+			continue
+		}
+		restricted := false
+		for _, r := range f.restricted {
+			restricted = restricted || suffix == r || strings.HasPrefix(suffix, r+"-")
+		}
+		if !restricted {
+			return lookup(api, f.base)
+		}
+	}
+	return Price{}, false
+}
+
+func antigravityTag(s string) bool {
+	switch s {
+	case "trial", "exp", "preview":
+		return true
+	}
+	return len(s) == 1 && s[0] >= 'a' && s[0] <= 'z'
 }
 
 func costWithPrice(t model.Turn, p Price, ok bool) (float64, bool) {
@@ -248,7 +296,9 @@ func costWithPrice(t model.Turn, p Price, ok bool) (float64, bool) {
 		return (i*p.Input + o*p.Output + r*p.CacheRead + t.CacheCreation5mTokens*p.CacheWrite + t.CacheCreation1hTokens*p.Input*2) / 1e6, true
 	}
 	p = p.ForPrompt(i + r + w)
-	if t.Agent == model.Antigravity && p.MissingCacheWrite && p.Source == "google" && p.SourceModel == "gemini-3.8-flash" {
+	// Google quotes no cache-write price for Gemini; estimate first processing
+	// at the input rate rather than leaving the turn unpriced.
+	if t.Agent == model.Antigravity && p.MissingCacheWrite && p.Source == "google" {
 		i += w
 		w = 0
 	}
