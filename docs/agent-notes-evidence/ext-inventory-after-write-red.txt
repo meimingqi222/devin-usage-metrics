@@ -1,0 +1,6 @@
+--- FAIL: TestExtWriteKeepsRowsWhenAgentFileBad (0.10s)
+    ext_test.go:106: stale after write: ["Sidebar" "A" "Agent Usage Metrics" "实时配额" "实时配额" "MCP 与 Skills" "MCP 与 Skills" "1" "▾  代理" "代理" "6" "▾" "Claude Code" "C" "Claude Code" "1" "Codex" "X" "Codex" "0" "Antigravity" "A" "Antigravity" "0" "OpenCode" "O" "OpenCode" "0" "pi-agent" "P" "pi-agent" "0" "WorkBuddy" "W" "WorkBuddy" "0" "▸  更多代理" "更多代理" "4" "▸" "同步已关" "同步已关" "设置" "设置" "v0.0.0" "v0.0.0" "Toolbar" "MCP Servers" "MCP Servers" "已安装 Skills" "已安装 Skills" "Discover" "Discover" "筛选" "批量添加 MCP" "批量添加 MCP" "撤销上次变更" "撤销上次变更" "已更新，请开启新的 Agent 会话。\nClaude Code: /var/folders/tl/74__pctd5f381mbyq6cc2pdh0000gn/T/TestExtWriteKeepsRowsWhenAgentFileBad2491999078/001/.claude.json: unterminated object" "MCP 与 Skills" "只改本机 Agent 配置，不参与同步。" "github" "Stdio" "正常" "已启用 1 个" "复制摘要" "复制摘要" "全局移除 github" "移除" "命令 / 服务源" "复制命令" "npx" "生效 Agent" "Claude Code" "Claude Code" "Codex" "✓ Codex" "Antigravity" "Antigravity" "OpenCode" "OpenCode" "WorkBuddy" "WorkBuddy"] msg=已更新，请开启新的 Agent 会话。
+        Claude Code: /var/folders/tl/74__pctd5f381mbyq6cc2pdh0000gn/T/TestExtWriteKeepsRowsWhenAgentFileBad2491999078/001/.claude.json: unterminated object
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/desktop	0.727s
+FAIL

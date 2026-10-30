@@ -1,0 +1,7 @@
+--- FAIL: TestInventorySkillsMarksInheritedShared (0.00s)
+    skills_test.go:131: codex: ok=false ext.SkillPlace{Agent:"", Dir:"", Link:false, Target:"", Shared:false, Inherited:false}
+--- FAIL: TestInventorySkillsOpenCodeInheritsClaude (0.00s)
+    skills_test.go:201: opencode ext.SkillPlace{Agent:"", Dir:"", Link:false, Target:"", Shared:false, Inherited:false} false
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/ext	0.436s
+FAIL

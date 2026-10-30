@@ -1,0 +1,5 @@
+--- FAIL: TestDeleteTOMLKeepsProfileWhenTripleQuoteInString (0.00s)
+    toml_test.go:102: multiline TOML requires a preserving TOML parser
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/ext	0.395s
+FAIL

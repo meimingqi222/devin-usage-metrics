@@ -1,0 +1,5 @@
+--- FAIL: TestFindSkillRelZipRoot (0.00s)
+    leftover_test.go:393: root skill SKILL.md not found in archive "" ""
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/ext	0.396s
+FAIL

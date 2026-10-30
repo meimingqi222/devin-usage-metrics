@@ -68,6 +68,7 @@ type App struct {
 	quotaUI                                    quotaUIState
 	usageUI                                    usageUIState
 	syncUI                                     syncState
+	extUI                                      extUIState
 }
 
 // syncState is the last sync's outcome shown in the sidebar.

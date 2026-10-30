@@ -75,6 +75,10 @@ func (a *App) View(c *ui.Context) {
 				ui.Scroll(c.Key("quota")).Grow(1).Padding(16).Gap(12).Children(func() { a.quotaView(c) })
 				return
 			}
+			if a.screen == "ext" {
+				ui.Scroll(c.Key("ext")).Grow(1).Padding(16).Gap(12).Children(func() { a.extView(c) })
+				return
+			}
 			if a.tab == "usage" {
 				ui.Column(c).Grow(1).MinHeight(0).MinWidth(0).Padding(16).Gap(12).Children(func() { a.usageView(c) })
 				return
@@ -106,6 +110,7 @@ func (a *App) View(c *ui.Context) {
 			a.pending = nil
 		}
 	}
+	a.extDialogs(c)
 }
 
 func (a *App) loadingView(c *ui.Context) {
@@ -159,6 +164,7 @@ func (a *App) sidebar(c *ui.Context) {
 			ui.Text(c, "Agent Usage Metrics").FontSize(13).FixedLineHeight(20).Bold().NoWrap().Ellipsis("…").MinWidth(0)
 		})
 		a.quotaEntry(c)
+		a.extEntry(c)
 		ui.Scroll(c).Grow(1).Padding(0, 10).Gap(2).Children(func() {
 			var shown, other []model.Agent
 			for _, agent := range model.Agents {
@@ -215,7 +221,7 @@ func (a *App) sidebar(c *ui.Context) {
 
 func (a *App) quotaEntry(c *ui.Context) {
 	t := c.Theme()
-	r := ui.Row(c).Margin(0, 10, 10).Padding(7, 10).Gap(7).Radius(6).Background(controlColor).Border(1, t.Border).AlignItems(ui.Center).Label(a.t("Live quotas", "实时配额")).Focusable()
+	r := ui.Row(c).Margin(0, 10, 4).Padding(7, 10).Gap(7).Radius(6).Background(controlColor).Border(1, t.Border).AlignItems(ui.Center).Label(a.t("Live quotas", "实时配额")).Focusable()
 	switch {
 	case a.screen == "quota":
 		r.Background(t.Accent.Alpha(.12)).Border(1, t.Accent.Alpha(.35))
@@ -396,6 +402,10 @@ func (a *App) header(c *ui.Context) {
 	compact := room > 0 && room < compactToolbarRoom
 	bar.Children(func() {
 		// The quota page titles itself; its toolbar keeps only reload.
+		if a.screen == "ext" {
+			a.extToolbar(c)
+			return
+		}
 		if a.screen != "quota" {
 			control(c, 6).Children(func() {
 				for _, tab := range []struct{ key, en, zh string }{{"usage", "Usage", "用量"}, {"sessions", "Sessions", "会话"}, {"compaction", "Compaction", "压缩建议"}} {
