@@ -98,10 +98,12 @@ func (a *App) settingsView(c *ui.Context) {
 		panel.Width(380).Padding(16).Gap(12).Radius(8).Background(c.Theme().Surface).Border(1, c.Theme().Border).FontSize(12).FixedLineHeight(20)
 		ui.Row(c).AlignItems(ui.Center).Children(func() {
 			ui.Row(c).Gap(8).AlignItems(ui.Center).Grow(1).Children(func() {
-				ui.Text(c, "⚙").FontSize(14).FixedLineHeight(24).Bold()
+				ui.Icon(c, gearIcon).Size(14, 14)
 				ui.Text(c, a.t("Settings", "设置")).FontSize(14).FixedLineHeight(24).Bold()
 			})
-			if settingsButton(c, "✕", false).Padding(4, 8).Label(a.t("Close settings", "关闭设置")).Clicked() {
+			closeBtn := settingsButton(c, "", false).Padding(4, 8).Label(a.t("Close settings", "关闭设置"))
+			closeBtn.Children(func() { ui.Icon(c, closeIcon).Size(13, 13) })
+			if closeBtn.Clicked() {
 				a.cancelSettings()
 			}
 		})

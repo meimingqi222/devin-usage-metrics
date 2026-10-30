@@ -425,7 +425,9 @@ func (a *App) sessionDetail(c *ui.Context, s model.Session) {
 	ui.Column(c).Padding(12).Gap(8).Radius(6).Background(c.Theme().Surface).Border(1, c.Theme().Accent.Alpha(.4)).Children(func() {
 		ui.Row(c).Children(func() {
 			ui.Text(c, s.Title).FontSize(14).Bold().Grow(1)
-			if textButton(c, "✕", false).Label(a.t("Close session details", "关闭会话详情")).Clicked() {
+			closeBtn := textButton(c, "", false).Label(a.t("Close session details", "关闭会话详情"))
+			closeBtn.Children(func() { ui.Icon(c, closeIcon).Size(12, 12) })
+			if closeBtn.Clicked() {
 				a.selected = nil
 			}
 		})

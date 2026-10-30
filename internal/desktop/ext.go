@@ -16,6 +16,9 @@ type extUIState struct {
 	pasteOpen, previewOpen, confirmOpen, loaded, hasUndo bool
 	previewErr                                           bool
 	pasteText, confirmTitle, confirmBody, confirmAction  string
+	driftOpen                                            bool
+	driftName                                            string
+	driftBase                                            model.Agent
 	undoKind, undoSummary                                string
 	pasteOn, previewOn, configured                       map[model.Agent]bool
 	expanded                                             map[string]bool
@@ -282,8 +285,24 @@ func extCard(c *ui.Context, key string) ui.Element {
 	return card
 }
 
-func extTag(c *ui.Context, label string, fill, border, text ui.Color) {
-	ui.Text(c, label).FontSize(10).FontWeight(600).Padding(2, 6).Radius(3).Background(fill).Border(1, border).TextColor(text).NoWrap()
+func extTag(c *ui.Context, label string, fill, border, text ui.Color) ui.Element {
+	return ui.Text(c, label).FontSize(10).FontWeight(600).Padding(2, 6).Radius(3).Background(fill).Border(1, border).TextColor(text).NoWrap()
+}
+
+// extTagButton is a tag that opens a dialog; it keeps the tag look instead of
+// the button look.
+func extTagButton(c *ui.Context, icon *ui.SVG, label string, fill, border, text ui.Color) ui.Element {
+	b := ui.ButtonBase(c).Label(label).Padding(2, 6).Radius(3).Background(fill).Border(1, border).TextColor(text)
+	if b.Hovered() {
+		b.Border(1, text)
+	}
+	b.Children(func() {
+		ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+			ui.Icon(c, icon).Size(11, 11).TextColor(text)
+			ui.Text(c, label).FontSize(10).FontWeight(600).NoWrap()
+		})
+	})
+	return b
 }
 
 func extGhostButton(c *ui.Context, label string) ui.Element {
@@ -316,9 +335,35 @@ func mcpKind(m ext.MCP) string {
 	return "Stdio"
 }
 
+// mcpCompatible splits targets that can take src's transport. Legacy SSE has
+// no equivalent in Codex or Antigravity.
+func mcpCompatible(src ext.MCP, agents []model.Agent) (ok, blocked []model.Agent) {
+	if !src.SSE() {
+		return agents, nil
+	}
+	for _, agent := range agents {
+		if ext.AcceptsSSE(agent) {
+			ok = append(ok, agent)
+		} else {
+			blocked = append(blocked, agent)
+		}
+	}
+	return ok, blocked
+}
+
+func mcpAgentLabels(agents []model.Agent) string {
+	labels := make([]string, len(agents))
+	for i, agent := range agents {
+		labels[i] = agent.Label()
+	}
+	return strings.Join(labels, ", ")
+}
+
 func (a *App) extMCPCard(c *ui.Context, row ext.Row, cols []model.Agent) {
 	t := c.Theme()
-	src, _ := row.Source()
+	srcPlace, _ := row.SourcePlacement()
+	src := srcPlace.MCP
+	drifted := row.DriftedAgents()
 	kind := mcpKind(src)
 	card := extCard(c, "mcp/"+row.Name)
 	card.Children(func() {
@@ -332,8 +377,13 @@ func (a *App) extMCPCard(c *ui.Context, row ext.Row, cols []model.Agent) {
 			default:
 				extTag(c, "Stdio", controlColor, t.Border, t.TextMuted)
 			}
-			if row.Drift {
-				extTag(c, a.t("Drift", "漂移 ⚠"), quotaRose.Alpha(.12), quotaRose.Alpha(.35), quotaRose)
+			if len(drifted) > 0 {
+				tag := extTagButton(c, warningIcon, fmt.Sprintf(a.t("Configs differ: %d", "配置不一致：%d 处"), len(drifted)), quotaRose.Alpha(.12), quotaRose.Alpha(.35), quotaRose)
+				tag.Label(a.t("Compare MCP configs", "对比 MCP 配置") + " " + row.Name)
+				tag.Tooltip(fmt.Sprintf(a.t("Base: %s. Differs: %s. Click to compare and fix.", "基准：%s；不一致：%s。点击查看并修复。"), srcPlace.Agent.Label(), mcpAgentLabels(drifted)))
+				if tag.Clicked() {
+					a.openDriftDialog(row)
+				}
 			}
 			if extAllDisabled(row) {
 				extTag(c, a.t("Disabled", "已停用"), controlColor, t.Border, t.TextMuted)
@@ -411,6 +461,139 @@ func (a *App) extMCPCard(c *ui.Context, row ext.Row, cols []model.Agent) {
 	})
 }
 
+// openDriftDialog defaults to the first enabled entry, which is also the row's
+// source, so the dialog opens on the config the card already shows.
+func (a *App) openDriftDialog(row ext.Row) {
+	a.extUI.driftOpen = true
+	a.extUI.driftName = row.Name
+	a.extUI.driftBase = ""
+	for _, agent := range ext.MatrixAgents() {
+		if p, ok := row.ByAgent[agent]; ok && !p.Disabled {
+			a.extUI.driftBase = agent
+			return
+		}
+	}
+}
+
+func (a *App) extRow(name string) (ext.Row, bool) {
+	for _, row := range a.extUI.mcpRows {
+		if row.Name == name {
+			return row, true
+		}
+	}
+	return ext.Row{}, false
+}
+
+// extDriftDialog shows every stored copy side by side and writes the selected
+// one over the others. It replaces the old implicit source pick.
+func (a *App) extDriftDialog(c *ui.Context) {
+	if !a.extUI.driftOpen {
+		return
+	}
+	row, ok := a.extRow(a.extUI.driftName)
+	if !ok {
+		a.extUI.driftOpen = false
+		return
+	}
+	base, hasBase := row.ByAgent[a.extUI.driftBase]
+	if !hasBase || base.Disabled {
+		a.extUI.driftBase = ""
+		for _, agent := range ext.MatrixAgents() {
+			if p, ok := row.ByAgent[agent]; ok && !p.Disabled {
+				a.extUI.driftBase, base, hasBase = agent, p, true
+				break
+			}
+		}
+	}
+	t := c.Theme()
+	ui.DialogBase(c, &a.extUI.driftOpen, func(back, panel ui.Element) {
+		back.Background(ui.RGBA(0, 0, 0, .55))
+		panel.Width(620).Padding(16).Gap(10).Radius(8).Background(t.Surface).Border(1, t.Border)
+		ui.Text(c, a.t("MCP configs differ", "MCP 配置不一致")).FontSize(14).Bold()
+		ui.Text(c, fmt.Sprintf(a.t("%s is stored differently in each agent. Pick the entry to keep; the others are overwritten and turned on.", "%s 在各 Agent 中的配置不同。选择要保留的一份，其余条目会被覆盖并启用。"), row.Name)).FontSize(12).TextColor(t.TextMuted)
+		ui.Text(c, a.t("Secrets stay on this device. Undo last change can revert this write.", "密钥只留在本机；写入后可用“撤销上次变更”回退。")).FontSize(11).TextColor(faint(t))
+
+		srcPlace, _ := row.SourcePlacement()
+		srcFP := srcPlace.MCP.Fingerprint()
+		for _, agent := range ext.MatrixAgents() {
+			place, ok := row.ByAgent[agent]
+			if !ok {
+				continue
+			}
+			selected := hasBase && agent == a.extUI.driftBase
+			bg, border := ui.Hex("#161b26"), t.Border
+			if selected {
+				bg, border = t.Accent.Alpha(.12), t.Accent.Alpha(.4)
+			}
+			line := ui.ButtonBase(c.Key("drift/"+string(agent))).FillWidth().Padding(6, 8).Gap(8).Radius(5).AlignItems(ui.Center).Background(bg).Border(1, border)
+			line.Label(agent.Label() + " " + place.MCP.Summary())
+			line.Disabled(place.Disabled)
+			line.Tooltip(place.Path)
+			line.Children(func() {
+				dot := ui.Box(c).Size(8, 8).Radius(4).Border(1, t.Border).Background(ui.Hex("#161b26"))
+				if selected {
+					dot.Border(1, t.Accent).Background(t.Accent)
+				}
+				ui.Text(c, agent.Label()).FontSize(12).FontWeight(600).TextColor(t.Text).Width(88).NoWrap()
+				if place.Disabled {
+					extTag(c, a.t("Disabled", "已停用"), controlColor, t.Border, t.TextMuted)
+				}
+				summary := place.MCP.Summary()
+				color := t.TextMuted
+				if place.MCP.Fingerprint() != srcFP {
+					color = quotaRose
+				}
+				txt := ui.Text(c, summary).FontSize(11).TextColor(color).Grow(1).MinWidth(0).NoWrap().Ellipsis("…")
+				if summary != "" {
+					txt.Tooltip(summary)
+				}
+			})
+			if line.Clicked() && !place.Disabled {
+				a.extUI.driftBase = agent
+			}
+		}
+
+		var targets, blocked []model.Agent
+		if hasBase && !base.Disabled {
+			fp := base.MCP.Fingerprint()
+			for _, agent := range ext.MatrixAgents() {
+				if agent == a.extUI.driftBase {
+					continue
+				}
+				if p, ok := row.ByAgent[agent]; ok && p.MCP.Fingerprint() != fp {
+					targets = append(targets, agent)
+				}
+			}
+			targets, blocked = mcpCompatible(base.MCP, targets)
+		}
+		switch {
+		case !hasBase:
+			ui.Text(c, a.t("Every entry is turned off. Turn one on in the card first.", "所有条目都已停用，先在卡片上启用一个条目。")).FontSize(11).TextColor(quotaRose)
+		case len(targets) == 0:
+			ui.Text(c, a.t("The rest already match this entry.", "其余条目已与这份配置一致。")).FontSize(11).TextColor(t.TextMuted)
+		case len(blocked) > 0:
+			ui.Text(c, fmt.Sprintf(a.t("%s does not accept legacy SSE; those entries are skipped.", "%s 不支持旧式 SSE，这些条目会被跳过。"), mcpAgentLabels(blocked))).FontSize(11).TextColor(quotaRose)
+		}
+
+		ui.Row(c).Justify(ui.End).Gap(8).Children(func() {
+			if settingsButton(c, a.t("Cancel", "取消"), false).Clicked() {
+				a.extUI.driftOpen = false
+			}
+			label := a.t("Sync from the selected entry", "以所选条目为基准统一")
+			if hasBase {
+				label = fmt.Sprintf(a.t("Sync from %s", "以 %s 为基准统一"), base.Agent.Label())
+			}
+			apply := settingsButton(c, label, true)
+			apply.Disabled(a.busy["ext"] || !hasBase || base.Disabled || len(targets) == 0)
+			if apply.Clicked() && !a.busy["ext"] && hasBase && !base.Disabled && len(targets) > 0 {
+				name, src, agents := row.Name, base.MCP, targets
+				a.extUI.driftOpen = false
+				a.runExt(func() error { return ext.ApplyMCP(name, src, agents) })
+			}
+		})
+	})
+}
+
 func (a *App) extMCPPill(c *ui.Context, row ext.Row, agent model.Agent) {
 	place, on := row.ByAgent[agent]
 	src, ok := row.Source()
@@ -467,11 +650,21 @@ func (a *App) extAgentPillState(c *ui.Context, key string, agent model.Agent, on
 	} else if disabled {
 		bg, border, color = ui.Hex("#10131a"), t.Border.Alpha(.35), faint(t).Alpha(.35)
 	}
-	b := ui.ButtonBase(c.Key(key)).Label(agent.Label()).FontSize(11).Padding(4, 10).Radius(12).Background(bg).Border(1, border).TextColor(color).Disabled(disabled)
+	b := ui.ButtonBase(c.Key(key)).Label(label).FontSize(11).Padding(4, 10).Radius(12).Background(bg).Border(1, border).TextColor(color).Disabled(disabled)
 	if b.Hovered() && !disabled {
 		b.Border(1, strongBorder).TextColor(t.Text)
 	}
-	b.Children(func() { ui.Text(c, label).NoWrap() })
+	b.Children(func() {
+		ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+			switch {
+			case paused:
+				ui.Icon(c, minusIcon).Size(10, 10).TextColor(color)
+			case on:
+				ui.Icon(c, checkIcon).Size(10, 10).TextColor(color)
+			}
+			ui.Text(c, agent.Label()).NoWrap()
+		})
+	})
 	return b
 }
 
@@ -642,6 +835,7 @@ func (a *App) extDialogs(c *ui.Context) {
 		a.extUI.queued = nil
 		a.runExt(fn)
 	}
+	a.extDriftDialog(c)
 	if a.extUI.pasteOpen {
 		ui.DialogBase(c, &a.extUI.pasteOpen, func(back, panel ui.Element) {
 			back.Background(ui.RGBA(0, 0, 0, .55))

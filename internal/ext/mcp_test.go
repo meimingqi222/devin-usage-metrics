@@ -89,6 +89,12 @@ func TestMCPDriftAndUndo(t *testing.T) {
 	if err != nil || !rows[0].Drift {
 		t.Fatalf("expected drift: %v %#v", err, rows)
 	}
+	if drifted := rows[0].DriftedAgents(); len(drifted) != 1 || drifted[0] != model.Codex {
+		t.Fatalf("drifted agents: %v", drifted)
+	}
+	if src, ok := rows[0].SourcePlacement(); !ok || src.Agent != model.Claude {
+		t.Fatalf("source placement: %#v %v", src, ok)
+	}
 	if err := RemoveMCP("github", []model.Agent{model.Codex}); err != nil {
 		t.Fatal(err)
 	}

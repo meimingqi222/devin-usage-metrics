@@ -529,7 +529,7 @@ func (a *App) deviceItem(c *ui.Context, id, name string, color ui.Color) {
 		text := ui.Text(c, name).FontSize(12).Grow(1).MinWidth(0).NoWrap().Ellipsis("…")
 		if selected {
 			text.FontWeight(600).TextColor(t.Accent)
-			ui.Text(c, "✓").FontSize(11).TextColor(t.Accent)
+			ui.Icon(c, checkIcon).Size(11, 11).TextColor(t.Accent)
 		}
 	})
 }

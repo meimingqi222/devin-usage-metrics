@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 	"github.com/meimingqi222/devin-usage-metrics/internal/ext"
@@ -122,13 +123,16 @@ func TestExtWriteKeepsRowsWhenAgentFileBad(t *testing.T) {
 
 func waitExt(t *testing.T, a *App, tt *ui.Tester) {
 	t.Helper()
-	for i := 0; i < 200; i++ {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
 		tt.Frame()
 		if a.extUI.loaded && !a.busy["ext"] {
 			return
 		}
+		// Rendering alone can starve the inventory goroutine on Windows.
+		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatal("ext inventory did not load")
+	t.Fatalf("ext inventory did not load: busy=%v msg=%q", a.busy["ext"], a.message)
 }
 
 func TestExtColumnsIncludeConfiguredAgentWithoutSessions(t *testing.T) {
@@ -221,4 +225,42 @@ func TestExtMCPShowsDisabledPlacement(t *testing.T) {
 		t.Fatalf("row tagged disabled while Claude is on: %q", tt.Texts())
 	}
 	capture(t, tt, "ext-mcp-disabled")
+}
+
+func TestExtMCPDriftExplainsAndSyncs(t *testing.T) {
+	a := fixture(t)
+	home := os.Getenv("HOME")
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mcpServers":{"github":{"command":"npx","args":["-y","server"]}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(home, ".codex/config.toml")
+	if err := os.WriteFile(cfg, []byte("[mcp_servers.github]\ncommand = \"uvx\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a.installed = map[model.Agent]bool{model.Claude: true, model.Codex: true}
+	a.lang = "zh"
+	tt := ui.NewTester(a.View, 1240, 780)
+	click(t, tt, "MCP 与 Skills")
+	waitExt(t, a, tt)
+	if !tt.HasText("配置不一致：1 处") {
+		t.Fatalf("drift tag missing: %q", tt.Texts())
+	}
+	click(t, tt, "配置不一致：1 处")
+	tt.Frame()
+	if !a.extUI.driftOpen || !tt.HasText("MCP 配置不一致") || !tt.HasText("以 Claude Code 为基准统一") || !tt.HasText("uvx") {
+		t.Fatalf("drift dialog missing: open=%v %q", a.extUI.driftOpen, tt.Texts())
+	}
+	capture(t, tt, "ext-mcp-drift")
+	click(t, tt, "以 Claude Code 为基准统一")
+	waitExt(t, a, tt)
+	b, err := os.ReadFile(cfg)
+	if err != nil || !strings.Contains(string(b), `command = "npx"`) || !strings.Contains(string(b), "server") {
+		t.Fatalf("sync did not copy the source config: %v %s", err, b)
+	}
+	if tt.HasText("配置不一致：") {
+		t.Fatalf("drift tag survived sync: %q", tt.Texts())
+	}
 }

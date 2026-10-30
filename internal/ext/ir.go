@@ -402,21 +402,44 @@ type Row struct {
 	ByAgent     map[model.Agent]Placement
 }
 
-// Source is the copy a row shows, filters on and copies to other agents: the
-// first entry in matrix order that is turned on, else the first entry.
-func (r Row) Source() (MCP, bool) {
+// SourcePlacement is the entry Row.Source reports, plus the agent that owns it:
+// the first enabled entry in matrix order, else the first entry.
+func (r Row) SourcePlacement() (Placement, bool) {
 	agents := MatrixAgents()
-	for _, wantOn := range []bool{true, false} {
+	for _, disabled := range []bool{false, true} {
 		for _, agent := range agents {
-			if p, ok := r.ByAgent[agent]; ok && p.Disabled != wantOn {
-				return p.MCP, true
+			if p, ok := r.ByAgent[agent]; ok && p.Disabled == disabled {
+				return p, true
 			}
 		}
 	}
-	for _, p := range r.ByAgent {
-		return p.MCP, true
+	return Placement{}, false
+}
+
+// Source is the copy a row shows, filters on and copies to other agents.
+func (r Row) Source() (MCP, bool) {
+	p, ok := r.SourcePlacement()
+	if !ok {
+		return MCP{}, false
 	}
-	return MCP{}, false
+	return p.MCP, true
+}
+
+// DriftedAgents lists, in matrix order, the agents whose stored entry differs
+// from the source one. On/off state is ignored: it is not part of Fingerprint.
+func (r Row) DriftedAgents() []model.Agent {
+	src, ok := r.SourcePlacement()
+	if !ok {
+		return nil
+	}
+	fp := src.MCP.Fingerprint()
+	var out []model.Agent
+	for _, agent := range MatrixAgents() {
+		if p, ok := r.ByAgent[agent]; ok && p.MCP.Fingerprint() != fp {
+			out = append(out, agent)
+		}
+	}
+	return out
 }
 
 func buildRows(places []Placement) []Row {
