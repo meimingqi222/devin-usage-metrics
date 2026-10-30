@@ -1,0 +1,5 @@
+--- FAIL: TestAntigravityCLISourceTag (0.02s)
+    sessions_visual_test.go:27: missing CLI source tag: [Search sessions Group by Project Group by Project Collapse All Collapse All Expand All Expand All Hide Reviews Hide Reviews Recycle Bin (0) Recycle Bin (0) Unspecified Project ▾ Unspecified Project  1 sessions 0 Tokens Last Active Session Title Model Msgs Tokens Cost Terminal session 10-30 11:53 x Terminal session unknown 0 0 — Copy ID ID Hide Hide]
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/desktop	0.611s
+FAIL

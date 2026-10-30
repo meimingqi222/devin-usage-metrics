@@ -103,7 +103,7 @@ func loadDBs(ctx context.Context, d *model.Data, a model.Agent, refresh bool, pr
 		}
 		paths = []string{filepath.Join(base, "cli/sessions.db"), filepath.Join(base, "cli-next/sessions.db")}
 	case model.Antigravity:
-		paths = files(d, a, []string{home(".gemini/antigravity/conversations")}, ".db")
+		paths = files(d, a, []string{home(".gemini/antigravity/conversations"), home(".gemini/antigravity-cli/conversations")}, ".db")
 	case model.ZCode:
 		paths = []string{home(".zcode/cli/db/db.sqlite"), home("Library/Application Support/zcode/cli/db/db.sqlite")}
 	default:
@@ -210,7 +210,7 @@ func loadDBs(ctx context.Context, d *model.Data, a model.Agent, refresh bool, pr
 						}
 						parseDevin(sourceCtx, &part, db, filepath.Base(filepath.Dir(p)), baseline)
 					case model.Antigravity:
-						parseAG(sourceCtx, &part, db, strings.TrimSuffix(filepath.Base(p), ".db"))
+						parseAG(sourceCtx, &part, db, strings.TrimSuffix(filepath.Base(p), ".db"), antigravitySource(p))
 					default:
 						parseSQLAgent(sourceCtx, &part, a, db)
 					}
@@ -622,9 +622,25 @@ func blob(v any) []byte {
 	}
 	return []byte(str(v))
 }
-func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id string) {
+
+// antigravitySource names the client that wrote a conversation database. The
+// desktop app and the CLI share the same schema but keep separate stores.
+func antigravitySource(p string) string {
+	cli := filepath.Clean(home(".gemini/antigravity-cli/conversations")) + string(filepath.Separator)
+	if strings.HasPrefix(filepath.Clean(p), cli) {
+		return "cli"
+	}
+	return "app"
+}
+func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source string) {
 	a := model.Antigravity
 	s := session(a, id)
+	s.Source = source
+	if source == "cli" {
+		// Keep the app's existing keys stable; namespace CLI sessions so a
+		// shared conversation UUID can never merge the two stores.
+		s.Key = "antigravity-cli/" + id
+	}
 	for _, r := range query(ctx, d, a, db, "trajectory_metadata", "SELECT data FROM trajectory_metadata_blob WHERE id='main'") {
 		b := blob(r["data"])
 		s.WorkingDirectory = strings.TrimPrefix(string(pb(b, 1, 1).b), "file://")

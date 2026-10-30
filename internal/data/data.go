@@ -119,7 +119,7 @@ func DeviceName() string {
 }
 
 // Bump when parsing changes so persisted records cannot bypass importer fixes.
-const snapshotVersion = 3
+const snapshotVersion = 4
 
 type snapshot struct {
 	Version   int

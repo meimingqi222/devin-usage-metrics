@@ -251,6 +251,37 @@ func TestAntigravityFullUsageSuppressesEcho(t *testing.T) {
 		t.Fatal(d)
 	}
 }
+func TestAntigravityIncludesCLIStore(t *testing.T) {
+	h := env(t)
+	desktop := db(t, h, ".gemini/antigravity/conversations/desktop.db")
+	cli := db(t, h, ".gemini/antigravity-cli/conversations/cli.db")
+	for _, conn := range []*sqlite.DB{desktop, cli} {
+		exec(t, conn, "CREATE TABLE trajectory_metadata_blob(id TEXT,data BLOB)")
+		exec(t, conn, "CREATE TABLE gen_metadata(idx INTEGER,data BLOB)")
+		exec(t, conn, "CREATE TABLE steps(idx INTEGER,step_type INTEGER,step_payload BLOB,metadata BLOB)")
+	}
+	usage := []byte{8, 3, 16, 4, 24, 7, 32, 1, 40, 6, 58, 1, 'a', 72, 2, 80, 5}
+	step := append([]byte{10, 2, 8, 100, 74, byte(len(usage))}, usage...)
+	exec(t, desktop, "INSERT INTO steps VALUES (1,0,NULL,?)", step)
+	exec(t, cli, "INSERT INTO steps VALUES (1,0,NULL,?)", step)
+	d := data.Load(model.Antigravity, 0, 200, true)
+	check(t, d, 2)
+	sessions := map[string]model.Session{}
+	for _, s := range d.Sessions {
+		sessions[s.ID] = s
+	}
+	if s, ok := sessions["desktop"]; !ok || s.Source != "app" || s.Key != "antigravity/desktop" {
+		t.Fatalf("desktop session: %+v", sessions)
+	}
+	if s, ok := sessions["cli"]; !ok || s.Source != "cli" || s.Key != "antigravity-cli/cli" {
+		t.Fatalf("cli session: %+v", sessions)
+	}
+	for _, turn := range d.Turns {
+		if turn.SessionKey != "antigravity/desktop" && turn.SessionKey != "antigravity-cli/cli" {
+			t.Fatalf("unexpected turn key %q", turn.SessionKey)
+		}
+	}
+}
 func TestCacheRefreshExpiryAndDevice(t *testing.T) {
 	h := env(t)
 	p := ".pi/agent/sessions/s.jsonl"

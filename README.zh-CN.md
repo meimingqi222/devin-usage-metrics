@@ -54,7 +54,7 @@ Windows PowerShell 应先执行 `$env:CGO_ENABLED = '0'`，再执行 `go build .
 
 ## 数据与兼容
 
-数据源位置与旧版保持一致：Claude 在 `~/.claude/projects`，Codex 在 `$CODEX_HOME`（默认 `~/.codex`），其他默认路径见 [英文数据源表](README.md#data-sources)。支持 WorkBuddy/CodeBuddy 路径别名、Claude 子 Agent 归并和跨文件去重、Codex 累积用量去重，以及只读 SQLite 导入。
+数据源位置基本与旧版一致：Claude 在 `~/.claude/projects`，Codex 在 `$CODEX_HOME`（默认 `~/.codex`），Antigravity 同时读取桌面端 `~/.gemini/antigravity/conversations` 与 CLI 的 `~/.gemini/antigravity-cli/conversations`，其他默认路径见 [英文数据源表](README.md#data-sources)。支持 WorkBuddy/CodeBuddy 路径别名、Claude 子 Agent 归并和跨文件去重、Codex 累积用量去重，以及只读 SQLite 导入。
 
 Go 磁盘缓存与 Rust 快照分开，TTL 为 5 分钟；强制重新加载绕过缓存，进程内按文件/数据库签名复用解析结果。配置目录继续使用平台目录下的 `devin-usage-metrics/`：Linux `~/.config`、macOS `~/Library/Application Support`、Windows `%APPDATA%`。保留设备 ID、语言偏好、同步设置、加密登录及旧版压缩撤销记录。
 

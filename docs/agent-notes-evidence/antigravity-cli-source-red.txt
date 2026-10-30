@@ -1,0 +1,6 @@
+CLI root removed (device identity and temp path redacted):
+--- FAIL: TestAntigravityIncludesCLIStore (0.03s)
+    data_test.go:268: want 2 turns: {Sessions:[{Agent:antigravity Key:antigravity/desktop Source:app ID:desktop Title:desktop WorkingDirectory: SelectedModel: RealModel:<nil> AgentMode: CreatedAt:100 LastActivityAt:100 InputTokens:4 OutputTokens:7 CachedTokens:6 CacheCreationTokens:1 CacheCreation5mTokens:0 CacheCreation1hTokens:0 AgentMessages:1 RecordedCost:<nil> DeviceID:<device-id> DeviceName:<device-name>}] Turns:[{Agent:antigravity SessionKey:antigravity/desktop CreatedAt:100 InputTokens:4 OutputTokens:7 CacheReadTokens:6 CacheCreationTokens:1 CacheCreation5mTokens:0 CacheCreation1hTokens:0 Model: ContextStream: ContextOrder:0 TTFTMs:0 TotalTimeMs:0 RecordedCost:<nil> DeviceID:<device-id> DeviceName:<device-name> DedupKey:}] TurnsStart:0 TurnsEnd:200 Errors:[] FileMtimes:map[<tmp>/TestAntigravityIncludesCLIStore/.gemini/antigravity/conversations/desktop.db:1793332364332206195] FileSessions:map[] SyncContentHash:282a51bed65034576e233368e45e435c39ced18d61226f7d65ee4540e0f2f11f}
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/data	0.402s
+FAIL

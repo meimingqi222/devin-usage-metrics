@@ -59,7 +59,7 @@ The sync server is a separate, existing Go module:
 | Devin | `~/.local/share/devin/{cli,cli-next}/sessions.db` (platform data directory on Windows) |
 | Claude Code | `~/.claude/projects/**/*.jsonl` |
 | Codex | `$CODEX_HOME/{sessions,archived_sessions}/**/*.jsonl`, default `~/.codex` |
-| Antigravity | `~/.gemini/antigravity/conversations/*.db` |
+| Antigravity | `~/.gemini/antigravity/conversations/*.db` (app) and `~/.gemini/antigravity-cli/conversations/*.db` (CLI) |
 | Grok Build | `~/.grok/sessions/*/{summary.json,updates.jsonl}` |
 | ZCode | `~/.zcode/cli/db/db.sqlite` |
 | OpenCode | platform data directory `opencode/opencode.db`, including `opencode2` |

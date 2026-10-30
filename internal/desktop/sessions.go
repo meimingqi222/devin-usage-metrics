@@ -361,6 +361,9 @@ func (a *App) sessionRow(c *ui.Context, s model.Session, modes bool) {
 			if s.Agent == model.Devin && s.Source == "cli-next" {
 				ui.Text(c, "next").FontSize(12).TextColor(c.Theme().TextMuted.Alpha(.7))
 			}
+			if s.Agent == model.Antigravity && s.Source == "cli" {
+				ui.Text(c, "CLI").FontSize(12).TextColor(c.Theme().TextMuted.Alpha(.7))
+			}
 		})
 		ui.Text(c, s.Title).Grow(1).MinWidth(0).FontSize(12).NoWrap().Ellipsis("…")
 		if modes {
