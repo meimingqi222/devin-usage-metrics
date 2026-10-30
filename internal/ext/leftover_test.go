@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -330,8 +331,12 @@ func TestPreviewAndInstallShareZip(t *testing.T) {
 		t.Fatalf("install %v %s", err, got)
 	}
 	st, err := os.Stat(filepath.Join(home, ".claude/skills/pdf/scripts/run.sh"))
-	if err != nil || st.Mode()&0111 == 0 {
-		t.Fatalf("exec bit lost: %v %v", err, st)
+	if err != nil {
+		t.Fatalf("install scripts: %v", err)
+	}
+	// Windows does not store Unix execute bits, so FileMode never reports them.
+	if runtime.GOOS != "windows" && st.Mode()&0111 == 0 {
+		t.Fatalf("exec bit lost: %v", st)
 	}
 	if err := os.MkdirAll(filepath.Join(home, ".agents/skills/pdf"), 0700); err != nil {
 		t.Fatal(err)
