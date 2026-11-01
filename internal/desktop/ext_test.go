@@ -264,3 +264,211 @@ func TestExtMCPDriftExplainsAndSyncs(t *testing.T) {
 		t.Fatalf("drift tag survived sync: %q", tt.Texts())
 	}
 }
+
+func TestExtMCPCardNoRedundantButtons(t *testing.T) {
+	a := fixture(t)
+	home := os.Getenv("HOME")
+	// Write an entry whose summary is >60 characters
+	longCmd := `{"mcpServers":{"long_server":{"command":"/usr/local/bin/my-very-long-custom-mcp-executable-command","args":["--verbose","--port","8080"]}}}`
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(longCmd), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a.installed = map[model.Agent]bool{model.Claude: true}
+	a.lang = "zh"
+	tt := ui.NewTester(a.View, 1240, 780)
+	click(t, tt, "MCP 与 Skills")
+	waitExt(t, a, tt)
+
+	if !tt.HasText("long_server") {
+		t.Fatalf("missing server: %q", tt.Texts())
+	}
+	// Verify "展开" or "收起" is NOT rendered
+	if tt.HasText("展开") || tt.HasText("收起") {
+		t.Fatalf("redundant expand/collapse button found: %q", tt.Texts())
+	}
+	// Verify separate "复制摘要" button is NOT rendered as a standalone action button
+	// Click the cap row to test copy functionality
+	click(t, tt, "复制摘要")
+	if !strings.Contains(a.message, "已复制摘要") {
+		t.Fatalf("expected copied notice, got: %s", a.message)
+	}
+}
+
+func TestExtMCPModalDisable(t *testing.T) {
+	a := fixture(t)
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(home, ".codex/config.toml")
+	if err := os.WriteFile(cfg, []byte("[mcp_servers.my_srv]\ncommand = \"npx\"\nstartup_timeout_sec = 40\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mcpServers":{"my_srv":{"command":"npx"}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a.installed = map[model.Agent]bool{model.Codex: true, model.Claude: true}
+	a.lang = "zh"
+	tt := ui.NewTester(a.View, 1240, 780)
+	click(t, tt, "MCP 与 Skills")
+	waitExt(t, a, tt)
+
+	// Clicking Claude (unsupported disable) should open standard confirmDialog (confirmOpen)
+	click(t, tt, "✓ Claude Code")
+	if !a.extUI.confirmOpen || a.extUI.mcpModalOpen {
+		t.Fatalf("expected confirmOpen for Claude: confirmOpen=%v, mcpModalOpen=%v", a.extUI.confirmOpen, a.extUI.mcpModalOpen)
+	}
+	a.extUI.confirmOpen = false
+	tt.Frame()
+
+	// Clicking Codex should open MCP modal (mcpModalOpen)
+	click(t, tt, "✓ Codex")
+	if !a.extUI.mcpModalOpen {
+		t.Fatal("expected mcpModalOpen for Codex")
+	}
+	if !tt.HasText("管理 my_srv（Codex）") || !tt.HasText("停用") || !tt.HasText("移除") {
+		t.Fatalf("modal missing expected texts: %q", tt.Texts())
+	}
+	capture(t, tt, "ext-mcp-modal")
+
+	// Click "停用" in modal
+	click(t, tt, "停用")
+	waitExt(t, a, tt)
+
+	// Modal closed, Codex disabled
+	if a.extUI.mcpModalOpen {
+		t.Fatal("modal did not close after clicking pause")
+	}
+	if !tt.HasText("– Codex") {
+		t.Fatalf("pill not showing paused state: %q", tt.Texts())
+	}
+	b, _ := os.ReadFile(cfg)
+	if !strings.Contains(string(b), "enabled = false") || !strings.Contains(string(b), "startup_timeout_sec = 40") {
+		t.Fatalf("config file was not updated with enabled = false: %s", b)
+	}
+}
+
+func TestExtSkillDescriptionAndSearchFilter(t *testing.T) {
+	a := fixture(t)
+	home := os.Getenv("HOME")
+	dir1 := filepath.Join(home, ".agents/skills/alpha-tool")
+	if err := os.MkdirAll(dir1, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir1, "SKILL.md"), []byte("---\nname: alpha-tool\ndescription: Manage kubernetes clusters\n---\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dir2 := filepath.Join(home, ".agents/skills/beta-tool")
+	if err := os.MkdirAll(dir2, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir2, "SKILL.md"), []byte("---\nname: beta-tool\ndescription: Database migration helper\n---\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a.installed = map[model.Agent]bool{model.Codex: true}
+	a.lang = "zh"
+	tt := ui.NewTester(a.View, 1240, 780)
+	click(t, tt, "MCP 与 Skills")
+	waitExt(t, a, tt)
+	click(t, tt, "已安装 Skills")
+
+	// Both skills and descriptions should appear
+	if !tt.HasText("alpha-tool") || !tt.HasText("Manage kubernetes clusters") {
+		t.Fatalf("missing alpha-tool description: %q", tt.Texts())
+	}
+	if !tt.HasText("beta-tool") || !tt.HasText("Database migration helper") {
+		t.Fatalf("missing beta-tool description: %q", tt.Texts())
+	}
+	capture(t, tt, "ext-skills-desc")
+
+	// Filter by description: "kubernetes" matches alpha-tool
+	a.extUI.filter = "kubernetes"
+	tt.Frame()
+	if !tt.HasText("alpha-tool") || tt.HasText("beta-tool") {
+		t.Fatalf("filter by description failed: %q", tt.Texts())
+	}
+
+	// Filter by non-existent text
+	a.extUI.filter = "nonexistent"
+	tt.Frame()
+	if !tt.HasText("没有符合当前筛选条件的 Skill。") {
+		t.Fatalf("expected empty filter message, got: %q", tt.Texts())
+	}
+}
+
+func TestExtAgentFilterDropdown(t *testing.T) {
+	a := fixture(t)
+	home := os.Getenv("HOME")
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mcpServers":{"claude_srv":{"command":"npx"}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex/config.toml"), []byte("[mcp_servers.codex_srv]\ncommand = \"npx\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a.installed = map[model.Agent]bool{model.Claude: true, model.Codex: true}
+	a.lang = "zh"
+	tt := ui.NewTester(a.View, 1240, 780)
+	click(t, tt, "MCP 与 Skills")
+	waitExt(t, a, tt)
+
+	if !tt.HasText("claude_srv") || !tt.HasText("codex_srv") {
+		t.Fatalf("initial matrix missing rows: %q", tt.Texts())
+	}
+	if !tt.HasText("全部 Agent") {
+		t.Fatalf("missing agent filter dropdown pill: %q", tt.Texts())
+	}
+
+	// Click filter dropdown to open popover
+	click(t, tt, "按 Agent 筛选")
+	tt.Frame()
+	if !a.extUI.agentMenu {
+		t.Fatal("agentMenu popover did not open")
+	}
+
+	// Select Codex
+	click(t, tt, "筛选：Codex")
+	tt.Frame()
+	if a.extUI.agentFilter != model.Codex {
+		t.Fatalf("agentFilter not set to Codex: %v", a.extUI.agentFilter)
+	}
+
+	// Now only codex_srv should be shown
+	if tt.HasText("claude_srv") || !tt.HasText("codex_srv") {
+		t.Fatalf("filter by agent did not isolate codex_srv: %q", tt.Texts())
+	}
+}
+
+func TestExtEnglishRenderNoFormattingErrors(t *testing.T) {
+	a := fixture(t)
+	home := os.Getenv("HOME")
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mcpServers":{"demo":{"command":"npx","args":["-y","server"]}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(home, ".agents/skills/my-skill")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\nname: my-skill\ndescription: Demo skill\n---\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a.installed = map[model.Agent]bool{model.Claude: true, model.Codex: true, model.Antigravity: true}
+	a.lang = "en"
+	tt := ui.NewTester(a.View, 1240, 780)
+	click(t, tt, "MCP & Skills")
+	waitExt(t, a, tt)
+
+	for _, text := range tt.Texts() {
+		if strings.Contains(text, "%!") {
+			t.Fatalf("formatting error in English UI: %q", text)
+		}
+	}
+	click(t, tt, "Installed Skills")
+	for _, text := range tt.Texts() {
+		if strings.Contains(text, "%!") {
+			t.Fatalf("formatting error in English Skills UI: %q", text)
+		}
+	}
+}

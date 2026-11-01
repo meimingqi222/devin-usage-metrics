@@ -15,11 +15,14 @@ const (
 	checkSVG           = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>`
 	warningSVG         = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`
 	minusSVG           = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/></svg>`
+	copySVG            = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`
+	externalLinkSVG    = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>`
 )
 
 var (
 	requeryIcon, resetIcon, checkIcon = svgIcon(refreshSVG), svgIcon(resetSVG), svgIcon(checkSVG)
 	warningIcon, minusIcon            = svgIcon(warningSVG), svgIcon(minusSVG)
+	copyIcon, externalLinkIcon        = svgIcon(copySVG), svgIcon(externalLinkSVG)
 	providerLogos                     = map[string]*ui.SVG{"Claude": svgIcon(claudeLogoSVG), "Devin": svgIcon(devinLogoSVG), "Antigravity": svgIcon(antigravityLogoSVG), "Grok": svgIcon(grokLogoSVG), "Codex": svgIcon(openAILogoSVG)}
 )
 

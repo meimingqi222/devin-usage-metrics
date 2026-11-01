@@ -161,7 +161,7 @@ func (a *App) sidebar(c *ui.Context) {
 			}).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
 				ui.Text(c, "A").FontSize(11).FixedLineHeight(14).FontWeight(800).TextColor(ui.Hex("#ffffff"))
 			})
-			ui.Text(c, "Agent Usage Metrics").FontSize(13).FixedLineHeight(20).Bold().NoWrap().Ellipsis("…").MinWidth(0)
+			ui.Text(c, "Agent Usage Metrics").FontSize(13).FixedLineHeight(20).Bold().SingleLine().Ellipsis("…").MinWidth(0)
 		})
 		a.quotaEntry(c)
 		a.extEntry(c)
@@ -317,7 +317,7 @@ func (a *App) agentItem(c *ui.Context, agent model.Agent) {
 		ui.Column(c).Size(17, 17).Shrink(0).Radius(4).Background(markFill).Border(1, markBorder).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
 			ui.Text(c, monogram(agent)).FontSize(10).FixedLineHeight(12).Bold().TextColor(mark)
 		})
-		name := ui.Text(c, agent.Label()).FontSize(12).Grow(1).MinWidth(0).NoWrap().Ellipsis("…").TextColor(text)
+		name := ui.Text(c, agent.Label()).FontSize(12).Grow(1).MinWidth(0).SingleLine().Ellipsis("…").TextColor(text)
 		if active {
 			name.FontWeight(600)
 		}
@@ -489,7 +489,7 @@ func (a *App) deviceScope(c *ui.Context) {
 	}
 	pill.Children(func() {
 		ui.Icon(c, monitorIcon).Size(13, 13).Shrink(0).TextColor(t.Accent)
-		ui.Text(c, name(a.device)).FontSize(12).FontWeight(500).Shrink(1).MinWidth(0).NoWrap().Ellipsis("…")
+		ui.Text(c, name(a.device)).FontSize(12).FontWeight(500).Shrink(1).MinWidth(0).SingleLine().Ellipsis("…")
 		ui.Text(c, "▾").FontSize(9).Shrink(0).TextColor(faint(t))
 	})
 	if pill.Clicked() {
@@ -526,7 +526,7 @@ func (a *App) deviceItem(c *ui.Context, id, name string, color ui.Color) {
 	}
 	r.Children(func() {
 		ui.Box(c).Size(6, 6).Shrink(0).Radius(3).Background(color)
-		text := ui.Text(c, name).FontSize(12).Grow(1).MinWidth(0).NoWrap().Ellipsis("…")
+		text := ui.Text(c, name).FontSize(12).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
 		if selected {
 			text.FontWeight(600).TextColor(t.Accent)
 			ui.Icon(c, checkIcon).Size(11, 11).TextColor(t.Accent)

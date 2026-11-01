@@ -260,40 +260,145 @@ func EnableMCP(name string, agent model.Agent) error {
 		if !ok || t.cap != CapMCPSkills {
 			return fmt.Errorf("%s does not support MCP writes", agent.Label())
 		}
-		got, err := readAgentMCP(t)
-		var place *Placement
-		for i := range got {
-			if got[i].MCP.Name == name {
-				place = &got[i]
-				break
-			}
-		}
-		if place == nil {
+		places, err := agentMCPPlacements(t, name)
+		if len(places) == 0 {
 			if err != nil {
 				return err
 			}
 			return fmt.Errorf("%s: %s is not configured", agent.Label(), name)
 		}
-		if !place.Disabled {
+		var needEnable []Placement
+		var paths []string
+		for _, p := range places {
+			if p.Disabled {
+				needEnable = append(needEnable, p)
+				paths = append(paths, p.Path)
+			}
+		}
+		if len(needEnable) == 0 {
 			return nil
 		}
-		snaps, err := captureFiles([]string{place.Path})
+		snaps, err := captureFiles(paths)
 		if err != nil {
 			return err
 		}
-		tt := t
-		tt.mcpPath, tt.mcpDialect = place.Path, place.Dialect
-		if place.Dialect == dialectServers && agent == model.OpenCode {
-			tt.mcpKey = "mcpServers"
-		}
-		m := place.MCP
-		m.Disabled = false
-		if err := writeOneMCP(tt, m); err != nil {
-			_ = restoreSnaps(snaps)
-			return err
+		for _, p := range needEnable {
+			tt := t
+			tt.mcpPath, tt.mcpDialect = p.Path, p.Dialect
+			if p.Dialect == dialectServers && agent == model.OpenCode {
+				tt.mcpKey = "mcpServers"
+			}
+			m := p.MCP
+			m.Disabled = false
+			if err := writeOneMCP(tt, m); err != nil {
+				_ = restoreSnaps(snaps)
+				return err
+			}
 		}
 		return saveSnapshot("mcp-enable", name, snaps)
 	})
+}
+
+// SupportsMCPDisable reports whether the agent has a native disabled switch
+// for individual MCP entries.
+func SupportsMCPDisable(agent model.Agent) bool {
+	switch agent {
+	case model.Codex, model.Antigravity, model.OpenCode, model.WorkBuddy:
+		return true
+	default:
+		return false
+	}
+}
+
+// DisableMCP switches off an existing entry in place in the file that holds
+// it, preserving extra and custom fields (timeouts, tool filters).
+func DisableMCP(name string, agent model.Agent) error {
+	if !SupportsMCPDisable(agent) {
+		return fmt.Errorf("%s does not support disabling individual MCP servers", agent.Label())
+	}
+	return withLock(func() error {
+		t, ok := targetFor(agent)
+		if !ok || t.cap != CapMCPSkills {
+			return fmt.Errorf("%s does not support MCP writes", agent.Label())
+		}
+		places, err := agentMCPPlacements(t, name)
+		if len(places) == 0 {
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("%s: %s is not configured", agent.Label(), name)
+		}
+		var needDisable []Placement
+		var paths []string
+		for _, p := range places {
+			if !p.Disabled {
+				needDisable = append(needDisable, p)
+				paths = append(paths, p.Path)
+			}
+		}
+		if len(needDisable) == 0 {
+			return nil
+		}
+		snaps, err := captureFiles(paths)
+		if err != nil {
+			return err
+		}
+		for _, p := range needDisable {
+			tt := t
+			tt.mcpPath, tt.mcpDialect = p.Path, p.Dialect
+			if p.Dialect == dialectServers && agent == model.OpenCode {
+				tt.mcpKey = "mcpServers"
+			}
+			m := p.MCP
+			m.Disabled = true
+			if err := writeOneMCP(tt, m); err != nil {
+				_ = restoreSnaps(snaps)
+				return err
+			}
+		}
+		return saveSnapshot("mcp-disable", name, snaps)
+	})
+}
+
+func agentMCPPlacements(t target, name string) ([]Placement, error) {
+	paths := append([]string{t.mcpPath}, extraMCPFiles(t)...)
+	var places []Placement
+	seen := map[string]bool{}
+	var lastErr error
+	for _, path := range paths {
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		text, err := readText(path)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		dialect := t.mcpDialect
+		key := t.mcpKey
+		if strings.HasSuffix(path, "mcp.json") && t.agent == model.OpenCode {
+			dialect, key = dialectServers, "mcpServers"
+		}
+		servers, err := parseMCPFile(text, dialect, key)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		for _, m := range servers {
+			if m.Name == name {
+				places = append(places, Placement{Agent: t.agent, Path: path, Dialect: dialect, MCP: m, Disabled: m.Disabled})
+				if t.agent != model.WorkBuddy {
+					return places, nil
+				}
+				break
+			}
+		}
+	}
+	return places, lastErr
 }
 
 func RemoveMCP(name string, agents []model.Agent) error {

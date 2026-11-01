@@ -241,7 +241,7 @@ func (a *App) summaryCard(c *ui.Context, v summaryCard) {
 	}
 	card.Children(func() {
 		ui.Row(c).Height(22).Gap(8).AlignItems(ui.Center).Margin(0, 0, 6, 0).Children(func() {
-			ui.Text(c, v.label).FontSize(12).FixedLineHeight(18).FontWeight(500).TextColor(t.TextMuted).Grow(1).MinWidth(0).NoWrap().Ellipsis("…")
+			ui.Text(c, v.label).FontSize(12).FixedLineHeight(18).FontWeight(500).TextColor(t.TextMuted).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
 			if v.badge != "" {
 				ui.Text(c, v.badge).FontSize(10).FontWeight(600).Padding(2, 6).Radius(3).Background(v.badgeColor.Alpha(.1)).Border(1, v.badgeColor.Alpha(.25)).TextColor(v.badgeColor).NoWrap()
 			}
@@ -368,7 +368,7 @@ func (a *App) usageChart(c *ui.Context, bs []analytics.Bucket) {
 	step := niceStep(hi / 3)
 	top := 3 * step
 	ui.Column(c).Padding(16, 20, 20, 20).Gap(16).Radius(6).Shrink(0).Background(t.Surface).Border(1, t.Border).Shadow(0, 1, 3, 0, ui.Hex("#000000").Alpha(.3)).Label(a.t("Stacked token usage chart", "Token 用量堆叠图")).Children(func() {
-		ui.Row(c).Gap(16).AlignItems(ui.Center).Children(func() {
+		ui.Row(c).Gap(16).AlignItems(ui.Center).Wrap().Children(func() {
 			ui.Row(c).Gap(12).AlignItems(ui.Baseline).Children(func() {
 				title := a.t("Token Usage Trend", "Token 用量趋势")
 				if cost {
@@ -556,7 +556,7 @@ func (a *App) usageRow(c *ui.Context, values []string, heading, inactive bool, o
 				a.modelSummary(c, models)
 				continue
 			}
-			e := ui.Text(c, v).FontSize(12).NoWrap().Ellipsis("…")
+			e := ui.Text(c, v).FontSize(12).SingleLine().Ellipsis("…")
 			if i < len(widths) {
 				e.Width(widths[i]).Shrink(0)
 				if i > 0 {
@@ -595,7 +595,7 @@ func (a *App) modelSummary(c *ui.Context, models map[string]analytics.ModelUsage
 		if len(names) == 1 {
 			label += " " + formatTokens(models[names[0]].Total())
 		}
-		ui.Text(c, label).MinWidth(0).FontSize(12).NoWrap().Ellipsis("…")
+		ui.Text(c, label).MinWidth(0).FontSize(12).SingleLine().Ellipsis("…")
 		if len(names) > 1 {
 			ui.Text(c, fmt.Sprintf("%.0f%%", models[names[0]].Total()/total*100)).Shrink(0).FontSize(12).TextColor(c.Theme().TextMuted)
 			ui.Text(c, fmt.Sprintf("+%d", len(names)-1)).Shrink(0).FontSize(12).Padding(.5, 4).Radius(2).Background(ui.Hex("#272733")).TextColor(c.Theme().TextMuted)
@@ -625,7 +625,7 @@ func (a *App) modelBreakdown(c *ui.Context, b analytics.Bucket, names []string) 
 				ui.Row(c).Gap(8).Padding(4, 0).AlignItems(ui.Center).Children(func() {
 					ui.Row(c).Width(220).Shrink(0).Gap(6).AlignItems(ui.Center).Children(func() {
 						ui.Box(c).Size(6, 6).Shrink(0).Radius(3).Background(modelColor(name))
-						ui.Text(c, name).MinWidth(0).FontSize(12).NoWrap().Ellipsis("…")
+						ui.Text(c, name).MinWidth(0).FontSize(12).SingleLine().Ellipsis("…")
 					})
 					cost := usageMoney(m.Cost)
 					if m.Cost == 0 && m.Priced {

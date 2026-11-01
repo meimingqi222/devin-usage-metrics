@@ -170,7 +170,7 @@ func TestAtomicWriteFollowsSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(real, link); err != nil {
-		t.Fatal(err)
+		t.Skip("symlinks unavailable:", err)
 	}
 	if err := atomicWrite(link, []byte(`{"a":2}`)); err != nil {
 		t.Fatal(err)
@@ -239,7 +239,7 @@ func TestRemoveSkillUndoRestoresSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(shared, link); err != nil {
-		t.Fatal(err)
+		t.Skip("symlinks unavailable:", err)
 	}
 	if err := RemoveSkill("foo", []model.Agent{model.Claude}, false); err != nil {
 		t.Fatal(err)

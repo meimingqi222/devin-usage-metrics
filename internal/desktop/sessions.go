@@ -291,7 +291,7 @@ func (a *App) sessionsView(c *ui.Context) {
 					ui.Text(c, arrow).FontSize(12).TextColor(c.Theme().TextMuted)
 					ui.Text(c, project).FontSize(14).Bold()
 					path := groups[project][0].WorkingDirectory
-					ui.Text(c, path).MaxWidth(320).MinWidth(0).FontSize(12).TextColor(c.Theme().TextMuted).NoWrap().Ellipsis("…")
+					ui.Text(c, path).MaxWidth(320).MinWidth(0).FontSize(12).TextColor(c.Theme().TextMuted).SingleLine().Ellipsis("…")
 					ui.Spacer(c)
 					var tokens, cost float64
 					priced := 0
@@ -357,7 +357,7 @@ func (a *App) sessionRow(c *ui.Context, s model.Session, modes bool) {
 		}
 		ui.Row(c).Width(110).Shrink(0).MinWidth(0).Gap(4).AlignItems(ui.Center).Clip().Children(func() {
 			ui.Box(c).Size(6, 6).Shrink(0).Radius(3).Background(modelColor(s.DisplayModel()))
-			ui.Text(c, id).Grow(1).MinWidth(0).FontSize(12).NoWrap().Ellipsis("…")
+			ui.Text(c, id).Grow(1).MinWidth(0).FontSize(12).SingleLine().Ellipsis("…")
 			if s.Agent == model.Devin && s.Source == "cli-next" {
 				ui.Text(c, "next").FontSize(12).TextColor(c.Theme().TextMuted.Alpha(.7))
 			}
@@ -365,9 +365,9 @@ func (a *App) sessionRow(c *ui.Context, s model.Session, modes bool) {
 				ui.Text(c, "CLI").FontSize(12).TextColor(c.Theme().TextMuted.Alpha(.7))
 			}
 		})
-		ui.Text(c, s.Title).Grow(1).MinWidth(0).FontSize(12).NoWrap().Ellipsis("…")
+		ui.Text(c, s.Title).Grow(1).MinWidth(0).FontSize(12).SingleLine().Ellipsis("…")
 		if modes {
-			ui.Text(c, s.AgentMode).Width(60).FontSize(12).NoWrap().Ellipsis("…")
+			ui.Text(c, s.AgentMode).Width(60).FontSize(12).SingleLine().Ellipsis("…")
 		}
 		modelText := s.SelectedModel
 		if modelText == "" {
@@ -377,7 +377,7 @@ func (a *App) sessionRow(c *ui.Context, s model.Session, modes bool) {
 		if adaptive {
 			modelText = "adaptive → " + s.DisplayModel()
 		}
-		m := ui.Text(c, modelText).Width(140).FontSize(12).NoWrap().Ellipsis("…")
+		m := ui.Text(c, modelText).Width(140).FontSize(12).SingleLine().Ellipsis("…")
 		if adaptive {
 			m.TextColor(c.Theme().Accent)
 		}

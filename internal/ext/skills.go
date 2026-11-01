@@ -30,9 +30,10 @@ type SkillPlace struct {
 }
 
 type SkillRow struct {
-	Name    string
-	Places  []SkillPlace
-	ByAgent map[model.Agent]SkillPlace
+	Name        string
+	Description string
+	Places      []SkillPlace
+	ByAgent     map[model.Agent]SkillPlace
 }
 
 func InventorySkills() ([]SkillRow, error) {
@@ -104,7 +105,44 @@ func InventorySkills() ([]SkillRow, error) {
 	sort.Strings(names)
 	out := make([]SkillRow, 0, len(names))
 	for _, name := range names {
-		out = append(out, *index[name])
+		row := *index[name]
+		for _, p := range row.Places {
+			if p.Dir == "" {
+				continue
+			}
+			f, err := os.Open(filepath.Join(p.Dir, "SKILL.md"))
+			if err != nil {
+				continue
+			}
+			buf, err := io.ReadAll(io.LimitReader(f, 16*1024))
+			_ = f.Close()
+			if err == nil {
+				if desc := skillDescription(string(buf)); desc != "" {
+					row.Description = desc
+					break
+				}
+			}
+		}
+		if row.Description == "" {
+			for _, p := range row.ByAgent {
+				if p.Dir == "" {
+					continue
+				}
+				f, err := os.Open(filepath.Join(p.Dir, "SKILL.md"))
+				if err != nil {
+					continue
+				}
+				buf, err := io.ReadAll(io.LimitReader(f, 16*1024))
+				_ = f.Close()
+				if err == nil {
+					if desc := skillDescription(string(buf)); desc != "" {
+						row.Description = desc
+						break
+					}
+				}
+			}
+		}
+		out = append(out, row)
 	}
 	return out, errors.Join(errs...)
 }

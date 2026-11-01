@@ -21,7 +21,11 @@ type extUIState struct {
 	driftBase                                            model.Agent
 	undoKind, undoSummary                                string
 	pasteOn, previewOn, configured                       map[model.Agent]bool
-	expanded                                             map[string]bool
+	agentFilter                                          model.Agent
+	agentMenu                                            bool
+	mcpModalOpen                                         bool
+	mcpModalName                                         string
+	mcpModalAgent                                        model.Agent
 	mcpRows                                              []ext.Row
 	skillRows                                            []ext.SkillRow
 	hits                                                 []ext.Hit
@@ -144,6 +148,8 @@ func (a *App) extToolbar(c *ui.Context) {
 		if goSearch.Clicked() {
 			a.searchSkills()
 		}
+	} else {
+		a.extAgentFilterMenu(c)
 	}
 	ui.Spacer(c)
 	if a.extUI.tab == "mcp" {
@@ -166,6 +172,19 @@ func (a *App) extToolbar(c *ui.Context) {
 			}
 		}
 	}
+	reload := ui.ButtonBase(c).Label(a.t("Reload", "刷新")).FontSize(11).Padding(4, 8).Radius(5).Background(ui.Hex("#161b26")).Border(1, t.Border).TextColor(t.TextMuted).Disabled(a.busy["ext"])
+	if reload.Hovered() && !a.busy["ext"] {
+		reload.TextColor(t.Text).Border(1, strongBorder)
+	}
+	reload.Children(func() {
+		ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+			ui.Icon(c, requeryIcon).Size(11, 11)
+			ui.Text(c, a.t("Reload", "刷新")).NoWrap()
+		})
+	})
+	if reload.Clicked() && !a.busy["ext"] {
+		a.refreshExt()
+	}
 	undo := ui.ButtonBase(c).Label(a.t("Undo last change", "撤销上次变更")).FontSize(11).Padding(4, 8).Radius(5).Background(ui.Hex("#161b26")).Border(1, t.Border).TextColor(t.TextMuted).Disabled(!a.extUI.hasUndo || a.busy["ext"])
 	if undo.Hovered() && a.extUI.hasUndo {
 		undo.TextColor(t.Text).Border(1, strongBorder)
@@ -177,6 +196,72 @@ func (a *App) extToolbar(c *ui.Context) {
 	if undo.Clicked() && a.extUI.hasUndo {
 		a.runExt(func() error { return ext.UndoLast() })
 	}
+}
+
+func (a *App) extAgentFilterMenu(c *ui.Context) {
+	t := c.Theme()
+	isSkills := a.extUI.tab == "skills"
+	cols := a.extColumns(isSkills)
+	selectedAgent := a.extUI.agentFilter
+	validSelected := false
+	if selectedAgent != "" {
+		for _, col := range cols {
+			if col == selectedAgent {
+				validSelected = true
+				break
+			}
+		}
+	}
+	label := a.t("All agents", "全部 Agent")
+	if validSelected {
+		label = selectedAgent.Label()
+	}
+
+	pill := ui.Row(c).Shrink(0).MinWidth(0).Gap(6).Padding(4, 8).Radius(5).AlignItems(ui.Center).Background(ui.Hex("#161b26")).Border(1, t.Border).Label(a.t("Filter by agent", "按 Agent 筛选")).Focusable()
+	if pill.Hovered() || a.extUI.agentMenu {
+		pill.Border(1, strongBorder)
+	}
+	pill.Children(func() {
+		ui.Text(c, label).FontSize(11).Shrink(1).MinWidth(0).SingleLine().Ellipsis("…").TextColor(t.Text)
+		ui.Text(c, "▾").FontSize(9).Shrink(0).TextColor(faint(t))
+	})
+	if pill.Clicked() {
+		a.extUI.agentMenu = !a.extUI.agentMenu
+	}
+	ui.PopoverBase(c, pill, &a.extUI.agentMenu, func(panel ui.Element) {
+		panel.MinWidth(140).Padding(4).Gap(2).Radius(6).Background(t.Surface).Border(1, strongBorder).Shadow(0, 8, 24, 0, ui.Hex("#000000").Alpha(.55))
+		panel.Children(func() {
+			a.extAgentFilterItem(c, "", a.t("All agents", "全部 Agent"), !validSelected || selectedAgent == "")
+			for _, agent := range cols {
+				a.extAgentFilterItem(c, agent, agent.Label(), validSelected && selectedAgent == agent)
+			}
+		})
+	})
+}
+
+func (a *App) extAgentFilterItem(c *ui.Context, agent model.Agent, label string, selected bool) {
+	t := c.Theme()
+	itemLabel := a.t("Filter: ", "筛选：") + label
+	r := ui.Row(c.Key("extAgentFilter/"+string(agent))).Height(26).Shrink(0).Padding(0, 8).Gap(8).Radius(4).AlignItems(ui.Center).Label(itemLabel).Focusable()
+	switch {
+	case selected:
+		r.Background(t.Accent.Alpha(.12))
+	case r.Hovered():
+		r.Background(t.SurfaceHover)
+	}
+	if r.Clicked() {
+		a.extUI.agentFilter = agent
+		a.extUI.agentMenu = false
+	}
+	r.Children(func() {
+		text := ui.Text(c, label).FontSize(11).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
+		if selected {
+			text.FontWeight(600).TextColor(t.Accent)
+			ui.Icon(c, checkIcon).Size(11, 11).TextColor(t.Accent)
+		} else {
+			text.TextColor(t.Text)
+		}
+	})
 }
 
 func (a *App) searchSkills() {
@@ -263,16 +348,38 @@ func (a *App) extMCPMatrix(c *ui.Context) {
 		ui.Text(c, a.t("No MCP-capable agents installed on this device.", "本机没有可写入 MCP 的 Agent。")).FontSize(14).TextColor(t.TextMuted)
 		return
 	}
+	activeAgentFilter := a.extUI.agentFilter
+	if activeAgentFilter != "" {
+		hasCol := false
+		for _, col := range cols {
+			if col == activeAgentFilter {
+				hasCol = true
+				break
+			}
+		}
+		if !hasCol {
+			activeAgentFilter = ""
+		}
+	}
 	shown := 0
 	for _, row := range a.extUI.mcpRows {
 		if !matchFilter(a.extUI.filter, row.Name, row.Summary) {
 			continue
 		}
+		if activeAgentFilter != "" {
+			if _, ok := row.ByAgent[activeAgentFilter]; !ok {
+				continue
+			}
+		}
 		shown++
 		a.extMCPCard(c, row, cols)
 	}
 	if shown == 0 {
-		ui.Text(c, a.t("No MCP servers on the installed agents.", "已安装的 Agent 上还没有 MCP。")).FontSize(14).TextColor(t.TextMuted)
+		if activeAgentFilter != "" || strings.TrimSpace(a.extUI.filter) != "" {
+			ui.Text(c, a.t("No MCP servers match the current filter.", "没有符合当前筛选条件的 MCP。")).FontSize(14).TextColor(t.TextMuted)
+		} else {
+			ui.Text(c, a.t("No MCP servers on the installed agents.", "已安装的 Agent 上还没有 MCP。")).FontSize(14).TextColor(t.TextMuted)
+		}
 	}
 }
 
@@ -308,16 +415,6 @@ func extTagButton(c *ui.Context, icon *ui.SVG, label string, fill, border, text 
 func extGhostButton(c *ui.Context, label string) ui.Element {
 	t := c.Theme()
 	b := ui.ButtonBase(c).Label(label).FontSize(11).Padding(3, 8).Radius(4).Background(ui.Hex("#161b26")).Border(1, t.Border).TextColor(t.TextMuted)
-	if b.Hovered() {
-		b.TextColor(t.Text).Border(1, strongBorder)
-	}
-	b.Children(func() { ui.Text(c, label).NoWrap() })
-	return b
-}
-
-func extMiniGhostButton(c *ui.Context, label string) ui.Element {
-	t := c.Theme()
-	b := ui.ButtonBase(c).Label(label).FontSize(10).Padding(2, 6).Radius(3).Background(ui.Hex("#161b26")).Border(1, t.Border).TextColor(t.TextMuted)
 	if b.Hovered() {
 		b.TextColor(t.Text).Border(1, strongBorder)
 	}
@@ -368,7 +465,7 @@ func (a *App) extMCPCard(c *ui.Context, row ext.Row, cols []model.Agent) {
 	card := extCard(c, "mcp/"+row.Name)
 	card.Children(func() {
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, row.Name).FontSize(13).FontWeight(600).Grow(1).MinWidth(0).NoWrap().Ellipsis("…")
+			ui.Text(c, row.Name).FontSize(13).FontWeight(600).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
 			switch kind {
 			case "SSE":
 				extTag(c, "SSE", quotaRose.Alpha(.12), quotaRose.Alpha(.35), quotaRose)
@@ -402,40 +499,16 @@ func (a *App) extMCPCard(c *ui.Context, row ext.Row, cols []model.Agent) {
 			}
 		})
 
-		ui.Row(c).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, a.t("Command / source", "命令 / 服务源")).FontSize(10).FontWeight(600).TextColor(faint(t)).Grow(1)
-			if row.Summary != "" {
-				ui.Row(c).Gap(6).Children(func() {
-					// The summary hides secrets and URL paths, so it is not a runnable command.
-					copyBtn := extMiniGhostButton(c, a.t("Copy summary", "复制摘要"))
-					if copyBtn.Clicked() {
-						c.WriteClipboard(row.Summary)
-						a.message = a.t("Copied summary; secrets are hidden.", "已复制摘要（密钥已隐去）。")
-					}
-					if len(row.Summary) > 60 || strings.Contains(row.Summary, "\n") {
-						isExp := a.extUI.expanded != nil && a.extUI.expanded[row.Name]
-						lbl := a.t("Expand", "展开")
-						if isExp {
-							lbl = a.t("Collapse", "收起")
-						}
-						expBtn := extMiniGhostButton(c, lbl)
-						if expBtn.Clicked() {
-							if a.extUI.expanded == nil {
-								a.extUI.expanded = make(map[string]bool)
-							}
-							a.extUI.expanded[row.Name] = !isExp
-						}
-					}
-				})
-			}
-		})
+		ui.Text(c, a.t("Command / source", "命令 / 服务源")).FontSize(10).FontWeight(600).TextColor(faint(t))
 
 		cmd := row.Summary
 		if cmd == "" {
 			cmd = "—"
 		}
-		isExpanded := a.extUI.expanded != nil && a.extUI.expanded[row.Name]
-		cap := ui.Row(c).FillWidth().MinWidth(0).Clip().Padding(6, 8).Radius(5).Background(ui.Hex("#161b26")).Border(1, t.Border).AlignItems(ui.Center).Label(a.t("Copy summary", "复制摘要")).Focusable()
+		cap := ui.Row(c).FillWidth().MinWidth(0).Gap(8).Padding(6, 8).Radius(5).Background(ui.Hex("#161b26")).Border(1, t.Border).AlignItems(ui.Center).Label(a.t("Copy summary", "复制摘要")).Focusable()
+		if row.Summary != "" {
+			cap.Tooltip(a.t("Click to copy summary (secrets hidden)", "点击复制摘要（密钥已隐去）"))
+		}
 		if cap.Hovered() {
 			cap.Border(1, strongBorder)
 		}
@@ -444,11 +517,13 @@ func (a *App) extMCPCard(c *ui.Context, row ext.Row, cols []model.Agent) {
 			a.message = a.t("Copied summary; secrets are hidden.", "已复制摘要（密钥已隐去）。")
 		}
 		cap.Children(func() {
-			txt := ui.Text(c, cmd).FontSize(11).TextColor(t.TextMuted).MinWidth(0).Grow(1)
-			if !isExpanded {
-				txt.NoWrap().Ellipsis("…")
-			} else {
-				txt.Wrap()
+			ui.Text(c, cmd).FontSize(11).TextColor(t.TextMuted).MinWidth(0).Grow(1).Wrap()
+			if row.Summary != "" {
+				copyColor := faint(t)
+				if cap.Hovered() {
+					copyColor = t.Text
+				}
+				ui.Icon(c, copyIcon).Size(12, 12).Shrink(0).TextColor(copyColor)
 			}
 		})
 
@@ -543,7 +618,7 @@ func (a *App) extDriftDialog(c *ui.Context) {
 				if place.MCP.Fingerprint() != srcFP {
 					color = quotaRose
 				}
-				txt := ui.Text(c, summary).FontSize(11).TextColor(color).Grow(1).MinWidth(0).NoWrap().Ellipsis("…")
+				txt := ui.Text(c, summary).FontSize(11).TextColor(color).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
 				if summary != "" {
 					txt.Tooltip(summary)
 				}
@@ -600,24 +675,38 @@ func (a *App) extMCPPill(c *ui.Context, row ext.Row, agent model.Agent) {
 	unsupported := !on && ok && src.SSE() && !ext.AcceptsSSE(agent)
 	disabled := a.busy["ext"] || unsupported
 	b := a.extAgentPillState(c, "mcp/"+row.Name+"/"+string(agent), agent, on, on && place.Disabled, disabled)
-	if unsupported {
+	switch {
+	case unsupported:
 		b.Tooltip(fmt.Sprintf(a.t("%s does not accept legacy SSE MCP.", "%s 不支持旧式 SSE MCP。"), agent.Label()))
-	}
-	if on && place.Disabled {
-		b.Tooltip(fmt.Sprintf(a.t("Turned off in %s. Click to turn it back on; its other settings stay.", "%s 里已停用。点击重新启用，其它设置保留。"), agent.Label()))
+	case on && place.Disabled:
+		b.Tooltip(fmt.Sprintf(a.t("%s\nTurned off in %s. Click to turn it back on; its other settings stay.", "%s\n%s 里已停用。点击重新启用，其它设置保留。"), place.Path, agent.Label()))
+	case on:
+		if ext.SupportsMCPDisable(agent) {
+			b.Tooltip(fmt.Sprintf(a.t("%s\nClick to pause or remove.", "%s\n点击可停用或移除。"), place.Path))
+		} else {
+			b.Tooltip(fmt.Sprintf(a.t("%s\nClick to remove.", "%s\n点击移除。"), place.Path))
+		}
+	default:
+		b.Tooltip(fmt.Sprintf(a.t("Click to configure %s in %s.", "点击将 %s 配置写入 %s。"), row.Name, agent.Label()))
 	}
 	if !b.Clicked() || unsupported {
 		return
 	}
-	// A paused pill turns back on in place; an active pill removes the entry.
+	// A paused pill turns back on in place.
 	if on && place.Disabled {
 		a.runExt(func() error { return ext.EnableMCP(row.Name, agent) })
 		return
 	}
 	if on {
-		a.askExt(a.t("Remove MCP", "移除 MCP"), a.t("Remove", "移除"), fmt.Sprintf(a.t("Remove %s (%s)?", "移除 %s（%s）？"), row.Name, agent.Label()), func() error {
-			return ext.RemoveMCP(row.Name, []model.Agent{agent})
-		})
+		if ext.SupportsMCPDisable(agent) {
+			a.extUI.mcpModalOpen = true
+			a.extUI.mcpModalName = row.Name
+			a.extUI.mcpModalAgent = agent
+		} else {
+			a.askExt(a.t("Remove MCP", "移除 MCP"), a.t("Remove", "移除"), fmt.Sprintf(a.t("Remove %s (%s)?", "移除 %s（%s）？"), row.Name, agent.Label()), func() error {
+				return ext.RemoveMCP(row.Name, []model.Agent{agent})
+			})
+		}
 		return
 	}
 	if !ok {
@@ -625,6 +714,44 @@ func (a *App) extMCPPill(c *ui.Context, row ext.Row, agent model.Agent) {
 		return
 	}
 	a.runExt(func() error { return ext.ApplyMCP(row.Name, src, []model.Agent{agent}) })
+}
+
+func (a *App) extMCPModal(c *ui.Context) {
+	if !a.extUI.mcpModalOpen {
+		return
+	}
+	t := c.Theme()
+	name := a.extUI.mcpModalName
+	agent := a.extUI.mcpModalAgent
+	ui.DialogBase(c, &a.extUI.mcpModalOpen, func(back, panel ui.Element) {
+		back.Background(ui.RGBA(0, 0, 0, .55))
+		panel.Width(440).Padding(16).Gap(12).Radius(8).Background(t.Surface).Border(1, t.Border)
+		ui.Text(c, fmt.Sprintf(a.t("Manage %s (%s)", "管理 %s（%s）"), name, agent.Label())).FontSize(14).Bold()
+		ui.Text(c, a.t("Pause keeps this entry and its custom settings (timeouts, tool filters) in the config file with its switch turned off. Remove deletes the entry.", "「停用」会在配置文件中原地关闭开关，保留超时、工具过滤等自定义字段；「移除」会删除该条目。")).FontSize(12).TextColor(t.TextMuted)
+		ui.Row(c).Justify(ui.End).Gap(8).Children(func() {
+			if settingsButton(c, a.t("Cancel", "取消"), false).Clicked() {
+				a.extUI.mcpModalOpen = false
+			}
+			pauseBtn := ui.ButtonBase(c).Label(a.t("Pause", "停用")).FontSize(12).FixedLineHeight(20).Padding(4, 12).Radius(4).Background(controlColor).Border(1, t.Border).TextColor(t.Text)
+			if pauseBtn.Hovered() {
+				pauseBtn.Border(1, strongBorder)
+			}
+			pauseBtn.Children(func() { ui.Text(c, a.t("Pause", "停用")).NoWrap() })
+			if pauseBtn.Clicked() {
+				a.extUI.mcpModalOpen = false
+				a.extUI.queued = func() error { return ext.DisableMCP(name, agent) }
+			}
+			removeBtn := ui.ButtonBase(c).Label(a.t("Remove", "移除")).FontSize(12).FixedLineHeight(20).Padding(4, 12).Radius(4).Background(quotaRose.Alpha(.12)).Border(1, quotaRose.Alpha(.35)).TextColor(quotaRose)
+			if removeBtn.Hovered() {
+				removeBtn.Background(quotaRose.Alpha(.22)).Border(1, quotaRose)
+			}
+			removeBtn.Children(func() { ui.Text(c, a.t("Remove", "移除")).NoWrap() })
+			if removeBtn.Clicked() {
+				a.extUI.mcpModalOpen = false
+				a.extUI.queued = func() error { return ext.RemoveMCP(name, []model.Agent{agent}) }
+			}
+		})
+	})
 }
 
 func (a *App) extAgentPill(c *ui.Context, key string, agent model.Agent, on, disabled bool) ui.Element {
@@ -684,16 +811,38 @@ func (a *App) extSkillsMatrix(c *ui.Context) {
 		ui.Text(c, a.t("No skill-capable agents installed on this device.", "本机没有可写入 Skill 的 Agent。")).FontSize(14).TextColor(t.TextMuted)
 		return
 	}
+	activeAgentFilter := a.extUI.agentFilter
+	if activeAgentFilter != "" {
+		hasCol := false
+		for _, col := range cols {
+			if col == activeAgentFilter {
+				hasCol = true
+				break
+			}
+		}
+		if !hasCol {
+			activeAgentFilter = ""
+		}
+	}
 	shown := 0
 	for _, row := range a.extUI.skillRows {
-		if !matchFilter(a.extUI.filter, row.Name, "") {
+		if !matchFilter(a.extUI.filter, row.Name, row.Description) {
 			continue
+		}
+		if activeAgentFilter != "" {
+			if _, ok := row.ByAgent[activeAgentFilter]; !ok {
+				continue
+			}
 		}
 		shown++
 		a.extSkillCard(c, row, cols)
 	}
 	if shown == 0 {
-		ui.Text(c, a.t("No skills on the installed agents.", "已安装的 Agent 上还没有 Skill。")).FontSize(14).TextColor(t.TextMuted)
+		if activeAgentFilter != "" || strings.TrimSpace(a.extUI.filter) != "" {
+			ui.Text(c, a.t("No skills match the current filter.", "没有符合当前筛选条件的 Skill。")).FontSize(14).TextColor(t.TextMuted)
+		} else {
+			ui.Text(c, a.t("No skills on the installed agents.", "已安装的 Agent 上还没有 Skill。")).FontSize(14).TextColor(t.TextMuted)
+		}
 	}
 }
 
@@ -715,7 +864,7 @@ func (a *App) extSkillCard(c *ui.Context, row ext.SkillRow, cols []model.Agent) 
 	card := extCard(c, "skill/"+row.Name)
 	card.Children(func() {
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, row.Name).FontSize(13).FontWeight(600).Grow(1).MinWidth(0).NoWrap().Ellipsis("…")
+			ui.Text(c, row.Name).FontSize(13).FontWeight(600).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
 			if shared {
 				extTag(c, a.t("shared", "共享"), controlColor, t.Border, t.TextMuted)
 			}
@@ -739,12 +888,25 @@ func (a *App) extSkillCard(c *ui.Context, row ext.SkillRow, cols []model.Agent) 
 				})
 			}
 		})
+		if row.Description != "" {
+			ui.Text(c, row.Description).FontSize(11).TextColor(t.TextMuted).Wrap()
+		}
 		ui.Text(c, a.t("Active agents", "生效 Agent")).FontSize(10).FontWeight(600).TextColor(faint(t))
 		ui.Row(c).Wrap().Gap(6).Children(func() {
 			for _, agent := range cols {
 				place, on := row.ByAgent[agent]
 				canEnable := !on && (shared || len(row.Places) > 0)
 				b := a.extAgentPill(c, "skill/"+row.Name+"/"+string(agent), agent, on, a.busy["ext"] || (!on && !canEnable))
+				switch {
+				case on && place.Inherited && place.Shared:
+					b.Tooltip(a.t("Loads automatically from ~/.agents/skills (shared). Use Unshare at top right to turn off.", "从 ~/.agents/skills 自动加载（共享），如需关闭共享副本请点右上角「取消共享」。"))
+				case on && place.Inherited && !place.Shared:
+					b.Tooltip(fmt.Sprintf(a.t("%s\nLoads automatically from Claude's skills folder.", "%s\n从 Claude 的 skills 目录自动加载。"), place.Dir))
+				case on && !place.Inherited:
+					b.Tooltip(fmt.Sprintf(a.t("%s\nClick to remove this agent's copy.", "%s\n点击可移除该 Agent 副本。"), place.Dir))
+				case !on && canEnable:
+					b.Tooltip(fmt.Sprintf(a.t("Click to copy to %s's skills folder.", "点击复制到 %s 的 skills 目录。"), agent.Label()))
+				}
 				if !b.Clicked() {
 					continue
 				}
@@ -768,6 +930,18 @@ func (a *App) extSkillCard(c *ui.Context, row ext.SkillRow, cols []model.Agent) 
 	})
 }
 
+func skillRepoURL(source string) string {
+	source = strings.TrimSpace(source)
+	if strings.ContainsAny(source, " \t\r\n?#") || strings.Contains(source, "..") {
+		return ""
+	}
+	parts := strings.Split(source, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+	return "https://github.com/" + source
+}
+
 func (a *App) extDiscover(c *ui.Context) {
 	t := c.Theme()
 	if a.busy["ext-search"] {
@@ -775,6 +949,22 @@ func (a *App) extDiscover(c *ui.Context) {
 	}
 	if strings.TrimSpace(a.extUI.query) == "" {
 		ui.Text(c, a.t("Type a keyword in the toolbar to search skills.sh.", "在顶栏输入关键词，从 skills.sh 检索 Skill。")).FontSize(14).TextColor(t.TextMuted)
+		if !a.busy["ext-search"] {
+			ui.Row(c).Wrap().Gap(6).Children(func() {
+				for _, tag := range []string{"mcp", "go", "react", "typescript", "testing", "git", "browser"} {
+					kw := tag
+					pill := ui.ButtonBase(c.Key("discoverTag/"+kw)).Label(kw).FontSize(11).Padding(4, 10).Radius(12).Background(ui.Hex("#161b26")).Border(1, t.Border).TextColor(faint(t))
+					if pill.Hovered() {
+						pill.Border(1, strongBorder).TextColor(t.Text)
+					}
+					pill.Children(func() { ui.Text(c, kw).NoWrap() })
+					if pill.Clicked() {
+						a.extUI.query = kw
+						a.searchSkills()
+					}
+				}
+			})
+		}
 		return
 	}
 	if len(a.extUI.hits) == 0 && !a.busy["ext-search"] {
@@ -787,9 +977,25 @@ func (a *App) extDiscover(c *ui.Context) {
 		card.Children(func() {
 			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 				ui.Column(c).Grow(1).MinWidth(0).Clip().Children(func() {
-					ui.Text(c, h.Source+"@"+h.SkillID).FontSize(13).FontWeight(600).NoWrap().Ellipsis("…").MinWidth(0)
+					ui.Text(c, h.Source+"@"+h.SkillID).FontSize(13).FontWeight(600).SingleLine().Ellipsis("…").MinWidth(0)
 					ui.Text(c, fmt.Sprintf(a.t("%d installs", "%d 次安装"), h.Installs)).FontSize(11).TextColor(faint(t))
 				})
+				repoURL := skillRepoURL(h.Source)
+				if a.openURL != nil && repoURL != "" {
+					gh := ui.ButtonBase(c.Key("gh/"+h.ID)).Label("GitHub "+h.Source).FontSize(11).Padding(4, 8).Radius(5).Background(ui.Hex("#161b26")).Border(1, t.Border).TextColor(t.TextMuted)
+					if gh.Hovered() {
+						gh.TextColor(t.Text).Border(1, strongBorder)
+					}
+					gh.Children(func() {
+						ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+							ui.Icon(c, externalLinkIcon).Size(11, 11)
+							ui.Text(c, "GitHub").NoWrap()
+						})
+					})
+					if gh.Clicked() {
+						a.openURL(repoURL)
+					}
+				}
 				install := ui.ButtonBase(c).Label(a.t("Install", "安装")+" "+h.ID).FontSize(11).Padding(4, 10).Radius(5).Background(tabActive).TextColor(ui.Hex("#ffffff"))
 				install.Children(func() { ui.Text(c, a.t("Install", "安装")).NoWrap() })
 				if install.Clicked() {
@@ -830,6 +1036,7 @@ func (a *App) extDialogs(c *ui.Context) {
 			a.extUI.queued, a.extUI.confirm = a.extUI.confirm, nil
 		}
 	}
+	a.extMCPModal(c)
 	if a.extUI.queued != nil && !a.busy["ext"] {
 		fn := a.extUI.queued
 		a.extUI.queued = nil
@@ -843,11 +1050,13 @@ func (a *App) extDialogs(c *ui.Context) {
 			ui.Text(c, a.t("Add MCP from JSON", "从 JSON 批量添加 MCP")).FontSize(14).Bold()
 			ui.Text(c, a.t("Paste a {\"mcpServers\":{...}} snippet. Secrets stay on this device.", "粘贴 {\"mcpServers\":{...}} 片段。密钥只留在本机。")).FontSize(12).TextColor(c.Theme().TextMuted)
 			ui.TextArea(c, &a.extUI.pasteText).Label(a.t("MCP JSON", "MCP JSON")).MinHeight(140).FillWidth()
-			ui.Row(c).Gap(8).Children(func() {
+			ui.Row(c).Gap(8).Wrap().Children(func() {
 				for _, agent := range a.extColumns(false) {
 					on := a.extUI.pasteOn[agent]
-					ui.Checkbox(c.Key("paste/"+string(agent)), &on, agent.Label())
-					a.extUI.pasteOn[agent] = on
+					pill := a.extAgentPill(c, "paste/"+string(agent), agent, on, false)
+					if pill.Clicked() {
+						a.extUI.pasteOn[agent] = !on
+					}
 				}
 			})
 			ui.Row(c).Justify(ui.End).Gap(8).Children(func() {
@@ -866,7 +1075,25 @@ func (a *App) extDialogs(c *ui.Context) {
 		ui.DialogBase(c, &a.extUI.previewOpen, func(back, panel ui.Element) {
 			back.Background(ui.RGBA(0, 0, 0, .55))
 			panel.Width(480).Padding(16).Gap(10).Radius(8).Background(c.Theme().Surface).Border(1, c.Theme().Border)
-			ui.Text(c, a.extUI.preview.Hit.Source+"@"+a.extUI.preview.Hit.SkillID).FontSize(14).Bold()
+			repoURL := skillRepoURL(a.extUI.preview.Hit.Source)
+			ui.Row(c).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, a.extUI.preview.Hit.Source+"@"+a.extUI.preview.Hit.SkillID).FontSize(14).Bold().Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
+				if a.openURL != nil && repoURL != "" {
+					gh := ui.ButtonBase(c).Label("GitHub").FontSize(11).Padding(3, 8).Radius(4).Background(ui.Hex("#161b26")).Border(1, c.Theme().Border).TextColor(c.Theme().TextMuted)
+					if gh.Hovered() {
+						gh.TextColor(c.Theme().Text).Border(1, strongBorder)
+					}
+					gh.Children(func() {
+						ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+							ui.Icon(c, externalLinkIcon).Size(11, 11)
+							ui.Text(c, "GitHub").NoWrap()
+						})
+					})
+					if gh.Clicked() {
+						a.openURL(repoURL)
+					}
+				}
+			})
 			desc := a.extUI.preview.Description
 			if desc == "" && !a.extUI.previewErr {
 				desc = a.t("No description in SKILL.md.", "SKILL.md 没有 description。")
@@ -882,11 +1109,13 @@ func (a *App) extDialogs(c *ui.Context) {
 					ui.Text(c, fmt.Sprintf(a.t("%d files", "%d 个文件"), n)).FontSize(11).TextColor(c.Theme().TextMuted)
 				}
 			}
-			ui.Row(c).Gap(8).Children(func() {
+			ui.Row(c).Gap(8).Wrap().Children(func() {
 				for _, agent := range a.extColumns(true) {
 					on := a.extUI.previewOn[agent]
-					ui.Checkbox(c.Key("preview/"+string(agent)), &on, agent.Label())
-					a.extUI.previewOn[agent] = on
+					pill := a.extAgentPill(c, "preview/"+string(agent), agent, on, false)
+					if pill.Clicked() {
+						a.extUI.previewOn[agent] = !on
+					}
 				}
 			})
 			ui.Row(c).Justify(ui.End).Gap(8).Children(func() {

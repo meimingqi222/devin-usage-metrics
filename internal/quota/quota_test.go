@@ -145,8 +145,17 @@ func TestClaudeCooldownSurvivesRestartAndBacksOff(t *testing.T) {
 	for _, tc := range []struct {
 		header  string
 		minimum int64
-	}{{"", 300}, {"0", 300}, {"invalid", 300}, {"-3", 300}, {time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat), 300}, {"7200", 7200}, {time.Now().Add(2 * time.Hour).UTC().Format(http.TimeFormat), 7200}} {
-		t.Run(tc.header, func(t *testing.T) {
+	}{{"", 300}, {"0", 300}, {"invalid", 300}, {"-3", 300}, {"past", 300}, {"7200", 7200}, {"future", 7200}} {
+		// HTTP-date headers are absolute: build them inside the subtest so a
+		// slow -race run does not eat into the remaining cooldown.
+		header := tc.header
+		switch header {
+		case "past":
+			header = time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat)
+		case "future":
+			header = time.Now().Add(2 * time.Hour).UTC().Format(http.TimeFormat)
+		}
+		t.Run(header, func(t *testing.T) {
 			fixtureHome(t)
 			fixture(t, ".claude/.credentials.json", `{"claudeAiOauth":{"accessToken":"private-fixture-token","refreshToken":"private-refresh"}}`)
 			a := Discover(false)[0]
@@ -155,7 +164,7 @@ func TestClaudeCooldownSurvivesRestartAndBacksOff(t *testing.T) {
 				if r.URL.Path == "/api/oauth/usage" && r.URL.RawQuery == "" {
 					calls++
 					if limited {
-						w.Header().Set("Retry-After", tc.header)
+						w.Header().Set("Retry-After", header)
 						w.WriteHeader(429)
 						fmt.Fprint(w, `{"error":"private-upstream-body"}`)
 						return

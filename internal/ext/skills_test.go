@@ -36,6 +36,7 @@ func TestInstallSkillCopiesDedicatedDirs(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("APPDATA", filepath.Join(home, "AppData"))
 	buf := new(bytes.Buffer)
 	zw := zip.NewWriter(buf)
 	add := func(name, body string) {

@@ -32,6 +32,7 @@ func archiveFixture(t *testing.T, names ...string) []byte {
 }
 func TestReleaseDownload(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("LOCALAPPDATA", t.TempDir())
 	b := archiveFixture(t, "devin-usage-metrics.exe", "assets/icon.png")
 	bad := false
 	var server *httptest.Server
