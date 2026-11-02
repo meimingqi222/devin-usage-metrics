@@ -336,7 +336,7 @@ func parseDevin(ctx context.Context, d *model.Data, db *sqlite.DB, source string
 	// Only the collector touches part until the query and collector finish.
 	part := model.Data{TurnsStart: d.TurnsStart, TurnsEnd: d.TurnsEnd}
 	workers := max(1, min(runtime.GOMAXPROCS(0)-1, 6))
-	pending := make(chan *devinBatch, 2*workers)
+	pending := make(chan *devinBatch, workers)
 	collected := make(chan struct{})
 	go func() {
 		defer close(collected)
@@ -617,6 +617,9 @@ func pb(b []byte, path ...uint64) field {
 	return field{}
 }
 func blob(v any) []byte {
+	if b, ok := v.(sqlite.BorrowedText); ok {
+		return b
+	}
 	if b, ok := v.([]byte); ok {
 		return b
 	}
@@ -649,23 +652,23 @@ func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source strin
 		}
 		observe(s, int64(pb(b, 2, 1).v))
 	}
-	for _, r := range query(ctx, d, a, db, "title_steps", "SELECT step_payload FROM steps WHERE step_type=14 ORDER BY idx LIMIT 5") {
+	each(ctx, d, a, db, "title_steps", "SELECT step_payload FROM steps WHERE step_type=14 ORDER BY idx LIMIT 5", func(r obj) {
 		b := blob(r["step_payload"])
 		for _, path := range [][]uint64{{26, 3, 1}, {26, 2, 1}, {19, 3, 1}, {19, 2, 1}} {
 			if txt := string(pb(b, path...).b); txt != "" && s.Title == "" {
 				s.Title = compact(txt)
 			}
 		}
-	}
-	for _, r := range query(ctx, d, a, db, "generation_metadata", "SELECT data FROM gen_metadata ORDER BY idx") {
+	})
+	each(ctx, d, a, db, "generation_metadata", "SELECT data FROM gen_metadata ORDER BY idx", func(r obj) {
 		if m := string(pb(blob(r["data"]), 1, 19).b); m != "" {
 			s.SelectedModel = m
 		}
-	}
+	})
 	var full, fallback []model.Turn
 	// A response can be recorded on more than one step; keep it once.
 	byMessage := map[string]int{}
-	for _, r := range query(ctx, d, a, db, "step_usage", "SELECT metadata FROM steps ORDER BY idx") {
+	each(ctx, d, a, db, "step_usage", "SELECT metadata FROM steps ORDER BY idx", func(r obj) {
 		b := blob(r["metadata"])
 		at := int64(pb(b, 1, 1).v)
 		observe(s, at)
@@ -708,14 +711,14 @@ func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source strin
 			full = append(full, t)
 		}
 		if len(usages) > 0 {
-			continue
+			return
 		}
 		t := model.Turn{Agent: a, SessionKey: s.Key, CreatedAt: at}
 		if p := pb(b, 11); p.n != 0 {
 			t.InputTokens = float64(p.v)
 			fallback = append(fallback, t)
 		}
-	}
+	})
 	if len(full) == 0 {
 		full = fallback
 	}

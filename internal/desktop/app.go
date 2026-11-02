@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -118,6 +119,10 @@ func (a *App) work(key string, fn func() func()) {
 	a.busy[key] = true
 	go func() {
 		done := fn()
+		// Collections peak several times the data they keep; without this the
+		// GC keeps the freed pages and the tray's RSS stays at the high-water
+		// mark for the life of the process.
+		debug.FreeOSMemory()
 		a.post(func() {
 			delete(a.busy, key)
 			if done != nil {

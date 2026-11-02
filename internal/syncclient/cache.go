@@ -98,7 +98,7 @@ func (t transport) account() string {
 	return hash([]byte(t.base + "\x00" + tenant))
 }
 
-var manifestCache = newLRU[[]byte](32<<20, 512)
+var manifestCache = newLRU[[]byte](8<<20, 512)
 
 func (t transport) cachedManifest(name string) []byte {
 	b, _ := manifestCache.get(t.account() + "/" + name)
@@ -118,7 +118,7 @@ type decodedBlock struct {
 
 // Decoding dominates sync CPU: a device that publishes a new manifest usually
 // changes one or two blocks, so caching per block keeps every other one.
-var blockCache = newLRU[decodedBlock](96<<20, 1<<16)
+var blockCache = newLRU[decodedBlock](24<<20, 1<<16)
 
 func (t transport) cachedDecoded(name string) (decodedBlock, bool) {
 	return blockCache.get(t.account() + "/" + name)
@@ -179,7 +179,7 @@ func cloneTurns(in []model.Turn) []model.Turn {
 	return out
 }
 
-var packageCache = newLRU[devicePackage](64<<20, 256)
+var packageCache = newLRU[devicePackage](16<<20, 256)
 
 func cachedPackage(key string) (devicePackage, bool) {
 	p, ok := packageCache.get(key)

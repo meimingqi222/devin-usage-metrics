@@ -313,7 +313,10 @@ func LoadAllContext(ctx context.Context, start, end int64, refresh bool) (result
 	d := empty(start, end)
 	parts := make([]model.Data, len(model.Agents))
 	var wg sync.WaitGroup
-	limit := make(chan struct{}, 4)
+	// Two loaders in flight keeps parallel peaks bounded; each loader is
+	// already internally parallel (prefetch decode, batch workers), so the
+	// wall-clock cost of a third/fourth lane is small.
+	limit := make(chan struct{}, 2)
 	for i, a := range model.Agents {
 		wg.Go(func() {
 			agentCtx := syncdiag.WithFields(ctx, "agent", diagnosticAgent(a))

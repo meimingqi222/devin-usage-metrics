@@ -223,7 +223,9 @@ var decodedFiles sync.Map
 // decodedBudget caps the decoded-transcript cache. Beyond it the files
 // used longest ago are dropped and decoded again on the next reload:
 // a large history otherwise kept over a gigabyte resident in the tray app.
-const decodedBudget = 128 << 20
+// Reloads re-decode only evicted files on four workers, so a tight budget
+// costs a little CPU on reload, never correctness.
+const decodedBudget = 32 << 20
 
 var decodedWeight struct {
 	sync.Mutex
