@@ -33,7 +33,7 @@ func TestReloadSyncIntervalMatchesRust(t *testing.T) {
 func fixture(t testing.TB) *App {
 	t.Helper()
 	h := t.TempDir()
-	for k, v := range map[string]string{"HOME": h, "USERPROFILE": h, "APPDATA": filepath.Join(h, "config"), "XDG_CONFIG_HOME": filepath.Join(h, "config"), "XDG_CACHE_HOME": filepath.Join(h, "cache"), "LANG": "en_US.UTF-8", "DEVIN_USAGE_DISABLE_MODELS_FETCH": "1"} {
+	for k, v := range map[string]string{"HOME": h, "USERPROFILE": h, "APPDATA": filepath.Join(h, "config"), "XDG_CONFIG_HOME": filepath.Join(h, "config"), "XDG_CACHE_HOME": filepath.Join(h, "cache"), "LANG": "en_US.UTF-8", "DEVIN_USAGE_DISABLE_MODELS_FETCH": "1", "PI_CONFIG_DIR": "", "PI_CODING_AGENT_DIR": ""} {
 		t.Setenv(k, v)
 	}
 	a := New(context.Background())

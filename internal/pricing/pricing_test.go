@@ -42,6 +42,18 @@ func TestAdaptiveBillingIgnoresDisplayModelAndRecordedEstimate(t *testing.T) {
 	}
 }
 
+func TestOmpDevinModelsUseProTableWithApiFallback(t *testing.T) {
+	var calculator pricing.Calculator
+	// devin/* names go to the Devin Pro table; swe-2-high is a confirmed
+	// free tier there.
+	for _, cost := range []func(model.Turn, string) (float64, bool){pricing.Cost, calculator.Cost} {
+		got, ok := cost(model.Turn{Agent: model.Omp, Model: "devin/swe-2-high", InputTokens: 100}, "")
+		if !ok || got != 0 {
+			t.Fatalf("devin/swe-2-high must resolve through the Pro table: %v %v", got, ok)
+		}
+	}
+}
+
 func TestRequestBillingRegressions(t *testing.T) {
 	for _, w := range []float64{997, 998} {
 		turn := model.Turn{Agent: model.Devin, Model: "gpt-5-6-luna-high", InputTokens: 3, OutputTokens: 1000, CacheReadTokens: 271000, CacheCreationTokens: w}

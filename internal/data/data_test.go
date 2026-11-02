@@ -23,7 +23,7 @@ func env(t testing.TB) string {
 	t.Setenv("USERPROFILE", h)
 	t.Setenv("APPDATA", filepath.Join(h, ".local/share"))
 	t.Setenv("LOCALAPPDATA", filepath.Join(h, "cache"))
-	for k, v := range map[string]string{"HOME": h, "XDG_CONFIG_HOME": filepath.Join(h, "config"), "XDG_CACHE_HOME": filepath.Join(h, "cache"), "XDG_DATA_HOME": filepath.Join(h, ".local/share"), "CODEX_HOME": filepath.Join(h, ".codex"), "WORKBUDDY_CONFIG_DIR": "", "WORKBUDDY_DIR": "", "CODEBUDDY_CONFIG_DIR": ""} {
+	for k, v := range map[string]string{"HOME": h, "XDG_CONFIG_HOME": filepath.Join(h, "config"), "XDG_CACHE_HOME": filepath.Join(h, "cache"), "XDG_DATA_HOME": filepath.Join(h, ".local/share"), "CODEX_HOME": filepath.Join(h, ".codex"), "WORKBUDDY_CONFIG_DIR": "", "WORKBUDDY_DIR": "", "CODEBUDDY_CONFIG_DIR": "", "PI_CONFIG_DIR": "", "PI_CODING_AGENT_DIR": ""} {
 		t.Setenv(k, v)
 	}
 	return h
@@ -175,6 +175,95 @@ func TestOmpSideChannelUsage(t *testing.T) {
 	r := d.Turns[0]
 	if r.Model != "typesafe/jev-latest" || r.ContextStream != "purpose/find" || r.InputTokens != 6661 || r.OutputTokens != 1220 || r.RecordedCost == nil || *r.RecordedCost != 0.0003 || r.SessionKey != "omp/s2" {
 		t.Fatalf("model_usage not counted: %+v", r)
+	}
+}
+
+func TestOmpForkCopiesDeduped(t *testing.T) {
+	h := env(t)
+	// createBranchedSession/fork deep-copies the parent's root-to-leaf entries
+	// into a new session file with the same entry ids, responseIds and entry
+	// timestamps; that usage was billed once. The fork's own follow-up turns
+	// (new ids, new timestamps) belong to the fork and must still count.
+	const copied = `{"type":"message","id":"m1","timestamp":"2026-11-02T01:01:00Z","message":{"role":"assistant","provider":"devin","model":"swe-2","responseId":"r1","usage":{"input":100,"output":10,"cost":{"total":0.001}}}}`
+	const fresh = `{"type":"message","id":"m2","timestamp":"2026-11-02T02:01:00Z","message":{"role":"assistant","provider":"devin","model":"swe-2","responseId":"r2","usage":{"input":7,"output":1,"cost":{"total":0.0001}}}}`
+	// Transcript names start with the creation timestamp, so basename order —
+	// not file mtime order — decides which file owns a copied entry.
+	write(t, h, ".omp/agent/sessions/project/2026-11-02T01-00-00-000Z_parent.jsonl",
+		`{"type":"session","id":"parent","timestamp":"2026-11-02T01:00:00Z"}`+"\n"+copied+"\n")
+	write(t, h, ".omp/agent/sessions/project/2026-11-02T02-00-00-000Z_fork.jsonl",
+		`{"type":"session","id":"fork","timestamp":"2026-11-02T02:00:00Z"}`+"\n"+copied+"\n"+fresh+"\n")
+	d := data.Load(model.Omp, 0, 2000000000, true)
+	check(t, d, 2)
+	if d.Turns[0].SessionKey != "omp/parent" || d.Turns[0].InputTokens != 100 {
+		t.Fatalf("copied entry must be owned by the parent session: %+v", d.Turns)
+	}
+	if d.Turns[1].SessionKey != "omp/fork" || d.Turns[1].InputTokens != 7 {
+		t.Fatalf("the fork's own turn must still count: %+v", d.Turns)
+	}
+	if len(d.Sessions) != 2 {
+		t.Fatalf("fork must remain a session: %+v", d.Sessions)
+	}
+}
+
+func TestOmpResumedSessionDeduped(t *testing.T) {
+	h := env(t)
+	// Resuming appends the same responseId records to a continued file under
+	// the same session id; each billed call must count once.
+	const copied = `{"type":"message","id":"m1","timestamp":"2026-11-02T01:01:00Z","message":{"role":"assistant","provider":"devin","model":"swe-2","responseId":"r1","usage":{"input":100,"output":10,"cost":{"total":0.001}}}}`
+	write(t, h, ".omp/agent/sessions/project/2026-11-02T01-00-00-000Z_a.jsonl",
+		`{"type":"session","id":"s","timestamp":"2026-11-02T01:00:00Z"}`+"\n"+copied+"\n")
+	write(t, h, ".omp/agent/sessions/project/2026-11-02T02-00-00-000Z_b.jsonl",
+		`{"type":"session","id":"s","timestamp":"2026-11-02T02:00:00Z"}`+"\n"+copied+"\n")
+	d := data.Load(model.Omp, 0, 2000000000, true)
+	check(t, d, 1)
+}
+
+func TestOmpCustomDirectories(t *testing.T) {
+	h := env(t)
+	// PI_CODING_AGENT_DIR points at the agent dir; sessions live in <dir>/sessions.
+	t.Setenv("PI_CODING_AGENT_DIR", filepath.Join(h, "custom-agent"))
+	// PI_CONFIG_DIR replaces the whole ~/.omp root, profiles live inside it.
+	t.Setenv("PI_CONFIG_DIR", filepath.Join(h, "my-omp"))
+	write(t, h, "custom-agent/sessions/p/2026-11-02T01-00-00-000Z_a.jsonl",
+		`{"type":"session","id":"a","timestamp":"2026-11-02T01:00:00Z"}`+"\n")
+	write(t, h, "my-omp/agent/sessions/p/2026-11-02T01-00-00-000Z_b.jsonl",
+		`{"type":"session","id":"b","timestamp":"2026-11-02T01:00:00Z"}`+"\n")
+	write(t, h, "my-omp/profiles/work/agent/sessions/p/2026-11-02T01-00-00-000Z_c.jsonl",
+		`{"type":"session","id":"c","timestamp":"2026-11-02T01:00:00Z"}`+"\n")
+	// XDG data home flattens the layout to <xdg>/omp/sessions.
+	write(t, h, ".local/share/omp/sessions/p/2026-11-02T01-00-00-000Z_d.jsonl",
+		`{"type":"session","id":"d","timestamp":"2026-11-02T01:00:00Z"}`+"\n")
+	d := data.Load(model.Omp, 0, 2000000000, true)
+	if len(d.Sessions) != 4 {
+		t.Fatalf("expected sessions from all custom roots, got %+v", d.Sessions)
+	}
+}
+
+func TestOmpOrchestrationAndZeroCost(t *testing.T) {
+	h := env(t)
+	write(t, h, ".omp/agent/sessions/p/2026-11-02T01-00-00-000Z_s.jsonl",
+		`{"type":"session","id":"s","timestamp":"2026-11-02T01:00:00Z"}`+"\n"+
+			`{"type":"message","id":"m1","timestamp":"2026-11-02T01:01:00Z","message":{"role":"assistant","provider":"xai","model":"grok-4-7","responseId":"r1","usage":{"input":10,"output":20,"cacheRead":30,"cacheWrite":0,"orchestration":{"input":15,"output":10,"cacheRead":5,"cacheWrite":1},"cost":{"total":0}}}}`+"\n")
+	d := data.Load(model.Omp, 0, 2000000000, true)
+	check(t, d, 1)
+	r := d.Turns[0]
+	if r.InputTokens != 25 || r.OutputTokens != 30 || r.CacheReadTokens != 35 || r.CacheCreationTokens != 1 {
+		t.Fatalf("orchestration legs must fold into buckets: %+v", r)
+	}
+	if r.RecordedCost != nil {
+		t.Fatalf("zero recorded cost must stay unknown, got %v", *r.RecordedCost)
+	}
+}
+
+func TestOmpUsesMessageTimestamp(t *testing.T) {
+	h := env(t)
+	write(t, h, ".omp/agent/sessions/p/2026-11-02T01-00-00-000Z_ts.jsonl",
+		`{"type":"session","id":"ts","timestamp":"2026-11-02T00:00:00Z"}`+"\n"+
+			`{"type":"message","id":"m1","timestamp":"2026-11-02T00:00:30Z","message":{"role":"assistant","provider":"devin","model":"swe-2","timestamp":1793542378000,"usage":{"input":1}}}`+"\n")
+	d := data.Load(model.Omp, 0, 2000000000, true)
+	check(t, d, 1)
+	if d.Turns[0].CreatedAt != 1793542378 {
+		t.Fatalf("message.timestamp must win over entry time, got %d", d.Turns[0].CreatedAt)
 	}
 }
 

@@ -217,8 +217,13 @@ func resolveLocked(agent model.Agent, name string) (Price, bool) {
 	s := strings.ToLower(strings.TrimSpace(name))
 	var p Price
 	var ok bool
-	if agent == model.Devin || (agent == model.Omp && s == "devin/adaptive") {
+	if agent == model.Devin || (agent == model.Omp && strings.HasPrefix(s, "devin/")) {
 		p, ok = devin(s)
+		if !ok && agent == model.Omp {
+			// OMP routes Devin requests by full name; a model missing from the
+			// Pro table can still exist in the API catalog.
+			p, ok = lookup(api, s)
+		}
 	} else {
 		p, ok = lookup(api, s)
 	}

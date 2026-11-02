@@ -177,7 +177,7 @@ func roots(a model.Agent) []string {
 	case model.Pi:
 		return []string{home(".pi/agent/sessions")}
 	case model.Omp:
-		return []string{home(".omp/agent/sessions")}
+		return ompRoots()
 	case model.Grok:
 		return []string{home(".grok/sessions")}
 	case model.WorkBuddy:
@@ -190,6 +190,41 @@ func roots(a model.Agent) []string {
 		return append(r, home(".workbuddy/projects"), home(".workbuddy-ai/projects"), home(".codebuddy/projects"))
 	}
 	return nil
+}
+
+// ompRoots mirrors OMP's directory resolution (packages/utils/src/dirs.ts):
+// PI_CONFIG_DIR replaces the config root (~/.omp), PI_CODING_AGENT_DIR
+// replaces the agent dir itself, named profiles keep their sessions under
+// <configRoot>/profiles/<profile>/agent, and an XDG data home flattens
+// <configRoot>/agent/sessions to <xdg>/omp/sessions. Several roots can hold
+// history at once, so all existing ones are scanned and deduped by path.
+func ompRoots() []string {
+	configRoot := os.Getenv("PI_CONFIG_DIR")
+	if configRoot == "" {
+		configRoot = home(".omp")
+	}
+	var roots []string
+	if d := os.Getenv("PI_CODING_AGENT_DIR"); d != "" {
+		roots = append(roots, filepath.Join(d, "sessions"))
+	}
+	roots = append(roots, filepath.Join(configRoot, "agent", "sessions"))
+	// Keep scanning the default root as well: history written before a
+	// config-dir migration still belongs to the user, and path dedup in
+	// files() removes the overlap when the roots coincide.
+	if configRoot != home(".omp") {
+		roots = append(roots, home(".omp/agent/sessions"))
+	}
+	if entries, e := os.ReadDir(filepath.Join(configRoot, "profiles")); e == nil {
+		for _, en := range entries {
+			if en.IsDir() {
+				roots = append(roots, filepath.Join(configRoot, "profiles", en.Name(), "agent", "sessions"))
+			}
+		}
+	}
+	if d := os.Getenv("XDG_DATA_HOME"); d != "" {
+		roots = append(roots, filepath.Join(d, "omp", "sessions"))
+	}
+	return roots
 }
 
 type lineCache struct {
@@ -518,6 +553,13 @@ func loadFiles(ctx context.Context, d *model.Data, a model.Agent, refresh bool, 
 	defer func() { finish(sourceResultError(*d)) }()
 	_, discovered := syncdiag.Watch(ctx, "discover_files")
 	paths, tracked := fileSources(d, a)
+	if a == model.Omp {
+		// omp transcript names start with the creation timestamp, so basename
+		// order is chronological. Accounting oldest-first lets a fork's copied
+		// prefix lose the (entry id, timestamp) dedup race to the parent file,
+		// like OMP's own first-write-wins stats.
+		sort.Slice(paths, func(i, j int) bool { return filepath.Base(paths[i]) < filepath.Base(paths[j]) })
+	}
 	current := map[string]string{}
 	for _, p := range tracked {
 		if info, err := os.Stat(p); err == nil {
@@ -704,6 +746,13 @@ func (f *fileParser) line(v obj) {
 		f.sessions[f.id] = s
 	}
 	at := ts(v["timestamp"])
+	if f.a == model.Omp {
+		// OMP stats buckets a turn by message.timestamp (request time) when
+		// present; the entry envelope time is only the write timestamp.
+		if mt := ts(get(m, "timestamp")); mt > 0 {
+			at = mt
+		}
+	}
 	observe(s, at)
 	if cwd := str(v["cwd"]); cwd != "" {
 		s.WorkingDirectory = cwd
@@ -872,14 +921,7 @@ func (f *fileParser) omp(v obj, s *model.Session, t model.Turn, kind string, m a
 		if u == nil {
 			return t, false
 		}
-		t.InputTokens = num(get(u, "input"))
-		t.OutputTokens = num(get(u, "output"))
-		t.CacheReadTokens = num(get(u, "cacheRead"))
-		t.CacheCreationTokens = num(get(u, "cacheWrite"))
-		if c := get(u, "cost", "total"); c != nil && num(c) >= 0 {
-			cost := num(c)
-			t.RecordedCost = &cost
-		}
+		ompUsage(u, &t)
 		if p := str(v["purpose"]); p != "" {
 			t.ContextStream = "purpose/" + p
 		}
@@ -891,14 +933,7 @@ func (f *fileParser) omp(v obj, s *model.Session, t model.Turn, kind string, m a
 		return t, false
 	}
 	u := get(m, "usage")
-	t.InputTokens = num(get(u, "input"))
-	t.OutputTokens = num(get(u, "output"))
-	t.CacheReadTokens = num(get(u, "cacheRead"))
-	t.CacheCreationTokens = num(get(u, "cacheWrite"))
-	if c := get(u, "cost", "total"); c != nil && num(c) >= 0 {
-		cost := num(c)
-		t.RecordedCost = &cost
-	}
+	ompUsage(u, &t)
 	t.TTFTMs = max(0, num(get(m, "ttft")))
 	t.TotalTimeMs = max(0, num(get(m, "duration")))
 	t.Model = modelName(str(get(m, "provider")), str(get(m, "model")))
@@ -910,11 +945,34 @@ func (f *fileParser) omp(v obj, s *model.Session, t model.Turn, kind string, m a
 	}
 	if upstream := strings.TrimSpace(str(get(m, "upstreamModel"))); upstream != "" {
 		// Keep the requested model for Devin-style adaptive display, but
-		// attribute each turn to its own upstream, never the session's last one.
+		// attribute each turn to its own upstream, never the session's last
+		// one. Billing is unaffected: adaptive turns already pinned
+		// BillingModel to the router rate above, and non-adaptive turns
+		// estimate by the served model — matching what OMP actually bills.
 		s.RealModel = &upstream
 		t.Model = modelName(str(get(m, "provider")), upstream)
 	}
 	return t, true
+}
+
+// ompUsage maps an OMP usage object onto a turn. Orchestration legs
+// (multi-agent routing) are billed inside usage, so they fold into the
+// same buckets — OMP's totalTokens includes them. A recorded cost of 0 is
+// not a free request: OMP initializes usage/cost to zero at stream start
+// and only fills it on success, so zero means unknown and repricing wins.
+func ompUsage(u any, t *model.Turn) {
+	t.InputTokens = num(get(u, "input"))
+	t.OutputTokens = num(get(u, "output"))
+	t.CacheReadTokens = num(get(u, "cacheRead"))
+	t.CacheCreationTokens = num(get(u, "cacheWrite"))
+	t.InputTokens += num(get(u, "orchestration", "input"))
+	t.OutputTokens += num(get(u, "orchestration", "output"))
+	t.CacheReadTokens += num(get(u, "orchestration", "cacheRead"))
+	t.CacheCreationTokens += num(get(u, "orchestration", "cacheWrite"))
+	if c := get(u, "cost", "total"); c != nil && num(c) > 0 {
+		cost := num(c)
+		t.RecordedCost = &cost
+	}
 }
 
 func (f *fileParser) workBuddy(v obj, s *model.Session, t model.Turn) (model.Turn, bool) {
@@ -950,9 +1008,12 @@ func (f *fileParser) workBuddy(v obj, s *model.Session, t model.Turn) (model.Tur
 	return t, true
 }
 
-// account adds the file's turns to d, dropping any already counted: Claude
-// dedups globally by message (a resumed session copies earlier messages),
-// the others per session.
+// account adds the file's turns to d, dropping any already counted. Claude
+// dedups globally by message id (a resumed session copies earlier messages);
+// omp keeps the per-session responseId dedup and additionally dedups
+// (responseId or entry id, timestamp) across sessions: fork/branch copies the
+// parent's entries into a new session file with the same ids and timestamps.
+// The other agents dedup per session.
 func (f *fileParser) account(d *model.Data, seen map[string]bool) {
 	if f.a == model.Claude {
 		for _, t := range f.latest {
@@ -969,6 +1030,18 @@ func (f *fileParser) account(d *model.Data, seen map[string]bool) {
 			continue
 		}
 		seen[key] = true
+		if f.a == model.Omp && t.DedupKey != "" {
+			// fork/branch deep-copies the parent's entries into a new session
+			// file with the same entry ids, responseIds and timestamps; OMP's
+			// own stats dedupe on that (id, timestamp) pair, first write wins.
+			// The per-session check above stays responseId-only so a retry that
+			// rewrites a response under a new entry id still dedups.
+			key = t.DedupKey + "\x00" + strconv.FormatInt(t.CreatedAt, 10)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+		}
 		s := f.sessions[strings.TrimPrefix(t.SessionKey, prefix(f.a)+"/")]
 		if f.a == model.Claude && (t.CreatedAt < d.TurnsStart || t.CreatedAt >= d.TurnsEnd) {
 			continue

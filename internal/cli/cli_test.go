@@ -20,7 +20,7 @@ func setup(t *testing.T) string {
 	t.Setenv("USERPROFILE", h)
 	t.Setenv("APPDATA", filepath.Join(h, "config"))
 	t.Setenv("LOCALAPPDATA", filepath.Join(h, "cache"))
-	for k, v := range map[string]string{"HOME": h, "XDG_CONFIG_HOME": filepath.Join(h, "config"), "XDG_CACHE_HOME": filepath.Join(h, "cache"), "XDG_DATA_HOME": filepath.Join(h, "data"), "DEVIN_USAGE_DISABLE_MODELS_FETCH": "1"} {
+	for k, v := range map[string]string{"HOME": h, "XDG_CONFIG_HOME": filepath.Join(h, "config"), "XDG_CACHE_HOME": filepath.Join(h, "cache"), "XDG_DATA_HOME": filepath.Join(h, "data"), "DEVIN_USAGE_DISABLE_MODELS_FETCH": "1", "PI_CONFIG_DIR": "", "PI_CODING_AGENT_DIR": ""} {
 		t.Setenv(k, v)
 	}
 	return h
