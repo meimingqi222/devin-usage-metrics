@@ -22,6 +22,26 @@ func near(t *testing.T, got, want float64) {
 		t.Fatalf("got %.12f want %.12f", got, want)
 	}
 }
+func TestAdaptiveBillingIgnoresDisplayModelAndRecordedEstimate(t *testing.T) {
+	var calculator pricing.Calculator
+	estimate := 123.0
+	for _, agent := range []model.Agent{model.Devin, model.Omp} {
+		for _, name := range []string{"swe-2-medium", "gpt-6-1-sol-low", "future-model"} {
+			for _, recorded := range []*float64{nil, new(float64), &estimate} {
+				turn := model.Turn{Agent: agent, Model: name, BillingModel: "devin/adaptive", InputTokens: 100, OutputTokens: 20, CacheReadTokens: 300, CacheCreationTokens: 40, RecordedCost: recorded}
+				want := (100*.5 + 20*2 + 300*.1 + 40*.5) / 1e6
+				for _, cost := range []func(model.Turn, string) (float64, bool){pricing.Cost, calculator.Cost} {
+					got, ok := cost(turn, "irrelevant-display-fallback")
+					if !ok {
+						t.Fatalf("adaptive model was not priced: %s/%s", agent, name)
+					}
+					near(t, got, want)
+				}
+			}
+		}
+	}
+}
+
 func TestRequestBillingRegressions(t *testing.T) {
 	for _, w := range []float64{997, 998} {
 		turn := model.Turn{Agent: model.Devin, Model: "gpt-5-6-luna-high", InputTokens: 3, OutputTokens: 1000, CacheReadTokens: 271000, CacheCreationTokens: w}

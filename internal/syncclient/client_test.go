@@ -190,7 +190,7 @@ func TestCycleV1MigrationReuseAndReadOnlyMerge(t *testing.T) {
 	s.objects["device-other.json"], _ = json.Marshal(pkg)
 	legacy := devicePackage{Schema: 1, DeviceID: "local", Start: now, End: now, Sessions: []model.Session{{Agent: model.Claude, DeviceID: "local", Key: "legacy", CreatedAt: now}}}
 	s.objects["device-local.json"], _ = json.Marshal(legacy)
-	local := model.Data{TurnsStart: 0, TurnsEnd: now + 3600, Turns: []model.Turn{{Agent: model.Claude, SessionKey: "local-session", CreatedAt: now, InputTokens: 2}}}
+	local := model.Data{TurnsStart: 0, TurnsEnd: now + 3600, Turns: []model.Turn{{Agent: model.Omp, SessionKey: "local-session", CreatedAt: now, Model: "devin/swe-2-medium", BillingModel: "devin/adaptive", InputTokens: 2}}}
 	ctx := context.Background()
 	remote, e := Cycle(ctx, local)
 	if e != nil {
@@ -231,6 +231,9 @@ func TestCycleV1MigrationReuseAndReadOnlyMerge(t *testing.T) {
 	p, e := (transport{server.URL, "token"}).load(ctx, "local", h)
 	if e != nil || len(p.Turns) != 1 {
 		t.Fatal(p, e)
+	}
+	if p.Turns[0].Model != "devin/swe-2-medium" || p.Turns[0].BillingModel != "devin/adaptive" {
+		t.Fatal("sync lost the independent adaptive billing model", p.Turns[0])
 	}
 	if len(p.Sessions) != 1 || p.Sessions[0].Key != "legacy" {
 		t.Fatal("v1 local migration lost history")
@@ -556,6 +559,11 @@ func BenchmarkUnchangedCycle(b *testing.B) {
 func TestTurnIdentityMatchesTurnID(t *testing.T) {
 	cost, other, zero, negZero := 1.5, 2.5, 0.0, math.Copysign(0, -1)
 	base := model.Turn{DeviceID: "d", Agent: model.Claude, SessionKey: "s", CreatedAt: 10, Model: "m", InputTokens: 1, OutputTokens: 2, CacheReadTokens: 3, CacheCreationTokens: 4, CacheCreation5mTokens: 5, CacheCreation1hTokens: 6, TTFTMs: 7, TotalTimeMs: 8, RecordedCost: &cost}
+	adaptive := base
+	adaptive.BillingModel = "devin/adaptive"
+	if turnID(base) == turnID(adaptive) || identityOf(base) == identityOf(adaptive) {
+		t.Fatal("billing route was omitted from the sync identity")
+	}
 	variants := []func(*model.Turn){
 		func(*model.Turn) {},
 		func(t *model.Turn) { t.DeviceID = "e" },
@@ -563,6 +571,8 @@ func TestTurnIdentityMatchesTurnID(t *testing.T) {
 		func(t *model.Turn) { t.SessionKey = "s2" },
 		func(t *model.Turn) { t.CreatedAt++ },
 		func(t *model.Turn) { t.Model = "m2" },
+		func(t *model.Turn) { t.BillingModel = "adaptive" },
+		func(t *model.Turn) { t.BillingModel = "devin/adaptive" },
 		func(t *model.Turn) { t.InputTokens = 9 },
 		func(t *model.Turn) { t.OutputTokens = 9 },
 		func(t *model.Turn) { t.CacheReadTokens = 9 },

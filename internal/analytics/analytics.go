@@ -108,7 +108,7 @@ func Build(data model.Data, p Period, page int, agent model.Agent, device string
 	}
 	sessions := make(map[identity]sessionInfo, len(data.Sessions))
 	for _, s := range data.Sessions {
-		sessions[identity{s.Agent, s.DeviceID, s.Key}] = sessionInfo{s.DisplayModel(), s.SelectedModel == "adaptive"}
+		sessions[identity{s.Agent, s.DeviceID, s.Key}] = sessionInfo{s.DisplayModel(), s.IsAdaptive()}
 	}
 	var calculator pricing.Calculator
 	for _, t := range data.Turns {
@@ -130,7 +130,12 @@ func Build(data model.Data, p Period, page int, agent model.Agent, device string
 				}
 			}
 			label := name
-			if s.adaptive && name != "unknown" && name != "compactor" {
+			adaptive := s.adaptive
+			if t.Agent == model.Omp {
+				// OMP records the route per turn, including model switches.
+				adaptive = t.IsAdaptive()
+			}
+			if adaptive && name != "unknown" && name != "compactor" && name != "adaptive" && name != "devin/adaptive" {
 				label += "(adaptive)"
 			}
 			cost, ok := calculator.Cost(t, name)
@@ -139,7 +144,7 @@ func Build(data model.Data, p Period, page int, agent model.Agent, device string
 			b.Cached += t.CacheReadTokens
 			b.CacheWrite += t.CacheCreationTokens
 			b.Cost += cost
-			if ok && t.RecordedCost == nil {
+			if ok && (t.RecordedCost == nil || t.IsAdaptive()) {
 				u := t
 				u.InputTokens += u.CacheReadTokens
 				u.CacheReadTokens = 0

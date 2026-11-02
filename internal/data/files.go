@@ -856,6 +856,7 @@ func (f *fileParser) omp(v obj, s *model.Session, t model.Turn, kind string, m a
 	case "model_change":
 		if x := str(v["model"]); x != "" {
 			s.SelectedModel = x
+			s.RealModel = nil
 		}
 		return t, false
 	case "session":
@@ -903,6 +904,16 @@ func (f *fileParser) omp(v obj, s *model.Session, t model.Turn, kind string, m a
 	t.Model = modelName(str(get(m, "provider")), str(get(m, "model")))
 	t.DedupKey = str(first(get(m, "responseId"), v["id"]))
 	s.SelectedModel = t.Model
+	s.RealModel = nil
+	if s.IsAdaptive() {
+		t.BillingModel = "devin/adaptive"
+	}
+	if upstream := strings.TrimSpace(str(get(m, "upstreamModel"))); upstream != "" {
+		// Keep the requested model for Devin-style adaptive display, but
+		// attribute each turn to its own upstream, never the session's last one.
+		s.RealModel = &upstream
+		t.Model = modelName(str(get(m, "provider")), upstream)
+	}
 	return t, true
 }
 

@@ -36,7 +36,7 @@ func v3SessionID(s model.Session) string {
 // about two turns per record every cycle; hashing canonical JSON for each was
 // over half of its CPU time.
 type turnIdentity struct {
-	device, session, model                        string
+	device, session, model, billing               string
 	agent                                         model.Agent
 	created                                       int64
 	input, output, read, create, five, hour, ttft uint64
@@ -69,6 +69,7 @@ func identityOf(t model.Turn) turnIdentity {
 		device:  jsonText(t.DeviceID),
 		session: jsonText(t.SessionKey),
 		model:   jsonText(t.Model),
+		billing: jsonText(t.BillingModel),
 		agent:   model.Agent(jsonText(string(t.Agent))),
 		created: t.CreatedAt,
 		input:   math.Float64bits(t.InputTokens),
@@ -108,7 +109,8 @@ func turnID(t model.Turn) string {
 		TTFT    uint64      `json:"ttft"`
 		Total   uint64      `json:"total_time"`
 		Cost    *uint64     `json:"recorded_cost"`
-	}{1, t.DeviceID, t.Agent, t.SessionKey, t.CreatedAt, math.Float64bits(t.InputTokens), math.Float64bits(t.OutputTokens), math.Float64bits(t.CacheReadTokens), math.Float64bits(t.CacheCreationTokens), math.Float64bits(t.CacheCreation5mTokens), math.Float64bits(t.CacheCreation1hTokens), t.Model, math.Float64bits(t.TTFTMs), math.Float64bits(t.TotalTimeMs), cost}
+		Billing string      `json:"billing_model,omitempty"`
+	}{1, t.DeviceID, t.Agent, t.SessionKey, t.CreatedAt, math.Float64bits(t.InputTokens), math.Float64bits(t.OutputTokens), math.Float64bits(t.CacheReadTokens), math.Float64bits(t.CacheCreationTokens), math.Float64bits(t.CacheCreation5mTokens), math.Float64bits(t.CacheCreation1hTokens), t.Model, math.Float64bits(t.TTFTMs), math.Float64bits(t.TotalTimeMs), cost, t.BillingModel}
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
 	enc.SetEscapeHTML(false)

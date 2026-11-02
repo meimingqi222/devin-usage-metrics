@@ -207,7 +207,7 @@ func packageCost(p devicePackage) int {
 		}
 	}
 	for _, t := range p.Turns {
-		n += 512 + len(t.DeviceID) + len(t.DeviceName) + len(t.SessionKey) + len(t.Model) + len(t.ContextStream) + len(t.DedupKey)
+		n += 512 + len(t.DeviceID) + len(t.DeviceName) + len(t.SessionKey) + len(t.Model) + len(t.BillingModel) + len(t.ContextStream) + len(t.DedupKey)
 	}
 	return n
 }

@@ -253,6 +253,7 @@ func parseDevin(ctx context.Context, d *model.Data, db *sqlite.DB, source string
 		rows = rows[:20000]
 	}
 	ids := map[string]bool{}
+	adaptiveSessions := map[string]bool{}
 	for _, r := range rows {
 		id := str(r["id"])
 		ids[id] = true
@@ -265,6 +266,7 @@ func parseDevin(ctx context.Context, d *model.Data, db *sqlite.DB, source string
 		s.Title = str(r["title"])
 		s.WorkingDirectory = str(r["working_directory"])
 		s.SelectedModel = str(r["model"])
+		adaptiveSessions[s.Key] = s.IsAdaptive()
 		s.AgentMode = str(r["agent_mode"])
 		s.CreatedAt = ts(r["created_at"])
 		s.LastActivityAt = ts(r["last_activity_at"])
@@ -387,6 +389,12 @@ func parseDevin(ctx context.Context, d *model.Data, db *sqlite.DB, source string
 	<-collected
 	d.Turns = append(d.Turns, part.Turns...)
 	d.Errors = append(d.Errors, part.Errors...)
+	for i := range d.Turns {
+		turn := &d.Turns[i]
+		if turn.Agent == model.Devin && adaptiveSessions[turn.SessionKey] && turn.Model != "compactor" {
+			turn.BillingModel = "adaptive"
+		}
+	}
 }
 
 type devinRow struct {

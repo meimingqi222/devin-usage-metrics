@@ -55,6 +55,9 @@ type Session struct {
 func (s Session) TotalTokens() float64 {
 	return s.InputTokens + s.OutputTokens + s.CachedTokens + s.CacheCreationTokens
 }
+func (s Session) IsAdaptive() bool {
+	return s.SelectedModel == "adaptive" || s.SelectedModel == "devin/adaptive"
+}
 func (s Session) DisplayModel() string {
 	if s.RealModel != nil && *s.RealModel != "" {
 		return *s.RealModel
@@ -76,6 +79,7 @@ type Turn struct {
 	CacheCreation5mTokens float64  `json:"cache_creation_5m_tokens"`
 	CacheCreation1hTokens float64  `json:"cache_creation_1h_tokens"`
 	Model                 string   `json:"model"`
+	BillingModel          string   `json:"billing_model,omitempty"`
 	ContextStream         string   `json:"context_stream,omitempty"`
 	ContextOrder          uint64   `json:"context_order"`
 	TTFTMs                float64  `json:"ttft_ms"`
@@ -84,6 +88,16 @@ type Turn struct {
 	DeviceID              string   `json:"device_id"`
 	DeviceName            string   `json:"device_name"`
 	DedupKey              string   `json:"dedup_key,omitempty"`
+}
+
+// IsAdaptive identifies the billing route independently of the display model.
+func (t Turn) IsAdaptive() bool {
+	name := t.BillingModel
+	if name == "" {
+		name = t.Model
+	}
+	return (t.Agent == Devin && (name == "adaptive" || name == "devin/adaptive")) ||
+		(t.Agent == Omp && name == "devin/adaptive")
 }
 
 type DataError struct {

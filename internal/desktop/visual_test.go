@@ -104,6 +104,35 @@ func TestOriginalDenseVisualStates(t *testing.T) {
 	capture(t, tt, "parity-settings-general")
 }
 
+func TestAdaptiveSessionModelDisplay(t *testing.T) {
+	for _, agent := range []model.Agent{model.Devin, model.Omp} {
+		t.Run(string(agent), func(t *testing.T) {
+			a := fixture(t)
+			a.agent = agent
+			selected := "adaptive"
+			if agent == model.Omp {
+				selected = "devin/adaptive"
+			}
+			upstream := "gpt-6-1-sol-low"
+			now := time.Now().Unix()
+			a.storeLoaded(agent, model.Data{Sessions: []model.Session{
+				{Agent: agent, DeviceID: a.localID, Key: "routed", ID: "routed", Title: "Routed session", SelectedModel: selected, RealModel: &upstream, LastActivityAt: now},
+				{Agent: agent, DeviceID: a.localID, Key: "legacy", ID: "legacy", Title: "Legacy adaptive session", SelectedModel: selected, LastActivityAt: now},
+			}})
+			tt := ui.NewTester(a.View, 1240, 780)
+			click(t, tt, "Sessions")
+			if !tt.HasText("adaptive → gpt-6-1-sol-low") || !tt.HasText("adaptive") || tt.HasText("adaptive → adaptive") {
+				t.Fatalf("adaptive models are not displayed consistently: %v", tt.Texts())
+			}
+			click(t, tt, "Routed session")
+			if !tt.HasText("adaptive → gpt-6-1-sol-low") || !tt.HasText("Close session details") {
+				t.Fatalf("session details lost adaptive routing: %v", tt.Texts())
+			}
+			capture(t, tt, string(agent)+"-adaptive-session")
+		})
+	}
+}
+
 // Long hostnames end with an ellipsis inside the toolbar's device pill
 // instead of pushing the reload button off the window.
 func TestDeviceNamesFitDeviceScope(t *testing.T) {

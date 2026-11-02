@@ -21,7 +21,7 @@ type Calculator struct {
 }
 
 func (c *Calculator) Cost(t model.Turn, fallback string) (float64, bool) {
-	if t.RecordedCost != nil && valid(*t.RecordedCost) {
+	if !t.IsAdaptive() && t.RecordedCost != nil && valid(*t.RecordedCost) {
 		return *t.RecordedCost, true
 	}
 	key := quoteKey{t.Agent, costModel(t, fallback)}

@@ -186,9 +186,10 @@ func devin(s string) (Price, bool) {
 }
 func valid(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 }
 
-// Cost prices one request; valid recorded billing (including zero) takes precedence.
+// Cost prices one request. Adaptive requests use the router's rate; otherwise
+// valid recorded billing (including zero) takes precedence.
 func Cost(t model.Turn, fallbackModel string) (float64, bool) {
-	if t.RecordedCost != nil && valid(*t.RecordedCost) {
+	if !t.IsAdaptive() && t.RecordedCost != nil && valid(*t.RecordedCost) {
 		return *t.RecordedCost, true
 	}
 	p, ok := resolve(t.Agent, costModel(t, fallbackModel))
@@ -196,6 +197,9 @@ func Cost(t model.Turn, fallbackModel string) (float64, bool) {
 }
 
 func costModel(t model.Turn, fallback string) string {
+	if t.BillingModel != "" {
+		return t.BillingModel
+	}
 	if t.Model != "" {
 		return t.Model
 	}
@@ -213,7 +217,7 @@ func resolveLocked(agent model.Agent, name string) (Price, bool) {
 	s := strings.ToLower(strings.TrimSpace(name))
 	var p Price
 	var ok bool
-	if agent == model.Devin {
+	if agent == model.Devin || (agent == model.Omp && s == "devin/adaptive") {
 		p, ok = devin(s)
 	} else {
 		p, ok = lookup(api, s)

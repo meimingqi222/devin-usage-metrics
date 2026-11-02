@@ -63,6 +63,18 @@ func sessionProject(s model.Session) string {
 	}
 	return filepath.Base(filepath.Clean(s.WorkingDirectory))
 }
+func sessionModelText(s model.Session) string {
+	if s.IsAdaptive() {
+		if s.RealModel != nil && *s.RealModel != "" {
+			return "adaptive → " + s.DisplayModel()
+		}
+		return "adaptive"
+	}
+	if s.SelectedModel != "" {
+		return s.SelectedModel
+	}
+	return s.DisplayModel()
+}
 func subagent(s model.Session) bool {
 	return strings.Contains(strings.ToLower(s.AgentMode), "review") || strings.Contains(s.Key, "subagent") || strings.Contains(s.Key, "/sub/")
 }
@@ -369,16 +381,9 @@ func (a *App) sessionRow(c *ui.Context, s model.Session, modes bool) {
 		if modes {
 			ui.Text(c, s.AgentMode).Width(60).FontSize(12).SingleLine().Ellipsis("…")
 		}
-		modelText := s.SelectedModel
-		if modelText == "" {
-			modelText = s.DisplayModel()
-		}
-		adaptive := modelText == "adaptive"
-		if adaptive {
-			modelText = "adaptive → " + s.DisplayModel()
-		}
-		m := ui.Text(c, modelText).Width(140).FontSize(12).SingleLine().Ellipsis("…")
-		if adaptive {
+		modelText := sessionModelText(s)
+		m := ui.Text(c, modelText).Width(140).FontSize(12).SingleLine().Ellipsis("…").Tooltip(modelText)
+		if s.IsAdaptive() {
 			m.TextColor(c.Theme().Accent)
 		}
 		ui.Text(c, fmt.Sprintf("%.0f", s.AgentMessages)).Width(42).FontSize(12).TextAlign(ui.End)
@@ -444,7 +449,7 @@ func (a *App) sessionDetail(c *ui.Context, s model.Session) {
 			sort.Float64s(ttft)
 			activity = fmt.Sprintf(a.t("%.0f agent messages · %d turns in window · median TTFT %.0f ms", "%.0f 条 agent 消息 · 窗口内 %d 轮 · TTFT 中位 %.0f ms"), s.AgentMessages, u.turns, ttft[len(ttft)/2])
 		}
-		for _, v := range [][2]string{{a.t("Session", "会话"), s.ID + " · " + s.Source + " · " + s.AgentMode}, {a.t("Workdir", "工作目录"), s.WorkingDirectory}, {a.t("Model", "模型"), s.DisplayModel()}, {a.t("Time", "时间"), time.Unix(s.CreatedAt, 0).Format(time.DateTime) + " → " + time.Unix(s.LastActivityAt, 0).Format(time.DateTime)}, {"Tokens", fmt.Sprintf(a.t("In %s · Out %s · Cache Write %s · Cache Read %s · Total %s", "输入 %s · 输出 %s · 缓存写入 %s · 缓存读取 %s · 总计 %s"), formatTokens(s.InputTokens), formatTokens(s.OutputTokens), formatTokens(s.CacheCreationTokens), formatTokens(s.CachedTokens), formatTokens(s.TotalTokens()))}, {a.t("Cost", "费用"), costText}, {a.t("Activity", "活动"), activity}} {
+		for _, v := range [][2]string{{a.t("Session", "会话"), s.ID + " · " + s.Source + " · " + s.AgentMode}, {a.t("Workdir", "工作目录"), s.WorkingDirectory}, {a.t("Model", "模型"), sessionModelText(s)}, {a.t("Time", "时间"), time.Unix(s.CreatedAt, 0).Format(time.DateTime) + " → " + time.Unix(s.LastActivityAt, 0).Format(time.DateTime)}, {"Tokens", fmt.Sprintf(a.t("In %s · Out %s · Cache Write %s · Cache Read %s · Total %s", "输入 %s · 输出 %s · 缓存写入 %s · 缓存读取 %s · 总计 %s"), formatTokens(s.InputTokens), formatTokens(s.OutputTokens), formatTokens(s.CacheCreationTokens), formatTokens(s.CachedTokens), formatTokens(s.TotalTokens()))}, {a.t("Cost", "费用"), costText}, {a.t("Activity", "活动"), activity}} {
 			ui.Row(c).Gap(8).Children(func() {
 				ui.Text(c, v[0]).Width(84).FontSize(12).TextColor(c.Theme().TextMuted)
 				ui.Text(c, v[1]).Grow(1).FontSize(12)

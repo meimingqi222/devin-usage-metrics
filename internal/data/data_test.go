@@ -10,8 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/meimingqi222/devin-usage-metrics/internal/analytics"
 	"github.com/meimingqi222/devin-usage-metrics/internal/data"
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
+	"github.com/meimingqi222/devin-usage-metrics/internal/pricing"
 	"github.com/meimingqi222/devin-usage-metrics/internal/sqlite"
 )
 
@@ -176,6 +178,71 @@ func TestOmpSideChannelUsage(t *testing.T) {
 	}
 }
 
+func TestOmpAdaptiveModels(t *testing.T) {
+	h := env(t)
+	path := ".omp/agent/sessions/project/2026-11-02T01-00-00-000Z_router.jsonl"
+	transcript := `{"type":"session","id":"router","timestamp":"2026-11-02T01:00:00Z"}
+{"type":"model_change","model":"devin/adaptive"}
+{"type":"message","id":"m1","timestamp":"2026-11-02T01:01:00Z","message":{"role":"assistant","provider":"devin","model":"adaptive","upstreamModel":"swe-2-medium","usage":{"input":10,"output":2,"cost":{"total":0.1}}}}
+{"type":"message","id":"m2","timestamp":"2026-11-02T01:02:00Z","message":{"role":"assistant","provider":"devin","model":"adaptive","upstreamModel":"gpt-6-1-sol-low","usage":{"input":20,"output":3,"cost":{"total":0.2}}}}
+{"type":"model_usage","id":"u1","timestamp":"2026-11-02T01:03:00Z","provider":"typesafe","model":"jev-latest","purpose":"find","usage":{"input":5,"cost":{"total":0.01}}}
+`
+	write(t, h, path, transcript)
+	// An otherwise fresh version-5 snapshot must not hide adaptive billing.
+	old, err := json.Marshal(map[string]any{"Version": 5, "At": time.Now().Unix(), "Data": model.Data{TurnsStart: 0, TurnsEnd: 2000000000}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, h, "cache/devin-usage-metrics/go-data-omp.json", string(old))
+	d := data.Load(model.Omp, 0, 2000000000, false)
+	check(t, d, 3)
+	s := d.Sessions[0]
+	if s.SelectedModel != "devin/adaptive" || s.DisplayModel() != "gpt-6-1-sol-low" {
+		t.Fatalf("adaptive selection and upstream model lost: %+v", s)
+	}
+	for i, want := range []string{"devin/swe-2-medium", "devin/gpt-6-1-sol-low", "typesafe/jev-latest"} {
+		if d.Turns[i].Model != want {
+			t.Fatalf("turn %d model = %q, want %q", i, d.Turns[i].Model, want)
+		}
+		if (i < 2) != d.Turns[i].IsAdaptive() {
+			t.Fatalf("wrong adaptive billing route: %+v", d.Turns[i])
+		}
+	}
+	now := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+	bs := analytics.Build(d, analytics.Day, 0, model.Omp, "", now)
+	b := bs[len(bs)-1]
+	for name, input := range map[string]float64{"devin/swe-2-medium(adaptive)": 10, "devin/gpt-6-1-sol-low(adaptive)": 20, "typesafe/jev-latest": 5} {
+		if b.ByModel[name].Input != input || !b.ByModel[name].Priced {
+			t.Fatalf("wrong model attribution for %q: %+v", name, b.ByModel)
+		}
+	}
+	wantCost := (30*.5+5*2)/1e6 + .01
+	if len(b.ByModel) != 3 || b.Cost < wantCost-1e-10 || b.Cost > wantCost+1e-10 {
+		t.Fatalf("wrong routed model totals: %+v", b)
+	}
+
+	for _, tc := range []struct {
+		name, tail, selected string
+	}{
+		{"old-message", `{"type":"message","id":"old","timestamp":"2026-11-02T01:04:00Z","message":{"role":"assistant","provider":"devin","model":"adaptive","usage":{"input":7}}}`, "devin/adaptive"},
+		{"switch-model", `{"type":"model_change","model":"devin/swe-2"}`, "devin/swe-2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			write(t, h, path, transcript+tc.tail+"\n")
+			updated := data.Load(model.Omp, 0, 2000000000, true)
+			if len(updated.Sessions) != 1 || updated.Sessions[0].SelectedModel != tc.selected || updated.Sessions[0].RealModel != nil {
+				t.Fatalf("stale upstream model after %s: %+v", tc.name, updated.Sessions)
+			}
+			if tc.name == "old-message" {
+				last := updated.Turns[len(updated.Turns)-1]
+				if last.Model != "devin/adaptive" {
+					t.Fatalf("old message borrowed a previous upstream model: %+v", last)
+				}
+			}
+		})
+	}
+}
+
 func TestSQLiteImportersReadOnlyAndParentRollup(t *testing.T) {
 	for _, a := range []model.Agent{model.OpenCode, model.MimoCode, model.ZCode} {
 		t.Run(string(a), func(t *testing.T) {
@@ -230,6 +297,27 @@ func TestDevinHiddenDedupMetadataTimeAndNullTTFT(t *testing.T) {
 	check(t, d, 1)
 	if len(d.Sessions) != 0 || d.Turns[0].CreatedAt != 100 || d.Turns[0].CacheCreationTokens != 8 {
 		t.Fatal(d)
+	}
+}
+
+func TestDevinAdaptiveBilling(t *testing.T) {
+	h := env(t)
+	conn := db(t, h, ".local/share/devin/cli/sessions.db")
+	exec(t, conn, "CREATE TABLE sessions(id TEXT,title TEXT,model TEXT,created_at INTEGER,last_activity_at INTEGER,hidden INTEGER)")
+	exec(t, conn, "INSERT INTO sessions VALUES ('s','routed','adaptive',90,200,0)")
+	exec(t, conn, "CREATE TABLE message_nodes(session_id TEXT,created_at INTEGER,chat_message TEXT)")
+	for i, name := range []string{"gpt-6-1-sol-low", "compactor"} {
+		body := fmt.Sprintf(`{"message_id":"m%d","metadata":{"generation_model":%q,"metrics":{"ttft_ms":1,"input_tokens":100,"output_tokens":20,"cache_read_tokens":300,"cache_creation_tokens":40}}}`, i, name)
+		exec(t, conn, "INSERT INTO message_nodes VALUES (?,?,?)", "s", 100+i, body)
+	}
+	d := data.Load(model.Devin, 0, 200, true)
+	check(t, d, 2)
+	if d.Turns[0].Model != "gpt-6-1-sol-low" || d.Turns[0].BillingModel != "adaptive" || d.Turns[1].BillingModel != "" {
+		t.Fatalf("display model and billing route were conflated: %+v", d.Turns)
+	}
+	cost, ok := pricing.Cost(d.Turns[0], "")
+	if !ok || cost < .00014-1e-10 || cost > .00014+1e-10 {
+		t.Fatalf("Devin adaptive priced using its upstream: %g, %v", cost, ok)
 	}
 }
 
