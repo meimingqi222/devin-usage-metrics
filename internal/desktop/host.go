@@ -34,6 +34,10 @@ func Run(templateIcon, colorIcon []byte) error {
 	if os.Getenv("GOMEMLIMIT") == "" {
 		debug.SetMemoryLimit(trayMemoryLimit)
 	}
+	// Loads allocate ~1.5 GB briefly; tighter collection keeps the freed
+	// spans from sitting resident between jobs (FreeOSMemory runs after
+	// each job anyway).
+	debug.SetGCPercent(50)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// A packaged app reports its bundle's version, which the build took

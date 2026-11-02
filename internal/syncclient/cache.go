@@ -118,7 +118,9 @@ type decodedBlock struct {
 
 // Decoding dominates sync CPU: a device that publishes a new manifest usually
 // changes one or two blocks, so caching per block keeps every other one.
-var blockCache = newLRU[decodedBlock](24<<20, 1<<16)
+// The decoded rows also live in the tray's remote dataset, so this cache
+// only needs to span one sync cycle, not the whole account.
+var blockCache = newLRU[decodedBlock](8<<20, 1<<16)
 
 func (t transport) cachedDecoded(name string) (decodedBlock, bool) {
 	return blockCache.get(t.account() + "/" + name)
@@ -179,7 +181,7 @@ func cloneTurns(in []model.Turn) []model.Turn {
 	return out
 }
 
-var packageCache = newLRU[devicePackage](16<<20, 256)
+var packageCache = newLRU[devicePackage](8<<20, 256)
 
 func cachedPackage(key string) (devicePackage, bool) {
 	p, ok := packageCache.get(key)

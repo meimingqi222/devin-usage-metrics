@@ -45,4 +45,24 @@ Halved by:
   halving its share of the load-time high-water mark.
 
 Result: all-agent refresh peaks ~240-290MB, devin alone 297->171MB,
-load time unchanged (~1.6s on a real history).
+load time ~1.6-2.8s on a real history (2-way loader concurrency trades
+a second of wall time for ~140MB of peak).
+
+## Second pass (0.3.8+1)
+
+`vmmap` on the shipped tray: Untagged (Go heap) ~134MB resident, IOSurface
+(GPU textures) 33MB, Malloc 15MB — non-Go surface is roughly fixed at
+~65MB. The Go share breaks down as model.Data (~40MB), decoded cache
+(<=32MB), sync LRUs, and GC-spare spans.
+
+- `blockCache` 24->8 MiB and `packageCache` 16->8 MiB: decoded blocks
+  duplicate what `a.remote` already holds; the cache only needs to span
+  one sync cycle.
+- `debug.SetGCPercent(50)` in the tray only (host.go): keeps freed spans
+  dense between jobs; CLI is unaffected.
+- `decodedBudget` stays 32 MiB — measured reload at 16 MiB thrashed
+  (multi-second re-decode), 32 MiB reuses the whole recent working set.
+
+Ceiling: steady state is bound near ~120-160MB resident; macOS UI/GPU
+plus model.Data cannot go lower without a disk-resident decoded cache
+or dropping per-agent `a.loaded` retention.
