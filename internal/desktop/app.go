@@ -34,42 +34,48 @@ type App struct {
 	period                                     analytics.Period
 	page                                       int
 	tab, screen, lang, device, search, message string
-	loaded                                     map[model.Agent]model.Data
-	busy                                       map[string]bool
-	remote                                     model.Data
-	accounts                                   []accountResult
-	selected                                   *model.Session
-	settings                                   bool
-	apiURL, deviceName                         string
-	auth                                       syncclient.Authorization
-	loginCancel                                context.CancelFunc
-	confirm                                    bool
-	pending                                    *compaction.Recommendation
-	release                                    updater.Release
-	payload                                    string
-	quit                                       func()
-	openFolder, openURL                        func(string)
-	languageChanged                            func()
-	updatePrefs                                updatePrefs
-	localID                                    string
-	pendingApply                               func() error
-	settingsUI                                 settingsUIState
-	trayUI                                     trayUIState
-	otherAgents, agentsClosed, deviceMenu      bool
-	sessionsUI                                 sessionsUIState
-	loadedAt                                   string
-	hasLoaded                                  bool
-	compactionDetails                          bool
-	installed                                  map[model.Agent]bool
-	cachedData                                 *model.Data
-	cachedKey                                  dataKey
-	compactionUI                               compactionState
-	sessionCosts                               map[sessionIdentity]sessionUsage
-	sessionList                                sessionListCache
-	quotaUI                                    quotaUIState
-	usageUI                                    usageUIState
-	syncUI                                     syncState
-	extUI                                      extUIState
+	// loaded holds only the current agent's data; switching agents drops the
+	// previous model.Data entirely instead of retaining one copy per agent.
+	// counts carries the sidebar's session count for agents already seen.
+	loaded                                model.Data
+	loadedAgent                           model.Agent
+	counts                                map[model.Agent]int
+	trayEntries                           map[model.Agent][]trayEntry
+	busy                                  map[string]bool
+	remote                                model.Data
+	accounts                              []accountResult
+	selected                              *model.Session
+	settings                              bool
+	apiURL, deviceName                    string
+	auth                                  syncclient.Authorization
+	loginCancel                           context.CancelFunc
+	confirm                               bool
+	pending                               *compaction.Recommendation
+	release                               updater.Release
+	payload                               string
+	quit                                  func()
+	openFolder, openURL                   func(string)
+	languageChanged                       func()
+	updatePrefs                           updatePrefs
+	localID                               string
+	pendingApply                          func() error
+	settingsUI                            settingsUIState
+	trayUI                                trayUIState
+	otherAgents, agentsClosed, deviceMenu bool
+	sessionsUI                            sessionsUIState
+	loadedAt                              string
+	hasLoaded                             bool
+	compactionDetails                     bool
+	installed                             map[model.Agent]bool
+	cachedData                            *model.Data
+	cachedKey                             dataKey
+	compactionUI                          compactionState
+	sessionCosts                          map[sessionIdentity]sessionUsage
+	sessionList                           sessionListCache
+	quotaUI                               quotaUIState
+	usageUI                               usageUIState
+	syncUI                                syncState
+	extUI                                 extUIState
 }
 
 // syncState is the last sync's outcome shown in the sidebar.
@@ -81,7 +87,7 @@ type syncState struct {
 func New(ctx context.Context) *App {
 	// Like Rust, start on this device's data; All devices is one click away.
 	id := data.DeviceID()
-	return &App{ctx: ctx, events: make(chan func(), 64), agent: model.Devin, period: analytics.Day, tab: "usage", screen: "history", lang: language(), loaded: map[model.Agent]model.Data{}, busy: map[string]bool{}, apiURL: syncclient.ReadConfig().APIURL, deviceName: data.DeviceName(), localID: id, device: id, usageUI: usageUIState{expandedBuckets: map[int64]bool{}}, sessionsUI: loadSessionUI(), installed: installedAgents(), quotaUI: quotaUIState{keychainLikely: quota.MacOSMayHaveKeychainAccounts()}, updatePrefs: loadUpdatePrefs()}
+	return &App{ctx: ctx, events: make(chan func(), 64), agent: model.Devin, loadedAgent: model.Agent(""), period: analytics.Day, tab: "usage", screen: "history", lang: language(), counts: map[model.Agent]int{}, trayEntries: map[model.Agent][]trayEntry{}, busy: map[string]bool{}, apiURL: syncclient.ReadConfig().APIURL, deviceName: data.DeviceName(), localID: id, device: id, usageUI: usageUIState{expandedBuckets: map[int64]bool{}}, sessionsUI: loadSessionUI(), installed: installedAgents(), quotaUI: quotaUIState{keychainLikely: quota.MacOSMayHaveKeychainAccounts()}, updatePrefs: loadUpdatePrefs()}
 }
 
 func (a *App) t(en, zh string) string {
@@ -141,9 +147,7 @@ func (a *App) load(agent model.Agent, refresh bool) {
 			readyAt := time.Now()
 			return func() {
 				syncdiag.Log(ctx, "desktop_load_applied", "apply_wait_ms", time.Since(readyAt).Milliseconds(), "phase", phase)
-				a.loaded[agent] = d
-				a.loadedAt = time.Now().Format("15:04:05")
-				a.hasLoaded = true
+				a.storeLoaded(agent, d)
 			}
 		}
 		var d model.Data
@@ -165,6 +169,20 @@ func (a *App) load(agent model.Agent, refresh bool) {
 			}
 		}
 	})
+}
+
+// storeLoaded records a finished load: sidebar/tray aggregates always land,
+// but the model.Data itself is kept only for the agent still selected.
+func (a *App) storeLoaded(agent model.Agent, d model.Data) {
+	a.counts[agent] = len(d.Sessions)
+	a.trayEntries[agent] = trayEntriesOf(d.Turns, a.localID)
+	if agent != a.agent {
+		return
+	}
+	a.loaded = d
+	a.loadedAgent = agent
+	a.loadedAt = time.Now().Format("15:04:05")
+	a.hasLoaded = true
 }
 
 func (a *App) syncDue(now time.Time) bool {
@@ -252,8 +270,38 @@ func first[T any](s []T) *T {
 	return &s[0]
 }
 
+// switchAgent selects an agent, dropping the previous agent's data and
+// reloading when the selection actually changes. Clicking the current
+// agent still returns from the quota/extension screens to history.
+func (a *App) switchAgent(agent model.Agent) {
+	if agent == a.agent {
+		a.screen = "history"
+		return
+	}
+	a.agent = agent
+	a.screen = "history"
+	a.page = 0
+	a.selected = nil
+	if a.tab == "compaction" && agent != model.Claude && agent != model.Codex {
+		a.tab = "usage"
+	}
+	a.loaded = model.Data{}
+	a.loadedAgent = ""
+	a.invalidateDerived()
+	a.load(agent, false)
+}
+
+// switching reports that the selected agent's load is in flight: the
+// content area shows a spinner instead of the previous agent's data.
+func (a *App) switching() bool {
+	return a.screen == "history" && a.loadedAgent != a.agent && a.busy[string(a.agent)]
+}
+
 func (a *App) dataKey() dataKey {
-	d := a.loaded[a.agent]
+	d := a.loaded
+	if a.loadedAgent != a.agent {
+		d = model.Data{}
+	}
 	return dataKey{a.agent, first(d.Sessions), first(a.remote.Sessions), first(d.Turns), first(a.remote.Turns), len(d.Sessions), len(a.remote.Sessions), len(d.Turns), len(a.remote.Turns)}
 }
 
@@ -267,7 +315,10 @@ func (a *App) allData() model.Data {
 	if a.cachedData != nil && a.cachedKey == key {
 		return *a.cachedData
 	}
-	d := a.loaded[a.agent]
+	d := a.loaded
+	if a.loadedAgent != a.agent {
+		d = model.Data{}
+	}
 	d.Sessions = append(append([]model.Session(nil), d.Sessions...), a.remote.Sessions...)
 	d.Turns = append(append([]model.Turn(nil), d.Turns...), a.remote.Turns...)
 	a.cachedData, a.cachedKey = &d, key

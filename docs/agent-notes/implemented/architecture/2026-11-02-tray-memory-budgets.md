@@ -63,6 +63,21 @@ a second of wall time for ~140MB of peak).
 - `decodedBudget` stays 32 MiB — measured reload at 16 MiB thrashed
   (multi-second re-decode), 32 MiB reuses the whole recent working set.
 
-Ceiling: steady state is bound near ~120-160MB resident; macOS UI/GPU
-plus model.Data cannot go lower without a disk-resident decoded cache
-or dropping per-agent `a.loaded` retention.
+Ceiling after pass three: the Go share is one model.Data + caches; the
+remaining floor is macOS UI/GPU (~65MB) plus whatever is needed to keep
+agent switches instant.
+
+## Third pass: single-copy agent data
+
+`a.loaded` was `map[Agent]Data`; switching agents retained every visited
+agent's full model.Data (~5-40MB each). Now `a.loaded`/`a.loadedAgent`
+keep only the selected agent; `a.counts` (session count per agent) and
+`a.trayEntries` (compact 24B/turn cost+token rows) carry everything the
+sidebar and tray menu need. `storeLoaded` always records the aggregates
+but drops the data when the load finished after the user moved on.
+
+Switch cost: snapshot-cache hit ~instant, stale snapshot re-decodes at
+the decoded-cache hit rate (~200-400ms for the largest agents). The
+content area shows `ui.Spinner` while `switching()` (selected agent's
+load in flight). `switchAgent` same-agent clicks still return from the
+quota/ext screens to history.

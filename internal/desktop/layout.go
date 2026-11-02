@@ -68,8 +68,12 @@ func (a *App) View(c *ui.Context) {
 			if a.message != "" {
 				ui.Text(c, a.message).FontSize(12).TextColor(c.Theme().Accent).Padding(4, 16)
 			}
-			for _, e := range a.loaded[a.agent].Errors {
+			for _, e := range a.loaded.Errors {
 				ui.Text(c, e.Message).FontSize(12).TextColor(c.Theme().Danger).Padding(4, 16)
+			}
+			if a.switching() {
+				ui.Column(c).Grow(1).MinWidth(0).AlignItems(ui.Center).Justify(ui.Center).Children(func() { ui.Spinner(c) })
+				return
 			}
 			if a.screen == "quota" {
 				ui.Scroll(c.Key("quota")).Grow(1).Padding(16).Gap(12).Children(func() { a.quotaView(c) })
@@ -168,8 +172,7 @@ func (a *App) sidebar(c *ui.Context) {
 		ui.Scroll(c).Grow(1).Padding(0, 10).Gap(2).Children(func() {
 			var shown, other []model.Agent
 			for _, agent := range model.Agents {
-				d, loaded := a.loaded[agent]
-				if a.installed[agent] || (loaded && len(d.Sessions) > 0) || agent == a.agent {
+				if a.installed[agent] || a.counts[agent] > 0 || agent == a.agent {
 					shown = append(shown, agent)
 				} else {
 					other = append(other, agent)
@@ -280,8 +283,7 @@ func monogram(agent model.Agent) string {
 func (a *App) agentItem(c *ui.Context, agent model.Agent) {
 	t := c.Theme()
 	active := a.screen == "history" && a.agent == agent
-	d, loaded := a.loaded[agent]
-	installed := a.installed[agent] || len(d.Sessions) > 0
+	installed := a.installed[agent] || a.counts[agent] > 0
 	r := ui.Row(c.Key(string(agent))).Height(30).Shrink(0).Padding(0, 8).Gap(8).Radius(6).AlignItems(ui.Center).Label(agent.Label()).Focusable()
 	hovered := r.Hovered()
 	switch {
@@ -293,16 +295,7 @@ func (a *App) agentItem(c *ui.Context, agent model.Agent) {
 		r.Background(t.Text.Alpha(.04))
 	}
 	if r.Clicked() {
-		a.agent = agent
-		a.screen = "history"
-		a.page = 0
-		a.selected = nil
-		if a.tab == "compaction" && agent != model.Claude && agent != model.Codex {
-			a.tab = "usage"
-		}
-		if !loaded {
-			a.load(agent, false)
-		}
+		a.switchAgent(agent)
 	}
 	text, mark, markFill, markBorder := t.TextMuted, t.TextMuted, ui.Hex("#1c2230"), ui.Hex("#283244")
 	switch {
@@ -321,12 +314,12 @@ func (a *App) agentItem(c *ui.Context, agent model.Agent) {
 		if active {
 			name.FontWeight(600)
 		}
-		if loaded {
+		if n := a.counts[agent]; n > 0 {
 			count := faint(t)
 			if active {
 				count = t.Accent.Alpha(.85)
 			}
-			ui.Text(c, fmt.Sprint(len(d.Sessions))).FontSize(10.5).FontWeight(500).FontFeatures("tnum").TextColor(count)
+			ui.Text(c, fmt.Sprint(n)).FontSize(10.5).FontWeight(500).FontFeatures("tnum").TextColor(count)
 		}
 	})
 }

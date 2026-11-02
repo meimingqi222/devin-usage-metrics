@@ -24,7 +24,7 @@ func denseFixture(t *testing.T) *App {
 	}
 	for _, agent := range model.Agents {
 		a.installed[agent] = true
-		delete(a.loaded, agent)
+		delete(a.counts, agent)
 	}
 	configDir, _ := os.UserConfigDir()
 	if err := os.WriteFile(filepath.Join(configDir, "devin-usage-metrics/github-sync-session.meta.json"), []byte(`{"login":"example-user"}`), 0600); err != nil {
@@ -61,7 +61,7 @@ func denseFixture(t *testing.T) *App {
 			d.Turns = append(d.Turns, turn)
 		}
 	}
-	a.loaded[model.Devin] = d
+	a.storeLoaded(model.Devin, d)
 	return a
 }
 

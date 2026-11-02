@@ -16,9 +16,9 @@ func TestTrayChinesePopulatedVisual(t *testing.T) {
 	a.trayUI.updatedAt = "12:43:24"
 	for agent, cost := range map[model.Agent]float64{model.Claude: 266.46, model.Devin: 57.79, model.Codex: 49.76} {
 		price := cost
-		a.loaded[agent] = model.Data{Turns: []model.Turn{{Agent: agent, CreatedAt: time.Now().Unix(), RecordedCost: &price}}}
+		a.storeLoaded(agent, model.Data{Turns: []model.Turn{{Agent: agent, CreatedAt: time.Now().Unix(), RecordedCost: &price}}})
 	}
-	a.loaded[model.Antigravity] = model.Data{Turns: []model.Turn{{Agent: model.Antigravity, CreatedAt: time.Now().Unix(), InputTokens: 501779800}}}
+	a.storeLoaded(model.Antigravity, model.Data{Turns: []model.Turn{{Agent: model.Antigravity, CreatedAt: time.Now().Unix(), InputTokens: 501779800}}})
 	a.accounts = []accountResult{
 		{account: quota.Account{Key: "claude", Provider: "claude"}, result: quota.Result{Plan: "Pro", Windows: []quota.Window{
 			{Label: "5h", ResetsAt: time.Now().Add(5 * time.Hour).Unix()},
@@ -92,7 +92,7 @@ func TestTrayOverviewIndependentOfDashboardAndRemote(t *testing.T) {
 	// Only local history from all supported sources belongs in the tray.
 	now := time.Now().Unix()
 	price := 2.0
-	a.loaded[model.Codex] = model.Data{Turns: []model.Turn{{Agent: model.Codex, CreatedAt: now, DeviceID: a.localID, RecordedCost: &price}}}
+	a.storeLoaded(model.Codex, model.Data{Turns: []model.Turn{{Agent: model.Codex, CreatedAt: now, DeviceID: a.localID, RecordedCost: &price}}})
 	tt := ui.NewTester(a.trayView, trayWidth, 520)
 	tt.SetScale(2)
 	if !tt.HasText("Claude Code") || !tt.HasText("Codex") || tt.HasText("Devin") {

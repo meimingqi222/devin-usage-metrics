@@ -11,7 +11,7 @@ import (
 func TestAntigravityCLISourceTag(t *testing.T) {
 	a := fixture(t)
 	a.agent = model.Antigravity
-	a.loaded[model.Antigravity] = model.Data{Sessions: []model.Session{{Agent: model.Antigravity, Key: "antigravity-cli/x", ID: "x", Source: "cli", Title: "Terminal session", DeviceID: a.localID, DeviceName: "Workstation", LastActivityAt: time.Now().Unix()}}}
+	a.storeLoaded(model.Antigravity, model.Data{Sessions: []model.Session{{Agent: model.Antigravity, Key: "antigravity-cli/x", ID: "x", Source: "cli", Title: "Terminal session", DeviceID: a.localID, DeviceName: "Workstation", LastActivityAt: time.Now().Unix()}}})
 	tt := ui.NewTester(func(c *ui.Context) {
 		a.theme(c)
 		ui.Column(c).Fill().Padding(16).Children(func() { a.sessionsView(c) })

@@ -10,8 +10,8 @@ import (
 
 func TestUsageSummaryCacheInvalidatesWithInputs(t *testing.T) {
 	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
-	a := &App{agent: model.Claude, period: analytics.Day, loaded: map[model.Agent]model.Data{}}
-	a.loaded[a.agent] = model.Data{Turns: []model.Turn{
+	a := &App{agent: model.Claude, period: analytics.Day, loadedAgent: model.Claude}
+	a.loaded = model.Data{Turns: []model.Turn{
 		{Agent: model.Claude, DeviceID: "one", SessionKey: "s", CreatedAt: now.Unix(), InputTokens: 10},
 		{Agent: model.Claude, DeviceID: "two", SessionKey: "s", CreatedAt: now.Unix(), InputTokens: 20},
 	}}
@@ -50,7 +50,7 @@ func BenchmarkUsageSummaryCached(b *testing.B) {
 	for i := range turns {
 		turns[i] = model.Turn{Agent: model.Claude, SessionKey: "s", CreatedAt: now.Unix(), InputTokens: 1}
 	}
-	a := &App{agent: model.Claude, period: analytics.Day, loaded: map[model.Agent]model.Data{model.Claude: {Turns: turns}}}
+	a := &App{agent: model.Claude, period: analytics.Day, loaded: model.Data{Turns: turns}, loadedAgent: model.Claude}
 	a.usageData(now)
 	b.ReportAllocs()
 	for b.Loop() {

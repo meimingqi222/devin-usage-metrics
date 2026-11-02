@@ -54,7 +54,7 @@ func BenchmarkSessionListCached(b *testing.B) {
 	for i := 0; i < 10000; i++ {
 		d.Sessions = append(d.Sessions, model.Session{Agent: model.Claude, Key: fmt.Sprint(i), LastActivityAt: int64(i)})
 	}
-	a := &App{agent: model.Claude, loaded: map[model.Agent]model.Data{model.Claude: d}}
+	a := &App{agent: model.Claude, loaded: d, loadedAgent: model.Claude}
 	a.visibleSessions()
 	b.ReportAllocs()
 	for b.Loop() {

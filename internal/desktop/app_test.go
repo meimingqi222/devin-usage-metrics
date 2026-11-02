@@ -46,11 +46,11 @@ func fixture(t testing.TB) *App {
 	a.hasLoaded = true // the fixture stands in for a finished first read
 	id := data.DeviceID()
 	now := time.Now()
-	a.loaded[model.Claude] = model.Data{Sessions: []model.Session{{Agent: model.Claude, Key: "claude-code/local", ID: "local", Title: "Implement streaming parser", WorkingDirectory: "/projects/usage-metrics", SelectedModel: "claude-sonnet-4-5", DeviceID: id, DeviceName: "Workstation", InputTokens: 37000, OutputTokens: 8000, CachedTokens: 120000, CacheCreationTokens: 3000, AgentMessages: 2, CreatedAt: now.AddDate(0, 0, -5).Unix(), LastActivityAt: now.Unix()}}, Turns: []model.Turn{{Agent: model.Claude, SessionKey: "claude-code/local", Model: "claude-sonnet-4-5", DeviceID: id, CreatedAt: now.AddDate(0, 0, -4).Unix(), InputTokens: 12000, OutputTokens: 3000, CacheReadTokens: 40000, CacheCreationTokens: 1000, TTFTMs: 150}, {Agent: model.Claude, SessionKey: "claude-code/local", Model: "claude-sonnet-4-5", DeviceID: id, CreatedAt: now.Unix(), InputTokens: 25000, OutputTokens: 5000, CacheReadTokens: 80000, CacheCreationTokens: 2000, TTFTMs: 240}}}
+	a.storeLoaded(model.Claude, model.Data{Sessions: []model.Session{{Agent: model.Claude, Key: "claude-code/local", ID: "local", Title: "Implement streaming parser", WorkingDirectory: "/projects/usage-metrics", SelectedModel: "claude-sonnet-4-5", DeviceID: id, DeviceName: "Workstation", InputTokens: 37000, OutputTokens: 8000, CachedTokens: 120000, CacheCreationTokens: 3000, AgentMessages: 2, CreatedAt: now.AddDate(0, 0, -5).Unix(), LastActivityAt: now.Unix()}}, Turns: []model.Turn{{Agent: model.Claude, SessionKey: "claude-code/local", Model: "claude-sonnet-4-5", DeviceID: id, CreatedAt: now.AddDate(0, 0, -4).Unix(), InputTokens: 12000, OutputTokens: 3000, CacheReadTokens: 40000, CacheCreationTokens: 1000, TTFTMs: 150}, {Agent: model.Claude, SessionKey: "claude-code/local", Model: "claude-sonnet-4-5", DeviceID: id, CreatedAt: now.Unix(), InputTokens: 25000, OutputTokens: 5000, CacheReadTokens: 80000, CacheCreationTokens: 2000, TTFTMs: 240}}})
 	a.remote = model.Data{Sessions: []model.Session{{Agent: model.Claude, Key: "claude-code/remote", ID: "remote", Title: "Review API changes", SelectedModel: "claude-opus-4-6", DeviceID: "laptop", DeviceName: "Laptop", InputTokens: 8000, OutputTokens: 1000, CachedTokens: 20000, CreatedAt: now.Unix(), LastActivityAt: now.Unix()}}, Turns: []model.Turn{{Agent: model.Claude, SessionKey: "claude-code/remote", Model: "claude-opus-4-6", DeviceID: "laptop", CreatedAt: now.Unix(), InputTokens: 8000, OutputTokens: 1000, CacheReadTokens: 20000}}}
 	for _, agent := range model.Agents {
 		if agent != model.Claude {
-			a.loaded[agent] = model.Data{}
+			a.storeLoaded(agent, model.Data{})
 		}
 	}
 	return a
@@ -238,7 +238,7 @@ func TestCompactionRequiresConfirmationAndSupportsUndo(t *testing.T) {
 			contextTokens = 60000
 		}
 	}
-	a.loaded[model.Codex] = d
+	a.storeLoaded(model.Codex, d)
 	tt := ui.NewTester(a.View, 1240, 780)
 	tt.SetScale(2)
 	settleCompaction(t, tt, a)
@@ -277,7 +277,7 @@ func TestDerivedCostsUpdateWithoutMixingDevices(t *testing.T) {
 	r.ID = "remote"
 	r.DeviceID = "other"
 	r.Title = "Remote shared key"
-	a.loaded[model.Claude] = model.Data{Sessions: []model.Session{s}, Turns: []model.Turn{{Agent: model.Claude, DeviceID: s.DeviceID, SessionKey: s.Key, CreatedAt: now, InputTokens: 10, RecordedCost: &localPrice}}}
+	a.storeLoaded(model.Claude, model.Data{Sessions: []model.Session{s}, Turns: []model.Turn{{Agent: model.Claude, DeviceID: s.DeviceID, SessionKey: s.Key, CreatedAt: now, InputTokens: 10, RecordedCost: &localPrice}}})
 	a.remote = model.Data{Sessions: []model.Session{r}, Turns: []model.Turn{{Agent: model.Claude, DeviceID: r.DeviceID, SessionKey: r.Key, CreatedAt: now, InputTokens: 20, RecordedCost: &remotePrice}}}
 	tt := ui.NewTester(a.View, 1240, 780)
 	if !tt.HasText("$9.50") {
@@ -288,10 +288,10 @@ func TestDerivedCostsUpdateWithoutMixingDevices(t *testing.T) {
 		t.Fatal("session costs mixed device identities")
 	}
 	a.post(func() {
-		d := a.loaded[model.Claude]
+		d := a.loaded
 		price := 5.0
 		d.Turns = append(d.Turns, model.Turn{Agent: model.Claude, DeviceID: s.DeviceID, SessionKey: s.Key, CreatedAt: now, InputTokens: 30, RecordedCost: &price})
-		a.loaded[model.Claude] = d
+		a.storeLoaded(model.Claude, d)
 	})
 	click(t, tt, "Usage")
 	if !tt.HasText("$14.50") {
@@ -303,7 +303,10 @@ func TestDerivedCostsUpdateWithoutMixingDevices(t *testing.T) {
 	}
 }
 
-func TestAgentSwitchKeepsLoadedDataUntilReload(t *testing.T) {
+// Switching agents drops the retained copy; the new agent reloads from the
+// snapshot or its sources. An explicit Reload must discover newly written
+// history.
+func TestAgentSwitchDropsLoadedDataAndReloadDiscoversNewFiles(t *testing.T) {
 	a := fixture(t)
 	a.remote = model.Data{}
 	a.installed[model.Codex] = true
@@ -317,27 +320,41 @@ func TestAgentSwitchKeepsLoadedDataUntilReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	tt := ui.NewTester(a.View, 1240, 780)
-	click(t, tt, "Codex")
-	click(t, tt, "Claude Code")
-	wait := func() {
+	wait := func(agent model.Agent) {
 		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
-		for tt.HasText("Loading…") && time.Now().Before(deadline) {
+		deadline := time.Now().Add(60 * time.Second)
+		for (a.busy[string(agent)] || a.loadedAgent != agent) && time.Now().Before(deadline) {
+			tt.Frame()
 			time.Sleep(time.Millisecond)
-			click(t, tt, "Usage")
 		}
-		if tt.HasText("Loading…") {
-			t.Fatal("reload timed out")
+		if a.loadedAgent != agent {
+			t.Fatalf("load for %s timed out", agent)
 		}
 	}
-	wait()
-	if !tt.HasText("168.0") {
-		t.Fatal("switching agent discarded the loaded snapshot")
+	newTurn := func() bool {
+		for _, turn := range a.loaded.Turns {
+			if turn.Model == "claude-sonnet-4-5" && turn.InputTokens == 9 {
+				return true
+			}
+		}
+		return false
+	}
+	click(t, tt, "Codex")
+	wait(model.Codex)
+	for _, turn := range a.loaded.Turns {
+		if turn.Agent == model.Claude {
+			t.Fatal("switching kept the previous agent's turns")
+		}
+	}
+	click(t, tt, "Claude Code")
+	wait(model.Claude)
+	if !newTurn() {
+		t.Fatal("switch load did not read the freshly written file")
 	}
 	click(t, tt, "Reload")
-	wait()
-	if tt.HasText("168.0") || !tt.HasText("9") {
-		t.Fatal("explicit reload failed to discover changed history")
+	wait(model.Claude)
+	if !newTurn() {
+		t.Fatal("explicit reload dropped the fresh file")
 	}
 }
 
@@ -354,7 +371,8 @@ func BenchmarkDashboardRedraw(b *testing.B) {
 					d.Turns = append(d.Turns, model.Turn{Agent: s.Agent, SessionKey: s.Key, DeviceID: s.DeviceID, CreatedAt: s.CreatedAt, InputTokens: 10, RecordedCost: &price})
 				}
 			}
-			a.loaded[model.Claude], a.remote, a.tab = d, model.Data{}, tab
+			a.storeLoaded(model.Claude, d)
+			a.remote, a.tab = model.Data{}, tab
 			tt := ui.NewTester(a.View, 1240, 780)
 			if tab == "sessions" && !tt.HasText("$2.00") {
 				b.Fatal("wrong session cost")
@@ -387,8 +405,8 @@ func TestCompactionExplainsRiskAdjustedRejection(t *testing.T) {
 			ctx = 60000
 		}
 	}
-	a.loaded[model.Codex] = d
 	a.agent, a.tab = model.Codex, "compaction"
+	a.storeLoaded(model.Codex, d)
 	tt := ui.NewTester(a.View, 1240, 780)
 	tt.SetScale(2)
 	settleCompaction(t, tt, a)
@@ -413,7 +431,7 @@ func TestCompactionReplayRunsOncePerInput(t *testing.T) {
 			t.Fatal("redraw restarted the replay")
 		}
 	}
-	a.loaded[model.Codex] = model.Data{Turns: []model.Turn{{Agent: model.Codex, CreatedAt: time.Now().Unix()}}}
+	a.storeLoaded(model.Codex, model.Data{Turns: []model.Turn{{Agent: model.Codex, CreatedAt: time.Now().Unix()}}})
 	settleCompaction(t, tt, a)
 	if a.compactionUI.ready == key {
 		t.Fatal("new data did not trigger a replay")
@@ -427,7 +445,7 @@ func TestCompactionStatusIsLocalized(t *testing.T) {
 	for i := 0; i < 60; i++ {
 		d.Turns = append(d.Turns, model.Turn{Agent: model.Codex, SessionKey: "s", DeviceID: a.localID, DeviceName: "Workstation", ContextStream: "main", CreatedAt: time.Now().Add(-time.Hour).Unix() + int64(i), Model: "gpt-5.2", InputTokens: 1000, CacheReadTokens: float64(20000 + i*1000)})
 	}
-	a.loaded[model.Codex] = d
+	a.storeLoaded(model.Codex, d)
 	tt := ui.NewTester(a.View, 1240, 780)
 	settleCompaction(t, tt, a)
 	if tt.HasText("not_enough_compactions") || !tt.HasText("Too few compactions: at least 3 suspected compactions are required. No default threshold is guessed.") {
@@ -452,7 +470,7 @@ func TestCompactionExplainsUncalibratedBaseline(t *testing.T) {
 			ctx, cycle = 60000, cycle+1
 		}
 	}
-	a.loaded[model.Codex] = d
+	a.storeLoaded(model.Codex, d)
 	tt := ui.NewTester(a.View, 1240, 780)
 	settleCompaction(t, tt, a)
 	if !tt.HasText("Low confidence") || tt.HasText("Already optimal") {
@@ -462,7 +480,8 @@ func TestCompactionExplainsUncalibratedBaseline(t *testing.T) {
 
 func TestFirstLoadShowsLoadingInsteadOfEmptyUsage(t *testing.T) {
 	a := fixture(t)
-	delete(a.loaded, a.agent)
+	a.loaded = model.Data{}
+	a.loadedAgent = ""
 	a.hasLoaded = false
 	a.busy[string(a.agent)] = true
 	tt := ui.NewTester(a.View, 1240, 780)
@@ -491,7 +510,7 @@ func TestCompactionApplyDisabledUnderEnvironmentOverride(t *testing.T) {
 			ctx = 60000
 		}
 	}
-	a.loaded[model.Claude] = d
+	a.storeLoaded(model.Claude, d)
 	tt := ui.NewTester(a.View, 1240, 780)
 	settleCompaction(t, tt, a)
 	if !tt.HasText("An environment variable overrides compaction. Remove it before applying.") {

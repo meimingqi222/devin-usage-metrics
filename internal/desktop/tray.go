@@ -89,18 +89,35 @@ func trayMoney(cost float64) string {
 	return fmt.Sprintf("$%.2f", cost)
 }
 
-// Like compute_cost_overview, aggregate local turns by agent, not by model,
-// dashboard selection, or synced device. Never perform disk/network IO in a view.
-// localUsage sums an agent's cost and tokens on this device between start
-// and end, from loaded history only.
-func (a *App) localUsage(agent model.Agent, start, end time.Time) (cost, tokens float64) {
-	for _, turn := range a.loaded[agent].Turns {
-		if turn.CreatedAt < start.Unix() || turn.CreatedAt > end.Unix() || (turn.DeviceID != "" && a.localID != "" && turn.DeviceID != a.localID) {
+// trayEntry is one turn's cost/token contribution to the menu overview,
+// precomputed at load time because only the current agent's turns are
+// kept in memory.
+type trayEntry struct {
+	at           int64
+	cost, tokens float64
+}
+
+func trayEntriesOf(turns []model.Turn, localID string) []trayEntry {
+	var out []trayEntry
+	for _, turn := range turns {
+		if turn.DeviceID != "" && localID != "" && turn.DeviceID != localID {
 			continue
 		}
 		v, _ := pricing.Cost(turn, turn.Model)
-		cost += v
-		tokens += turn.InputTokens + turn.OutputTokens + turn.CacheReadTokens + turn.CacheCreationTokens
+		out = append(out, trayEntry{at: turn.CreatedAt, cost: v, tokens: turn.InputTokens + turn.OutputTokens + turn.CacheReadTokens + turn.CacheCreationTokens})
+	}
+	return out
+}
+
+// localUsage sums an agent's cost and tokens on this device between start
+// and end, from the precomputed per-agent entries.
+func (a *App) localUsage(agent model.Agent, start, end time.Time) (cost, tokens float64) {
+	for _, e := range a.trayEntries[agent] {
+		if e.at < start.Unix() || e.at > end.Unix() {
+			continue
+		}
+		cost += e.cost
+		tokens += e.tokens
 	}
 	return cost, tokens
 }
