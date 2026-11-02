@@ -488,8 +488,14 @@ func Cycle(ctx context.Context, local model.Data) (result model.Data, resultErr 
 			syncdiag.Log(syncdiag.WithDevice(ctx, d), "device_last_good_used")
 			p = clonePackage(good)
 		} else {
-			lastGood[key] = clonePackage(p)
+			// No clone: remote copies the values and nothing mutates
+			// packages, so the fallback can share the live read.
+			lastGood[key] = p
 		}
+		if remote.RemoteHeads == nil {
+			remote.RemoteHeads = map[string]string{}
+		}
+		remote.RemoteHeads[d] = chosen[d][0]
 		remote.Sessions = append(remote.Sessions, p.Sessions...)
 		remote.Turns = append(remote.Turns, p.Turns...)
 		if remote.TurnsStart == 0 || p.Start < remote.TurnsStart {
@@ -535,6 +541,69 @@ func (t transport) importDevice(ctx context.Context, d string, names []string, l
 	syncdiag.Log(deviceCtx, "device_import_result", "sessions", len(p.Sessions), "turns", len(p.Turns), "error", syncdiag.ErrorCode(e))
 	deviceDone(e)
 	return p, e
+}
+
+// DecodeRemoteDevices re-reads the named remote device heads and merges
+// their records. It hits the disk/object caches like a normal cycle but
+// never lists objects or publishes, so the tray can rebuild remote data
+// on demand without triggering a sync. Devices that fail keep their
+// entries out of the result and join the error.
+func DecodeRemoteDevices(ctx context.Context, heads map[string]string) (model.Data, error) {
+	var remote model.Data
+	c := ReadConfig()
+	if !c.Enabled {
+		return remote, nil
+	}
+	base, e := baseURL(c.APIURL)
+	if e != nil {
+		return remote, e
+	}
+	s, e := loadSession()
+	if e != nil {
+		return remote, e
+	}
+	t := transport{base, s.Token}
+	devices := make([]string, 0, len(heads))
+	for d := range heads {
+		devices = append(devices, d)
+	}
+	sort.Strings(devices)
+	packages := make([]devicePackage, len(devices))
+	failures := make([]error, len(devices))
+	var wg sync.WaitGroup
+	limit := make(chan struct{}, 3)
+	for i, d := range devices {
+		wg.Go(func() {
+			limit <- struct{}{}
+			defer func() { <-limit }()
+			packages[i], failures[i] = t.readDevice(ctx, d, heads[d])
+		})
+	}
+	wg.Wait()
+	var problems []error
+	for i, d := range devices {
+		p, err := packages[i], failures[i]
+		if err != nil {
+			problems = append(problems, fmt.Errorf("device %s: %w", d, err))
+			good, ok := lastGood[t.account()+"/"+d]
+			if !ok {
+				continue
+			}
+			syncdiag.Log(syncdiag.WithDevice(ctx, d), "device_last_good_used")
+			p = clonePackage(good)
+		}
+		remote.Sessions = append(remote.Sessions, p.Sessions...)
+		remote.Turns = append(remote.Turns, p.Turns...)
+		if remote.TurnsStart == 0 || p.Start < remote.TurnsStart {
+			remote.TurnsStart = p.Start
+		}
+		remote.TurnsEnd = max(remote.TurnsEnd, p.End)
+	}
+	sort.Slice(remote.Turns, func(i, j int) bool { return remote.Turns[i].CreatedAt < remote.Turns[j].CreatedAt })
+	if len(problems) > 0 {
+		return remote, fmt.Errorf("%w: %w", ErrPartial, errors.Join(problems...))
+	}
+	return remote, nil
 }
 func (t transport) put(ctx context.Context, name string, b []byte, h map[string]string) error {
 	_, _, s, e := t.request(ctx, "PUT", "/v1/objects/"+url.PathEscape(name), b, h)

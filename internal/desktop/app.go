@@ -37,12 +37,17 @@ type App struct {
 	// loaded holds only the current agent's data; switching agents drops the
 	// previous model.Data entirely instead of retaining one copy per agent.
 	// counts carries the sidebar's session count for agents already seen.
-	loaded                                model.Data
-	loadedAgent                           model.Agent
-	counts                                map[model.Agent]int
-	trayEntries                           map[model.Agent][]trayEntry
-	busy                                  map[string]bool
-	remote                                model.Data
+	loaded      model.Data
+	loadedAgent model.Agent
+	counts      map[model.Agent]int
+	trayEntries map[model.Agent][]trayEntry
+	busy        map[string]bool
+	remote      model.Data
+	// remoteTurns holds remote devices' turns only while the device scope
+	// shows them; remoteHeads names each remote device's last head object
+	// so ensureRemote can rebuild the turns from the sync disk cache.
+	remoteTurns                           []model.Turn
+	remoteHeads                           map[string]string
 	accounts                              []accountResult
 	selected                              *model.Session
 	settings                              bool
@@ -220,6 +225,15 @@ func (a *App) sync() {
 		return func() {
 			syncdiag.Log(runCtx, "desktop_sync_applied", "remote_replaced", usable, "apply_wait_ms", time.Since(readyAt).Milliseconds())
 			if usable {
+				a.remoteHeads = remote.RemoteHeads
+				if a.scopeIsLocal() {
+					// This device is the scope: remote turns stay out of
+					// memory until the scope needs them.
+					a.remoteTurns = nil
+					remote.Turns = nil
+				} else {
+					a.remoteTurns = remote.Turns
+				}
 				a.remote = remote
 				a.syncUI.completedAt = time.Now()
 				a.syncUI.lastAt = a.syncUI.completedAt.Format("15:04:05")
@@ -257,6 +271,7 @@ func (a *App) refreshQuota(force bool) {
 // slices, so their identity changes whenever the merged view would.
 type dataKey struct {
 	agent                      model.Agent
+	device                     string
 	sessions, remoteSessions   *model.Session
 	turns, remoteTurns         *model.Turn
 	nSessions, nRemoteSessions int
@@ -297,12 +312,62 @@ func (a *App) switching() bool {
 	return a.screen == "history" && a.loadedAgent != a.agent && a.busy[string(a.agent)]
 }
 
+// remoteView returns the remote records the current device scope needs:
+// everything for "All devices" or a remote device, sessions only when the
+// scope is this device. Remote turns are kept out of memory until then;
+// a.remoteTurns carries the on-demand rebuild.
+
+// scopeIsLocal is true only for the explicit "this device" scope; an empty
+// device is the "All devices" scope, not a missing device.
+func (a *App) scopeIsLocal() bool {
+	return a.localID != "" && a.device == a.localID
+}
+
+func (a *App) remoteView() model.Data {
+	var r model.Data
+	if !a.scopeIsLocal() {
+		r.Sessions, r.Turns = a.remote.Sessions, a.remoteTurns
+		return r
+	}
+	r.Sessions = a.remote.Sessions
+	return r
+}
+
+// ensureRemote rebuilds remote turns from the cached sync heads when the
+// device scope needs them, and frees them when it does not.
+func (a *App) ensureRemote() {
+	if a.scopeIsLocal() {
+		if len(a.remoteTurns) > 0 {
+			a.remoteTurns = nil
+			a.invalidateDerived()
+			debug.FreeOSMemory()
+		}
+		return
+	}
+	if len(a.remoteTurns) > 0 || len(a.remoteHeads) == 0 || a.busy["remote"] {
+		return
+	}
+	a.work("remote", func() func() {
+		ctx := syncdiag.WithFields(syncdiag.WithRun(a.ctx), "operation", "remote_decode")
+		remote, err := syncclient.DecodeRemoteDevices(ctx, a.remoteHeads)
+		return func() {
+			usable := err == nil || errors.Is(err, syncclient.ErrPartial)
+			syncdiag.Log(ctx, "remote_decode_result", "usable", usable, "error", syncdiag.ErrorCode(err), "turns", len(remote.Turns))
+			if usable {
+				a.remoteTurns = remote.Turns
+				a.invalidateDerived()
+			}
+		}
+	})
+}
+
 func (a *App) dataKey() dataKey {
 	d := a.loaded
 	if a.loadedAgent != a.agent {
 		d = model.Data{}
 	}
-	return dataKey{a.agent, first(d.Sessions), first(a.remote.Sessions), first(d.Turns), first(a.remote.Turns), len(d.Sessions), len(a.remote.Sessions), len(d.Turns), len(a.remote.Turns)}
+	r := a.remoteView()
+	return dataKey{a.agent, a.device, first(d.Sessions), first(r.Sessions), first(d.Turns), first(r.Turns), len(d.Sessions), len(r.Sessions), len(d.Turns), len(r.Turns)}
 }
 
 // invalidateDerived drops values computed from data, e.g. after prices change.
@@ -319,8 +384,9 @@ func (a *App) allData() model.Data {
 	if a.loadedAgent != a.agent {
 		d = model.Data{}
 	}
-	d.Sessions = append(append([]model.Session(nil), d.Sessions...), a.remote.Sessions...)
-	d.Turns = append(append([]model.Turn(nil), d.Turns...), a.remote.Turns...)
+	r := a.remoteView()
+	d.Sessions = append(append([]model.Session(nil), d.Sessions...), r.Sessions...)
+	d.Turns = append(append([]model.Turn(nil), d.Turns...), r.Turns...)
 	a.cachedData, a.cachedKey = &d, key
 	a.sessionCosts = nil
 	a.sessionList.valid = false

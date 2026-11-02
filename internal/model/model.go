@@ -99,4 +99,7 @@ type Data struct {
 	FileMtimes      map[string]int64  `json:"file_mtimes"`
 	FileSessions    map[string]string `json:"file_sessions"`
 	SyncContentHash string            `json:"sync_content_hash"`
+	// RemoteHeads maps a remote device ID to the head object name read during
+	// sync. It is in-memory only: remote data never enters local snapshots.
+	RemoteHeads map[string]string `json:"-"`
 }

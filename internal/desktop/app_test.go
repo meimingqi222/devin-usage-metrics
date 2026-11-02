@@ -48,6 +48,7 @@ func fixture(t testing.TB) *App {
 	now := time.Now()
 	a.storeLoaded(model.Claude, model.Data{Sessions: []model.Session{{Agent: model.Claude, Key: "claude-code/local", ID: "local", Title: "Implement streaming parser", WorkingDirectory: "/projects/usage-metrics", SelectedModel: "claude-sonnet-4-5", DeviceID: id, DeviceName: "Workstation", InputTokens: 37000, OutputTokens: 8000, CachedTokens: 120000, CacheCreationTokens: 3000, AgentMessages: 2, CreatedAt: now.AddDate(0, 0, -5).Unix(), LastActivityAt: now.Unix()}}, Turns: []model.Turn{{Agent: model.Claude, SessionKey: "claude-code/local", Model: "claude-sonnet-4-5", DeviceID: id, CreatedAt: now.AddDate(0, 0, -4).Unix(), InputTokens: 12000, OutputTokens: 3000, CacheReadTokens: 40000, CacheCreationTokens: 1000, TTFTMs: 150}, {Agent: model.Claude, SessionKey: "claude-code/local", Model: "claude-sonnet-4-5", DeviceID: id, CreatedAt: now.Unix(), InputTokens: 25000, OutputTokens: 5000, CacheReadTokens: 80000, CacheCreationTokens: 2000, TTFTMs: 240}}})
 	a.remote = model.Data{Sessions: []model.Session{{Agent: model.Claude, Key: "claude-code/remote", ID: "remote", Title: "Review API changes", SelectedModel: "claude-opus-4-6", DeviceID: "laptop", DeviceName: "Laptop", InputTokens: 8000, OutputTokens: 1000, CachedTokens: 20000, CreatedAt: now.Unix(), LastActivityAt: now.Unix()}}, Turns: []model.Turn{{Agent: model.Claude, SessionKey: "claude-code/remote", Model: "claude-opus-4-6", DeviceID: "laptop", CreatedAt: now.Unix(), InputTokens: 8000, OutputTokens: 1000, CacheReadTokens: 20000}}}
+	a.remoteTurns = a.remote.Turns
 	for _, agent := range model.Agents {
 		if agent != model.Claude {
 			a.storeLoaded(agent, model.Data{})
@@ -279,6 +280,7 @@ func TestDerivedCostsUpdateWithoutMixingDevices(t *testing.T) {
 	r.Title = "Remote shared key"
 	a.storeLoaded(model.Claude, model.Data{Sessions: []model.Session{s}, Turns: []model.Turn{{Agent: model.Claude, DeviceID: s.DeviceID, SessionKey: s.Key, CreatedAt: now, InputTokens: 10, RecordedCost: &localPrice}}})
 	a.remote = model.Data{Sessions: []model.Session{r}, Turns: []model.Turn{{Agent: model.Claude, DeviceID: r.DeviceID, SessionKey: r.Key, CreatedAt: now, InputTokens: 20, RecordedCost: &remotePrice}}}
+	a.remoteTurns = a.remote.Turns
 	tt := ui.NewTester(a.View, 1240, 780)
 	if !tt.HasText("$9.50") {
 		t.Fatal("incorrect initial aggregate")

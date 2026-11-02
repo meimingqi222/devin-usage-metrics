@@ -34,6 +34,7 @@ func TestUsageSummaryCacheInvalidatesWithInputs(t *testing.T) {
 	a.device = ""
 	check(2, 2, 30)
 	a.remote = model.Data{Turns: []model.Turn{{Agent: model.Claude, DeviceID: "three", SessionKey: "s", CreatedAt: now.Unix(), InputTokens: 40}}}
+	a.remoteTurns = a.remote.Turns
 	check(3, 3, 70)
 	a.invalidateDerived()
 	check(3, 3, 70)

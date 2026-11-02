@@ -516,6 +516,7 @@ func (a *App) deviceItem(c *ui.Context, id, name string, color ui.Color) {
 	if r.Clicked() {
 		a.device = id
 		a.deviceMenu = false
+		a.ensureRemote()
 	}
 	r.Children(func() {
 		ui.Box(c).Size(6, 6).Shrink(0).Radius(3).Background(color)

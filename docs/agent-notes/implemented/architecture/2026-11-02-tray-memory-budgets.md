@@ -81,3 +81,18 @@ the decoded-cache hit rate (~200-400ms for the largest agents). The
 content area shows `ui.Spinner` while `switching()` (selected agent's
 load in flight). `switchAgent` same-agent clicks still return from the
 quota/ext screens to history.
+
+## Fourth pass: lazy remote turns
+
+A sync pulled 127k remote turns (~50MB) that sit unused under the default
+"this device" scope. Now:
+
+- `Cycle` records `Data.RemoteHeads` (device -> head object name,
+  `json:"-"`, never snapshotted).
+- `a.remoteTurns` holds remote turns only while the scope is "All
+  devices" or a remote device; switching scope to a remote device runs
+  `syncclient.DecodeRemoteDevices` (disk/object caches, no listing, no
+  publish) and switching back frees the slice plus FreeOSMemory.
+- `allData` merges `remoteView()`, so `dataKey` gained a device field.
+- `lastGood` no longer clones packages — the remote merge already copies
+  values, so the fallback and `a.remote` can share one copy.
