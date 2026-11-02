@@ -227,10 +227,12 @@ func (a *App) sync() {
 			if usable {
 				a.remoteHeads = remote.RemoteHeads
 				if a.scopeIsLocal() {
-					// This device is the scope: remote turns stay out of
-					// memory until the scope needs them.
+					// This device is the scope: remote turns and their
+					// last-good fallback copies stay out of memory until
+					// the scope needs them.
 					a.remoteTurns = nil
 					remote.Turns = nil
+					syncclient.DropRemoteCache()
 				} else {
 					a.remoteTurns = remote.Turns
 				}

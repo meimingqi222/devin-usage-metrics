@@ -25,7 +25,7 @@ const (
 // Loading every agent briefly needs several times the data it keeps, and
 // without a limit the GC let that resident set grow far beyond Rust's. Above
 // it the GC works harder; nothing fails. GOMEMLIMIT still takes precedence.
-const trayMemoryLimit = 384 << 20
+const trayMemoryLimit = 192 << 20
 
 // Run starts the native desktop host with the tray's macOS template icon
 // and its color icon for other platforms. The content views never own
@@ -37,7 +37,7 @@ func Run(templateIcon, colorIcon []byte) error {
 	// Loads allocate ~1.5 GB briefly; tighter collection keeps the freed
 	// spans from sitting resident between jobs (FreeOSMemory runs after
 	// each job anyway).
-	debug.SetGCPercent(50)
+	debug.SetGCPercent(30)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// A packaged app reports its bundle's version, which the build took

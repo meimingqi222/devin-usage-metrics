@@ -215,3 +215,12 @@ func packageCost(p devicePackage) int {
 // lastGood keeps each remote device's newest valid package, protected by
 // cycleMu, so a device that fails to load keeps showing its last data.
 var lastGood = map[string]devicePackage{}
+
+// DropRemoteCache frees the last-good fallback copies. The tray calls this
+// after a cycle that ran under the local-only scope, where remote turns
+// are discarded anyway.
+func DropRemoteCache() {
+	cycleMu.Lock()
+	defer cycleMu.Unlock()
+	lastGood = map[string]devicePackage{}
+}

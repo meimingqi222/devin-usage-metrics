@@ -96,3 +96,23 @@ A sync pulled 127k remote turns (~50MB) that sit unused under the default
 - `allData` merges `remoteView()`, so `dataKey` gained a device field.
 - `lastGood` no longer clones packages — the remote merge already copies
   values, so the fallback and `a.remote` can share one copy.
+
+## Fifth pass (measured on a live tray)
+
+`vmmap` + heap profile of the real app settled after load+sync:
+inuse ~35MB, physical footprint 156MB (was ~220MB at 0.3.8, ~243MB at
+0.3.9). What changed:
+
+- `DropRemoteCache` clears `lastGood` after a cycle that runs under the
+  local scope; it repopulates on the next remote-scope decode. It held a
+  full second copy of every remote package (~25MB).
+- `decodedBudget` 32->16 MiB: the earlier "thrash" measurement was
+  polluted by the live tray competing for IO; on a quiet system reload
+  stays ~2-3s.
+- `trayMemoryLimit` 384->192 MiB, `SetGCPercent` 50->30: inuse is now
+  ~35MB so tighter collection costs little CPU and keeps dirty spans
+  close to the live set. `FreeOSMemory` continues to run after jobs —
+  cumulative released >250MB per launch.
+
+macOS reports: `ps` RSS (~450MB) counts compressed pages; Activity
+Monitor's "Memory" column matches vmmap's physical footprint (~156MB).

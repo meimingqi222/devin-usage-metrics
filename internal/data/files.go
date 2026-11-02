@@ -225,7 +225,7 @@ var decodedFiles sync.Map
 // a large history otherwise kept over a gigabyte resident in the tray app.
 // Reloads re-decode only evicted files on four workers, so a tight budget
 // costs a little CPU on reload, never correctness.
-const decodedBudget = 32 << 20
+const decodedBudget = 16 << 20
 
 var decodedWeight struct {
 	sync.Mutex

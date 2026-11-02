@@ -488,8 +488,8 @@ func Cycle(ctx context.Context, local model.Data) (result model.Data, resultErr 
 			syncdiag.Log(syncdiag.WithDevice(ctx, d), "device_last_good_used")
 			p = clonePackage(good)
 		} else {
-			// No clone: remote copies the values and nothing mutates
-			// packages, so the fallback can share the live read.
+			// p is a fresh clone from readManifest and packages are never
+			// mutated, so the fallback can share it with the remote merge.
 			lastGood[key] = p
 		}
 		if remote.RemoteHeads == nil {
@@ -550,6 +550,8 @@ func (t transport) importDevice(ctx context.Context, d string, names []string, l
 // entries out of the result and join the error.
 func DecodeRemoteDevices(ctx context.Context, heads map[string]string) (model.Data, error) {
 	var remote model.Data
+	cycleMu.Lock()
+	defer cycleMu.Unlock()
 	c := ReadConfig()
 	if !c.Enabled {
 		return remote, nil
@@ -591,6 +593,8 @@ func DecodeRemoteDevices(ctx context.Context, heads map[string]string) (model.Da
 			}
 			syncdiag.Log(syncdiag.WithDevice(ctx, d), "device_last_good_used")
 			p = clonePackage(good)
+		} else {
+			lastGood[t.account()+"/"+d] = p
 		}
 		remote.Sessions = append(remote.Sessions, p.Sessions...)
 		remote.Turns = append(remote.Turns, p.Turns...)
