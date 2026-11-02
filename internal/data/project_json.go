@@ -40,6 +40,10 @@ var transcriptProjections = func() map[model.Agent]*jsonProjection {
 		}
 		result[a] = p
 	}
+	omp := keepJSON("type", "id", "timestamp", "cwd", "title", "thinkingLevel", "model", "provider", "purpose", "usage")
+	omp.fields["message"] = keepJSON("role", "model", "provider", "usage", "responseId", "ttft", "duration")
+	omp.fields["message"].fields["content"] = title
+	result[model.Omp] = omp
 	grok := keepJSON("timestamp")
 	grok.fields["_meta"] = keepJSON("agentTimestampMs")
 	grok.fields["params"] = keepJSON()

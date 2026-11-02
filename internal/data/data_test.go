@@ -142,6 +142,40 @@ func TestPiAndGrokRecordedCost(t *testing.T) {
 		t.Fatal(d)
 	}
 }
+func TestOmpTranscript(t *testing.T) {
+	h := env(t)
+	write(t, h, ".omp/agent/sessions/-work-code-app/2026-11-02T00-54-47-761Z_s1.jsonl", `{"type":"title","v":1,"title":"Fix login bug","source":"auto","updatedAt":"2026-11-02T00:55:00.000Z"}
+{"type":"session","version":3,"id":"s1","timestamp":"2026-11-02T00:54:47.761Z","cwd":"/app","title":"Fix login bug"}
+{"type":"model_change","timestamp":"2026-11-02T00:54:48.000Z","model":"devin/swe-2"}
+{"type":"thinking_level_change","timestamp":"2026-11-02T00:54:48.001Z","thinkingLevel":"high"}
+{"type":"message","id":"m1","timestamp":"2026-11-02T00:54:50.000Z","message":{"role":"assistant","model":"swe-2","provider":"devin","usage":{"input":3,"output":4,"cacheRead":5,"cacheWrite":6,"cost":{"total":0.5}},"responseId":"r1","ttft":150,"duration":2000}}
+{"type":"message","id":"m2","timestamp":"2026-11-02T00:54:51.000Z","message":{"role":"assistant","model":"swe-2","provider":"devin","usage":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"cost":{"total":0.25}},"responseId":"r1","ttft":100,"duration":500}}
+`)
+	d := data.Load(model.Omp, 0, 2000000000, true)
+	check(t, d, 1)
+	r := d.Turns[0]
+	if r.Model != "devin/swe-2" || r.InputTokens != 3 || r.OutputTokens != 4 || r.CacheReadTokens != 5 || r.CacheCreationTokens != 6 || r.TTFTMs != 150 || r.TotalTimeMs != 2000 || r.RecordedCost == nil || *r.RecordedCost != 0.5 {
+		t.Fatalf("wrong omp turn %+v", r)
+	}
+	s := d.Sessions[0]
+	if s.Key != "omp/s1" || s.Title != "Fix login bug" || s.WorkingDirectory != "/app" || s.AgentMode != "high" || s.SelectedModel != "devin/swe-2" {
+		t.Fatalf("wrong omp session %+v", s)
+	}
+}
+
+func TestOmpSideChannelUsage(t *testing.T) {
+	h := env(t)
+	write(t, h, ".omp/agent/sessions/-work-code-app/2026-11-02T01-00-00-000Z_s2.jsonl", `{"type":"session","version":3,"id":"s2","timestamp":"2026-11-02T01:00:00.000Z","cwd":"/app"}
+{"type":"model_usage","id":"u1","timestamp":"2026-11-02T01:01:00.000Z","purpose":"find","role":"typesafe","api":"typesafe","provider":"typesafe","model":"jev-latest","usage":{"input":6661,"output":1220,"cacheRead":0,"cacheWrite":0,"cost":{"total":0.0003}},"stopReason":"stop"}
+`)
+	d := data.Load(model.Omp, 0, 2000000000, true)
+	check(t, d, 1)
+	r := d.Turns[0]
+	if r.Model != "typesafe/jev-latest" || r.ContextStream != "purpose/find" || r.InputTokens != 6661 || r.OutputTokens != 1220 || r.RecordedCost == nil || *r.RecordedCost != 0.0003 || r.SessionKey != "omp/s2" {
+		t.Fatalf("model_usage not counted: %+v", r)
+	}
+}
+
 func TestSQLiteImportersReadOnlyAndParentRollup(t *testing.T) {
 	for _, a := range []model.Agent{model.OpenCode, model.MimoCode, model.ZCode} {
 		t.Run(string(a), func(t *testing.T) {

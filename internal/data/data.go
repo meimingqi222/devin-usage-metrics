@@ -248,7 +248,7 @@ func load(ctx context.Context, a model.Agent, start, end int64, lm loadMode) (re
 	var databases map[string]string
 	var sourceFiles map[string]string
 	switch a {
-	case model.Claude, model.Codex, model.Pi, model.WorkBuddy, model.Grok:
+	case model.Claude, model.Codex, model.Pi, model.Omp, model.WorkBuddy, model.Grok:
 		// Decoded transcripts are keyed by size and mtime (and appends are
 		// verified), so a reload reuses them; only a full refresh decodes all.
 		sourceFiles = loadFiles(ctx, &d, a, refresh && !reuseUnchanged, previous, old.Files)

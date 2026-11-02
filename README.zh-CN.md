@@ -8,7 +8,7 @@
 
 ## 功能
 
-- 读取 Devin、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode、pi-agent、MimoCode、WorkBuddy / CodeBuddy 的本地历史。
+- 读取 Devin、Claude Code、Codex、Antigravity、Grok Build、ZCode、OpenCode、pi-agent、omp、MimoCode、WorkBuddy / CodeBuddy 的本地历史。
 - 按日（15 天）/ 周（12 周）/ 月（12 个月）聚合，堆叠 Token 图、模型分布、自报/API 等价费用、设备筛选。
 - 最近 500 条会话、搜索、模型识别、Token 总数、时间范围、TTFT 中位数及续读命令。
 - Claude、Codex、Grok、Devin、Antigravity 实时配额，缓存过期标记与限流冷却；钥匙串访问需明确开启。

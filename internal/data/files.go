@@ -176,6 +176,8 @@ func roots(a model.Agent) []string {
 		return []string{filepath.Join(b, "sessions"), filepath.Join(b, "archived_sessions")}
 	case model.Pi:
 		return []string{home(".pi/agent/sessions")}
+	case model.Omp:
+		return []string{home(".omp/agent/sessions")}
 	case model.Grok:
 		return []string{home(".grok/sessions")}
 	case model.WorkBuddy:
@@ -650,7 +652,16 @@ type fileParser struct {
 }
 
 func newFileParser(a model.Agent, p string, sessions map[string]*model.Session) *fileParser {
-	f := &fileParser{a: a, p: p, id: fileID(p), stream: "main", sessions: sessions, latest: map[string]model.Turn{}}
+	id := fileID(p)
+	if a == model.Omp {
+		// omp names transcripts "<createdAt>_<session-id>.jsonl"; the UUID
+		// suffix matches the session record's id, which the "title" record
+		// can precede.
+		if i := strings.LastIndexByte(id, '_'); i >= 0 {
+			id = id[i+1:]
+		}
+	}
+	f := &fileParser{a: a, p: p, id: id, stream: "main", sessions: sessions, latest: map[string]model.Turn{}}
 	if a == model.Claude && filepath.Base(filepath.Dir(p)) == "subagents" {
 		f.id = filepath.Base(filepath.Dir(filepath.Dir(p)))
 		f.stream = "subagent/" + strings.TrimSuffix(filepath.Base(p), ".jsonl")
@@ -678,7 +689,7 @@ func (f *fileParser) line(v obj) {
 		if s := str(first(get(payload, "id"), get(payload, "session_id"))); s != "" {
 			f.id = s
 		}
-	} else if f.a == model.Pi && kind == "session" {
+	} else if (f.a == model.Pi || f.a == model.Omp) && kind == "session" {
 		if s := str(v["id"]); s != "" {
 			f.id = s
 		}
@@ -713,6 +724,8 @@ func (f *fileParser) line(v obj) {
 		t, valid = f.codex(s, t, kind, payload)
 	case model.Pi:
 		t, valid = pi(v, s, t, kind, m)
+	case model.Omp:
+		t, valid = f.omp(v, s, t, kind, m)
 	case model.WorkBuddy:
 		t, valid = f.workBuddy(v, s, t)
 	}
@@ -820,6 +833,73 @@ func pi(v obj, s *model.Session, t model.Turn, kind string, m any) (model.Turn, 
 		t.RecordedCost = &cost
 	}
 	t.Model = modelName(str(get(m, "provider")), str(get(m, "model")))
+	s.SelectedModel = t.Model
+	return t, true
+}
+
+// omp transcripts share pi's record schema; omp also carries titles, a model
+// change record, per-response ttft/duration and a responseId that dedups
+// repeated assistant records.
+func (f *fileParser) omp(v obj, s *model.Session, t model.Turn, kind string, m any) (model.Turn, bool) {
+	if kind == "thinking_level_change" {
+		s.AgentMode = str(v["thinkingLevel"])
+		return t, false
+	}
+	switch kind {
+	case "title", "title_change":
+		if x := str(v["title"]); x != "" {
+			s.Title = compact(x)
+		}
+		return t, false
+	case "model_change":
+		if x := str(v["model"]); x != "" {
+			s.SelectedModel = x
+		}
+		return t, false
+	case "session":
+		if s.Title == "" {
+			s.Title = compact(str(v["title"]))
+		}
+		return t, false
+	}
+	if kind == "model_usage" {
+		// Side-channel calls (find, auto-thinking, judge) log usage outside
+		// the message stream; purpose marks them in the turn's stream.
+		u := get(v, "usage")
+		if u == nil {
+			return t, false
+		}
+		t.InputTokens = num(get(u, "input"))
+		t.OutputTokens = num(get(u, "output"))
+		t.CacheReadTokens = num(get(u, "cacheRead"))
+		t.CacheCreationTokens = num(get(u, "cacheWrite"))
+		if c := get(u, "cost", "total"); c != nil && num(c) >= 0 {
+			cost := num(c)
+			t.RecordedCost = &cost
+		}
+		if p := str(v["purpose"]); p != "" {
+			t.ContextStream = "purpose/" + p
+		}
+		t.Model = modelName(str(v["provider"]), str(v["model"]))
+		t.DedupKey = str(v["id"])
+		return t, true
+	}
+	if kind != "message" || str(get(m, "role")) != "assistant" || get(m, "usage") == nil {
+		return t, false
+	}
+	u := get(m, "usage")
+	t.InputTokens = num(get(u, "input"))
+	t.OutputTokens = num(get(u, "output"))
+	t.CacheReadTokens = num(get(u, "cacheRead"))
+	t.CacheCreationTokens = num(get(u, "cacheWrite"))
+	if c := get(u, "cost", "total"); c != nil && num(c) >= 0 {
+		cost := num(c)
+		t.RecordedCost = &cost
+	}
+	t.TTFTMs = max(0, num(get(m, "ttft")))
+	t.TotalTimeMs = max(0, num(get(m, "duration")))
+	t.Model = modelName(str(get(m, "provider")), str(get(m, "model")))
+	t.DedupKey = str(first(get(m, "responseId"), v["id"]))
 	s.SelectedModel = t.Model
 	return t, true
 }

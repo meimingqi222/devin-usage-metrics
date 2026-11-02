@@ -24,7 +24,7 @@ func sessionID(s model.Session) string {
 	return hash([]byte("session-v1\x00" + s.DeviceID + "\x00" + slug(s.Agent) + "\x00" + s.Key))
 }
 
-var v3AgentNames = map[model.Agent]string{model.Devin: "Devin", "amp": "Amp", model.Claude: "Claude", model.Codex: "Codex", model.Antigravity: "Antigravity", model.Grok: "Grok", model.ZCode: "ZCode", model.OpenCode: "OpenCode", model.Pi: "Pi", model.MimoCode: "MimoCode", model.WorkBuddy: "WorkBuddy"}
+var v3AgentNames = map[model.Agent]string{model.Devin: "Devin", "amp": "Amp", model.Claude: "Claude", model.Codex: "Codex", model.Antigravity: "Antigravity", model.Grok: "Grok", model.ZCode: "ZCode", model.OpenCode: "OpenCode", model.Pi: "Pi", model.Omp: "omp", model.MimoCode: "MimoCode", model.WorkBuddy: "WorkBuddy"}
 
 func v3SessionID(s model.Session) string {
 

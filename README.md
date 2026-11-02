@@ -8,7 +8,7 @@ Local coding-agent analytics, now implemented in **Go + [MyGo native UI](https:/
 
 ## Features
 
-- Ten local history importers: Devin, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, pi-agent, MimoCode, WorkBuddy / CodeBuddy.
+- Eleven local history importers: Devin, Claude Code, Codex, Antigravity, Grok Build, ZCode, OpenCode, pi-agent, omp, MimoCode, WorkBuddy / CodeBuddy.
 - Daily (15), weekly (12), and monthly (12) calendar buckets, stacked token charts, per-model distributions, recorded/API-equivalent costs, and device filtering.
 - Latest 500 sessions, search, token totals, model resolution, timestamps, median TTFT and resume commands.
 - Live quotas for Claude, Codex, Grok, Devin and Antigravity, including cached/stale results and rate-limit cooldowns. Keychain discovery requires opt-in.
@@ -64,6 +64,7 @@ The sync server is a separate, existing Go module:
 | ZCode | `~/.zcode/cli/db/db.sqlite` |
 | OpenCode | platform data directory `opencode/opencode.db`, including `opencode2` |
 | pi-agent | `~/.pi/agent/sessions/**/*.jsonl` |
+| omp | `~/.omp/agent/sessions/**/*.jsonl` |
 | MimoCode | platform data directory `mimocode/mimocode.db` |
 | WorkBuddy | `~/.{workbuddy,workbuddy-ai,codebuddy}/projects/**/*.jsonl`; `WORKBUDDY_CONFIG_DIR` / `CODEBUDDY_CONFIG_DIR` supported |
 

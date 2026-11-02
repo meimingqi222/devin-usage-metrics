@@ -136,6 +136,7 @@ func matrixTargets() []target {
 		{agent: model.OpenCode, cap: CapMCPSkills, mcpPath: openJSON, mcpDialect: dialectOpenCode, mcpKey: "mcp", skillDirs: []string{filepath.Join(open, "skills")}},
 		{agent: model.WorkBuddy, cap: CapMCPSkills, mcpPath: wbPath, mcpDialect: dialectServers, mcpKey: "mcpServers", skillDirs: wbSkills},
 		{agent: model.Pi, cap: CapSkills, skillDirs: []string{homePath(".pi", "agent", "skills")}},
+		{agent: model.Omp, cap: CapSkills, skillDirs: []string{homePath(".omp", "agent", "skills")}},
 	}
 }
 
@@ -239,7 +240,7 @@ func otherPaths(main string, paths []string) []string {
 func inheritedSkillDirs(t target) []string {
 	var dirs []string
 	switch t.agent {
-	case model.Codex, model.Pi:
+	case model.Codex, model.Pi, model.Omp:
 		dirs = []string{sharedSkillDir()}
 	case model.OpenCode:
 		dirs = []string{sharedSkillDir(), homePath(".claude", "skills")}
