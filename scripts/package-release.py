@@ -15,12 +15,13 @@ def package(target: str, build_root: Path, output: Path) -> Path:
     }[target]
     source = build_root.resolve() / directory
     output.mkdir(parents=True, exist_ok=True)
-    archive = output.resolve() / f"devin-usage-metrics-{asset}.zip"
+    product = "Agent Usage Metrics" if target == "windows/amd64" else "devin-usage-metrics"
+    archive = output.resolve() / f"{product}-{asset}.zip"
     if target == "windows/amd64":
-        # Rust 0.2.11's updater replaces this exact name. SQLite is compiled in.
+        # Windows release branding follows the native app's executable name.
         executable = source / "Agent Usage Metrics.exe"
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
-            bundle.write(executable, "devin-usage-metrics.exe")
+            bundle.write(executable, executable.name)
     else:
         # Keep the native bundle layout, executable modes and signing resources.
         app = source / "Agent Usage Metrics.app"

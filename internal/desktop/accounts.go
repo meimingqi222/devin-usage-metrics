@@ -12,6 +12,7 @@ import (
 	"github.com/egoist/mygo/ui"
 	"github.com/meimingqi222/devin-usage-metrics/internal/accounts"
 	"github.com/meimingqi222/devin-usage-metrics/internal/quota"
+	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 )
 
 type accountMessage struct {
@@ -393,11 +394,14 @@ func (a *App) startAccountLogin(provider string) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(a.ctx, 5*time.Minute)
+	ctx = syncdiag.WithFields(syncdiag.WithRun(ctx), "operation", "account_login", "provider", provider)
 	a.accountUI.loginProvider = provider
 	a.accountUI.loginStatus = a.t("Waiting for the browser sign-in…", "正在等待浏览器登录…")
 	a.accountUI.loginURL = ""
 	a.accountUI.loginCancel = cancel
 	go func() {
+		defer cancel()
+		syncdiag.Log(ctx, "account_login_start")
 		var doc map[string]any
 		var kind string
 		var err error
@@ -409,13 +413,24 @@ func (a *App) startAccountLogin(provider string) {
 						a.openURL(raw)
 					}
 				})
+			}, func() {
+				a.post(func() {
+					if ctx.Err() == nil {
+						a.accountUI.loginStatus = a.t("Google authorized. Exchanging credentials…", "Google 已授权，正在换取登录凭证…")
+					}
+				})
 			})
 		} else {
 			doc, kind, err = accounts.CLILogin(ctx, provider)
 		}
 		if err == nil {
+			err = ctx.Err()
+		}
+		if err == nil {
+			syncdiag.Log(ctx, "account_login_save_start")
 			_, err = a.accountStore.Add(provider, doc, kind)
 		}
+		syncdiag.Log(ctx, "account_login_end", "error", syncdiag.ErrorCode(err))
 		a.post(func() {
 			a.accountUI.loginProvider, a.accountUI.loginStatus, a.accountUI.loginURL = "", "", ""
 			a.accountUI.loginCancel = nil
@@ -424,6 +439,9 @@ func (a *App) startAccountLogin(provider string) {
 					a.message = a.t("Sign-in canceled.", "已取消登录。")
 				} else if errors.Is(err, context.DeadlineExceeded) {
 					a.message = a.t("Sign-in timed out.", "登录超时。")
+					if provider == "antigravity" {
+						a.message = a.t("Google sign-in timed out. Check the connection to oauth2.googleapis.com and try again.", "Google 登录超时，请检查到 oauth2.googleapis.com 的网络连接后重试。")
+					}
 				} else {
 					a.message = err.Error()
 				}
@@ -485,11 +503,21 @@ func (a *App) accountsDialog(c *ui.Context) {
 				a.message = err.Error()
 			} else if a.accountUI.enabled {
 				a.refreshQuota(true)
+			} else {
+				a.lockAccountSync()
 			}
 		}
 		if !a.accountUI.enabled {
 			ui.Text(c, a.t("Off keeps this app read-only: it only queries quotas. Enabling stores account names and copies of the agents' sign-ins on this device.", "关闭时只查询配额，不写任何登录；启用后才在本机保存账号名称和 Agent 登录副本。")).FontSize(10.5).TextColor(faint(t))
 		}
+		ui.Row(c).Gap(8).Children(func() {
+			if settingsButton(c, a.t("Import accounts", "导入账号"), false).Disabled(!a.accountUI.enabled || a.busy["account-backup"]).Clicked() {
+				a.openAccountBackup("import")
+			}
+			if settingsButton(c, a.t("Export accounts", "导出账号"), false).Disabled(len(a.profiles) == 0 || a.busy["account-backup"]).Clicked() {
+				a.openAccountBackup("export")
+			}
+		})
 		ui.Scroll(c).MaxHeight(380).Grow(1).Children(func() {
 			ui.Column(c).Gap(10).Children(func() {
 				hidden := 0

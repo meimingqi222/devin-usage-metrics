@@ -51,6 +51,10 @@ func (a *App) saveSettings() bool {
 		return false
 	}
 	if changed {
+		if err := a.disableAccountSync(); err != nil {
+			a.message = err.Error()
+			return false
+		}
 		if err := syncclient.Logout(); err != nil {
 			a.message = err.Error()
 			return false
@@ -139,53 +143,60 @@ func (a *App) settingsView(c *ui.Context) {
 }
 
 func (a *App) settingsSync(c *ui.Context) {
-	ui.Column(c).Gap(12).Children(func() {
-		ui.Text(c, a.t("Self-hosted sync API", "同步 API 地址")).FontSize(12).TextColor(c.Theme().TextMuted)
-		input := ui.TextInputBase(c, &a.settingsUI.apiURL).Label(a.t("Sync API URL", "同步 API 地址")).Placeholder("https://sync.example.com").FontSize(12).FixedLineHeight(20).Padding(8, 12).Radius(6).FillWidth().Background(ui.Hex("#101014")).Border(0, ui.Color{}).Shadow(0, 0, 0, 0, ui.Color{}).Disabled(a.busy["login"])
-		if input.Focused() {
-			input.Background(c.Theme().SurfaceHover).Border(1, c.Theme().Accent)
-		} else if input.Hovered() {
-			input.Background(c.Theme().SurfaceHover)
-		}
-		status := a.t("Not signed in; devices using the same GitHub account sync automatically", "未登录；同一 GitHub 账号的设备会自动同步")
-		label := a.t("Sign in with GitHub", "登录 GitHub")
-		if session := syncclient.SessionLabel(); session != "" {
-			status = a.t("Signed in as ", "已登录 GitHub：") + session
-			label = a.t("Sign in again with GitHub", "重新登录 GitHub")
-		}
-		if a.busy["login"] {
-			status = a.t("Preparing browser login…", "正在准备浏览器登录…")
-			label = a.t("Waiting for GitHub authorization…", "等待 GitHub 授权…")
-		}
-		if a.auth.UserCode != "" {
-			status = a.auth.VerificationURI + "\n" + a.auth.UserCode
-		}
-		ui.Text(c, status).FontSize(12).TextColor(c.Theme().TextMuted).Selectable()
-		if settingsButton(c, label, true).FillWidth().Padding(8, 12).Disabled(a.busy["login"] || strings.TrimSpace(a.settingsUI.apiURL) == "").Clicked() {
-			a.apiURL = strings.TrimRight(strings.TrimSpace(a.settingsUI.apiURL), "/")
-			a.beginLogin()
-		}
-		if a.busy["login"] && a.auth.UserCode != "" {
-			if settingsButton(c, a.t("Copy code", "复制验证码"), false).FillWidth().Background(c.Theme().SurfaceHover).Border(1, c.Theme().Border).TextColor(c.Theme().Text).Clicked() {
-				c.WriteClipboard(a.auth.UserCode)
+	ui.Scroll(c).MaxHeight(420).Children(func() {
+		ui.Column(c).Gap(12).Children(func() {
+			ui.Text(c, a.t("Self-hosted sync API", "同步 API 地址")).FontSize(12).TextColor(c.Theme().TextMuted)
+			input := ui.TextInputBase(c, &a.settingsUI.apiURL).Label(a.t("Sync API URL", "同步 API 地址")).Placeholder("https://sync.example.com").FontSize(12).FixedLineHeight(20).Padding(8, 12).Radius(6).FillWidth().Background(ui.Hex("#101014")).Border(0, ui.Color{}).Shadow(0, 0, 0, 0, ui.Color{}).Disabled(a.busy["login"])
+			if input.Focused() {
+				input.Background(c.Theme().SurfaceHover).Border(1, c.Theme().Accent)
+			} else if input.Hovered() {
+				input.Background(c.Theme().SurfaceHover)
 			}
-			if settingsButton(c, a.t("Cancel login", "取消登录"), false).Clicked() && a.loginCancel != nil {
-				a.loginCancel()
+			status := a.t("Not signed in; devices using the same GitHub account sync automatically", "未登录；同一 GitHub 账号的设备会自动同步")
+			label := a.t("Sign in with GitHub", "登录 GitHub")
+			if session := syncclient.SessionLabel(); session != "" {
+				status = a.t("Signed in as ", "已登录 GitHub：") + session
+				label = a.t("Sign in again with GitHub", "重新登录 GitHub")
 			}
-		}
-		if syncclient.SessionLabel() != "" && settingsButton(c, a.t("Sign out", "退出 GitHub"), false).FillWidth().Justify(ui.Start).TextAlign(ui.Start).Disabled(a.busy["login"]).Clicked() {
-			cfg := syncclient.ReadConfig()
-			cfg.Enabled = false
-			if err := syncclient.SaveConfig(cfg); err != nil {
-				a.message = err.Error()
-			} else if err := syncclient.Logout(); err != nil {
-				a.message = err.Error()
-			} else {
-				a.remote.Sessions = nil
-				a.remote.Turns = nil
+			if a.busy["login"] {
+				status = a.t("Preparing browser login…", "正在准备浏览器登录…")
+				label = a.t("Waiting for GitHub authorization…", "等待 GitHub 授权…")
 			}
-		}
-		ui.Text(c, a.t("Devices using the same GitHub account merge into the same sync data", "同一 GitHub 账号的设备会合并到同一份同步数据")).FontSize(12).TextColor(c.Theme().TextMuted)
+			if a.auth.UserCode != "" {
+				status = a.auth.VerificationURI + "\n" + a.auth.UserCode
+			}
+			ui.Text(c, status).FontSize(12).TextColor(c.Theme().TextMuted).Selectable()
+			if settingsButton(c, label, true).FillWidth().Padding(8, 12).Disabled(a.busy["login"] || strings.TrimSpace(a.settingsUI.apiURL) == "").Clicked() {
+				a.apiURL = strings.TrimRight(strings.TrimSpace(a.settingsUI.apiURL), "/")
+				a.beginLogin()
+			}
+			if a.busy["login"] && a.auth.UserCode != "" {
+				if settingsButton(c, a.t("Copy code", "复制验证码"), false).FillWidth().Background(c.Theme().SurfaceHover).Border(1, c.Theme().Border).TextColor(c.Theme().Text).Clicked() {
+					c.WriteClipboard(a.auth.UserCode)
+				}
+				if settingsButton(c, a.t("Cancel login", "取消登录"), false).Clicked() && a.loginCancel != nil {
+					a.loginCancel()
+				}
+			}
+			if syncclient.SessionLabel() != "" && settingsButton(c, a.t("Sign out", "退出 GitHub"), false).FillWidth().Justify(ui.Start).TextAlign(ui.Start).Disabled(a.busy["login"]).Clicked() {
+				if err := a.disableAccountSync(); err != nil {
+					a.message = err.Error()
+					return
+				}
+				cfg := syncclient.ReadConfig()
+				cfg.Enabled = false
+				if err := syncclient.SaveConfig(cfg); err != nil {
+					a.message = err.Error()
+				} else if err := syncclient.Logout(); err != nil {
+					a.message = err.Error()
+				} else {
+					a.remote.Sessions = nil
+					a.remote.Turns = nil
+				}
+			}
+			ui.Text(c, a.t("Devices using the same GitHub account merge into the same sync data", "同一 GitHub 账号的设备会合并到同一份同步数据")).FontSize(12).TextColor(c.Theme().TextMuted)
+			a.accountSyncSettings(c)
+		})
 	})
 }
 
@@ -411,6 +422,11 @@ func (a *App) updateDialog(c *ui.Context) {
 }
 
 func (a *App) beginLogin() {
+	// Reauthorizing can select a different tenant even at the same endpoint.
+	if err := a.disableAccountSync(); err != nil {
+		a.message = err.Error()
+		return
+	}
 	apiURL := a.apiURL
 	cfg := syncclient.ReadConfig()
 	if cfg.APIURL != apiURL {

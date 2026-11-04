@@ -33,13 +33,13 @@ func archiveFixture(t *testing.T, names ...string) []byte {
 func TestReleaseDownload(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	t.Setenv("LOCALAPPDATA", t.TempDir())
-	b := archiveFixture(t, "devin-usage-metrics.exe", "assets/icon.png")
+	b := archiveFixture(t, "Agent Usage Metrics.exe", "assets/icon.png")
 	bad := false
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/latest":
-			fmt.Fprintf(w, `{"tag_name":"v0.2.12","html_url":"https://example.test/release","body":"notes","assets":[{"name":"devin-usage-metrics-windows-x64.zip","browser_download_url":%q}]}`, server.URL+"/asset")
+			fmt.Fprintf(w, `{"tag_name":"v0.2.12","html_url":"https://example.test/release","body":"notes","assets":[{"name":"Agent Usage Metrics-windows-x64.zip","browser_download_url":%q}]}`, server.URL+"/asset")
 		case "/asset":
 			w.Write(b)
 		case "/asset.sha256":
@@ -68,6 +68,9 @@ func TestReleaseDownload(t *testing.T) {
 	if content, e := os.ReadFile(p); e != nil || string(content) != "fixture" {
 		t.Fatal(e)
 	}
+	if filepath.Base(p) != "Agent Usage Metrics.exe" {
+		t.Fatal("download did not retain the branded executable name")
+	}
 	bad = true
 	if _, e = Download(context.Background(), r, nil); e == nil {
 		t.Fatal("malformed checksum accepted")
@@ -79,6 +82,46 @@ func TestReleaseDownload(t *testing.T) {
 	}
 	if r, e = check(context.Background(), "0.2.12", server.URL+"/latest", "windows", "amd64"); e != nil || r.Version != "" {
 		t.Fatal(r, e)
+	}
+}
+
+func TestWindowsReleaseNamesPreferBrandingAndAcceptLegacy(t *testing.T) {
+	canonical, err := assetName("windows", "amd64")
+	if err != nil || canonical != "Agent Usage Metrics-windows-x64.zip" {
+		t.Fatalf("Windows asset: %q %v", canonical, err)
+	}
+	for _, legacyOnly := range []bool{false, true} {
+		t.Run(fmt.Sprint("legacyOnly=", legacyOnly), func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assets := `{"name":"devin-usage-metrics-windows-x64.zip","browser_download_url":"https://example.test/old"}`
+				if !legacyOnly {
+					assets += `,{"name":"Agent Usage Metrics-windows-x64.zip","browser_download_url":"https://example.test/new"}`
+				}
+				fmt.Fprintf(w, `{"tag_name":"v1.0.0","assets":[%s]}`, assets)
+			}))
+			defer ts.Close()
+			r, err := check(context.Background(), "0.9.0", ts.URL, "windows", "amd64")
+			want := canonical
+			if legacyOnly {
+				want = "devin-usage-metrics-windows-x64.zip"
+			}
+			if err != nil || r.assetName != want {
+				t.Fatalf("selected %q, want %q: %v", r.assetName, want, err)
+			}
+		})
+	}
+	for _, name := range []string{"Agent Usage Metrics.exe", "devin-usage-metrics.exe"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			archive := filepath.Join(dir, "windows.zip")
+			if err := os.WriteFile(archive, archiveFixture(t, name), 0600); err != nil {
+				t.Fatal(err)
+			}
+			payload, err := extract(archive, filepath.Join(dir, "unpacked"), "windows")
+			if err != nil || filepath.Base(payload) != name {
+				t.Fatalf("payload %q: %v", payload, err)
+			}
+		})
 	}
 }
 func TestUnsafeArchives(t *testing.T) {

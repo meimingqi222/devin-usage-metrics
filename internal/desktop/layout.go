@@ -100,6 +100,7 @@ func (a *App) View(c *ui.Context) {
 	a.accountsDialog(c)
 	a.addAccountDialog(c)
 	a.accountsConfirm(c)
+	a.accountBackupDialog(c)
 	if a.pending != nil {
 		r := *a.pending
 		text := fmt.Sprintf(a.t("Apply %s threshold %s? Only this device's user configuration changes. Start a new agent session afterwards.", "为 %s 应用 %s 阈值？仅修改本机用户配置，应用后请开启新的 Agent 会话。"), r.Model, formatTokens(float64(r.Recommended)))

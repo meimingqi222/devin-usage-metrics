@@ -38,6 +38,8 @@ type Profile struct {
 	Name        string `json:"name,omitempty"`
 	CreatedAt   int64  `json:"created_at"`
 	LastUsedAt  int64  `json:"last_used_at"`
+	ModifiedAt  int64  `json:"credential_modified_at,omitempty"`
+	Imported    bool   `json:"imported_backup,omitempty"`
 	Credentials string `json:"-"` // runtime document hash for fallback matching
 	Active      bool   `json:"-"`
 	Writable    bool   `json:"-"`
@@ -54,9 +56,10 @@ func (p Profile) DisplayName() string {
 }
 
 type manifest struct {
-	Version  int       `json:"version"`
-	Enabled  bool      `json:"enabled"`
-	Profiles []Profile `json:"profiles"`
+	Version           int       `json:"version"`
+	Enabled           bool      `json:"enabled"`
+	Profiles          []Profile `json:"profiles"`
+	SuppressedBackups []string  `json:"suppressed_backups,omitempty"`
 }
 
 type journalFile struct {
@@ -456,6 +459,7 @@ func (s *Store) Remove(provider, id string) error {
 			if s.active[provider] == id {
 				return errors.New("switch to another account before removing the active one")
 			}
+			s.suppressBackupLocked(p)
 			_ = os.Remove(s.credentialPath(provider, id))
 			s.data.Profiles = append(s.data.Profiles[:i], s.data.Profiles[i+1:]...)
 			return s.saveLocked()
@@ -471,6 +475,7 @@ func (s *Store) RemoveAll() error {
 	defer s.mu.Unlock()
 	s.loadLocked()
 	for _, p := range s.data.Profiles {
+		s.suppressBackupLocked(p)
 		_ = os.Remove(s.credentialPath(p.Provider, p.ID))
 	}
 	s.data.Profiles = nil
@@ -606,7 +611,7 @@ func (s *Store) repairLocked() bool {
 func (s *Store) latestProfileLocked(provider string) string {
 	id, at := "", int64(-1)
 	for _, p := range s.data.Profiles {
-		if p.Provider != provider || p.Hidden {
+		if p.Provider != provider || p.Hidden || (p.Imported && p.LastUsedAt == 0) {
 			continue
 		}
 		stamp := p.LastUsedAt
@@ -795,7 +800,21 @@ func (s *Store) writeCredential(p Profile, doc map[string]any) error {
 	if err != nil {
 		return err
 	}
-	return writePrivate(s.credentialPath(p.Provider, p.ID), append(b, '\n'))
+	// Reconciliation reads the same credential repeatedly. Preserve the
+	// modification time so backups cannot make an old token look newer.
+	if old, err := s.readCredential(p); err == nil && docHash(old) == docHash(doc) {
+		return nil
+	}
+	if err := writePrivate(s.credentialPath(p.Provider, p.ID), append(b, '\n')); err != nil {
+		return err
+	}
+	for i := range s.data.Profiles {
+		if s.data.Profiles[i].Provider == p.Provider && s.data.Profiles[i].ID == p.ID {
+			s.data.Profiles[i].ModifiedAt = time.Now().UnixNano()
+			break
+		}
+	}
+	return nil
 }
 
 func (s *Store) saveLocked() error {

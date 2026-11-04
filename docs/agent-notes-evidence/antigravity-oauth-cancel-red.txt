@@ -1,0 +1,8 @@
+--- FAIL: TestAntigravityOAuthRepeatedCallbackCanCancel (2.51s)
+    login_test.go:122: callback 3 blocked: Get "http://127.0.0.1:3157/oauth-callback?state=Q6LbVb9MIJKHqd_2kP6vkA&code=fixture-code": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+    login_test.go:142: login stayed stuck after cancellation with repeated callbacks
+--- FAIL: TestAntigravityOAuthCancelWithBrowserPreconnect (2.00s)
+    login_test.go:171: login cancellation waited indefinitely for browser connection
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/accounts	4.669s
+FAIL

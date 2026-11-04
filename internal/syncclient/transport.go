@@ -26,6 +26,8 @@ type Authorization struct {
 }
 type transport struct{ base, token string }
 
+type responseLimitKey struct{}
+
 // One client keeps connections alive across a cycle's many small transfers;
 // the default pool keeps only two idle connections per host.
 var httpClient = &http.Client{
@@ -98,8 +100,12 @@ func (t transport) requestOnce(ctx context.Context, method, p string, b []byte, 
 		return nil, nil, 0, errors.New("sync transport request failed")
 	}
 	defer resp.Body.Close()
-	b, e = io.ReadAll(io.LimitReader(resp.Body, 256*1024*1024+1))
-	if len(b) > 256*1024*1024 {
+	limit := 256 * 1024 * 1024
+	if n, ok := ctx.Value(responseLimitKey{}).(int); ok && n > 0 && n < limit {
+		limit = n
+	}
+	b, e = io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
+	if len(b) > limit {
 		return nil, nil, 0, errors.New("sync response exceeds limit")
 	}
 	return b, resp.Header, resp.StatusCode, e
@@ -262,7 +268,7 @@ func resourceKind(p string) string {
 	if p == "/v1/objects" || strings.HasPrefix(p, "/v1/objects?") {
 		return "object_list"
 	}
-	for _, prefix := range []string{"v3-head-", "v2-head-", "v3-manifest-", "v2-generation-", "v3-block-", "v3-session-", "v2-object-", "device-"} {
+	for _, prefix := range []string{"v3-head-", "v2-head-", "v3-manifest-", "v2-generation-", "v3-block-", "v3-session-", "v2-object-", "device-", accountPrefix} {
 		if strings.HasPrefix(p, "/v1/objects/"+prefix) {
 			return strings.TrimSuffix(prefix, "-")
 		}

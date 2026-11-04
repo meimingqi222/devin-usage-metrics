@@ -113,6 +113,7 @@ func main() {
 	mux.HandleFunc("POST /v1/auth/github/token", s.githubToken)
 	mux.HandleFunc("GET /v1/objects", s.list)
 	mux.HandleFunc("GET /v1/usage", s.usage)
+	mux.HandleFunc("GET /v1/capabilities", s.capabilities)
 	mux.HandleFunc("POST /v1/gc", s.gc)
 	mux.HandleFunc("/v1/objects/", s.object)
 	addr := envOr("SYNC_LISTEN", ":8080")
@@ -236,6 +237,13 @@ func objectName(path string) (string, bool) {
 func (s *server) health(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = io.WriteString(w, `{"ok":true}`)
+}
+
+func (s *server) capabilities(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.tenant(w, r); !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"account_backups": 1})
 }
 
 type githubDeviceCode struct {
@@ -787,6 +795,10 @@ func (s *server) gcTenant(tenant string, now time.Time) (int, error) {
 		if !entry.Type().IsRegular() || marked[entry.Name()] {
 			continue
 		}
+		// Account snapshots are roots outside the usage manifest graph.
+		if accountBackupObject(entry.Name()) {
+			continue
+		}
 		// v2/v1 的清理需要客户端确认所有设备已稳定迁移至少 14 天；首期服务
 		// 没有设备确认数据库，因此宁可保留旧协议对象，绝不由通用 GC 提前删掉。
 		if strings.HasPrefix(entry.Name(), "v2-") || strings.HasPrefix(entry.Name(), "device-") {
@@ -808,6 +820,19 @@ func (s *server) gcTenant(tenant string, now time.Time) (int, error) {
 		deleted++
 	}
 	return deleted, nil
+}
+
+func accountBackupObject(name string) bool {
+	digest := strings.TrimSuffix(strings.TrimPrefix(name, "accounts-v1-"), ".json")
+	if name != "accounts-v1-"+digest+".json" || len(digest) != 64 {
+		return false
+	}
+	for _, c := range digest {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return false
+		}
+	}
+	return true
 }
 
 func v2MigrationReady(dir string, entries []os.DirEntry, now time.Time) bool {

@@ -41,6 +41,7 @@ func newTestServerWithQuota(t *testing.T, quota int64) http.Handler {
 	mux.HandleFunc("POST /v1/auth/github/token", s.githubToken)
 	mux.HandleFunc("GET /v1/objects", s.list)
 	mux.HandleFunc("GET /v1/usage", s.usage)
+	mux.HandleFunc("GET /v1/capabilities", s.capabilities)
 	mux.HandleFunc("POST /v1/gc", s.gc)
 	mux.HandleFunc("/v1/objects/", s.object)
 	return mux

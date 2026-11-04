@@ -19,9 +19,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/quota"
+	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 )
 
 // CLILogin runs an agent's own browser sign-in in an isolated config
@@ -248,8 +250,11 @@ func googleAccountEmail(ctx context.Context, access string) string {
 
 // AntigravityLogin signs in with Google in the browser and returns the
 // credential in the shape Antigravity stores it. open receives the sign-in
-// URL; the desktop opens it in the user's browser.
-func AntigravityLogin(ctx context.Context, open func(string)) (map[string]any, string, error) {
+// URL; exchanging reports that browser authorization has reached the app.
+func AntigravityLogin(ctx context.Context, open func(string), exchanging func()) (map[string]any, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	ctx = syncdiag.WithFields(syncdiag.WithRun(ctx), "operation", "account_login", "provider", "antigravity")
 	clientID, clientSecret := quota.AntigravityOAuthClient()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -273,50 +278,85 @@ func AntigravityLogin(ctx context.Context, open func(string)) (map[string]any, s
 		"code_challenge":         {base64.RawURLEncoding.EncodeToString(challenge[:])},
 		"code_challenge_method":  {"S256"},
 	}.Encode()
-	codeCh := make(chan string, 1)
-	errCh := make(chan error, 1)
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	type callback struct {
+		code string
+		err  error
+	}
+	resultCh := make(chan callback, 1)
+	var firstCallback sync.Once
+	srv := &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/oauth-callback" {
 			http.NotFound(w, r)
 			return
 		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		if r.URL.Query().Get("state") != state {
 			http.Error(w, "state mismatch", http.StatusBadRequest)
-			errCh <- errors.New("Google sign-in state did not match")
+			syncdiag.Log(ctx, "oauth_callback_rejected", "reason", "state_mismatch")
 			return
 		}
+		result := callback{code: r.URL.Query().Get("code")}
 		if e := r.URL.Query().Get("error"); e != "" {
-			http.Error(w, e, http.StatusBadRequest)
-			errCh <- fmt.Errorf("Google sign-in: %s", e)
+			result.err = errors.New("Google sign-in authorization was declined")
+		} else if result.code == "" {
+			result.err = errors.New("Google sign-in returned no code")
+		}
+		accepted := false
+		// Refreshing/reopening the callback must never block a handler after
+		// the login worker has consumed its only result.
+		firstCallback.Do(func() {
+			resultCh <- result
+			accepted = true
+		})
+		if !accepted {
+			syncdiag.Log(ctx, "oauth_callback_duplicate")
+		} else {
+			syncdiag.Log(ctx, "oauth_callback_received", "has_code", result.code != "", "failed", result.err != nil)
+		}
+		if result.err != nil {
+			http.Error(w, "Authorization failed. Return to the app for details.", http.StatusBadRequest)
 			return
 		}
-		code := r.URL.Query().Get("code")
-		if code == "" {
-			http.Error(w, "missing code", http.StatusBadRequest)
-			errCh <- errors.New("Google sign-in returned no code")
-			return
-		}
-		codeCh <- code
-		_, _ = io.WriteString(w, "<html><body>Sign-in complete. You can close this window.</body></html>")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, "<html><body>Authorization received. Return to the app to finish signing in. You can close this window.</body></html>")
 	})}
 	go func() { _ = srv.Serve(ln) }()
-	defer srv.Shutdown(context.Background())
+	defer func() {
+		// Browsers may leave speculative connections or partial requests open.
+		// Graceful shutdown alone can outlive the login's cancellation forever.
+		shutdownCtx, stop := context.WithTimeout(context.Background(), time.Second)
+		defer stop()
+		if srv.Shutdown(shutdownCtx) != nil {
+			syncdiag.Log(ctx, "oauth_callback_force_close")
+			_ = srv.Close()
+		}
+	}()
+	syncdiag.Log(ctx, "oauth_callback_listening")
 	if open != nil {
 		open(auth)
 	}
 	select {
-	case code := <-codeCh:
-		return exchangeGoogle(ctx, clientID, clientSecret, redirect, verifier, code)
-	case err := <-errCh:
-		return nil, "", err
+	case result := <-resultCh:
+		if result.err != nil {
+			return nil, "", result.err
+		}
+		if exchanging != nil {
+			exchanging()
+		}
+		return exchangeGoogle(ctx, clientID, clientSecret, redirect, verifier, result.code)
 	case <-ctx.Done():
 		return nil, "", ctx.Err()
-	case <-time.After(5 * time.Minute):
-		return nil, "", errors.New("Google sign-in timed out")
 	}
 }
 
-func exchangeGoogle(ctx context.Context, clientID, clientSecret, redirect, verifier, code string) (map[string]any, string, error) {
+func exchangeGoogle(ctx context.Context, clientID, clientSecret, redirect, verifier, code string) (doc map[string]any, kind string, err error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	ctx, finish := syncdiag.Stage(ctx, "google_token_exchange")
+	defer func() { finish(err) }()
 	form := url.Values{
 		"code": {code}, "client_id": {clientID}, "client_secret": {clientSecret},
 		"redirect_uri": {redirect}, "grant_type": {"authorization_code"}, "code_verifier": {verifier},
@@ -331,9 +371,25 @@ func exchangeGoogle(ctx context.Context, clientID, clientSecret, redirect, verif
 		return nil, "", err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	syncdiag.Log(ctx, "google_token_response", "status_code", resp.StatusCode)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, "", err
+	}
 	if resp.StatusCode >= 300 {
-		return nil, "", fmt.Errorf("Google token exchange failed: HTTP %d", resp.StatusCode)
+		var rejection struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(b, &rejection)
+		// Only protocol error codes may reach diagnostics or the UI. An
+		// arbitrary response or error_description may contain credentials.
+		switch rejection.Error {
+		case "invalid_grant", "invalid_client", "invalid_request", "unauthorized_client", "unsupported_grant_type", "access_denied", "invalid_scope", "redirect_uri_mismatch", "temporarily_unavailable", "server_error":
+		default:
+			rejection.Error = "unknown_error"
+		}
+		syncdiag.Log(ctx, "google_token_rejected", "oauth_error", rejection.Error)
+		return nil, "", fmt.Errorf("Google token exchange failed: HTTP %d (%s)", resp.StatusCode, rejection.Error)
 	}
 	var tok struct {
 		AccessToken  string `json:"access_token"`
@@ -345,8 +401,8 @@ func exchangeGoogle(ctx context.Context, clientID, clientSecret, redirect, verif
 		return nil, "", errors.New("Google returned an incomplete sign-in")
 	}
 	exp := time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).UTC()
-	kind := "file"
-	doc := map[string]any{
+	kind = "file"
+	doc = map[string]any{
 		"access_token": tok.AccessToken, "token_type": "Bearer",
 		"refresh_token": tok.RefreshToken, "expiry_date": exp.UnixMilli(), "id_token": tok.IDToken,
 	}

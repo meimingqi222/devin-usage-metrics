@@ -42,7 +42,7 @@ func assetName(goos, arch string) (string, error) {
 	suffix := ""
 	switch {
 	case goos == "windows" && arch == "amd64":
-		suffix = "windows-x64"
+		return "Agent Usage Metrics-windows-x64.zip", nil
 	case goos == "darwin" && arch == "amd64":
 		suffix = "macos-x64"
 	case goos == "darwin" && arch == "arm64":
@@ -147,9 +147,17 @@ func check(ctx context.Context, current, url, goos, arch string) (Release, error
 	if !newer {
 		return Release{}, nil
 	}
-	for _, a := range d.Assets {
-		if a.Name == name && a.URL != "" {
-			return Release{strings.TrimPrefix(d.Tag, "v"), d.URL, d.Body, a.URL, name, goos}, nil
+	names := []string{name}
+	if goos == "windows" {
+		// Prefer current branding regardless of asset order, while allowing
+		// this client to download releases published before the rename.
+		names = append(names, "devin-usage-metrics-windows-x64.zip")
+	}
+	for _, candidate := range names {
+		for _, a := range d.Assets {
+			if a.Name == candidate && a.URL != "" {
+				return Release{strings.TrimPrefix(d.Tag, "v"), d.URL, d.Body, a.URL, candidate, goos}, nil
+			}
 		}
 	}
 	return Release{}, errors.New("no matching asset for this platform")

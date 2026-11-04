@@ -23,7 +23,7 @@ jobs:
           - target: windows/amd64
             os: windows-latest
             directory: windows-amd64
-            artifact: devin-usage-metrics-windows-x64.zip
+            artifact: Agent Usage Metrics-windows-x64.zip
           - target: darwin/arm64
             os: macos-latest
             directory: darwin-arm64
@@ -53,6 +53,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Verify release archive naming
+        run: python -m unittest discover -s tests -p test_package_release.py
       - name: Package release ZIP and checksum
         run: python scripts/package-release.py --target ${{ matrix.target }} --output .
       - uses: actions/upload-artifact@v4

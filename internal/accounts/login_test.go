@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,6 +17,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 )
 
 func TestCLILoginImportsIsolatedClaude(t *testing.T) {
@@ -39,6 +44,7 @@ printf '%s' '{"claudeAiOauth":{"emailAddress":"new@example.com","accessToken":"a
 }
 
 func TestAntigravityOAuthFlow(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	oldToken := googleTokenURL
 	defer func() { googleTokenURL = oldToken }()
 	id := loginJWT(map[string]any{"email": "g@example.com", "sub": "sub-1"})
@@ -54,6 +60,7 @@ func TestAntigravityOAuthFlow(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	exchanging := false
 	doc, kind, err := AntigravityLogin(ctx, func(raw string) {
 		u, err := url.Parse(raw)
 		if err != nil {
@@ -68,14 +75,21 @@ func TestAntigravityOAuthFlow(t *testing.T) {
 				t.Error(err)
 				return
 			}
+			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			if strings.Contains(string(body), "Sign-in complete") {
+				t.Error("callback claimed completion before the token exchange finished")
+			}
 		}()
-	})
+	}, func() { exchanging = true })
 	if err != nil {
 		t.Fatal(err)
 	}
 	if kind == "" || doc == nil {
 		t.Fatalf("empty sign-in: %s %#v", kind, doc)
+	}
+	if !exchanging {
+		t.Fatal("authorization progress was not reported")
 	}
 	b, _ := json.Marshal(doc)
 	if !strings.Contains(string(b), `"refresh_token":"r"`) || !strings.Contains(string(b), `"id_token":"x.`) {
@@ -83,9 +97,181 @@ func TestAntigravityOAuthFlow(t *testing.T) {
 	}
 }
 
+type googleRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f googleRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestGoogleTokenExchangeDeadlineAndDiagnostics(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	oldClient := http.DefaultClient
+	t.Cleanup(func() { http.DefaultClient = oldClient })
+	transportErr := errors.New("fixture transport error with private-code")
+	http.DefaultClient = &http.Client{Transport: googleRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		deadline, ok := r.Context().Deadline()
+		if !ok || time.Until(deadline) > 30*time.Second {
+			t.Error("token exchange has no independent 30-second deadline")
+		}
+		return nil, transportErr
+	})}
+	_, _, err := exchangeGoogle(context.Background(), "private-client", "private-secret", "http://localhost/private-redirect", "private-verifier", "private-code")
+	if !errors.Is(err, transportErr) {
+		t.Fatalf("exchange error: %v", err)
+	}
+	b, err := os.ReadFile(syncdiag.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"private-client", "private-secret", "private-redirect", "private-verifier", "private-code"} {
+		if strings.Contains(string(b), secret) {
+			t.Errorf("diagnostics contain %s", secret)
+		}
+	}
+	for _, event := range []string{`"stage":"google_token_exchange"`, `"event":"stage_start"`, `"event":"stage_end"`, `"status":"failed"`} {
+		if !strings.Contains(string(b), event) {
+			t.Errorf("missing diagnostic %s", event)
+		}
+	}
+}
+
+func TestGoogleTokenExchangeCancelsWhileReadingBody(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	oldToken := googleTokenURL
+	t.Cleanup(func() { googleTokenURL = oldToken })
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+	googleTokenURL = ts.URL
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, _, err := exchangeGoogle(ctx, "fixture-client", "fixture-secret", "http://localhost", "fixture-verifier", "fixture-code")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("body read timeout was lost: %v", err)
+	}
+}
+
+func TestGoogleTokenRejectionDiagnosticsAreSanitized(t *testing.T) {
+	for _, code := range []string{"invalid_grant", "invalid_client", "private-server-data"} {
+		t.Run(code, func(t *testing.T) {
+			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+			oldToken := googleTokenURL
+			t.Cleanup(func() { googleTokenURL = oldToken })
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprintf(w, `{"error":%q,"error_description":"private-response-body"}`, code)
+			}))
+			defer ts.Close()
+			googleTokenURL = ts.URL
+			_, _, err := exchangeGoogle(context.Background(), "fixture-client", "fixture-secret", "http://localhost", "fixture-verifier", "fixture-code")
+			want := code
+			if code == "private-server-data" {
+				want = "unknown_error"
+			}
+			if err == nil || !strings.Contains(err.Error(), "HTTP 400 ("+want+")") {
+				t.Fatalf("wrong rejection: %v", err)
+			}
+			b, readErr := os.ReadFile(syncdiag.Path())
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if !strings.Contains(string(b), `"oauth_error":"`+want+`"`) {
+				t.Error("missing sanitized OAuth rejection code")
+			}
+			if strings.Contains(string(b)+err.Error(), "private-") {
+				t.Error("upstream response details escaped sanitization")
+			}
+		})
+	}
+}
+
 func loginJWT(claims map[string]any) string {
 	b, _ := json.Marshal(claims)
 	return "x." + base64.RawURLEncoding.EncodeToString(b) + ".y"
+}
+
+func TestAntigravityOAuthRepeatedCallbackCanCancel(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	oldToken := googleTokenURL
+	t.Cleanup(func() { googleTokenURL = oldToken })
+	started := make(chan struct{})
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+	}))
+	t.Cleanup(ts.Close)
+	t.Cleanup(func() { close(release) })
+	googleTokenURL = ts.URL
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	callback := make(chan string, 1)
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := AntigravityLogin(ctx, func(raw string) {
+			u, _ := url.Parse(raw)
+			q := u.Query()
+			callback <- q.Get("redirect_uri") + "?state=" + url.QueryEscape(q.Get("state")) + "&code=fixture-code"
+		}, nil)
+		done <- err
+	}()
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	for i, target := 0, <-callback; i < 3; i++ {
+		resp, err := client.Get(target)
+		if err != nil {
+			t.Errorf("callback %d blocked: %v", i+1, err)
+			break
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if i == 0 {
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("token exchange did not start")
+			}
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("login stayed stuck after cancellation with repeated callbacks")
+	}
+}
+
+func TestAntigravityOAuthCancelWithBrowserPreconnect(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opened := make(chan string, 1)
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := AntigravityLogin(ctx, func(raw string) { opened <- raw }, nil)
+		done <- err
+	}()
+	u, _ := url.Parse(<-opened)
+	redirect, _ := url.Parse(u.Query().Get("redirect_uri"))
+	conn, err := net.Dial("tcp", redirect.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// A partial header proves the server accepted this speculative browser connection.
+	_, _ = io.WriteString(conn, "GET /oauth-callback HTTP/1.1\r\nHost: "+redirect.Host+"\r\n")
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("login cancellation waited indefinitely for browser connection")
+	}
 }
 
 func TestCLILoginImportsIsolatedCodex(t *testing.T) {

@@ -95,6 +95,17 @@ func Run(templateIcon, colorIcon []byte) error {
 			titleBarHeight = toolbarHeight
 		}
 		main = mygo.NewWindow(mygo.WindowOptions{Title: "Agent Usage Metrics", Width: 1240, Height: 780, MinWidth: 1000, MinHeight: 640, TitleBarStyle: mygo.TitleBarHidden, TitleBarHeight: titleBarHeight, TrafficLightPosition: &mygo.Point{X: 16, Y: 16}, Content: ui.View(a.View)})
+		a.accountBackupFile = func(save bool, title string) (string, error) {
+			filters := []mygo.FileFilter{{Name: "Encrypted account backup", Extensions: []string{"aumaccounts"}}}
+			if save {
+				return mygo.Dialog.Save(mygo.SaveDialogOptions{Parent: main, Title: title, DefaultPath: "agent-accounts.aumaccounts", Filters: filters})
+			}
+			paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{Parent: main, Title: title, Filters: filters})
+			if err != nil || len(paths) == 0 {
+				return "", err
+			}
+			return paths[0], nil
+		}
 		popup = mygo.NewWindow(mygo.WindowOptions{Title: "Agent Usage Metrics — Quotas", Width: trayWidth, Height: 520, Hidden: true, Frameless: true, DisableResize: true, AlwaysOnTop: true, SkipTaskbar: true, Content: ui.View(a.trayView)})
 		openDashboard := func() { popup.Hide(); main.Show(); main.Focus() }
 		a.trayUI.openDashboard = openDashboard

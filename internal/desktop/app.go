@@ -64,6 +64,7 @@ type App struct {
 	payload                               string
 	quit                                  func()
 	openFolder, openURL                   func(string)
+	accountBackupFile                     func(save bool, title string) (string, error)
 	languageChanged                       func()
 	updatePrefs                           updatePrefs
 	localID                               string
@@ -85,6 +86,8 @@ type App struct {
 	accountStore                          *accounts.Store
 	profiles                              []accounts.Profile
 	accountUI                             accountUIState
+	backupUI                              accountBackupUI
+	accountSync                           accountSyncState
 	usageUI                               usageUIState
 	syncUI                                syncState
 	extUI                                 extUIState
@@ -211,6 +214,7 @@ func (a *App) sync() {
 	if !syncclient.ReadConfig().Enabled {
 		return
 	}
+	a.syncAccounts()
 	a.work("sync", func() func() {
 		runCtx := syncdiag.WithFields(syncdiag.WithRun(a.ctx), "operation", "sync")
 		started := time.Now()
