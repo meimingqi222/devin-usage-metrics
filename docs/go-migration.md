@@ -42,7 +42,7 @@ Claude quota values, cooldowns, failure counts and hourly grant-check timestamps
 
 ## Sync diagnostics
 
-Account backup import/export and separately enabled encrypted account sync are described in [account backups](account-backups.md). Encryption, additive import, two-device HTTP fixtures, consent/scope isolation, native UI previews and server GC retention have regression coverage. Account sync requires the new server capability and a password unlocked for this process; no production server has been upgraded by these checks. Windows packaging is checked locally; macOS/Linux native installation and cross-platform account activation remain separate acceptance work.
+Account backup import/export and separately enabled encrypted account sync are described in [account backups](account-backups.md). Encryption, additive import, two-device HTTP fixtures, consent/scope isolation, native UI previews and server GC retention have regression coverage. Account sync requires the new server capability and a sync password optionally remembered by the system credential store; no production server has been upgraded by these checks. Windows packaging is checked locally; macOS/Linux native installation and cross-platform account activation remain separate acceptance work.
 
 For per-agent collection timings, SQLite read counters and cache decisions, see [同步耗时诊断](sync-diagnostics.md).
 

@@ -28,23 +28,24 @@ var ErrDisabled = errors.New("account switching is off")
 // Profile is one saved account. The credential itself is kept beside the
 // manifest, never in it.
 type Profile struct {
-	ID          string `json:"id"`
-	Provider    string `json:"provider"`
-	Label       string `json:"label"`
-	Email       string `json:"email,omitempty"`
-	StableID    string `json:"stable_id,omitempty"`
-	Plan        string `json:"plan,omitempty"`
-	Kind        string `json:"kind,omitempty"`
-	Name        string `json:"name,omitempty"`
-	CreatedAt   int64  `json:"created_at"`
-	LastUsedAt  int64  `json:"last_used_at"`
-	ModifiedAt  int64  `json:"credential_modified_at,omitempty"`
-	Imported    bool   `json:"imported_backup,omitempty"`
-	Credentials string `json:"-"` // runtime document hash for fallback matching
-	Active      bool   `json:"-"`
-	Writable    bool   `json:"-"`
-	Reason      string `json:"-"`
-	Hidden      bool   `json:"-"`
+	ID             string `json:"id"`
+	Provider       string `json:"provider"`
+	Label          string `json:"label"`
+	Email          string `json:"email,omitempty"`
+	StableID       string `json:"stable_id,omitempty"`
+	Plan           string `json:"plan,omitempty"`
+	Kind           string `json:"kind,omitempty"`
+	Name           string `json:"name,omitempty"`
+	CreatedAt      int64  `json:"created_at"`
+	LastUsedAt     int64  `json:"last_used_at"`
+	ModifiedAt     int64  `json:"credential_modified_at,omitempty"`
+	NameModifiedAt int64  `json:"name_modified_at,omitempty"`
+	Imported       bool   `json:"imported_backup,omitempty"`
+	Credentials    string `json:"-"` // runtime document hash for fallback matching
+	Active         bool   `json:"-"`
+	Writable       bool   `json:"-"`
+	Reason         string `json:"-"`
+	Hidden         bool   `json:"-"`
 }
 
 // DisplayName is the user's rename, else the detected label.
@@ -56,10 +57,10 @@ func (p Profile) DisplayName() string {
 }
 
 type manifest struct {
-	Version           int       `json:"version"`
-	Enabled           bool      `json:"enabled"`
-	Profiles          []Profile `json:"profiles"`
-	SuppressedBackups []string  `json:"suppressed_backups,omitempty"`
+	Version  int              `json:"version"`
+	Enabled  bool             `json:"enabled"`
+	Profiles []Profile        `json:"profiles"`
+	Deleted  map[string]int64 `json:"deleted_accounts,omitempty"`
 }
 
 type journalFile struct {
@@ -152,6 +153,20 @@ func (s *Store) Add(provider string, doc map[string]any, kind string) (Profile, 
 	if err != nil {
 		return Profile{}, err
 	}
+	key := backupIdentity(BackupEntry{Provider: provider, Credential: doc})
+	if deletedAt := s.data.Deleted[key]; deletedAt > 0 {
+		p.ModifiedAt = max(time.Now().UnixNano(), deletedAt+1)
+		for i := range s.data.Profiles {
+			if s.data.Profiles[i].ID == p.ID && s.data.Profiles[i].Provider == provider {
+				s.data.Profiles[i].ModifiedAt = p.ModifiedAt
+			}
+		}
+		stamp := time.Unix(0, p.ModifiedAt)
+		if err := os.Chtimes(s.credentialPath(provider, p.ID), stamp, stamp); err != nil {
+			return Profile{}, err
+		}
+		delete(s.data.Deleted, key)
+	}
 	if err := s.saveLocked(); err != nil {
 		return Profile{}, err
 	}
@@ -230,6 +245,21 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 		}
 		kind := a.CredentialKind()
 		hash := docHash(doc)
+		// A normal quota refresh must not recreate an account removed by sync.
+		// Signing in/capturing explicitly goes through Add and restores it.
+		key := backupIdentity(BackupEntry{Provider: a.Provider, Credential: doc})
+		if s.data.Deleted[key] > 0 {
+			for _, p := range s.data.Profiles {
+				if p.Provider != a.Provider {
+					continue
+				}
+				if saved, err := s.readCredential(p); err == nil && backupIdentity(BackupEntry{Provider: p.Provider, Credential: saved}) == key {
+					s.active[a.Provider] = p.ID
+					break
+				}
+			}
+			continue
+		}
 		if s.recoverLocked(a.Provider, doc, hash) {
 			changed = true
 		}
@@ -441,6 +471,7 @@ func (s *Store) Rename(provider, id, name string) error {
 	for i := range s.data.Profiles {
 		if s.data.Profiles[i].Provider == provider && s.data.Profiles[i].ID == id {
 			s.data.Profiles[i].Name = strings.TrimSpace(name)
+			s.data.Profiles[i].NameModifiedAt = time.Now().UnixNano()
 			return s.saveLocked()
 		}
 	}
@@ -596,33 +627,11 @@ func (s *Store) repairLocked() bool {
 		}
 	}
 	for _, provider := range []string{"claude", "codex", "antigravity", "grok"} {
-		if s.active[provider] == "" {
-			if id := s.latestProfileLocked(provider); id != "" {
-				s.active[provider], changed = id, true
-			}
-		}
 		if s.hideLegacyDuplicatesLocked(provider) {
 			changed = true
 		}
 	}
 	return changed
-}
-
-func (s *Store) latestProfileLocked(provider string) string {
-	id, at := "", int64(-1)
-	for _, p := range s.data.Profiles {
-		if p.Provider != provider || p.Hidden || (p.Imported && p.LastUsedAt == 0) {
-			continue
-		}
-		stamp := p.LastUsedAt
-		if stamp == 0 {
-			stamp = p.CreatedAt
-		}
-		if stamp > at {
-			id, at = p.ID, stamp
-		}
-	}
-	return id
 }
 
 // hideLegacyDuplicatesLocked hides unnamed copies once the active profile

@@ -88,6 +88,7 @@ func Run(templateIcon, colorIcon []byte) error {
 	}
 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) { quitting = true; cancel() })
 	mygo.App.WhenReady(func() {
+		a.accountPasswords = systemAccountPasswords{}
 		// Windows draws its caption buttons as tall as the title bar: keep
 		// them inside the toolbar instead of over its bottom border.
 		titleBarHeight := 48
@@ -225,6 +226,7 @@ func Run(templateIcon, colorIcon []byte) error {
 					hourly := minutes%60 == 0
 					a.post(func() {
 						a.refreshQuota(false)
+						a.syncAccounts()
 						if hourly {
 							a.sync()
 							go func() {

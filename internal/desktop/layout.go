@@ -328,20 +328,21 @@ func (a *App) agentItem(c *ui.Context, agent model.Agent) {
 	})
 }
 
-// syncStatus shows the sync state and last time; a click toggles sync, or
-// opens settings when it is not configured.
+// syncStatus shows the usage-sync state and last time; a click toggles sync,
+// or opens settings when it is not configured. "Usage sync" names this row so
+// it is not confused with account sync in settings.
 func (a *App) syncStatus(c *ui.Context) {
 	t := c.Theme()
 	cfg := syncclient.ReadConfig()
-	label, color := a.t("Sync off", "同步已关"), t.TextMuted
+	label, color := a.t("Usage sync off", "用量同步已关"), t.TextMuted
 	if cfg.Enabled {
-		label, color = a.t("Sync on", "同步已开"), syncOnColor
+		label, color = a.t("Usage sync on", "用量同步已开"), syncOnColor
 		if a.busy["sync"] {
-			label = a.t("Syncing…", "正在同步…")
+			label = a.t("Usage syncing…", "正在同步用量…")
 		} else if a.syncUI.err != "" {
-			label, color = a.t("Sync failed", "同步失败"), syncFailColor
-		} else if a.syncUI.lastAt != "" {
-			label = a.t("Synced", "已同步")
+			label, color = a.t("Usage sync failed", "用量同步失败"), syncFailColor
+		} else if !a.syncUI.completedAt.IsZero() {
+			label = a.t("Usage synced", "用量已同步")
 		}
 	}
 	r := ui.Row(c).Gap(7).Padding(2, 4).Margin(0, -4).Radius(4).AlignItems(ui.Center).Label(label).Focusable()
@@ -363,13 +364,31 @@ func (a *App) syncStatus(c *ui.Context) {
 	r.Children(func() {
 		ui.Box(c).Size(6, 6).Shrink(0).Radius(3).Background(color)
 		ui.Text(c, label).FontSize(11).FontWeight(500).TextColor(t.TextMuted).Grow(1).NoWrap()
-		if cfg.Enabled && !a.busy["sync"] && a.syncUI.err == "" && a.syncUI.lastAt != "" {
-			ui.Text(c, a.syncUI.lastAt).FontSize(10).FontFeatures("tnum").TextColor(faint(t)).Label(a.t("Last sync ", "上次同步 ") + a.syncUI.lastAt)
+		if cfg.Enabled && !a.busy["sync"] && a.syncUI.err == "" && !a.syncUI.completedAt.IsZero() {
+			// Relative time; the row label above carries the absolute moment
+			// as its hover tooltip. "3 days ago" reads honestly where a bare
+			// "14:05" would look current.
+			r.Label(label + " · " + a.t("Last sync ", "上次同步 ") + a.relativeSyncTime(a.syncUI.completedAt) + " · " + fullSyncTime(a.syncUI.completedAt))
+			ui.Text(c, a.relativeSyncTime(a.syncUI.completedAt)).FontSize(10).FontFeatures("tnum").TextColor(faint(t))
 		}
 	})
 	if cfg.Enabled && !a.busy["sync"] && a.syncUI.err != "" {
-		ui.Text(c, a.syncUI.err).FontSize(11).TextColor(syncFailColor).Margin(-4, 0, 0, 0)
+		ui.Text(c, a.usageSyncError(a.syncUI.err)).FontSize(11).TextColor(syncFailColor).Margin(-4, 0, 0, 0)
 	}
+}
+
+// usageSyncError translates the known usage-sync failure classes; the sidebar
+// line is small, so unknown errors still pass through raw.
+func (a *App) usageSyncError(text string) string {
+	switch {
+	case strings.HasPrefix(text, "sync timed out after"):
+		return a.t("Usage sync timed out. It retries automatically.", "用量同步超时，稍后会自动重试。")
+	case strings.Contains(text, syncclient.ErrTransport.Error()):
+		return a.t("Could not reach the sync server. It retries automatically.", "暂时无法连接同步服务器，稍后会自动重试。")
+	case strings.HasPrefix(text, "sync API HTTP "):
+		return a.t("The sync server reported a problem. It retries automatically.", "同步服务器出现问题，稍后会自动重试。")
+	}
+	return text
 }
 
 // segment is one option of a recessed segmented control.

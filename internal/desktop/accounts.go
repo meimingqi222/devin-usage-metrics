@@ -12,6 +12,7 @@ import (
 	"github.com/egoist/mygo/ui"
 	"github.com/meimingqi222/devin-usage-metrics/internal/accounts"
 	"github.com/meimingqi222/devin-usage-metrics/internal/quota"
+	"github.com/meimingqi222/devin-usage-metrics/internal/syncclient"
 	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 )
 
@@ -450,8 +451,43 @@ func (a *App) startAccountLogin(provider string) {
 			a.accountUI.add = ""
 			a.profiles = a.accountStore.List()
 			a.message = a.t("Account added. It is ready to switch.", "账号已添加，可以切换了。")
+			a.accountChanged()
 		})
 	}()
+}
+
+func (a *App) captureCurrentAccount(provider string) {
+	a.work("capture/"+provider, func() func() {
+		var err error
+		found := false
+		for _, live := range quota.Discover(quota.KeychainAllowed()) {
+			if live.Provider != provider {
+				continue
+			}
+			found = true
+			doc, readErr := live.CredentialDoc()
+			err = readErr
+			if err == nil {
+				_, err = a.accountStore.Add(provider, doc, live.CredentialKind())
+			}
+			break
+		}
+		return func() {
+			if !found {
+				a.message = a.t("No current sign-in found. Sign in to this agent first.", "未找到当前登录，请先在这个 Agent 中登录。")
+				return
+			}
+			if err != nil {
+				a.message = a.accountBackupError(err)
+				return
+			}
+			a.accountUI.add = ""
+			a.profiles = a.accountStore.List()
+			a.message = a.t("Current account saved.", "已保存当前账号。")
+			a.refreshQuota(true)
+			a.accountChanged()
+		}
+	})
 }
 
 func (a *App) cancelAccountLogin() {
@@ -479,6 +515,7 @@ func (a *App) accountsDialog(c *ui.Context) {
 			}
 		})
 		ui.Text(c, a.t("Switches the agent's own sign-in. Running sessions keep their account until restarted.", "切换 Agent 自己的登录。已运行的会话在重启前仍使用原账号。")).FontSize(11.5).TextColor(t.TextMuted)
+		a.accountSyncManagerRow(c)
 		if a.accountUI.managerMsg != "" {
 			color := quotaGreen
 			if a.accountUI.managerErr {
@@ -556,12 +593,16 @@ func (a *App) accountsDialog(c *ui.Context) {
 	})
 	if a.accountUI.removeAll {
 		text := a.t("Remove every account name and saved sign-in copy from this device? The agents' current sign-ins stay as they are.", "移除本机保存的全部账号名称和登录副本？Agent 当前的登录保持不变。")
+		if syncclient.ReadAccountSyncConfig().Enabled {
+			text = a.t("Remove all saved accounts and sync the removals to your other devices? Current agent sign-ins stay unchanged.", "移除全部已保存账号，并同步删除其他设备上的副本？Agent 当前的登录保持不变。")
+		}
 		if ui.AlertDialog(c, &a.accountUI.removeAll, a.t("Remove saved accounts", "移除已保存账号"), text, a.t("Cancel", "取消"), a.t("Remove", "移除")) == 1 {
 			if err := a.accountStore.RemoveAll(); err != nil {
 				a.accountUI.managerMsg, a.accountUI.managerErr = err.Error(), true
 			} else {
 				a.profiles = a.accountStore.List()
 				a.accountUI.managerMsg, a.accountUI.managerErr = a.t("Saved accounts removed.", "已移除保存的账号。"), false
+				a.accountChanged()
 			}
 		}
 	}
@@ -638,6 +679,7 @@ func (a *App) accountManagerRow(c *ui.Context, provider string, p accounts.Profi
 				} else {
 					a.profiles = a.accountStore.List()
 					a.accountUI.renameID = ""
+					a.accountChanged()
 				}
 			}
 			if settingsButton(c, a.t("Cancel", "取消"), false).Clicked() {
@@ -709,6 +751,7 @@ func (a *App) accountManagerRow(c *ui.Context, provider string, p accounts.Profi
 					} else {
 						a.profiles = a.accountStore.List()
 						a.accountUI.managerMsg, a.accountUI.managerErr = a.t("Account removed.", "账号已移除。"), false
+						a.accountChanged()
 					}
 				}
 			}
@@ -830,9 +873,7 @@ func (a *App) addAccountDialog(c *ui.Context) {
 					})
 				})
 				if btn.Clicked() {
-					a.accountUI.add = ""
-					a.refreshQuota(true)
-					a.message = a.t("Captured current login as backup copy.", "已将本机当前登录凭证保存为备用副本。")
+					a.captureCurrentAccount(provider)
 				}
 				ui.Text(c, a.t("Detects active credentials on this device and saves a switchable copy.", "自动读取本机该 Agent 的当前活跃凭证并另存为可切换的独立副本")).FontSize(10).TextColor(faintText)
 			}
@@ -845,9 +886,7 @@ func (a *App) addAccountDialog(c *ui.Context) {
 				ui.Spacer(c)
 				capBtn := settingsButton(c, a.t("Capture current login", "捕获当前登录"), false)
 				if capBtn.Clicked() {
-					a.accountUI.add = ""
-					a.refreshQuota(true)
-					a.message = a.t("Captured current login as backup copy.", "已将本机当前登录凭证保存为备用副本。")
+					a.captureCurrentAccount(provider)
 				}
 			})
 		}

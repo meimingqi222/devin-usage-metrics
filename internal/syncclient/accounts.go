@@ -14,11 +14,22 @@ import (
 
 const accountPrefix = "accounts-v1-"
 
-// AccountSyncConfig stores consent and its exact server/tenant scope, never the
-// password. A process restart requires unlocking again.
+// Account sync failures a user can act on. The desktop UI matches these with
+// errors.Is; the message text is also the syncdiag error code, so do not reword.
+var (
+	ErrNotSignedIn    = errors.New("sign in to sync before enabling account sync")
+	ErrSyncReenabled  = errors.New("account sync must be enabled again for this server and GitHub account")
+	ErrServerTooOld   = errors.New("update the sync server to support encrypted account backups")
+	ErrTooManyDevices = errors.New("too many account backup devices")
+	ErrTooManyRemote  = errors.New("too many accounts in remote backups")
+	ErrSyncAborted    = errors.New("account sync was disabled or its account changed")
+)
+
+// AccountSyncConfig stores consent and scope, never the password itself.
 type AccountSyncConfig struct {
-	Enabled bool   `json:"enabled"`
-	Scope   string `json:"scope,omitempty"`
+	Enabled  bool   `json:"enabled"`
+	Scope    string `json:"scope,omitempty"`
+	Remember bool   `json:"remember,omitempty"`
 }
 
 func ReadAccountSyncConfig() AccountSyncConfig {
@@ -41,7 +52,7 @@ func SaveAccountSyncConfig(c AccountSyncConfig) error {
 func accountTransport() (transport, error) {
 	c := ReadConfig()
 	if !c.Enabled {
-		return transport{}, errors.New("sign in to sync before enabling account sync")
+		return transport{}, ErrNotSignedIn
 	}
 	base, err := baseURL(c.APIURL)
 	if err != nil {
@@ -49,7 +60,7 @@ func accountTransport() (transport, error) {
 	}
 	s, err := loadSession()
 	if err != nil || s.Expires <= time.Now().Unix() {
-		return transport{}, errors.New("sign in to sync before enabling account sync")
+		return transport{}, ErrNotSignedIn
 	}
 	return transport{base, s.Token}, nil
 }
@@ -63,13 +74,20 @@ func AccountSyncScope() (string, error) {
 }
 
 type AccountSyncResult struct {
-	Added, Kept, Devices int
+	accounts.SyncResult
+	Devices int
+	// Unreadable counts remote snapshots that neither password could open:
+	// devices still sealed with a retired password (mid-rotation) or offline
+	// and out of date. They are skipped, never merged.
+	Unreadable int
 }
 
-// SyncAccounts publishes one encrypted snapshot per device and imports missing
-// accounts from all devices. A device never overwrites another device's object.
-// Existing local credentials, active sign-ins and deletions are not replicated.
-func SyncAccounts(ctx context.Context, store *accounts.Store, password, scope string) (result AccountSyncResult, err error) {
+// SyncAccounts reconciles encrypted saved accounts across devices. Each device
+// publishes its own snapshot; additions, edits and deletions are merged while
+// active agent sign-ins are kept out of the write path. prevPassword, when the
+// password was just rotated, still opens snapshots sealed with the previous
+// one so the rotation publishes a complete merge.
+func SyncAccounts(ctx context.Context, store *accounts.Store, password, scope, prevPassword string) (result AccountSyncResult, err error) {
 	ctx = context.WithValue(ctx, responseLimitKey{}, accounts.MaxBackupBytes)
 	ctx = syncdiag.WithFields(syncdiag.WithRun(ctx), "operation", "account_sync")
 	ctx, finish := syncdiag.Stage(ctx, "account_sync")
@@ -83,7 +101,7 @@ func SyncAccounts(ctx context.Context, store *accounts.Store, password, scope st
 	}
 	consent := ReadAccountSyncConfig()
 	if !consent.Enabled || consent.Scope != scope || t.account() != scope {
-		return result, errors.New("account sync must be enabled again for this server and GitHub account")
+		return result, ErrSyncReenabled
 	}
 	if !store.Enabled() {
 		return result, accounts.ErrDisabled
@@ -102,16 +120,17 @@ func SyncAccounts(ctx context.Context, store *accounts.Store, password, scope st
 		AccountBackups int `json:"account_backups"`
 	}
 	if status != 200 || json.Unmarshal(raw, &capabilities) != nil || capabilities.AccountBackups != 1 {
-		return result, errors.New("update the sync server to support encrypted account backups")
+		return result, ErrServerTooOld
 	}
 	files, err := t.list(ctx, accountPrefix)
 	if err != nil {
 		return result, err
 	}
 	if len(files) > 64 {
-		return result, errors.New("too many account backup devices")
+		return result, ErrTooManyDevices
 	}
 	merged := accounts.Backup{Version: 1}
+	unreadable := 0
 	for _, name := range files {
 		if !validAccountObject(name) {
 			return result, errors.New("invalid account backup object name")
@@ -121,16 +140,29 @@ func SyncAccounts(ctx context.Context, store *accounts.Store, password, scope st
 			return result, err
 		}
 		b, err := accounts.OpenBackup(raw, password)
+		if err != nil && prevPassword != "" && prevPassword != password {
+			b, err = accounts.OpenBackup(raw, prevPassword)
+		}
 		if err != nil {
-			// Never publish or import on a wrong password or corrupt snapshot,
-			// including when replacing our own device's backup.
-			return result, err
+			// A snapshot sealed with a password this device does not hold — a
+			// device that has not received a rotation yet, or a damaged copy
+			// — must not abort the cycle, or no device could ever change the
+			// password. Skip it and report the count; the guard below still
+			// rejects an outright wrong password before publishing anything.
+			unreadable++
+			continue
 		}
 		merged = accounts.MergeBackups(merged, b)
 		if len(merged.Entries) > accounts.MaxBackupAccounts {
-			return result, errors.New("too many accounts in remote backups")
+			return result, ErrTooManyRemote
 		}
 	}
+	if len(files) > 0 && unreadable == len(files) {
+		// Nothing unlocked, including our own previous snapshot: the entered
+		// password is simply wrong. Never publish or import in that case.
+		return result, accounts.ErrBackupPassword
+	}
+	result.Unreadable = unreadable
 	if err = ctx.Err(); err != nil {
 		return
 	}
@@ -139,7 +171,8 @@ func SyncAccounts(ctx context.Context, store *accounts.Store, password, scope st
 	if err != nil {
 		return result, err
 	}
-	raw, err = accounts.SealBackup(local, password)
+	merged = accounts.MergeBackups(merged, local)
+	raw, err = accounts.SealBackup(merged, password)
 	if err != nil {
 		return result, err
 	}
@@ -150,7 +183,7 @@ func SyncAccounts(ctx context.Context, store *accounts.Store, password, scope st
 	consent = ReadAccountSyncConfig()
 	current, currentErr := AccountSyncScope()
 	if !consent.Enabled || consent.Scope != scope || currentErr != nil || current != scope {
-		return result, errors.New("account sync was disabled or its account changed")
+		return result, ErrSyncAborted
 	}
 	if !store.Enabled() {
 		return result, accounts.ErrDisabled
@@ -165,11 +198,11 @@ func SyncAccounts(ctx context.Context, store *accounts.Store, password, scope st
 	consent = ReadAccountSyncConfig()
 	current, currentErr = AccountSyncScope()
 	if !consent.Enabled || consent.Scope != scope || currentErr != nil || current != scope {
-		return result, errors.New("account sync was disabled or its account changed")
+		return result, ErrSyncAborted
 	}
-	result.Added, result.Kept, err = store.ImportSyncedBackup(merged)
+	result.SyncResult, err = store.ApplySync(merged)
 	result.Devices = len(files)
-	syncdiag.Log(ctx, "account_sync_result", "added", result.Added, "kept", result.Kept, "devices", result.Devices, "error", syncdiag.ErrorCode(err))
+	syncdiag.Log(ctx, "account_sync_result", "added", result.Added, "updated", result.Updated, "removed", result.Removed, "protected", result.Protected, "devices", result.Devices, "unreadable", result.Unreadable, "error", syncdiag.ErrorCode(err))
 	return
 }
 

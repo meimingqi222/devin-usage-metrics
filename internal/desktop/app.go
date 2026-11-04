@@ -88,6 +88,8 @@ type App struct {
 	accountUI                             accountUIState
 	backupUI                              accountBackupUI
 	accountSync                           accountSyncState
+	accountPasswords                      accountPasswordStore
+	accountPasswordMu                     sync.Mutex
 	usageUI                               usageUIState
 	syncUI                                syncState
 	extUI                                 extUIState
@@ -95,7 +97,7 @@ type App struct {
 
 // syncState is the last sync's outcome shown in the sidebar.
 type syncState struct {
-	lastAt, err string
+	err         string
 	completedAt time.Time
 }
 
@@ -250,7 +252,6 @@ func (a *App) sync() {
 				}
 				a.remote = remote
 				a.syncUI.completedAt = time.Now()
-				a.syncUI.lastAt = a.syncUI.completedAt.Format("15:04:05")
 			}
 			a.syncUI.err = ""
 			if err != nil {
@@ -261,6 +262,13 @@ func (a *App) sync() {
 }
 
 func (a *App) refreshQuota(force bool) {
+	// Saved credentials may refresh during quota reads. Do not replace the
+	// same files concurrently while account changes are being synchronized.
+	if a.busy["account-sync"] {
+		a.accountSync.quotaPending = true
+		a.accountSync.quotaForce = a.accountSync.quotaForce || force
+		return
+	}
 	existing := make(map[string]accountResult, len(a.accounts))
 	for _, ar := range a.accounts {
 		existing[ar.account.Key] = ar
@@ -368,6 +376,9 @@ func (a *App) refreshQuota(force bool) {
 			a.profiles = profiles
 			if profileErr != nil {
 				a.message = profileErr.Error()
+			}
+			if a.accountSync.dirty {
+				a.syncAccounts()
 			}
 		}
 	})

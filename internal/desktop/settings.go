@@ -31,6 +31,9 @@ func (a *App) cancelSettings() {
 	a.settings = false
 	a.settingsUI.open = false
 	a.settingsUI.apiURL = syncclient.ReadConfig().APIURL
+	// Closing settings abandons an unanswered disable confirmation; the switch
+	// stays on and sync continues.
+	a.accountSync.pendingOff = false
 }
 
 func (a *App) saveSettings() bool {
@@ -139,6 +142,14 @@ func (a *App) settingsView(c *ui.Context) {
 	if !a.settings && a.settingsUI.open {
 		a.cancelSettings()
 	}
+	if a.settings && a.accountSync.pendingOff {
+		text := a.t("Turn off account sync? This device stops sending account changes to your other devices, and the sync password remembered here is removed. Saved accounts stay on this device.", "关闭账号同步？本设备将停止向其他设备同步账号更改，并删除本机记住的同步密码。已保存的账号不受影响。")
+		if ui.AlertDialog(c, &a.accountSync.pendingOff, a.t("Turn off account sync", "关闭账号同步"), text, a.t("Cancel", "取消"), a.t("Turn off", "关闭同步")) == 1 {
+			if err := a.disableAccountSync(); err != nil {
+				a.message = err.Error()
+			}
+		}
+	}
 	a.updateDialog(c)
 }
 
@@ -166,7 +177,7 @@ func (a *App) settingsSync(c *ui.Context) {
 				status = a.auth.VerificationURI + "\n" + a.auth.UserCode
 			}
 			ui.Text(c, status).FontSize(12).TextColor(c.Theme().TextMuted).Selectable()
-			if settingsButton(c, label, true).FillWidth().Padding(8, 12).Disabled(a.busy["login"] || strings.TrimSpace(a.settingsUI.apiURL) == "").Clicked() {
+			if (syncclient.SessionLabel() == "" || a.busy["login"] || a.accountSync.authRequired) && settingsButton(c, label, true).FillWidth().Padding(8, 12).Disabled(a.busy["login"] || strings.TrimSpace(a.settingsUI.apiURL) == "").Clicked() {
 				a.apiURL = strings.TrimRight(strings.TrimSpace(a.settingsUI.apiURL), "/")
 				a.beginLogin()
 			}
@@ -194,7 +205,6 @@ func (a *App) settingsSync(c *ui.Context) {
 					a.remote.Turns = nil
 				}
 			}
-			ui.Text(c, a.t("Devices using the same GitHub account merge into the same sync data", "同一 GitHub 账号的设备会合并到同一份同步数据")).FontSize(12).TextColor(c.Theme().TextMuted)
 			a.accountSyncSettings(c)
 		})
 	})

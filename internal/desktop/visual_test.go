@@ -17,7 +17,8 @@ import (
 func denseFixture(t *testing.T) *App {
 	a := fixture(t)
 	a.agent, a.lang, a.device = model.Devin, "zh", a.localID
-	a.loadedAt, a.syncUI.lastAt = "10:52:53", "11:53:16"
+	a.loadedAt = "10:52:53"
+	a.syncUI.completedAt = time.Now().Add(-53 * time.Minute)
 	a.remote = model.Data{Sessions: []model.Session{{DeviceID: "laptop", DeviceName: "LAPTOP-9MA1G6"}}}
 	if err := syncclient.SaveConfig(syncclient.Config{Enabled: true, APIURL: "https://sync.example.test"}); err != nil {
 		t.Fatal(err)
@@ -69,7 +70,7 @@ func TestOriginalDenseVisualStates(t *testing.T) {
 	a := denseFixture(t)
 	tt := ui.NewTester(a.View, 1240, 780)
 	tt.SetScale(2)
-	if !tt.HasText("隐藏无活动日期") || !tt.HasText("上次同步 11:53:16") {
+	if !tt.HasText("隐藏无活动日期") || !tt.HasText("上次同步") || !tt.HasText("53 分钟前") {
 		t.Fatal("missing original toolbar/footer controls")
 	}
 	capture(t, tt, "parity-usage")

@@ -6,13 +6,13 @@ import (
 	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"maps"
 	"os"
 	"runtime"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -29,19 +29,30 @@ const (
 	backupDomain      = "aum-account-backup-v1"
 )
 
-var ErrBackupPassword = errors.New("incorrect backup password or damaged account backup")
+var (
+	// ErrBackupPassword covers both a wrong password and a damaged envelope;
+	// callers answer with the same re-enter-password flow.
+	ErrBackupPassword = errors.New("incorrect backup password or damaged account backup")
+	ErrShortPassword  = errors.New("use an account backup password of at least 10 characters")
+	// ErrTooManySavedAccounts and ErrBackupFileConflict surface in import and
+	// sync paths; the message text is the syncdiag error code, do not reword.
+	ErrTooManySavedAccounts = errors.New("too many saved accounts")
+	ErrBackupFileConflict   = errors.New("account backup conflicts with an existing saved file")
+)
 
 // Backup is plaintext in memory only. Never log or upload its JSON directly.
 type Backup struct {
-	Version int           `json:"version"`
-	Entries []BackupEntry `json:"accounts"`
+	Version int              `json:"version"`
+	Entries []BackupEntry    `json:"accounts"`
+	Deleted map[string]int64 `json:"deleted,omitempty"`
 }
 
 type BackupEntry struct {
-	Provider   string         `json:"provider"`
-	Name       string         `json:"name,omitempty"`
-	ModifiedAt int64          `json:"modified_at"`
-	Credential map[string]any `json:"credential"`
+	Provider       string         `json:"provider"`
+	Name           string         `json:"name,omitempty"`
+	ModifiedAt     int64          `json:"modified_at"`
+	Credential     map[string]any `json:"credential"`
+	NameModifiedAt int64          `json:"name_modified_at,omitempty"`
 }
 
 type backupEnvelope struct {
@@ -56,7 +67,7 @@ type backupEnvelope struct {
 
 func CheckBackupPassword(password string) error {
 	if utf8.RuneCountInString(password) < 10 || len(password) > 1024 || strings.TrimSpace(password) == "" {
-		return errors.New("use an account backup password of at least 10 characters")
+		return ErrShortPassword
 	}
 	return nil
 }
@@ -75,12 +86,21 @@ func backupCipher(password string, salt []byte) (cipher.AEAD, error) {
 }
 
 func validateBackup(b Backup) error {
-	if b.Version != 1 || len(b.Entries) > MaxBackupAccounts {
+	if b.Version != 1 || len(b.Entries) > MaxBackupAccounts || len(b.Deleted) > 4096 {
 		return errors.New("unsupported or oversized account backup")
 	}
 	for _, e := range b.Entries {
-		if !supported(e.Provider) || !accountDocument(e.Provider, e.Credential) || len(e.Name) > 512 || e.ModifiedAt < 0 || e.ModifiedAt > time.Now().Add(24*time.Hour).UnixNano() {
+		if !supported(e.Provider) || !accountDocument(e.Provider, e.Credential) || len(e.Name) > 512 || e.ModifiedAt < 0 || e.ModifiedAt > time.Now().Add(24*time.Hour).UnixNano() || e.NameModifiedAt < 0 || e.NameModifiedAt > time.Now().Add(24*time.Hour).UnixNano() {
 			return errors.New("invalid account backup entry")
+		}
+	}
+	for key, at := range b.Deleted {
+		provider, id, ok := strings.Cut(key, "/")
+		if !ok || !supported(provider) || len(id) != 16 || strings.ContainsAny(id, "/\\.") || at <= 0 || at > time.Now().Add(24*time.Hour).UnixNano() {
+			return errors.New("invalid deleted account")
+		}
+		if _, err := hex.DecodeString(id); err != nil {
+			return errors.New("invalid deleted account")
 		}
 	}
 	plain, err := json.Marshal(b)
@@ -179,7 +199,11 @@ func (s *Store) Snapshot() (Backup, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loadLocked()
-	b := Backup{Version: 1, Entries: []BackupEntry{}}
+	return s.snapshotLocked()
+}
+
+func (s *Store) snapshotLocked() (Backup, error) {
+	b := Backup{Version: 1, Entries: []BackupEntry{}, Deleted: maps.Clone(s.data.Deleted)}
 	for _, p := range s.data.Profiles {
 		doc, err := s.readCredential(p)
 		if err != nil {
@@ -194,7 +218,7 @@ func (s *Store) Snapshot() (Backup, error) {
 		if info, err := os.Stat(s.credentialPath(p.Provider, p.ID)); err == nil {
 			stamp = max(stamp, info.ModTime().UnixNano())
 		}
-		b.Entries = append(b.Entries, BackupEntry{p.Provider, p.Name, stamp, doc})
+		b.Entries = append(b.Entries, BackupEntry{Provider: p.Provider, Name: p.Name, ModifiedAt: stamp, Credential: doc, NameModifiedAt: p.NameModifiedAt})
 	}
 	return b, validateBackup(b)
 }
@@ -204,16 +228,31 @@ func backupIdentity(e BackupEntry) string {
 	return e.Provider + "/" + profileID(e.Provider, id, e.Credential, docHash(e.Credential))
 }
 
-// MergeBackups unions device snapshots. Newer credential modifications win in
-// the backup only; importing always preserves an existing local credential.
+// MergeBackups reconciles credentials, names and deletions independently.
 func MergeBackups(backups ...Backup) Backup {
 	entries := map[string]BackupEntry{}
+	deleted := map[string]int64{}
 	for _, b := range backups {
 		for _, e := range b.Entries {
 			key := backupIdentity(e)
-			if old, ok := entries[key]; !ok || e.ModifiedAt > old.ModifiedAt {
+			old, exists := entries[key]
+			if !exists {
 				entries[key] = e
+				continue
 			}
+			credential := old
+			if e.ModifiedAt > old.ModifiedAt || e.ModifiedAt == old.ModifiedAt && docHash(e.Credential) > docHash(old.Credential) {
+				credential = e
+			}
+			name := old
+			if e.NameModifiedAt > old.NameModifiedAt || e.NameModifiedAt == old.NameModifiedAt && e.Name > old.Name {
+				name = e
+			}
+			credential.Name, credential.NameModifiedAt = name.Name, name.NameModifiedAt
+			entries[key] = credential
+		}
+		for key, at := range b.Deleted {
+			deleted[key] = max(deleted[key], at)
 		}
 	}
 	keys := make([]string, 0, len(entries))
@@ -221,9 +260,11 @@ func MergeBackups(backups ...Backup) Backup {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	b := Backup{Version: 1, Entries: []BackupEntry{}}
+	b := Backup{Version: 1, Entries: []BackupEntry{}, Deleted: deleted}
 	for _, key := range keys {
-		b.Entries = append(b.Entries, entries[key])
+		if deleted[key] < entries[key].ModifiedAt || deleted[key] == 0 {
+			b.Entries = append(b.Entries, entries[key])
+		}
 	}
 	return b
 }
@@ -239,16 +280,6 @@ func (e BackupEntry) Label() string {
 // Reconcile. In particular, upsertLocked's active-account fallback is unsuitable
 // for foreign credentials without identity claims.
 func (s *Store) ImportBackup(b Backup) (added, kept int, err error) {
-	return s.importBackup(b, false)
-}
-
-// ImportSyncedBackup honors local removals; an explicit file import can restore
-// them, while a later sync cannot silently resurrect a removed account.
-func (s *Store) ImportSyncedBackup(b Backup) (added, kept int, err error) {
-	return s.importBackup(b, true)
-}
-
-func (s *Store) importBackup(b Backup, synced bool) (added, kept int, err error) {
 	if err = validateBackup(b); err != nil {
 		return
 	}
@@ -259,27 +290,23 @@ func (s *Store) importBackup(b Backup, synced bool) (added, kept int, err error)
 		return 0, 0, ErrDisabled
 	}
 	before := append([]Profile(nil), s.data.Profiles...)
-	beforeSuppressed := append([]string(nil), s.data.SuppressedBackups...)
+	beforeDeleted := maps.Clone(s.data.Deleted)
 	var created []string
 	defer func() {
 		if err != nil {
 			s.data.Profiles = before
-			s.data.SuppressedBackups = beforeSuppressed
+			s.data.Deleted = beforeDeleted
 			for _, path := range created {
 				_ = os.Remove(path)
 			}
 			added = 0
 		}
 	}()
+	// File import is an explicit restore, so deletion history is not applied.
+	b.Deleted = nil
 	for _, e := range MergeBackups(b).Entries {
 		key := backupIdentity(e)
-		if synced && slices.Contains(s.data.SuppressedBackups, key) {
-			kept++
-			continue
-		}
-		if !synced {
-			s.data.SuppressedBackups = slices.DeleteFunc(s.data.SuppressedBackups, func(k string) bool { return k == key })
-		}
+		delete(s.data.Deleted, key)
 		id := credentialid.Of(e.Provider, e.Credential)
 		pid := profileID(e.Provider, id, e.Credential, docHash(e.Credential))
 		exists := false
@@ -295,7 +322,7 @@ func (s *Store) importBackup(b Backup, synced bool) (added, kept int, err error)
 			continue
 		}
 		if len(s.data.Profiles) >= MaxBackupAccounts {
-			return 0, kept, errors.New("too many saved accounts")
+			return 0, kept, ErrTooManySavedAccounts
 		}
 		kind := "file"
 		if runtime.GOOS == "darwin" && (e.Provider == "claude" || e.Provider == "antigravity") {
@@ -306,23 +333,26 @@ func (s *Store) importBackup(b Backup, synced bool) (added, kept int, err error)
 			doc = maps.Clone(doc)
 			doc["email"] = id.Email
 		}
-		p := Profile{ID: pid, Provider: e.Provider, Label: profileLabel(e.Provider, id, pid), Email: id.Email, StableID: id.Stable, Plan: id.Plan, Name: e.Name, Kind: kind, CreatedAt: time.Now().Unix(), ModifiedAt: e.ModifiedAt, Imported: true}
+		p := Profile{ID: pid, Provider: e.Provider, Label: profileLabel(e.Provider, id, pid), Email: id.Email, StableID: id.Stable, Plan: id.Plan, Name: e.Name, Kind: kind, CreatedAt: time.Now().Unix(), ModifiedAt: e.ModifiedAt, NameModifiedAt: e.NameModifiedAt, Imported: true}
+		if beforeDeleted[key] > 0 {
+			p.ModifiedAt = max(time.Now().UnixNano(), beforeDeleted[key]+1)
+		}
 		path := s.credentialPath(p.Provider, p.ID)
 		if _, statErr := os.Stat(path); statErr == nil || !os.IsNotExist(statErr) {
-			return 0, kept, errors.New("account backup conflicts with an existing saved file")
+			return 0, kept, ErrBackupFileConflict
 		}
 		if err = s.writeCredential(p, doc); err != nil {
 			return
 		}
 		created = append(created, path)
-		modified := time.Unix(0, e.ModifiedAt)
+		modified := time.Unix(0, p.ModifiedAt)
 		if err = os.Chtimes(path, modified, modified); err != nil {
 			return
 		}
 		s.data.Profiles = append(s.data.Profiles, p)
 		added++
 	}
-	if added > 0 || !slices.Equal(beforeSuppressed, s.data.SuppressedBackups) {
+	if added > 0 || !maps.Equal(beforeDeleted, s.data.Deleted) {
 		err = s.saveLocked()
 	}
 	return
@@ -333,10 +363,11 @@ func (s *Store) suppressBackupLocked(p Profile) {
 	if doc, err := s.readCredential(p); err == nil {
 		keys = append(keys, backupIdentity(BackupEntry{Provider: p.Provider, Credential: doc}))
 	}
+	if s.data.Deleted == nil {
+		s.data.Deleted = map[string]int64{}
+	}
 	for _, key := range keys {
-		if !slices.Contains(s.data.SuppressedBackups, key) {
-			s.data.SuppressedBackups = append(s.data.SuppressedBackups, key)
-		}
+		s.data.Deleted[key] = time.Now().UnixNano()
 	}
 }
 

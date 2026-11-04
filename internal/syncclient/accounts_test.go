@@ -104,22 +104,69 @@ func TestEncryptedAccountSyncTwoDevicesAndWrongPassword(t *testing.T) {
 	first, scope := accountSyncDevice(t, ts.URL, "device-one")
 	firstRoot := os.Getenv("APPDATA")
 	addSyncAccount(t, first, "first@example.test", "private-first-token")
-	if _, err := SyncAccounts(context.Background(), first, accountTestPassword, scope); err != nil {
+	if _, err := SyncAccounts(context.Background(), first, accountTestPassword, scope, ""); err != nil {
 		t.Fatal(err)
 	}
 	second, scope := accountSyncDevice(t, ts.URL, "device-two")
 	secondRoot := os.Getenv("APPDATA")
 	addSyncAccount(t, second, "second@example.test", "private-second-token")
-	result, err := SyncAccounts(context.Background(), second, accountTestPassword, scope)
+	result, err := SyncAccounts(context.Background(), second, accountTestPassword, scope, "")
 	if err != nil || result.Added != 1 || len(second.List()) != 2 {
 		t.Fatalf("second device: added=%d error=%v", result.Added, err)
 	}
 	for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "LOCALAPPDATA"} {
 		t.Setenv(key, firstRoot)
 	}
-	result, err = SyncAccounts(context.Background(), first, accountTestPassword, scope)
+	result, err = SyncAccounts(context.Background(), first, accountTestPassword, scope, "")
 	if err != nil || result.Added != 1 || len(first.List()) != 2 {
 		t.Fatalf("first device: added=%d error=%v", result.Added, err)
+	}
+	var firstID string
+	for _, p := range first.List() {
+		if p.Email == "first@example.test" {
+			firstID = p.ID
+		}
+	}
+	if err := first.Rename("claude", firstID, "Laptop account"); err != nil {
+		t.Fatal(err)
+	}
+	addSyncAccount(t, first, "first@example.test", "private-updated-token")
+	if _, err := SyncAccounts(context.Background(), first, accountTestPassword, scope, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "LOCALAPPDATA"} {
+		t.Setenv(key, secondRoot)
+	}
+	result, err = SyncAccounts(context.Background(), second, accountTestPassword, scope, "")
+	if err != nil || result.Updated != 1 {
+		t.Fatalf("updated account not synchronized: %+v %v", result, err)
+	}
+	for _, p := range second.List() {
+		if p.Email == "first@example.test" {
+			if p.Name != "Laptop account" {
+				t.Fatal("renamed account not synchronized")
+			}
+			doc, e := second.ProfileCredential(p.Provider, p.ID)
+			if e != nil || doc["claudeAiOauth"].(map[string]any)["accessToken"] != "private-updated-token" {
+				t.Fatal("updated credential not synchronized")
+			}
+		}
+	}
+	for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "LOCALAPPDATA"} {
+		t.Setenv(key, firstRoot)
+	}
+	if err := first.Remove("claude", firstID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SyncAccounts(context.Background(), first, accountTestPassword, scope, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "LOCALAPPDATA"} {
+		t.Setenv(key, secondRoot)
+	}
+	result, err = SyncAccounts(context.Background(), second, accountTestPassword, scope, "")
+	if err != nil || result.Removed != 1 || len(second.List()) != 1 {
+		t.Fatalf("deleted account not synchronized: %+v %v", result, err)
 	}
 	cloud.mu.Lock()
 	writes := cloud.writes
@@ -134,7 +181,7 @@ func TestEncryptedAccountSyncTwoDevicesAndWrongPassword(t *testing.T) {
 	for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "LOCALAPPDATA"} {
 		t.Setenv(key, secondRoot)
 	}
-	if _, err := SyncAccounts(context.Background(), second, "incorrect-password", scope); !errors.Is(err, accounts.ErrBackupPassword) {
+	if _, err := SyncAccounts(context.Background(), second, "incorrect-password", scope, ""); !errors.Is(err, accounts.ErrBackupPassword) {
 		t.Fatalf("wrong password: %v", err)
 	}
 	cloud.mu.Lock()
@@ -161,24 +208,82 @@ func TestAccountSyncRequiresConsentScopeAndServerCapability(t *testing.T) {
 	defer ts.Close()
 	store, scope := accountSyncDevice(t, ts.URL, "device-one")
 	addSyncAccount(t, store, "fixture@example.test", "private-token")
-	if _, err := SyncAccounts(context.Background(), store, accountTestPassword, scope); err == nil || !strings.Contains(err.Error(), "update the sync server") {
+	if _, err := SyncAccounts(context.Background(), store, accountTestPassword, scope, ""); err == nil || !strings.Contains(err.Error(), "update the sync server") {
 		t.Fatalf("old server was accepted: %v", err)
 	}
 	if err := SaveAccountSyncConfig(AccountSyncConfig{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := SyncAccounts(context.Background(), store, accountTestPassword, scope); err == nil {
+	if _, err := SyncAccounts(context.Background(), store, accountTestPassword, scope, ""); err == nil {
 		t.Fatal("sync ran without consent")
 	}
-	if err := SaveAccountSyncConfig(AccountSyncConfig{true, "other-scope"}); err != nil {
+	if err := SaveAccountSyncConfig(AccountSyncConfig{Enabled: true, Scope: "other-scope"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := SyncAccounts(context.Background(), store, accountTestPassword, scope); err == nil {
+	if _, err := SyncAccounts(context.Background(), store, accountTestPassword, scope, ""); err == nil {
 		t.Fatal("sync crossed server/tenant scope")
 	}
 	cloud.mu.Lock()
 	defer cloud.mu.Unlock()
 	if cloud.writes != 0 {
 		t.Fatal("unsupported or unauthorized sync uploaded credentials")
+	}
+}
+
+func TestSyncAccountsPasswordRotation(t *testing.T) {
+	cloud := &accountServerFixture{objects: map[string][]byte{}, capable: true}
+	ts := httptest.NewServer(http.HandlerFunc(cloud.serve))
+	defer ts.Close()
+	const newPassword = "rotated-passphrase"
+	first, scope := accountSyncDevice(t, ts.URL, "device-one")
+	firstRoot := os.Getenv("APPDATA")
+	addSyncAccount(t, first, "first@example.test", "private-first-token")
+	if _, err := SyncAccounts(context.Background(), first, accountTestPassword, scope, ""); err != nil {
+		t.Fatal(err)
+	}
+	second, scope := accountSyncDevice(t, ts.URL, "device-two")
+	secondRoot := os.Getenv("APPDATA")
+	addSyncAccount(t, second, "second@example.test", "private-second-token")
+	if _, err := SyncAccounts(context.Background(), second, accountTestPassword, scope, ""); err != nil {
+		t.Fatal(err)
+	}
+	// The first device rotates: knowing the old password, it reads every
+	// snapshot and publishes sealed with the new one.
+	for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "LOCALAPPDATA"} {
+		t.Setenv(key, firstRoot)
+	}
+	result, err := SyncAccounts(context.Background(), first, newPassword, scope, accountTestPassword)
+	if err != nil || result.Unreadable != 0 {
+		t.Fatalf("rotation: unreadable=%d error=%v", result.Unreadable, err)
+	}
+	// A device still on the old password keeps syncing its own data but sees
+	// the rotated snapshot as unreadable.
+	for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "LOCALAPPDATA"} {
+		t.Setenv(key, secondRoot)
+	}
+	result, err = SyncAccounts(context.Background(), second, accountTestPassword, scope, "")
+	if err != nil || result.Unreadable != 1 || len(second.List()) != 2 {
+		t.Fatalf("stale device: unreadable=%d error=%v", result.Unreadable, err)
+	}
+	// Entering the new password finishes the rotation; the old one still opens
+	// this device's own previous snapshot.
+	result, err = SyncAccounts(context.Background(), second, newPassword, scope, accountTestPassword)
+	if err != nil || result.Unreadable != 0 || len(second.List()) != 2 {
+		t.Fatalf("rotation catch-up: unreadable=%d error=%v", result.Unreadable, err)
+	}
+	// Everything is sealed with the new password now.
+	for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "LOCALAPPDATA"} {
+		t.Setenv(key, firstRoot)
+	}
+	result, err = SyncAccounts(context.Background(), first, newPassword, scope, "")
+	if err != nil || result.Unreadable != 0 {
+		t.Fatalf("post-rotation: unreadable=%d error=%v", result.Unreadable, err)
+	}
+	cloud.mu.Lock()
+	defer cloud.mu.Unlock()
+	for _, raw := range cloud.objects {
+		if bytes.Contains(raw, []byte(accountTestPassword)) || bytes.Contains(raw, []byte(newPassword)) {
+			t.Error("server received a password")
+		}
 	}
 }

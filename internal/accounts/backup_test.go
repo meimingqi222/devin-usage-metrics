@@ -104,8 +104,8 @@ func TestAccountBackupImportPreservesLocalAndLiveCredentials(t *testing.T) {
 	}
 	// Reload to prove local removal markers survive a process restart.
 	s = Open()
-	if added, _, err := s.ImportSyncedBackup(b); err != nil || added != 0 {
-		t.Fatalf("sync resurrected removed accounts: %d %v", added, err)
+	if result, err := s.ApplySync(b); err != nil || result.Added != 0 {
+		t.Fatalf("sync resurrected removed accounts: %d %v", result.Added, err)
 	}
 	if added, _, err := s.ImportBackup(b); err != nil || added != 2 {
 		t.Fatalf("explicit import could not restore backup: %d %v", added, err)

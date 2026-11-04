@@ -26,6 +26,11 @@ type Authorization struct {
 }
 type transport struct{ base, token string }
 
+// ErrTransport is a request that never reached a usable HTTP response. The
+// underlying cause is logged separately at transport_failure; keep this message
+// stable, the syncdiag error-code whitelist matches it verbatim.
+var ErrTransport = errors.New("sync transport request failed")
+
 type responseLimitKey struct{}
 
 // One client keeps connections alive across a cycle's many small transfers;
@@ -97,7 +102,7 @@ func (t transport) requestOnce(ctx context.Context, method, p string, b []byte, 
 		if ctx.Err() != nil {
 			return nil, nil, 0, ctx.Err()
 		}
-		return nil, nil, 0, errors.New("sync transport request failed")
+		return nil, nil, 0, ErrTransport
 	}
 	defer resp.Body.Close()
 	limit := 256 * 1024 * 1024
@@ -110,7 +115,14 @@ func (t transport) requestOnce(ctx context.Context, method, p string, b []byte, 
 	}
 	return b, resp.Header, resp.StatusCode, e
 }
-func statusError(s int) error { return fmt.Errorf("sync API HTTP %d", s) }
+
+// APIStatusError is a non-retryable HTTP status; the message text feeds the
+// syncdiag "http_<code>" classification, so keep the format.
+type APIStatusError struct{ Code int }
+
+func (e APIStatusError) Error() string { return fmt.Sprintf("sync API HTTP %d", e.Code) }
+
+func statusError(s int) error { return APIStatusError{Code: s} }
 func BeginLogin(ctx context.Context, apiURL string) (Authorization, error) {
 	var a Authorization
 	base, e := baseURL(apiURL)

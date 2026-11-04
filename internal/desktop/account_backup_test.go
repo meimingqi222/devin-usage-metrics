@@ -82,7 +82,7 @@ func TestAccountSyncSettingsLockAndEndpointChange(t *testing.T) {
 	a := fixture(t)
 	a.settings = true
 	tt := ui.NewTester(func(c *ui.Context) { a.theme(c); a.settingsView(c); a.accountBackupDialog(c) }, 800, 780)
-	if !tt.HasText("Encrypted account sync") || !tt.HasText("Off · enable separately from usage sync") {
+	if !tt.HasText("Account sync") || !tt.HasText("Sign in to GitHub above to sync accounts.") {
 		t.Fatal("independent opt-in account sync controls missing")
 	}
 	capture(t, tt, "go-account-sync-settings")
