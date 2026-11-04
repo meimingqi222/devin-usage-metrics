@@ -6,10 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"runtime/debug"
 	"sync"
 	"time"
 
+	"github.com/meimingqi222/devin-usage-metrics/internal/accounts"
 	"github.com/meimingqi222/devin-usage-metrics/internal/analytics"
 	"github.com/meimingqi222/devin-usage-metrics/internal/compaction"
 	"github.com/meimingqi222/devin-usage-metrics/internal/data"
@@ -21,9 +23,11 @@ import (
 )
 
 type accountResult struct {
-	account quota.Account
-	result  quota.Result
-	err     error
+	account   quota.Account
+	result    quota.Result
+	err       error
+	profileID string
+	isLive    bool
 }
 
 type App struct {
@@ -78,6 +82,9 @@ type App struct {
 	sessionCosts                          map[sessionIdentity]sessionUsage
 	sessionList                           sessionListCache
 	quotaUI                               quotaUIState
+	accountStore                          *accounts.Store
+	profiles                              []accounts.Profile
+	accountUI                             accountUIState
 	usageUI                               usageUIState
 	syncUI                                syncState
 	extUI                                 extUIState
@@ -92,7 +99,8 @@ type syncState struct {
 func New(ctx context.Context) *App {
 	// Like Rust, start on this device's data; All devices is one click away.
 	id := data.DeviceID()
-	return &App{ctx: ctx, events: make(chan func(), 64), agent: model.Devin, loadedAgent: model.Agent(""), period: analytics.Day, tab: "usage", screen: "history", lang: language(), counts: map[model.Agent]int{}, trayEntries: map[model.Agent][]trayEntry{}, busy: map[string]bool{}, apiURL: syncclient.ReadConfig().APIURL, deviceName: data.DeviceName(), localID: id, device: id, usageUI: usageUIState{expandedBuckets: map[int64]bool{}}, sessionsUI: loadSessionUI(), installed: installedAgents(), quotaUI: quotaUIState{keychainLikely: quota.MacOSMayHaveKeychainAccounts()}, updatePrefs: loadUpdatePrefs()}
+	store := accounts.Open()
+	return &App{ctx: ctx, events: make(chan func(), 64), agent: model.Devin, loadedAgent: model.Agent(""), period: analytics.Day, tab: "usage", screen: "history", lang: language(), counts: map[model.Agent]int{}, trayEntries: map[model.Agent][]trayEntry{}, busy: map[string]bool{}, apiURL: syncclient.ReadConfig().APIURL, deviceName: data.DeviceName(), localID: id, device: id, usageUI: usageUIState{expandedBuckets: map[int64]bool{}}, sessionsUI: loadSessionUI(), installed: installedAgents(), quotaUI: quotaUIState{keychainLikely: quota.MacOSMayHaveKeychainAccounts()}, accountStore: store, profiles: store.List(), updatePrefs: loadUpdatePrefs()}
 }
 
 func (a *App) t(en, zh string) string {
@@ -249,22 +257,114 @@ func (a *App) sync() {
 }
 
 func (a *App) refreshQuota(force bool) {
+	existing := make(map[string]accountResult, len(a.accounts))
+	for _, ar := range a.accounts {
+		existing[ar.account.Key] = ar
+	}
 	a.work("quota", func() func() {
-		accounts := quota.Discover(quota.KeychainAllowed())
-		out := make([]accountResult, len(accounts))
+		liveAccounts := quota.Discover(quota.KeychainAllowed())
+		profiles, profileErr := a.accountStore.ReconcileContext(a.ctx, liveAccounts)
+
+		type target struct {
+			account   quota.Account
+			profileID string
+			isLive    bool
+		}
+		var targets []target
+		seenProvider := map[string]bool{}
+
+		for _, acc := range liveAccounts {
+			seenProvider[acc.Provider] = true
+			profID := ""
+			for _, p := range profiles {
+				if p.Provider == acc.Provider && p.Active {
+					profID = p.ID
+					break
+				}
+			}
+			targets = append(targets, target{account: acc, profileID: profID, isLive: true})
+
+			if a.accountStore.Enabled() {
+				for _, p := range profiles {
+					if p.Provider == acc.Provider && !p.Hidden && !p.Active {
+						credPath := a.accountStore.CredentialPath(p.Provider, p.ID)
+						if _, err := os.Stat(credPath); err == nil {
+							key := "profile-" + p.ID
+							label := a.profileName(p.Provider, p)
+							storedAcc := quota.ProfileAccount(key, p.Provider, label, credPath)
+							targets = append(targets, target{account: storedAcc, profileID: p.ID, isLive: false})
+						}
+					}
+				}
+			}
+		}
+
+		if a.accountStore.Enabled() {
+			for _, p := range profiles {
+				if !seenProvider[p.Provider] && !p.Hidden && !p.Active {
+					credPath := a.accountStore.CredentialPath(p.Provider, p.ID)
+					if _, err := os.Stat(credPath); err == nil {
+						key := "profile-" + p.ID
+						label := a.profileName(p.Provider, p)
+						storedAcc := quota.ProfileAccount(key, p.Provider, label, credPath)
+						targets = append(targets, target{account: storedAcc, profileID: p.ID, isLive: false})
+					}
+				}
+			}
+		}
+
+		// Frame-0 snapshot: immediately surface discovered targets and their tabbed grouping
+		// to the UI without waiting seconds for remote network queries to complete.
+		initial := make([]accountResult, len(targets))
+		for i, t := range targets {
+			if prev, ok := existing[t.account.Key]; ok {
+				initial[i] = prev
+				initial[i].isLive = t.isLive
+				initial[i].profileID = t.profileID
+			} else {
+				initial[i] = accountResult{
+					account:   t.account,
+					profileID: t.profileID,
+					isLive:    t.isLive,
+				}
+			}
+		}
+		a.post(func() {
+			a.accounts = initial
+			a.profiles = profiles
+		})
+
+		out := make([]accountResult, len(targets))
+		copy(out, initial)
 		var wg sync.WaitGroup
 		limit := make(chan struct{}, 4)
-		for i, account := range accounts {
+		for i, t := range targets {
 			wg.Go(func() {
 				limit <- struct{}{}
 				defer func() { <-limit }()
-				result, err := quota.Fetch(a.ctx, account, force)
-				out[i] = accountResult{account, result, err}
+				result, err := quota.Fetch(a.ctx, t.account, force)
+				res := accountResult{
+					account:   t.account,
+					result:    result,
+					err:       err,
+					profileID: t.profileID,
+					isLive:    t.isLive,
+				}
+				out[i] = res
+				a.post(func() {
+					if i < len(a.accounts) && a.accounts[i].account.Key == res.account.Key {
+						a.accounts[i] = res
+					}
+				})
 			})
 		}
 		wg.Wait()
 		return func() {
 			a.accounts, a.quotaUI.queriedAt = out, time.Now().Format("15:04:05")
+			a.profiles = profiles
+			if profileErr != nil {
+				a.message = profileErr.Error()
+			}
 		}
 	})
 }

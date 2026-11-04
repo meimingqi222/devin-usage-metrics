@@ -30,7 +30,7 @@ func quotaFixture(t *testing.T) *App {
 
 func TestQuotaCardsFormAUniformGrid(t *testing.T) {
 	a := quotaFixture(t)
-	tt := ui.NewTester(a.View, 1240, 780)
+	tt := ui.NewTester(a.View, 1240, 1000)
 	tt.SetScale(2)
 	capture(t, tt, "go-quota-cards")
 	rect := func(label string) ui.Rect {
@@ -43,7 +43,7 @@ func TestQuotaCardsFormAUniformGrid(t *testing.T) {
 	}
 	// Two columns of one width; cards in a row share its height even when
 	// their content differs, and the next row starts below both.
-	claude, codex, devin := rect("Claude · work@example.com"), rect("Codex · a-very-long-account-label-that-must-ellipsize@example.com"), rect("Devin · team")
+	claude, codex, devin := rect("Claude"), rect("Codex · a-very-long-account-label-that-must-ellipsize@example.com"), rect("Devin")
 	if codex.Y != claude.Y || codex.H != claude.H || codex.W != claude.W || codex.X <= claude.X {
 		t.Fatalf("cards in one row differ: %+v vs %+v", codex, claude)
 	}
@@ -51,7 +51,7 @@ func TestQuotaCardsFormAUniformGrid(t *testing.T) {
 		t.Fatalf("second row breaks the grid: %+v under %+v", devin, claude)
 	}
 	// The odd card out keeps the column width instead of filling the row.
-	if last := rect("Claude · home@example.com"); last.W != claude.W {
+	if last := rect("Antigravity · g@example.com"); last.W != claude.W {
 		t.Fatalf("last card left the grid: %+v vs %+v", last, claude)
 	}
 	if !tt.HasText("7 accounts · 3 high-usage alerts") {
@@ -60,13 +60,30 @@ func TestQuotaCardsFormAUniformGrid(t *testing.T) {
 	if label, ok := tt.Find("a-very-long-account-label-that-must-ellipsize@example.com"); ok && label.X+label.W > codex.X+codex.W {
 		t.Fatalf("account label overflows its card: %+v in %+v", label, codex)
 	}
-	for _, text := range []string{"5-hour window", "7-day · Opus", "Gemini 3 Pro · 5-hour window", "resets in 3d 3h", "Query failed: HTTP 401", "No record", "Extra: 120 ACUs left", "Cached data (5m ago) - rate limited, retry in 2m"} {
+	for _, text := range []string{"5-hour window", "7-day · Opus", "Gemini 3 Pro · 5-hour window", "resets in 3d 3h", "Query failed: HTTP 401", "Extra: 120 ACUs left"} {
 		if !tt.HasText(text) {
 			t.Fatalf("missing %q: %q", text, tt.Texts())
 		}
 	}
 	if remove, ok := tt.Find("Remove"); !ok || remove.H > 24 {
 		t.Fatalf("remove must be a compact link, not a button: %+v", remove)
+	}
+
+	// In the multi-account tabbed view, clicking tabs previews the secondary account quotas
+	if err := tt.Click("cli"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if !tt.HasText("No record") {
+		t.Fatalf("missing No record for Devin cli tab: %q", tt.Texts())
+	}
+
+	if err := tt.Click("home@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if !tt.HasText("Cached data (5m ago) - rate limited, retry in 2m") {
+		t.Fatalf("missing cached data for Claude home tab: %q", tt.Texts())
 	}
 }
 
@@ -81,12 +98,20 @@ func TestClaudeResetGrantNeedsConfirmation(t *testing.T) {
 	if !tt.HasText("Reset grants: 2 of 3 left") || !tt.HasText("Expires "+expires) {
 		t.Fatalf("missing grant summary: %q", tt.Texts())
 	}
-	tt.Scroll(600, 400, 0, 400)
+	// Clicking the secondary account tab previews its blocked grant without switching credentials
+	if err := tt.Click("home@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
 	soon := time.Unix(a.accounts[6].result.Reset.EndsAt, 0).Format("01-02 15:04")
 	if !tt.HasText("Reset grants: 1 of 1 left") || !tt.HasText("Expires "+soon+" (in 1d 2h)") {
 		t.Fatalf("missing blocked grant: %q", tt.Texts())
 	}
-	tt.Scroll(600, 400, 0, -400)
+	// Switch back to work account and test reset flow
+	if err := tt.Click("work@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
 	click(t, tt, "Reset now")
 	if !tt.HasText("Spend one Claude reset grant for work@example.com? This clears 5h now and cannot be undone.") {
 		t.Fatalf("reset did not ask first: %q", tt.Texts())
@@ -123,5 +148,18 @@ func TestStaleNotLimitedYieldsToFullWindow(t *testing.T) {
 	}
 	if resetWindowFull(five, []quota.Window{{Label: "5h", UsedPercent: 99}, {Label: "7d", UsedPercent: 100}}) {
 		t.Fatal("a window the grant does not clear enabled it")
+	}
+}
+
+func TestQuotaRefreshShowsProgress(t *testing.T) {
+	a := quotaFixture(t)
+	a.lang = "zh"
+	a.busy["quota"] = true
+	tt := ui.NewTester(a.View, 1240, 1000)
+	tt.Frame()
+	for _, text := range []string{"正在刷新…", "查询中…"} {
+		if !tt.HasText(text) {
+			t.Fatalf("refresh progress missing %q: %q", text, tt.Texts())
+		}
 	}
 }

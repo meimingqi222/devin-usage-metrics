@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/meimingqi222/devin-usage-metrics/internal/credentialid"
 )
 
 func homePath(p string) string {
@@ -83,17 +85,105 @@ func keyExists(s string) bool {
 	_, e := security("find-generic-password", "-s", s)
 	return e == nil
 }
-func keyRead(s string) (object, error) {
-	b, e := security("find-generic-password", "-s", s, "-w")
+func keyReadItem(service, account string) (object, error) {
+	d, e := keyReadFullItem(service, account)
+	if e != nil {
+		return nil, e
+	}
+	if service == "gemini" {
+		return obj(d["token"]), nil
+	}
+	return d, nil
+}
+
+// keyReadFullItem returns the whole item, including Antigravity's wrapper
+// fields. Switching must put the same shape back.
+func keyReadFullItem(service, account string) (object, error) {
+	args := []string{"find-generic-password", "-s", service}
+	if account != "" {
+		args = append(args, "-a", account)
+	}
+	args = append(args, "-w")
+	b, e := security(args...)
 	if e != nil {
 		return nil, errors.New("keychain credentials unavailable")
 	}
-	if s == "gemini" {
-		b, _ = base64.StdEncoding.DecodeString(strings.TrimPrefix(strings.TrimSpace(string(b)), "go-keyring-base64:"))
-		d, e := decodeDoc(b)
-		return obj(d["token"]), e
+	if service == "gemini" {
+		raw := strings.TrimSpace(string(b))
+		if strings.HasPrefix(raw, "go-keyring-base64:") {
+			raw = strings.TrimPrefix(raw, "go-keyring-base64:")
+			b, _ = base64.StdEncoding.DecodeString(raw)
+		} else {
+			b = []byte(raw)
+		}
 	}
 	return decodeDoc(b)
+}
+
+// keychainAccountFor is the account name each provider's item uses. A user
+// name is enough to create Claude's item; Antigravity's go-keyring item uses
+// "antigravity".
+func keychainAccountFor(provider string) string {
+	if provider == "antigravity" {
+		return "antigravity"
+	}
+	if user := strings.TrimSpace(os.Getenv("USER")); user != "" {
+		return user
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		if base := filepath.Base(home); base != "." && base != string(filepath.Separator) {
+			return base
+		}
+	}
+	return "claude-code-user"
+}
+
+// keyWriteDoc updates or creates a provider's keychain item. Claude Code
+// stores compact JSON; Antigravity's go-keyring item is base64 with a prefix.
+func keyWriteDoc(provider, service string, d object) error {
+	value, err := keychainValue(provider, d)
+	if err != nil {
+		return err
+	}
+	account := keychainAccountFor(provider)
+	if provider == "claude" {
+		// Update the item Claude Code created rather than adding a second
+		// one under a different account name.
+		if existing := keychainAccountName(service); existing != "" {
+			account = existing
+		}
+	}
+	_, err = security("add-generic-password", "-U", "-s", service, "-a", account, "-w", value)
+	if err != nil {
+		return errors.New("keychain update failed")
+	}
+	return nil
+}
+
+func keychainValue(provider string, d object) (string, error) {
+	data, err := json.Marshal(d)
+	if err != nil {
+		return "", errors.New("keychain credentials encode failed")
+	}
+	if provider == "antigravity" {
+		return "go-keyring-base64:" + base64.StdEncoding.EncodeToString(data), nil
+	}
+	return string(data), nil
+}
+
+func keychainAccountName(service string) string {
+	b, err := security("find-generic-password", "-s", service)
+	if err != nil {
+		return ""
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		l = strings.TrimSpace(l)
+		if strings.HasPrefix(l, `"acct"<blob>=`) {
+			account, _ := strconv.Unquote(strings.TrimPrefix(l, `"acct"<blob>=`))
+			return account
+		}
+	}
+	return ""
 }
 func keyWrite(s string, d object) error {
 	b, e := security("find-generic-password", "-s", s)
@@ -118,6 +208,20 @@ func keyWrite(s string, d object) error {
 	return nil
 }
 
+func antigravityStatePaths() []string {
+	switch runtime.GOOS {
+	case "windows":
+		if appData := os.Getenv("APPDATA"); appData != "" {
+			return []string{filepath.Join(appData, "Antigravity", "User", "globalStorage", "state.vscdb")}
+		}
+	case "darwin":
+		return []string{homePath("Library/Application Support/Antigravity/User/globalStorage/state.vscdb")}
+	default:
+		return []string{homePath(".config/Antigravity/User/globalStorage/state.vscdb")}
+	}
+	return nil
+}
+
 // Discover never performs network requests. Keychain is touched only with explicit consent.
 func Discover(allowKeychain bool) []Account {
 	out := []Account{}
@@ -132,6 +236,28 @@ func Discover(allowKeychain bool) []Account {
 		}
 		label := map[string]string{"claude": "Claude", "codex": "Codex", "grok": "Grok", "antigravity": "Antigravity"}[p]
 		d, _ := readDoc(path)
+		service := ""
+		if p == "claude" {
+			service = "Claude Code-credentials"
+		}
+		if p == "antigravity" {
+			service = "gemini"
+		}
+		keychain := allowKeychain && service != "" && keyExists(service)
+		if keychain {
+			var kd object
+			var ke error
+			if p == "antigravity" {
+				kd, ke = keyReadFullItem(service, "antigravity")
+			} else {
+				kd, ke = keyReadFullItem(service, keychainAccountFor(p))
+			}
+			if ke == nil {
+				// The live Keychain value, not a possibly stale file or
+				// state row, names the account the agent will use.
+				d = kd
+			}
+		}
 		email := str(d["email"])
 		if p == "claude" {
 			email = str(at(d, "claudeAiOauth", "emailAddress"))
@@ -141,30 +267,36 @@ func Discover(allowKeychain bool) []Account {
 			email = str(g["email"])
 		}
 		if p == "antigravity" {
-			parts := strings.Split(str(d["id_token"]), ".")
-			if len(parts) > 1 {
-				b, _ := base64.RawURLEncoding.DecodeString(parts[1])
-				var c object
-				_ = json.Unmarshal(b, &c)
-				email = str(c["email"])
+			email = str(d["id_token_email"])
+			if email == "" {
+				parts := strings.Split(str(d["id_token"]), ".")
+				if len(parts) > 1 {
+					b, _ := base64.RawURLEncoding.DecodeString(parts[1])
+					var c object
+					_ = json.Unmarshal(b, &c)
+					email = str(c["email"])
+				}
 			}
 		}
 		if email != "" {
 			label = email
 		}
-		if filepath.Ext(path) == ".vscdb" {
+		if filepath.Ext(path) == ".vscdb" && (email == "" || label == "Antigravity") {
 			if email := readAntigravityStateEmail(path); email != "" {
 				label = email
 			}
 		}
-		service := ""
-		if p == "claude" {
-			service = "Claude Code-credentials"
+		if p == "antigravity" && (email == "" || label == "Antigravity") {
+			// The desktop app's state database names the signed-in account
+			// even when the credential itself has no id_token.
+			for _, state := range antigravityStatePaths() {
+				if found := readAntigravityStateEmail(state); found != "" {
+					label = found
+					break
+				}
+			}
 		}
-		if p == "antigravity" {
-			service = "gemini"
-		}
-		if allowKeychain && service != "" && keyExists(service) {
+		if keychain {
 			out = append(out, Account{p + "-keychain", p, label, "keychain:" + service})
 		} else if exists(path) {
 			out = append(out, Account{p + "-local", p, label, path})
@@ -253,6 +385,35 @@ func credentialIdentity(a Account) string {
 		t, o := devinCLI()
 		return t + o
 	}
+	d, err := loadAccount(a)
+	if err != nil {
+		return ""
+	}
+	if id := credentialid.Of(a.Provider, d).Stable; id != "" {
+		return id
+	}
+	// A provider's document without identity claims: bind the cache to the
+	// tokens it was read with, so another login in the same file cannot
+	// inherit the previous account's cache.
+	switch a.Provider {
+	case "claude":
+		c := obj(d["claudeAiOauth"])
+		return str(c["accessToken"]) + "\x00" + str(c["refreshToken"])
+	case "codex":
+		if token := str(at(d, "tokens", "refresh_token")); token != "" {
+			return token
+		}
+		return str(d["refresh_token"])
+	case "grok":
+		_, entry := grokEntry(d)
+		return str(entry["refresh_token"])
+	case "antigravity":
+		token := d
+		if nested := obj(d["token"]); nested != nil {
+			token = nested
+		}
+		return str(token["refresh_token"])
+	}
 	return ""
 }
 func loadAccount(a Account) (object, error) {
@@ -261,7 +422,17 @@ func loadAccount(a Account) (object, error) {
 }
 func loadAccountSource(a Account) (object, string, error) {
 	if strings.HasPrefix(a.source, "keychain:") {
-		d, e := keyRead(strings.TrimPrefix(a.source, "keychain:"))
+		service := strings.TrimPrefix(a.source, "keychain:")
+		var d object
+		var e error
+		if a.Provider == "antigravity" {
+			d, e = keyReadItem(service, "antigravity")
+		} else {
+			d, e = keyReadItem(service, keychainAccountFor(a.Provider))
+			if e != nil {
+				d, e = keyReadItem(service, "")
+			}
+		}
 		if a.Provider == "claude" && (e != nil || strings.TrimSpace(str(at(d, "claudeAiOauth", "accessToken"))) == "") {
 			p := homePath(".claude/.credentials.json")
 			d, e = readDoc(p)
@@ -275,4 +446,157 @@ func loadAccountSource(a Account) (object, string, error) {
 	}
 	d, e := readDoc(a.source)
 	return d, a.source, e
+}
+
+// CredentialDoc is the account's full credential document. It is meant for
+// identity and for an in-process switch, never for logging. Unlike
+// loadAccount, Antigravity's keychain value keeps its wrapper fields so a
+// write puts the same shape back.
+func (a Account) CredentialDoc() (object, error) {
+	if strings.HasPrefix(a.source, "keychain:") {
+		service := strings.TrimPrefix(a.source, "keychain:")
+		if a.Provider == "antigravity" {
+			return keyReadFullItem(service, "antigravity")
+		}
+		d, err := keyReadFullItem(service, keychainAccountFor(a.Provider))
+		if err != nil {
+			return keyReadFullItem(service, "")
+		}
+		return d, nil
+	}
+	return loadAccount(a)
+}
+
+// CredentialKind names where the credential is stored.
+func (a Account) CredentialKind() string {
+	switch {
+	case strings.HasPrefix(a.source, "keychain:"):
+		return "keychain"
+	case strings.HasPrefix(a.source, "stored:"):
+		return "stored"
+	case filepath.Ext(a.source) == ".vscdb":
+		return "vscdb"
+	default:
+		return "file"
+	}
+}
+
+// Writable says this account's store can be replaced in place.
+func (a Account) Writable() bool { return a.ReadOnlyReason() == "" }
+
+// ReadOnlyReason says why this account's live store cannot be replaced, ""
+// when it can. A provider may keep its sign-in somewhere this app does not
+// write even though a file exists (Codex's keyring/auto store).
+func (a Account) ReadOnlyReason() string {
+	switch a.Provider {
+	case "claude", "codex", "antigravity", "grok":
+		if a.CredentialKind() != "file" && a.CredentialKind() != "keychain" {
+			if a.CredentialKind() == "vscdb" {
+				return "Antigravity keeps this sign-in in its database; switching is not supported here"
+			}
+			return "this account store is read-only"
+		}
+		if a.Provider == "codex" {
+			return codexStoreReason()
+		}
+		return ""
+	}
+	return "this agent's accounts can't be switched"
+}
+
+// LoginNote says why the live document is not a switchable account while
+// its store is still writable (Codex API-key mode, a signed-out file). It
+// is nil for a real account.
+func (a Account) LoginNote() string {
+	d, err := loadAccount(a)
+	if err != nil {
+		return ""
+	}
+	switch a.Provider {
+	case "codex":
+		switch codexLoginMode(d) {
+		case "apikey":
+			return "Codex is in API-key mode; there is no account to switch"
+		case "none":
+			return "Codex is not signed in"
+		}
+	case "claude":
+		if str(at(d, "claudeAiOauth", "accessToken")) == "" && str(at(d, "claudeAiOauth", "refreshToken")) == "" {
+			return "Claude Code is not signed in"
+		}
+	}
+	return ""
+}
+
+func codexLoginMode(d object) string {
+	if str(d["auth_mode"]) == "apikey" {
+		return "apikey"
+	}
+	tokens := obj(d["tokens"])
+	if tokens == nil {
+		tokens = d
+	}
+	if str(tokens["access_token"]) != "" || str(tokens["refresh_token"]) != "" {
+		return "oauth"
+	}
+	if str(d["OPENAI_API_KEY"]) != "" {
+		return "apikey"
+	}
+	return "none"
+}
+
+// codexStoreReason reads where Codex keeps its sign-in. We only write
+// auth.json; keyring and auto modes may be read from a keychain or Codex's
+// encrypted storage instead.
+func codexStoreReason() string {
+	home := os.Getenv("CODEX_HOME")
+	if home == "" {
+		home = homePath(".codex")
+	}
+	b, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		return ""
+	}
+	mode, secrets := "", false
+	inFeatures := false
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
+		if strings.HasPrefix(line, "[") {
+			inFeatures = line == "[features]"
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key, value = strings.TrimSpace(key), strings.Trim(strings.TrimSpace(value), `"`)
+		switch {
+		case key == "cli_auth_credentials_store":
+			mode = value
+		case inFeatures && key == "secret_auth_storage":
+			secrets = value == "true"
+		}
+	}
+	if mode == "" || mode == "file" {
+		return ""
+	}
+	if mode == "ephemeral" {
+		return "Codex keeps this sign-in only in its own memory"
+	}
+	if mode == "keyring" || mode == "auto" || secrets {
+		return "Codex keeps its sign-in in the system keychain or encrypted storage; switching auth.json isn't supported here"
+	}
+	return ""
+}
+
+// WriteCredential replaces the account's live credential document.
+func (a Account) WriteCredential(d object) error {
+	switch {
+	case strings.HasPrefix(a.source, "keychain:"):
+		return keyWriteDoc(a.Provider, strings.TrimPrefix(a.source, "keychain:"), d)
+	case strings.HasPrefix(a.source, "stored:"), filepath.Ext(a.source) == ".vscdb":
+		return errors.New("this account store is read-only")
+	default:
+		return atomicWrite(a.source, d)
+	}
 }

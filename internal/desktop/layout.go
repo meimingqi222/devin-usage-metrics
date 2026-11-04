@@ -97,6 +97,9 @@ func (a *App) View(c *ui.Context) {
 		})
 	})
 	a.settingsView(c)
+	a.accountsDialog(c)
+	a.addAccountDialog(c)
+	a.accountsConfirm(c)
 	if a.pending != nil {
 		r := *a.pending
 		text := fmt.Sprintf(a.t("Apply %s threshold %s? Only this device's user configuration changes. Start a new agent session afterwards.", "为 %s 应用 %s 阈值？仅修改本机用户配置，应用后请开启新的 Agent 会话。"), r.Model, formatTokens(float64(r.Recommended)))
@@ -427,7 +430,10 @@ func (a *App) header(c *ui.Context) {
 		if a.screen == "quota" {
 			// The quota page has its own query button and time.
 			if a.busy["quota"] {
-				ui.Text(c, a.t("Querying…", "查询中…")).FontSize(11).TextColor(faint(t)).NoWrap()
+				ui.Row(c).Gap(5).AlignItems(ui.Center).Shrink(0).Children(func() {
+					ui.Spinner(c).Size(11, 11).Label(a.t("Querying…", "查询中…"))
+					ui.Text(c, a.t("Querying…", "查询中…")).FontSize(11).TextColor(faint(t)).NoWrap()
+				})
 			}
 			return
 		}

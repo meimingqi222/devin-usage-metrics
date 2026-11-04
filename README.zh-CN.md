@@ -12,6 +12,8 @@
 - 按日（15 天）/ 周（12 周）/ 月（12 个月）聚合，堆叠 Token 图、模型分布、自报/API 等价费用、设备筛选。
 - 最近 500 条会话、搜索、模型识别、Token 总数、时间范围、TTFT 中位数及续读命令。
 - Claude、Codex、Grok、Devin、Antigravity 实时配额，缓存过期标记与限流冷却；钥匙串访问需明确开启。
+- 可选的 Claude Code / Codex / Antigravity / Grok 账号切换：从配额卡片或托盘选择账号；需要在设置中明确开启，开启后仅在本机保存账号名称与登录副本，运行中的会话在重启前仍使用原账号。
+- 添加账号不覆盖当前登录：Claude Code / Codex 在独立配置目录里走官方浏览器登录，Antigravity 使用应用内 Google OAuth，登录完成后直接加入账号列表。Codex 的 API 模式、以及没有本地 OAuth 登录的 Claude API-key 模式不会被当成可切换账号；配额卡片仍可显示其 API 模式状态。
 - Claude / Codex 历史压缩回放、确认应用本机配置、外部修改保护及跨重启撤销。估算不预测质量、订阅配额或实际账单。
 - 默认关闭的 GitHub 身份验证 + 自建 API 同步；导入 v1/v2 历史，以内容寻址 v3 协议发布。
 - 原生桌面窗口与托盘配额面板，中英双语 UI 并记住选择。CLI 人类可读输出目前仍为英文，CSV 列名固定英文。
@@ -62,6 +64,7 @@ Go 磁盘缓存与 Rust 快照分开，TTL 为 5 分钟；强制重新加载绕�
 
 - 仅在开启同步后向用户配置的自建 API 发送本地历史，GitHub 仅用于身份验证。
 - 实时配额访问对应供应商 API，OAuth 轮换可能写回 Agent 凭证；钥匙串发现需要明确授权。
+- 账号切换默认关闭；开启后会在本机保存账号名称和 Agent 登录副本，切换会改写 Agent 自己的登录存储。删除账号只删本应用的副本，不会撤销上游会话。
 - 定价从 `models.opencode.ai` 与 Devin 文档刷新，缓存 24h，失败退避 1h。`DEVIN_USAGE_DISABLE_MODELS_FETCH=1` 关闭定价拉取；`DEVIN_USAGE_MODELS_URL` / `DEVIN_USAGE_MODELS_PATH` 可覆盖来源和缓存。
 - 打包版本启动 10 秒后及每 4 小时检查一次 GitHub 更新并自动下载（`config.json` 中 `auto_check_updates: false` 可关闭），安装仍需用户确认；ZIP SHA-256 校验用于检测损坏，不代替发布者签名。
 - 压缩建议只有明确应用/撤销才修改 Claude/Codex 设置，保留无关内容、拒绝覆盖检测到的外部修改；撤销记录不参与同步。应用后请开启新的 Agent 会话。

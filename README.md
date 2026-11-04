@@ -12,6 +12,8 @@ Local coding-agent analytics, now implemented in **Go + [MyGo native UI](https:/
 - Daily (15), weekly (12), and monthly (12) calendar buckets, stacked token charts, per-model distributions, recorded/API-equivalent costs, and device filtering.
 - Latest 500 sessions, search, token totals, model resolution, timestamps, median TTFT and resume commands.
 - Live quotas for Claude, Codex, Grok, Devin and Antigravity, including cached/stale results and rate-limit cooldowns. Keychain discovery requires opt-in.
+- Optional account switching for Claude Code, Codex, Antigravity and Grok from the quota card or tray. It stores account names and sign-in copies locally only after opt-in; running sessions keep their account until restarted.
+- Adding an account does not replace the current sign-in: Claude Code and Codex use their own browser login in an isolated config directory, and Antigravity uses in-app Google OAuth. Codex API-key mode, and Claude setups with only an API key and no local OAuth login, are not treated as switchable accounts; the quota card can still show the API mode.
 - Claude/Codex historical compaction analysis, explicit local apply, external-edit protection and durable undo. Estimates do not predict task quality or subscription billing.
 - Opt-in, GitHub-authenticated self-hosted synchronization, v1/v2 imports and content-addressed v3 publication.
 - Native desktop window and tray quota panel; English/Chinese UI with persisted preference. CLI human-readable output currently remains English; CSV columns are stable English identifiers.
@@ -76,6 +78,7 @@ Configuration stays in `devin-usage-metrics/` under the OS configuration directo
 
 - Local history is sent only to the configured self-hosted API while sync is enabled. GitHub is used for identity.
 - Quota queries contact provider APIs and may rotate/write agent OAuth credentials. Keychain access is opt-in.
+- Account switching for Claude Code, Codex, Antigravity and Grok is opt-in. Enabling it stores account names and copies of the agents' sign-ins locally; switching rewrites the agent's own sign-in store. Running sessions keep their account until restarted. Removing an account deletes only this app's copy and does not revoke anything upstream.
 - Pricing catalogs refresh from `models.opencode.ai` and Devin documentation (24h TTL, 1h failure backoff). Set `DEVIN_USAGE_DISABLE_MODELS_FETCH=1` to disable catalog fetching; `DEVIN_USAGE_MODELS_URL` / `DEVIN_USAGE_MODELS_PATH` override its source/cache.
 - Packaged builds check GitHub for updates 10 seconds after launch and every four hours and download them (set `auto_check_updates` to `false` in `config.json` to opt out); installing still needs user action. ZIP checksums detect corruption, not publisher authenticity.
 - Only explicit compaction Apply/Undo changes Claude/Codex settings; unrelated fields are preserved, external edits refused, undo stays local. Start a new agent session afterwards.

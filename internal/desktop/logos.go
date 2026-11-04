@@ -27,3 +27,12 @@ var (
 )
 
 func svgIcon(s string) *ui.SVG { return ui.MustParseSVG([]byte(s)) }
+
+// spinIcon draws icon at size, or a spinner of that size while work is
+// in progress. Spinner only repaints its spokes; it does not rebuild the view.
+func spinIcon(c *ui.Context, icon *ui.SVG, size float32, spinning bool) ui.Element {
+	if spinning {
+		return ui.Spinner(c).Size(size, size)
+	}
+	return ui.Icon(c, icon).Size(size, size)
+}

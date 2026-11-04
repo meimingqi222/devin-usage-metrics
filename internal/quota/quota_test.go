@@ -2,6 +2,7 @@ package quota
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/meimingqi222/devin-usage-metrics/internal/sqlite"
 )
 
 type localTransport struct {
@@ -372,4 +375,93 @@ func saveDevinAccount(label, cookie, org string) error {
 	s := loadStore()
 	s.Devin = append(s.Devin, storedDevin{label, cookie, org})
 	return atomicWrite(configPath("quota-accounts.json"), s)
+}
+
+func TestKeychainValueEncoding(t *testing.T) {
+	d := object{"token": map[string]any{"refresh_token": "r"}}
+	v, err := keychainValue("antigravity", d)
+	if err != nil || !strings.HasPrefix(v, "go-keyring-base64:") {
+		t.Fatalf("antigravity encoding: %q %v", v, err)
+	}
+	v, err = keychainValue("claude", d)
+	if err != nil || strings.Contains(v, "\n") {
+		t.Fatalf("claude keychain value must be one-line JSON: %q %v", v, err)
+	}
+}
+
+func TestCodexReadOnlyStoreModes(t *testing.T) {
+	fixtureHome(t)
+	home := filepath.Join(os.Getenv("HOME"), ".codex")
+	t.Setenv("CODEX_HOME", home)
+	if err := os.MkdirAll(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(home, "config.toml")
+	if err := os.WriteFile(cfg, []byte("cli_auth_credentials_store = \"keyring\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if codexStoreReason() == "" {
+		t.Fatal("keyring store must be read-only")
+	}
+	if err := os.WriteFile(cfg, []byte("cli_auth_credentials_store = \"file\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if codexStoreReason() != "" {
+		t.Fatal("file store must stay writable")
+	}
+	if err := os.WriteFile(cfg, []byte("cli_auth_credentials_store = \"auto\"\n[features]\nsecret_auth_storage = true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if codexStoreReason() == "" {
+		t.Fatal("encrypted auth storage must be read-only")
+	}
+}
+
+func TestAntigravityStateTokenCarriesEmail(t *testing.T) {
+	fixtureHome(t)
+	path := filepath.Join(os.Getenv("HOME"), ".gemini", "antigravity", "state.vscdb")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sqlite.Open(context.Background(), path, sqlite.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Execute(context.Background(), "CREATE TABLE ItemTable(key TEXT, value TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	info := append(pbBytes(1, []byte("access")), pbBytes(3, []byte("refresh"))...)
+	entry := append(pbBytes(1, []byte("oauthTokenInfoSentinelKey")), pbBytes(2, pbBytes(1, []byte(base64.StdEncoding.EncodeToString(info))))...)
+	value := base64.StdEncoding.EncodeToString(pbBytes(1, entry))
+	for key, val := range map[string]string{
+		"antigravityUnifiedStateSync.oauthToken": value,
+		"antigravityAuthStatus":                  `{"email":"g@example.com"}`,
+	} {
+		if _, err := db.Execute(context.Background(), "INSERT INTO ItemTable(key, value) VALUES (?, ?)", key, val); err != nil {
+			t.Fatal(err)
+		}
+	}
+	doc, err := readAntigravityStateToken(path)
+	if err != nil || doc["email"] != "g@example.com" || doc["access_token"] != "access" {
+		t.Fatalf("state token: %#v %v", doc, err)
+	}
+}
+
+func TestAntigravityModelLevelArgonQuota(t *testing.T) {
+	models := object{"models": object{
+		"gemini-4-argon-high":   object{"displayName": "Gemini 4 Argon (High)", "quotaInfo": object{"remainingFraction": 0.75, "resetTime": "2026-11-09T07:33:21Z"}},
+		"gemini-4-argon-medium": object{"displayName": "Gemini 4 Argon (Medium)", "quotaInfo": object{"remainingFraction": 0.75, "resetTime": "2026-11-09T07:33:21Z"}},
+		"gemini-3.8-flash-high": object{"displayName": "Gemini 3.8 Flash (High)", "quotaInfo": object{"remainingFraction": 1}},
+	}}
+	got := antigravityModelWindows(models, nil)
+	if len(got) != 1 || got[0].Label != "Gemini 4 Argon" || got[0].UsedPercent != 25 {
+		t.Fatalf("model-level Argon: %+v", got)
+	}
+	if got := antigravityModelWindows(models, []Window{{Label: "Gemini 4 Argon – Weekly"}}); len(got) != 0 {
+		t.Fatalf("summary group duplicated: %+v", got)
+	}
+	if ua := antigravityUserAgent(); !strings.Contains(ua, "antigravity/hub/4.5.0") || !strings.Contains(ua, "aidev_client") {
+		t.Fatalf("user agent: %q", ua)
+	}
 }

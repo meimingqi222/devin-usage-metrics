@@ -52,13 +52,20 @@ func trayButton(c *ui.Context, label string) ui.Element {
 	return b
 }
 
-func trayIconButton(c *ui.Context, key, label string, icon *ui.SVG) ui.Element {
+func trayIconButton(c *ui.Context, key, label string, icon *ui.SVG, spinning bool) ui.Element {
 	b := ui.ButtonBase(c.Key(key)).Label(label).Size(22, 22).Radius(4).Border(0, ui.Color{}).Background(ui.Color{}).TextColor(traySecondary).AlignItems(ui.Center).Justify(ui.Center)
-	if b.Hovered() {
+	if b.Hovered() && !spinning {
 		b.Background(trayPill).TextColor(trayText)
 	}
-	b.Children(func() { ui.Icon(c, icon).Size(13, 13) })
+	b.Children(func() { spinIcon(c, icon, 13, spinning) })
 	return b
+}
+
+func trayLoadingLine(c *ui.Context, label string) {
+	ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+		ui.Spinner(c).Size(12, 12).Label(label)
+		ui.Text(c, label).FontSize(11).TextColor(trayMuted)
+	})
 }
 
 func trayCardBox(c *ui.Context) ui.Element {
@@ -180,10 +187,10 @@ func (a *App) trayView(c *ui.Context) {
 				status = a.t("Updated ", "更新于 ") + a.trayUI.updatedAt
 			}
 			ui.Text(c, status).FontSize(10).FontFeatures("tnum").TextColor(trayMuted).Grow(1).NoWrap()
-			if trayIconButton(c, "tray-refresh", a.t("Refresh Quotas", "刷新配额"), refreshIcon).Clicked() {
+			if trayIconButton(c, "tray-refresh", a.t("Refresh Quotas", "刷新配额"), refreshIcon, loading).Clicked() && !loading {
 				a.refreshQuota(true)
 			}
-			if trayIconButton(c, "tray-close", a.t("Close", "关闭"), closeIcon).Clicked() && a.trayUI.closePopup != nil {
+			if trayIconButton(c, "tray-close", a.t("Close", "关闭"), closeIcon, false).Clicked() && a.trayUI.closePopup != nil {
 				a.trayUI.closePopup()
 			}
 		})
@@ -205,7 +212,9 @@ func (a *App) trayView(c *ui.Context) {
 				idle = append(idle, providerName(ar.account.Provider)+" ("+plan+")")
 			}
 			if loading {
-				ui.Text(c, "↻ "+a.t("Querying subscription quotas", "正在查询订阅配额")).FontSize(11).TextColor(trayMuted).Padding(16, 0).AlignSelf(ui.Center)
+				ui.Row(c).Padding(16, 0).AlignSelf(ui.Center).Children(func() {
+					trayLoadingLine(c, a.t("Querying subscription quotas", "正在查询订阅配额"))
+				})
 			}
 			if len(idle) > 0 {
 				trayCardBox(c).Gap(4).Children(func() {
@@ -238,6 +247,7 @@ func (a *App) trayView(c *ui.Context) {
 	if a.quotaUI.resetFromTray {
 		a.claudeResetDialog(c)
 	}
+	a.accountsConfirm(c)
 }
 
 func (a *App) trayOverviewView(c *ui.Context, loading bool) {
@@ -262,7 +272,9 @@ func (a *App) trayOverviewView(c *ui.Context, loading bool) {
 		})
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Padding(2, 0).Children(func() {
 			if loading && len(items) == 0 {
-				ui.Text(c, "↻ "+a.t("Loading usage records…", "正在加载用量记录…")).Height(68).FontSize(11).TextColor(trayMuted)
+				ui.Row(c).Height(68).AlignItems(ui.Center).Children(func() {
+					trayLoadingLine(c, a.t("Loading usage records…", "正在加载用量记录…"))
+				})
 				return
 			}
 			const size, outer, inner = 68, 33.5, 28.5
@@ -372,9 +384,7 @@ func (a *App) trayDenseCard(c *ui.Context, ar accountResult) {
 				}
 			})
 			ui.Text(c, provider).FontSize(12).FontWeight(600).TextColor(trayText).NoWrap()
-			if label := strings.TrimSpace(ar.account.Label); label != "" && label != provider && label != providerName(ar.account.Provider) {
-				ui.Text(c, label).FontSize(10).TextColor(trayMuted).MinWidth(0).MaxWidth(150).SingleLine()
-			}
+			a.accountLabel(c, ar, true)
 			ui.Spacer(c)
 			if plan := ar.result.Plan; plan != "" {
 				tag := ui.Text(c, strings.ToUpper(plan)).FontSize(9).FontWeight(600).Padding(1, 5).Radius(3).Background(ui.Hex("#1d2331")).Border(1, ui.Hex("#293448")).TextColor(trayMuted).NoWrap()
@@ -383,6 +393,22 @@ func (a *App) trayDenseCard(c *ui.Context, ar accountResult) {
 				} else {
 					tag.TextColor(c.Theme().Accent).Border(1, c.Theme().Accent.Alpha(.3))
 				}
+			}
+			if !ar.isLive && ar.profileID != "" {
+				switching := a.accountUI.switching[ar.account.Provider]
+				sw := ui.ButtonBase(c).Label(a.t("Switch", "切换")).Padding(1, 6).Radius(3).Background(c.Theme().Accent.Alpha(.15)).Border(1, c.Theme().Accent.Alpha(.3)).Disabled(switching)
+				sw.Children(func() {
+					if switching {
+						ui.Spinner(c)
+					} else {
+						ui.Text(c, a.t("Switch", "切换")).FontSize(9).TextColor(c.Theme().Accent).NoWrap()
+					}
+				})
+				if sw.Clicked() {
+					a.switchAccount(ar.account.Provider, ar.profileID)
+				}
+			} else if ar.isLive && len(a.profilesFor(ar.account.Provider)) > 1 {
+				ui.Text(c, a.t("Active", "当前")).FontSize(9).FontWeight(600).Padding(1, 4).Radius(3).Background(quotaGreen.Alpha(.1)).Border(1, quotaGreen.Alpha(.3)).TextColor(quotaGreen).NoWrap()
 			}
 		})
 		ui.Column(c).Gap(6).Children(func() {

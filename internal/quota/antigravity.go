@@ -6,6 +6,10 @@ import (
 	"time"
 )
 
+// AntigravityOAuthClient returns the public desktop OAuth client the app
+// uses for an in-app account sign-in.
+func AntigravityOAuthClient() (string, string) { return antigravityClient() }
+
 // Public desktop OAuth client, encoded identically to the Rust implementation.
 func antigravityClient() (string, string) {
 	decode := func(b []byte) string {

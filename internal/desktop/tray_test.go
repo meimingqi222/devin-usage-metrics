@@ -107,6 +107,25 @@ func TestTrayOverviewIndependentOfDashboardAndRemote(t *testing.T) {
 
 // A Claude reset can be asked from the tray; its confirmation opens there,
 // not in the dashboard, and cancelling spends nothing.
+func TestTrayRefreshShowsProgress(t *testing.T) {
+	a := fixture(t)
+	a.lang = "zh"
+	a.busy["quota"] = true
+	a.accounts = []accountResult{
+		{account: quota.Account{Key: "claude", Provider: "claude", Label: "me@example.com"}, result: quota.Result{Plan: "Pro", Windows: []quota.Window{{Label: "5h", UsedPercent: 40}}}},
+	}
+	tt := ui.NewTester(a.trayView, trayWidth, 520)
+	tt.Frame()
+	for _, text := range []string{"正在更新…", "正在查询订阅配额"} {
+		if !tt.HasText(text) {
+			t.Fatalf("tray refresh progress missing %q: %q", text, tt.Texts())
+		}
+	}
+	if tt.HasText("↻") {
+		t.Fatal("tray refresh still uses a glyph in place of the spinner")
+	}
+}
+
 func TestTrayClaudeResetConfirmsInTray(t *testing.T) {
 	a := fixture(t)
 	a.accounts = []accountResult{{account: quota.Account{Key: "claude", Provider: "claude", Label: "me@example.com"}, result: quota.Result{Plan: "Pro", Windows: []quota.Window{{Label: "5h", UsedPercent: 100, ResetsAt: time.Now().Add(time.Hour).Unix()}}, Reset: &quota.ClaudeReset{Left: 2, Total: 3, GrantID: "g", Clears: []string{"five_hour"}}}}}

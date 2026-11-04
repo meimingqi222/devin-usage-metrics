@@ -27,6 +27,8 @@ type quotaUIState struct {
 	resetFromTray bool
 	// resetResult is the last claim's outcome, also shown in the tray.
 	resetResult string
+	// selectedAccount maps provider -> selected account.Key in tabbed multi-account view.
+	selectedAccount map[string]string
 }
 
 func providerName(provider string) string {
@@ -157,22 +159,40 @@ func (a *App) quotaView(c *ui.Context) {
 			ui.Text(c, a.t("Live subscription quotas", "实时订阅配额")).FontSize(15).Bold()
 		})
 		summary := fmt.Sprintf(a.t("%d accounts", "%d 个已授权账号"), len(a.accounts))
+		if len(a.profiles) > 0 {
+			active := 0
+			for _, p := range a.profiles {
+				if p.Active {
+					active++
+				}
+			}
+			summary = fmt.Sprintf(a.t("%d accounts · %d active", "%d 个账号 · %d 个当前使用"), len(a.profiles), active)
+		}
 		if alerts > 0 {
 			summary += fmt.Sprintf(a.t(" · %d high-usage alerts", " · %d 个高用量告警"), alerts)
 		}
 		ui.Text(c, summary).FontSize(11).Padding(4, 10).Radius(4).Background(ui.Hex("#161a23")).Border(1, t.Border).TextColor(t.TextMuted).NoWrap()
 		ui.Spacer(c)
-		requery := ui.ButtonBase(c).Label(a.t("Query again", "重新查询")).FontSize(11).Padding(3, 8).Radius(4).Background(ui.Hex("#141720")).Border(1, t.Border).TextColor(t.TextMuted).Disabled(a.busy["quota"])
-		if requery.Hovered() {
+		accountsBtn := textButton(c, a.t("Accounts", "账号"), a.accountUI.manager).Height(24)
+		if accountsBtn.Clicked() {
+			a.openAccounts()
+		}
+		busy := a.busy["quota"]
+		requeryLabel := a.t("Query again", "重新查询")
+		if busy {
+			requeryLabel = a.t("Refreshing…", "正在刷新…")
+		}
+		requery := ui.ButtonBase(c).Label(requeryLabel).FontSize(11).Padding(3, 8).Radius(4).Background(ui.Hex("#141720")).Border(1, t.Border).TextColor(t.TextMuted)
+		if requery.Hovered() && !busy {
 			requery.TextColor(t.Text)
 		}
 		requery.Children(func() {
 			ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
-				ui.Icon(c, requeryIcon).Size(11, 11)
-				ui.Text(c, a.t("Query again", "重新查询")).NoWrap()
+				spinIcon(c, requeryIcon, 11, busy)
+				ui.Text(c, requeryLabel).NoWrap()
 			})
 		})
-		if requery.Clicked() {
+		if !busy && requery.Clicked() {
 			a.refreshQuota(true)
 		}
 		if a.quotaUI.queriedAt != "" {
@@ -181,13 +201,349 @@ func (a *App) quotaView(c *ui.Context) {
 	})
 	// A uniform two-column grid: cards in a row share its height.
 	ui.Grid(c).Columns(2).Gap(12).Children(func() {
-		for _, ar := range a.accounts {
-			a.quotaCard(c.Key(ar.account.Key), ar)
+		for _, grp := range a.groupedAccounts() {
+			a.quotaProviderCard(c.Key("grp/"+grp.provider), grp)
 		}
 	})
 	if !a.quotaUI.resetFromTray {
 		a.claudeResetDialog(c)
 	}
+}
+
+type providerQuotaGroup struct {
+	provider string
+	accounts []accountResult
+}
+
+func (a *App) groupedAccounts() []providerQuotaGroup {
+	var groups []providerQuotaGroup
+	index := map[string]int{}
+	for _, ar := range a.accounts {
+		p := ar.account.Provider
+		if i, ok := index[p]; ok {
+			groups[i].accounts = append(groups[i].accounts, ar)
+		} else {
+			index[p] = len(groups)
+			groups = append(groups, providerQuotaGroup{provider: p, accounts: []accountResult{ar}})
+		}
+	}
+	return groups
+}
+
+func (a *App) quotaProviderCard(c *ui.Context, grp providerQuotaGroup) {
+	t := c.Theme()
+	faintText := faint(t)
+	hasAlert := false
+	for _, ar := range grp.accounts {
+		if ar.err == nil && quotaAlert(ar.result) {
+			hasAlert = true
+			break
+		}
+	}
+	card := ui.Column(c).MinWidth(0).Padding(14, 16).Gap(12).Radius(6).Background(t.Surface).Border(1, t.Border).Shadow(0, 1, 3, 0, ui.Hex("#000000").Alpha(.2))
+	switch {
+	case hasAlert:
+		card.Border(1, quotaRose.Alpha(.4))
+	case card.Hovered():
+		card.Border(1, strongBorder)
+	}
+	brand := providerColor(grp.provider)
+	label := providerName(grp.provider)
+	if len(grp.accounts) == 1 {
+		label += " · " + grp.accounts[0].account.Label
+	}
+	card.Label(label).Children(func() {
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Column(c).Size(22, 22).Shrink(0).Radius(5).Background(ui.Hex("#171b24")).Border(1, ui.Hex("#232938")).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+				if logo := providerLogos[providerName(grp.provider)]; logo != nil {
+					ui.Image(c, logo).Size(14, 14)
+				} else {
+					ui.Text(c, strings.ToUpper(providerName(grp.provider)[:1])).FontSize(10).FixedLineHeight(12).Bold().TextColor(brand)
+				}
+			})
+			ui.Text(c, providerName(grp.provider)).FontSize(13).FontWeight(600).NoWrap()
+			if len(grp.accounts) > 1 {
+				ui.Text(c, fmt.Sprintf(a.t("%d accounts", "%d 个已绑定账号"), len(grp.accounts))).FontSize(10.5).FontWeight(500).Padding(1, 6).Radius(3).Background(controlColor).Border(1, ui.Hex("#242c3d")).TextColor(faintText).NoWrap()
+			} else {
+				a.accountLabel(c, grp.accounts[0], false)
+				if r := grp.accounts[0].result; r.Plan != "" && grp.accounts[0].err == nil {
+					tag := ui.Text(c, strings.ToUpper(r.Plan)).FontSize(10).FontWeight(600).Padding(1, 6).Radius(3).Background(controlColor).Border(1, ui.Hex("#242c3d")).TextColor(faintText).NoWrap()
+					if r.Plan != "API MODE" {
+						tag.Background(t.Accent.Alpha(.08)).Border(1, t.Accent.Alpha(.25)).TextColor(t.Accent)
+					}
+				}
+			}
+			ui.Spacer(c)
+			if a.busy["quota"] {
+				ui.Spinner(c).Size(12, 12).Label(a.t("Refreshing…", "正在刷新…"))
+			}
+			if a.accountStore.Enabled() && switchableProvider(grp.provider) {
+				addBtn := ui.ButtonBase(c).Label(a.t("Add account", "添加账号")).Padding(2, 6).Radius(4).Background(ui.Color{}).Border(1, t.Border).TextColor(t.TextMuted)
+				if addBtn.Hovered() {
+					addBtn.TextColor(t.Text).Border(1, strongBorder)
+				}
+				addBtn.Children(func() { ui.Text(c, a.t("+ Backup", "+ 备用号")).FontSize(10).NoWrap() })
+				if addBtn.Clicked() {
+					a.openAddAccount(grp.provider)
+				}
+			}
+			if len(grp.accounts) == 1 {
+				ar := grp.accounts[0]
+				if index, err := strconv.Atoi(strings.TrimPrefix(ar.account.Key, "devin-")); strings.HasPrefix(ar.account.Key, "devin-") && err == nil {
+					remove := ui.ButtonBase(c).Padding(0, 4).Border(0, ui.Color{}).Background(ui.Color{}).TextColor(faintText)
+					if remove.Hovered() {
+						remove.TextColor(quotaRose)
+					}
+					remove.Children(func() { ui.Text(c, a.t("Remove", "移除")).FontSize(11).NoWrap() })
+					if remove.Clicked() {
+						if err := quota.RemoveDevinAccount(index); err != nil {
+							a.message = err.Error()
+						} else {
+							a.refreshQuota(true)
+						}
+					}
+				}
+			}
+		})
+
+		if m, ok := a.accountUI.message[grp.provider]; ok && m.text != "" {
+			color := t.TextMuted
+			if m.err {
+				color = quotaRose
+			} else {
+				color = quotaGreen
+			}
+			ui.Text(c, m.text).FontSize(11).MinWidth(0).TextColor(color)
+		}
+
+		if len(grp.accounts) == 1 {
+			a.singleAccountBody(c, grp.accounts[0])
+		} else {
+			a.tabbedAccountBody(c, grp)
+		}
+	})
+}
+
+func (a *App) isAccountLive(provider string, ar accountResult) bool {
+	if ar.isLive {
+		return true
+	}
+	profiles := a.profilesFor(provider)
+	if len(profiles) > 0 {
+		for _, p := range profiles {
+			if p.Active && (p.Label == ar.account.Label || p.DisplayName() == ar.account.Label || p.Email == ar.account.Label) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, aRes := range a.accounts {
+		if aRes.account.Provider == provider {
+			return aRes.account.Key == ar.account.Key
+		}
+	}
+	return false
+}
+
+func (a *App) selectedAccountForProvider(grp providerQuotaGroup) accountResult {
+	if a.quotaUI.selectedAccount == nil {
+		a.quotaUI.selectedAccount = make(map[string]string)
+	}
+	selKey := a.quotaUI.selectedAccount[grp.provider]
+	if selKey != "" {
+		for _, ar := range grp.accounts {
+			if ar.account.Key == selKey {
+				return ar
+			}
+		}
+	}
+	for _, ar := range grp.accounts {
+		if a.isAccountLive(grp.provider, ar) {
+			return ar
+		}
+	}
+	return grp.accounts[0]
+}
+
+func (a *App) tabbedAccountBody(c *ui.Context, grp providerQuotaGroup) {
+	t := c.Theme()
+	faintText := faint(t)
+	selected := a.selectedAccountForProvider(grp)
+
+	ui.Column(c).Gap(10).Children(func() {
+		// 1. Account selection tabs bar
+		ui.Row(c.Key("tabs/" + grp.provider)).Gap(6).AlignItems(ui.Center).Wrap().Children(func() {
+			for _, ar := range grp.accounts {
+				ar := ar
+				isLive := a.isAccountLive(grp.provider, ar)
+				isSelected := ar.account.Key == selected.account.Key
+
+				tabBG := ui.Hex("#13161f")
+				tabBorder := t.Border
+				if isSelected {
+					tabBG = controlColor
+					tabBorder = t.Accent.Alpha(.4)
+				}
+				tab := ui.ButtonBase(c.Key("tab/"+ar.account.Key)).Label(ar.account.Label).Padding(4, 9).Radius(5).Background(tabBG).Border(1, tabBorder)
+				if tab.Hovered() && !isSelected {
+					tab.Border(1, strongBorder)
+				}
+				tab.Children(func() {
+					ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+						dotColor := faintText.Alpha(.6)
+						switch {
+						case ar.err != nil:
+							dotColor = quotaRose
+						case quotaAlert(ar.result):
+							dotColor = quotaAmber
+						case isLive:
+							dotColor = quotaGreen
+						}
+						ui.Box(c).Size(6, 6).Radius(3).Background(dotColor)
+
+						labelColor := t.TextMuted
+						if isSelected {
+							labelColor = t.Text
+						}
+						ui.Text(c, ar.account.Label).FontSize(11.5).FontWeight(func() int {
+							if isSelected {
+								return 600
+							}
+							return 400
+						}()).NoWrap().TextColor(labelColor)
+
+						if ar.result.Plan != "" && ar.err == nil {
+							planTag := ui.Text(c, strings.ToUpper(ar.result.Plan)).FontSize(9).FontWeight(600).Padding(1, 4).Radius(3).Background(ui.Hex("#1a1e28")).Border(1, ui.Hex("#273040")).TextColor(faintText).NoWrap()
+							if ar.result.Plan != "API MODE" {
+								planTag.Background(t.Accent.Alpha(.08)).Border(1, t.Accent.Alpha(.25)).TextColor(t.Accent)
+							}
+						}
+
+						if isLive {
+							ui.Text(c, a.t("Active", "当前使用")).FontSize(9).FontWeight(600).Padding(1, 5).Radius(3).Background(t.Accent.Alpha(.15)).Border(1, t.Accent.Alpha(.35)).TextColor(t.Accent).NoWrap()
+						}
+					})
+				})
+				if tab.Clicked() {
+					if a.quotaUI.selectedAccount == nil {
+						a.quotaUI.selectedAccount = make(map[string]string)
+					}
+					a.quotaUI.selectedAccount[grp.provider] = ar.account.Key
+				}
+			}
+		})
+
+		// 2. Selected account action & status banner
+		selectedLive := a.isAccountLive(grp.provider, selected)
+		bannerBG := ui.Hex("#11151f")
+		bannerBorder := t.Border.Alpha(.7)
+		if selectedLive {
+			bannerBorder = quotaGreen.Alpha(.25)
+		}
+		ui.Row(c.Key("banner/"+selected.account.Key)).Gap(8).Padding(6, 10).Radius(5).Background(bannerBG).Border(1, bannerBorder).AlignItems(ui.Center).Children(func() {
+			if selectedLive {
+				ui.Box(c).Size(6, 6).Radius(3).Background(quotaGreen)
+				ui.Text(c, a.t("Active now · Local sessions use this account", "本机当前使用 · 新会话即时生效")).FontSize(11).TextColor(quotaGreen).FontWeight(500)
+			} else {
+				ui.Box(c).Size(6, 6).Radius(3).Border(1, faintText.Alpha(.6))
+				ui.Text(c, a.t("Previewing inactive account quota", "预览此账号配额（未生效）")).FontSize(11).TextColor(t.TextMuted)
+			}
+			ui.Spacer(c)
+			profileID := selected.profileID
+			if profileID == "" {
+				for _, p := range a.profiles {
+					if p.Provider == grp.provider && !p.Active && (p.Label == selected.account.Label || p.DisplayName() == selected.account.Label || p.Email == selected.account.Label) {
+						profileID = p.ID
+						break
+					}
+				}
+			}
+			if !selectedLive && profileID != "" {
+				switching := a.accountUI.switching[grp.provider]
+				sw := ui.ButtonBase(c.Key("sw/"+profileID)).Label(a.t("Switch to this account", "切为此账号")).Padding(3, 10).Radius(4).Background(t.Accent.Alpha(.15)).Border(1, t.Accent.Alpha(.35)).Disabled(switching)
+				if sw.Hovered() {
+					sw.Background(t.Accent.Alpha(.25))
+				}
+				sw.Children(func() {
+					if switching {
+						ui.Spinner(c)
+						ui.Text(c, a.t("Switching…", "正在切换…")).FontSize(10.5).TextColor(t.TextMuted).NoWrap()
+					} else {
+						ui.Text(c, a.t("Switch to this account", "切为此账号")).FontSize(10.5).FontWeight(600).TextColor(t.Accent).NoWrap()
+					}
+				})
+				if sw.Clicked() {
+					a.switchAccount(grp.provider, profileID)
+				}
+			}
+			if index, err := strconv.Atoi(strings.TrimPrefix(selected.account.Key, "devin-")); strings.HasPrefix(selected.account.Key, "devin-") && err == nil {
+				remove := ui.ButtonBase(c.Key("rm/"+selected.account.Key)).Padding(0, 4).Border(0, ui.Color{}).Background(ui.Color{}).TextColor(faintText)
+				if remove.Hovered() {
+					remove.TextColor(quotaRose)
+				}
+				remove.Children(func() { ui.Text(c, a.t("Remove", "移除")).FontSize(11).NoWrap() })
+				if remove.Clicked() {
+					if err := quota.RemoveDevinAccount(index); err != nil {
+						a.message = err.Error()
+					} else {
+						a.refreshQuota(true)
+					}
+				}
+			}
+		})
+
+		// 3. Quota windows body for selected account
+		a.singleAccountBody(c, selected)
+	})
+}
+
+func (a *App) singleAccountBody(c *ui.Context, ar accountResult) {
+	t := c.Theme()
+	faintText := faint(t)
+	if ar.err != nil {
+		ui.Text(c, fmt.Sprintf(a.t("Query failed: %s", "查询失败：%s"), ar.err)).FontSize(11.5).TextColor(quotaRose)
+		return
+	}
+	r := ar.result
+	ui.Column(c).Gap(8).Children(func() {
+		for _, w := range r.Windows {
+			a.quotaWindow(c, w)
+		}
+		switch {
+		case len(r.Windows) == 0 && r.Plan == "API MODE":
+			ui.Row(c).Gap(6).Padding(4, 0).AlignItems(ui.Center).Children(func() {
+				ui.Icon(c, checkIcon).Size(12, 12).TextColor(quotaGreen)
+				ui.Text(c, a.t("Pay-as-you-go API · no window limits", "按量直连模式 · 无窗口速率限制")).FontSize(11.5).TextColor(t.TextMuted)
+			})
+		case len(r.Windows) == 0 && a.busy["quota"]:
+			ui.Row(c).Gap(6).Padding(4, 0).AlignItems(ui.Center).Children(func() {
+				ui.Spinner(c)
+				ui.Text(c, a.t("Querying quota…", "正在查询配额…")).FontSize(11.5).TextColor(t.TextMuted)
+			})
+		case len(r.Windows) == 0:
+			ui.Text(c, a.t("No record", "无记录")).FontSize(11.5).TextColor(faintText)
+		}
+	})
+	if r.Extra == "" && r.Stale == "" && r.Reset == nil {
+		return
+	}
+	ui.Spacer(c)
+	ui.Column(c).Gap(4).Padding(8, 0, 0, 0).BorderWidth(1, 0, 0, 0).BorderColor(ui.Hex("#1a1e2a")).Children(func() {
+		if r.Reset != nil {
+			a.claudeResetBar(c, ar.account, *r.Reset, r.Windows)
+		}
+		if r.Extra != "" {
+			ui.Text(c, fmt.Sprintf(a.t("Extra: %s", "附加：%s"), r.Extra)).FontSize(11).MinWidth(0).TextColor(faintText)
+		}
+		if r.Stale != "" {
+			age := a.duration(max(r.StaleAge, 60))
+			text := fmt.Sprintf(a.t("Cached data (%s ago) - refresh failed: %s", "缓存数据（%s前），本次查询失败：%s"), age, r.Stale)
+			if r.RetryIn > 0 {
+				text = fmt.Sprintf(a.t("Cached data (%s ago) - rate limited, retry in %s", "缓存数据（%s前），被限流，%s后重试"), age, a.duration(max(r.RetryIn, 60)))
+			}
+			ui.Text(c, text).FontSize(11).MinWidth(0).TextColor(quotaAmber)
+		}
+	})
 }
 
 func (a *App) keychainBanner(c *ui.Context) {
@@ -208,92 +564,6 @@ func (a *App) keychainBanner(c *ui.Context) {
 			}
 			if textButton(c, a.t("Not now", "暂不"), false).Height(24).Clicked() {
 				a.quotaUI.keychainDismissed = true
-			}
-		})
-	})
-}
-
-func (a *App) quotaCard(c *ui.Context, ar accountResult) {
-	t := c.Theme()
-	faintText := faint(t)
-	r := ar.result
-	card := ui.Column(c).MinWidth(0).Padding(14, 16).Gap(12).Radius(6).Background(t.Surface).Border(1, t.Border).Shadow(0, 1, 3, 0, ui.Hex("#000000").Alpha(.2))
-	switch {
-	case ar.err == nil && quotaAlert(r):
-		card.Border(1, quotaRose.Alpha(.4))
-	case card.Hovered():
-		card.Border(1, strongBorder)
-	}
-	brand := providerColor(ar.account.Provider)
-	card.Label(providerName(ar.account.Provider) + " · " + ar.account.Label).Children(func() {
-		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Column(c).Size(22, 22).Shrink(0).Radius(5).Background(ui.Hex("#171b24")).Border(1, ui.Hex("#232938")).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
-				if logo := providerLogos[providerName(ar.account.Provider)]; logo != nil {
-					ui.Image(c, logo).Size(14, 14)
-				} else {
-					ui.Text(c, strings.ToUpper(providerName(ar.account.Provider)[:1])).FontSize(10).FixedLineHeight(12).Bold().TextColor(brand)
-				}
-			})
-			ui.Text(c, providerName(ar.account.Provider)).FontSize(13).FontWeight(600).NoWrap()
-			ui.Text(c, ar.account.Label).FontSize(11).Grow(1).MinWidth(0).SingleLine().TextColor(faintText)
-			if r.Plan != "" && ar.err == nil {
-				tag := ui.Text(c, strings.ToUpper(r.Plan)).FontSize(10).FontWeight(600).Padding(1, 6).Radius(3).Background(controlColor).Border(1, ui.Hex("#242c3d")).TextColor(faintText).NoWrap()
-				if r.Plan != "API MODE" {
-					tag.Background(t.Accent.Alpha(.08)).Border(1, t.Accent.Alpha(.25)).TextColor(t.Accent)
-				}
-			}
-			// Saved Devin cookies are removable; the CLI login is not.
-			if index, err := strconv.Atoi(strings.TrimPrefix(ar.account.Key, "devin-")); strings.HasPrefix(ar.account.Key, "devin-") && err == nil {
-				remove := ui.ButtonBase(c).Padding(0, 4).Border(0, ui.Color{}).Background(ui.Color{}).TextColor(faintText)
-				if remove.Hovered() {
-					remove.TextColor(quotaRose)
-				}
-				remove.Children(func() { ui.Text(c, a.t("Remove", "移除")).FontSize(11).NoWrap() })
-				if remove.Clicked() {
-					if err := quota.RemoveDevinAccount(index); err != nil {
-						a.message = err.Error()
-					} else {
-						a.refreshQuota(true)
-					}
-				}
-			}
-		})
-		if ar.err != nil {
-			ui.Text(c, fmt.Sprintf(a.t("Query failed: %s", "查询失败：%s"), ar.err)).FontSize(11.5).TextColor(quotaRose)
-			return
-		}
-		ui.Column(c).Gap(8).Children(func() {
-			for _, w := range r.Windows {
-				a.quotaWindow(c, w)
-			}
-			switch {
-			case len(r.Windows) == 0 && r.Plan == "API MODE":
-				ui.Row(c).Gap(6).Padding(4, 0).AlignItems(ui.Center).Children(func() {
-					ui.Icon(c, checkIcon).Size(12, 12).TextColor(quotaGreen)
-					ui.Text(c, a.t("Pay-as-you-go API · no window limits", "按量直连模式 · 无窗口速率限制")).FontSize(11.5).TextColor(t.TextMuted)
-				})
-			case len(r.Windows) == 0:
-				ui.Text(c, a.t("No record", "无记录")).FontSize(11.5).TextColor(faintText)
-			}
-		})
-		if r.Extra == "" && r.Stale == "" && r.Reset == nil {
-			return
-		}
-		ui.Spacer(c)
-		ui.Column(c).Gap(4).Padding(8, 0, 0, 0).BorderWidth(1, 0, 0, 0).BorderColor(ui.Hex("#1a1e2a")).Children(func() {
-			if r.Reset != nil {
-				a.claudeResetBar(c, ar.account, *r.Reset, r.Windows)
-			}
-			if r.Extra != "" {
-				ui.Text(c, fmt.Sprintf(a.t("Extra: %s", "附加：%s"), r.Extra)).FontSize(11).MinWidth(0).TextColor(faintText)
-			}
-			if r.Stale != "" {
-				age := a.duration(max(r.StaleAge, 60))
-				text := fmt.Sprintf(a.t("Cached data (%s ago) - refresh failed: %s", "缓存数据（%s前），本次查询失败：%s"), age, r.Stale)
-				if r.RetryIn > 0 {
-					text = fmt.Sprintf(a.t("Cached data (%s ago) - rate limited, retry in %s", "缓存数据（%s前），被限流，%s后重试"), age, a.duration(max(r.RetryIn, 60)))
-				}
-				ui.Text(c, text).FontSize(11).MinWidth(0).TextColor(quotaAmber)
 			}
 		})
 	})

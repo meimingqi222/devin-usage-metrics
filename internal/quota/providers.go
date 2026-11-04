@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -113,10 +114,19 @@ func openLogin(a Account) (*oauthLogin, error) {
 	case "claude":
 		l.c = obj(d["claudeAiOauth"])
 		l.tokenKey, l.expiryKey, l.refreshKey = "accessToken", "expiresAt", "refreshToken"
+	case "codex":
+		// Codex keeps OAuth tokens under "tokens"; older/API documents are
+		// flat. Accept both so switching does not depend on one shape.
+		if tokens := obj(d["tokens"]); tokens != nil {
+			l.c = tokens
+		}
 	case "grok":
 		l.entryKey, l.c = grokEntry(d)
 		l.tokenKey, l.expiryKey = "key", "expires_at"
 	case "antigravity":
+		if tok := obj(d["token"]); tok != nil {
+			l.c = tok
+		}
 		l.expiryKey = "expiry_date"
 	}
 	if l.c == nil {
@@ -218,9 +228,42 @@ func (l *oauthLogin) refresh(ctx context.Context) error {
 		l.d[l.entryKey] = c
 	}
 	if !strings.HasPrefix(a.source, "keychain:") && filepath.Ext(a.source) != ".vscdb" {
+		// Another login or a switch may have replaced the live document
+		// while the refresh was in flight. Only write back the same login.
+		if current, _, ce := loadAccountSource(a); ce != nil || refreshTokenOf(a.Provider, current) != rt {
+			return nil
+		}
 		_ = atomicWrite(a.source, l.d)
 	}
 	return nil
+}
+
+// refreshTokenOf is the token a provider's document rotates on refresh.
+func refreshTokenOf(provider string, d object) string {
+	switch provider {
+	case "claude":
+		return str(at(d, "claudeAiOauth", "refreshToken"))
+	case "codex":
+		if token := str(at(d, "tokens", "refresh_token")); token != "" {
+			return token
+		}
+		return str(d["refresh_token"])
+	case "grok":
+		_, entry := grokEntry(d)
+		return str(entry["refresh_token"])
+	case "antigravity":
+		if token := obj(d["token"]); token != nil {
+			return str(token["refresh_token"])
+		}
+		return str(d["refresh_token"])
+	}
+	return ""
+}
+
+func antigravityUserAgent() string {
+	arch := runtime.GOARCH
+	osName := runtime.GOOS
+	return fmt.Sprintf("antigravity/hub/4.5.0 (aidev_client; os_type=%s; arch=%s; cl=998881661)", osName, arch)
 }
 
 // requestUsage asks a provider for its quota, as its own CLI does; h is
@@ -240,8 +283,11 @@ func requestUsage(ctx context.Context, provider string, h map[string]string) (ob
 		h["User-Agent"] = "grok-pager/0.2.91 grok-shell/0.2.91 (windows; x86_64)"
 		return jsonRequest(ctx, "GET", "https://cli-chat-proxy.grok.com/v1/billing?format=credits", "", h, false)
 	case "antigravity":
-		h["User-Agent"] = "antigravity/2.11.0"
-		h["x-goog-api-client"] = "antigravity/2.11.0"
+		// The official hub UA is version-gated: older values hide Gemini 4
+		// Argon from both the model list and its model-level quota.
+		ua := antigravityUserAgent()
+		h["User-Agent"] = ua
+		h["x-goog-api-client"] = ua
 		return jsonRequest(ctx, "POST", "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary", "{}", h, false)
 	}
 	return nil, errors.New("unsupported provider")
@@ -273,6 +319,15 @@ func finishUsage(ctx context.Context, a Account, usage object, h map[string]stri
 	case "grok":
 		m, _ := jsonRequest(ctx, "GET", "https://cli-chat-proxy.grok.com/v1/billing", "", h, false)
 		return ParseGrokBilling(usage, m), nil
+	case "antigravity":
+		r := ParseAntigravityQuota(usage)
+		// The summary endpoint omits model-only pools (notably Gemini 4
+		// Argon). The model list carries their quotaInfo; merge it when the
+		// summary has no matching group.
+		if models, err := jsonRequest(ctx, "POST", "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels", "{}", h, false); err == nil {
+			r.Windows = append(r.Windows, antigravityModelWindows(models, r.Windows)...)
+		}
+		return r, nil
 	}
 	return ParseAntigravityQuota(usage), nil
 }
@@ -501,6 +556,50 @@ func ParseGrokBilling(v, m object) Result {
 	}
 	return r
 }
+
+// antigravityModelWindows adds model-level pools the summary endpoint does
+// not list, such as Gemini 4 Argon, once per distinct pool.
+func antigravityModelWindows(v object, have []Window) []Window {
+	seen := map[string]bool{}
+	for _, w := range have {
+		if strings.Contains(strings.ToLower(w.Label), "argon") {
+			return nil // the summary already lists this model pool
+		}
+		seen[strings.ToLower(w.Label)] = true
+	}
+	var out []Window
+	for id, raw := range obj(v["models"]) {
+		m := obj(raw)
+		name := str(m["displayName"])
+		label := strings.ToLower(id + " " + name)
+		if !strings.Contains(label, "argon") && !strings.Contains(label, "gemini-4") && !strings.Contains(label, "gemini 4") {
+			continue
+		}
+		q := obj(m["quotaInfo"])
+		frac, ok := q["remainingFraction"].(float64)
+		if !ok {
+			continue
+		}
+		if name == "" {
+			name = id
+		}
+		if at := strings.Index(name, " ("); at > 0 {
+			name = name[:at]
+		}
+		if seen[strings.ToLower(name)] {
+			continue
+		}
+		key := fmt.Sprintf("%s|%.4f|%d", strings.ToLower(name), frac, when(q["resetTime"]))
+		if seen[key] {
+			continue
+		}
+		seen[strings.ToLower(name)] = true
+		seen[key] = true
+		out = append(out, Window{Label: name, UsedPercent: max(0, min(999, (1-frac)*100)), ResetsAt: when(q["resetTime"])})
+	}
+	return out
+}
+
 func ParseAntigravityQuota(v object) Result {
 	r := Result{}
 	for _, g := range arr(v["groups"]) {

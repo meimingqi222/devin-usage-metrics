@@ -22,6 +22,11 @@ type Account struct {
 	source   string
 }
 
+// ProfileAccount returns an Account pointing to a locally saved profile credential.
+func ProfileAccount(key, provider, label, path string) Account {
+	return Account{Key: key, Provider: provider, Label: label, source: path}
+}
+
 func (a Account) String() string   { return a.Provider + ": " + a.Label }
 func (a Account) GoString() string { return a.String() }
 
@@ -225,8 +230,8 @@ func Fetch(ctx context.Context, a Account, force bool) (Result, error) {
 		defer saveQuotaCache(a, key, s)
 	}
 	r, e := fetch(ctx, a)
-	if a.Provider == "claude" && quotaKey(a) != key {
-		// A refresh or external CLI login changed credentials in flight. Do
+	if quotaKey(a) != key {
+		// A refresh or external login changed credentials in flight. Do
 		// not associate the new login's answer with the original cache key.
 		return r, e
 	}

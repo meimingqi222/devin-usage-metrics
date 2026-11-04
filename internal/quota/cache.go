@@ -8,16 +8,14 @@ import (
 	"time"
 )
 
-// Claude caches are credential-scoped. Only hashes, quota values and timestamps
-// reach disk, never OAuth tokens or upstream error bodies. A changed credential
-// pair cannot inherit another login's cached values or cooldown.
+// Quota caches are credential-scoped. Only hashes, quota values and timestamps
+// reach disk, never OAuth tokens or upstream error bodies. quotaKey binds a
+// cache to the account's stable identity, not its path: switching accounts in
+// one live file must not inherit the previous one's cached values or cooldown.
+// Providers without identity claims fall back to their tokens in
+// credentialIdentity.
 func quotaKey(a Account) string {
 	identity := credentialIdentity(a)
-	if a.Provider == "claude" {
-		d, _ := loadAccount(a)
-		c := obj(d["claudeAiOauth"])
-		identity = str(c["accessToken"]) + "\x00" + str(c["refreshToken"])
-	}
 	fingerprint := sha256.Sum256([]byte(a.source + "\x00" + identity))
 	return fmt.Sprintf("%s:%x", a.Key, fingerprint)
 }

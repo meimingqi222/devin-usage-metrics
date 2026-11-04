@@ -191,6 +191,20 @@ func (a *App) settingsSync(c *ui.Context) {
 
 func (a *App) settingsGeneral(c *ui.Context) {
 	ui.Column(c).Gap(16).Padding(4, 0).Children(func() {
+		ui.Column(c).Gap(6).Children(func() {
+			ui.Text(c, a.t("Agents", "Agent")).FontSize(12).TextColor(c.Theme().TextMuted)
+			ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
+				status := a.t("Off · read-only", "未启用 · 只读")
+				if a.accountStore.Enabled() {
+					status = fmt.Sprintf(a.t("On · %d accounts", "已启用 · %d 个账号"), len(a.profiles))
+				}
+				ui.Text(c, status).FontSize(12).Grow(1)
+				if settingsButton(c, a.t("Manage accounts", "管理账号"), false).Clicked() {
+					a.openAccounts()
+				}
+			})
+			ui.Text(c, a.t("Switching moves the agents' own sign-ins. Running sessions keep their account until restarted.", "切换会写入 Agent 自己的登录；已运行的会话在重启前仍使用原账号。")).FontSize(11).TextColor(faint(c.Theme()))
+		})
 		ui.Column(c).Gap(8).Children(func() {
 			ui.Text(c, a.t("Language", "语言")).FontSize(12).TextColor(c.Theme().TextMuted)
 			ui.Row(c).Gap(8).Children(func() {

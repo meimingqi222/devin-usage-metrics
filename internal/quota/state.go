@@ -111,7 +111,13 @@ func readAntigravityStateToken(path string) (object, error) {
 		}
 		access, refresh := stateFirst(info, 1), stateFirst(info, 3)
 		if len(access) > 0 && utf8.Valid(access) && utf8.Valid(refresh) {
-			return object{"access_token": string(access), "refresh_token": string(refresh)}, nil
+			doc := object{"access_token": string(access), "refresh_token": string(refresh)}
+			// The state database also names the account; keep it with the
+			// token so profiles can tell two Antigravity accounts apart.
+			if email := readAntigravityStateEmail(path); email != "" {
+				doc["email"] = email
+			}
+			return doc, nil
 		}
 	}
 	return nil, errors.New("Antigravity current login token unavailable; reopen Antigravity and sign in")
