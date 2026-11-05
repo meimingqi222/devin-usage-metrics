@@ -107,7 +107,7 @@ func loadDBs(ctx context.Context, d *model.Data, a model.Agent, refresh bool, pr
 	case model.ZCode:
 		paths = []string{home(".zcode/cli/db/db.sqlite"), home("Library/Application Support/zcode/cli/db/db.sqlite")}
 	case model.Dim:
-		paths = []string{home(".dimcode-alpha/rust/dimcode.sqlite"), home(".dimcode/rust/dimcode.sqlite")}
+		paths = []string{home(".dimcode-alpha/rust/dimcode.sqlite"), home(".dimcode/rust/dimcode.sqlite"), home(".dimcode/v2/dimcode.sqlite")}
 	default:
 		base := os.Getenv("XDG_DATA_HOME")
 		if base == "" {
@@ -177,7 +177,7 @@ func loadDBs(ctx context.Context, d *model.Data, a model.Agent, refresh bool, pr
 					}
 				}
 				cached = databaseCache{signatures[p], base}
-			} else if previous != nil && len(existing) == 1 && a != model.Antigravity {
+			} else if previous != nil && len(existing) == 1 && a != model.Antigravity && a != model.Dim {
 				cached = databaseCache{signatures[p], *previous}
 			}
 			covered := cached.Data.TurnsStart <= d.TurnsStart && cached.Data.TurnsEnd >= min(d.TurnsEnd, time.Now().Unix())
@@ -749,13 +749,83 @@ func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source strin
 }
 
 func dimSource(p string) string {
-	if strings.Contains(p, "dimcode-alpha") {
+	p = filepath.ToSlash(p)
+	switch {
+	case strings.Contains(p, "dimcode-alpha"):
 		return "dimcode-alpha"
+	case strings.Contains(p, "/v2/"):
+		return "dimcode-desktop"
+	default:
+		return "dimcode"
 	}
-	return "dimcode"
+}
+
+func dimOpen(sessions map[string]*model.Session, source, id string) *model.Session {
+	if s := sessions[id]; s != nil {
+		return s
+	}
+	s := session(model.Dim, id)
+	s.Source = source
+	s.Key = source + "/" + id
+	sessions[id] = s
+	return s
+}
+
+func dimCost(v any) *float64 {
+	if v == nil {
+		return nil
+	}
+	n := num(v)
+	return &n
+}
+
+func dimRecord(d *model.Data, s *model.Session, t model.Turn) {
+	if t.CreatedAt < d.TurnsStart || t.CreatedAt >= d.TurnsEnd {
+		return
+	}
+	if t.Model == "" || t.Model == "unknown" {
+		if s.SelectedModel != "" {
+			t.Model = s.SelectedModel
+		} else {
+			t.Model = "unknown"
+		}
+	}
+	if s.SelectedModel == "" {
+		s.SelectedModel = t.Model
+	}
+	observe(s, t.CreatedAt)
+	add(s, t)
+	d.Turns = append(d.Turns, t)
+}
+
+func dimKeep(d *model.Data, sessions map[string]*model.Session) {
+	for _, s := range sessions {
+		if s.AgentMessages == 0 {
+			continue
+		}
+		if s.Title == "" {
+			s.Title = s.ID
+		}
+		d.Sessions = append(d.Sessions, *s)
+	}
 }
 
 func parseDim(ctx context.Context, d *model.Data, db *sqlite.DB, source string) {
+	names := map[string]bool{}
+	for _, r := range query(ctx, d, model.Dim, db, "dim_schema", "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('timeline_events', 'usage_run_stats', 'usage_ledger')") {
+		names[str(r["name"])] = true
+	}
+	switch {
+	case names["timeline_events"]:
+		parseDimCLI(ctx, d, db, source)
+	case names["usage_run_stats"] || names["usage_ledger"]:
+		parseDimDesktop(ctx, d, db, source, names)
+	default:
+		fail(d, model.Dim, "unrecognized DimAgent database")
+	}
+}
+
+func parseDimCLI(ctx context.Context, d *model.Data, db *sqlite.DB, source string) {
 	a := model.Dim
 	sessions := map[string]*model.Session{}
 	for _, r := range query(ctx, d, a, db, "dim_sessions", "SELECT s.session_id, s.created_at_ms, m.title, c.cwd, c.updated_at_ms, json_extract(s.config, '$.model.providerId') AS provider_id, json_extract(s.config, '$.model.modelId') AS model_id FROM agent_sessions s LEFT JOIN session_metadata m ON m.session_id = s.session_id LEFT JOIN session_catalog c ON c.session_id = s.session_id") {
@@ -763,9 +833,7 @@ func parseDim(ctx context.Context, d *model.Data, db *sqlite.DB, source string) 
 		if id == "" {
 			continue
 		}
-		s := session(a, id)
-		s.Source = source
-		s.Key = source + "/" + id
+		s := dimOpen(sessions, source, id)
 		s.Title = str(r["title"])
 		s.WorkingDirectory = str(r["cwd"])
 		s.CreatedAt = ts(r["created_at_ms"])
@@ -774,7 +842,6 @@ func parseDim(ctx context.Context, d *model.Data, db *sqlite.DB, source string) 
 			s.LastActivityAt = s.CreatedAt
 		}
 		s.SelectedModel = modelName(str(r["provider_id"]), str(r["model_id"]))
-		sessions[id] = s
 	}
 	models := map[string]string{}
 	for _, r := range query(ctx, d, a, db, "dim_model_calls", "SELECT json_extract(body, '$.record.event.data.request_id') AS request_id, json_extract(body, '$.record.event.data.request.providerId') AS provider_id, json_extract(body, '$.record.event.data.request.modelId') AS model_id FROM timeline_events WHERE branch_id = 'main' AND kind = 'model/call'") {
@@ -795,38 +862,52 @@ func parseDim(ctx context.Context, d *model.Data, db *sqlite.DB, source string) 
 			continue
 		}
 		seen[key] = true
-		at := ts(r["create_at"])
-		if at < d.TurnsStart || at >= d.TurnsEnd {
-			continue
-		}
-		sid := str(r["session_id"])
-		s := sessions[sid]
-		if s == nil {
-			s = session(a, sid)
-			s.Source = source
-			s.Key = source + "/" + sid
-			sessions[sid] = s
-		}
 		cache := num(r["cache_read_tokens"])
-		prompt := num(r["prompt_tokens"])
-		t := model.Turn{Agent: a, SessionKey: s.Key, CreatedAt: at, Model: models[req], InputTokens: max(0, prompt-cache), OutputTokens: num(r["completion_tokens"]), CacheReadTokens: cache, DedupKey: key}
-		if t.Model == "" {
-			t.Model = s.SelectedModel
-		}
-		if t.Model == "" {
-			t.Model = "unknown"
-		}
-		observe(s, at)
-		add(s, t)
-		d.Turns = append(d.Turns, t)
+		s := dimOpen(sessions, source, str(r["session_id"]))
+		dimRecord(d, s, model.Turn{Agent: a, SessionKey: s.Key, CreatedAt: ts(r["create_at"]), Model: models[req], InputTokens: max(0, num(r["prompt_tokens"])-cache), OutputTokens: num(r["completion_tokens"]), CacheReadTokens: cache, DedupKey: key})
 	}
-	for _, s := range sessions {
-		if s.AgentMessages == 0 {
+	dimKeep(d, sessions)
+}
+
+func parseDimDesktop(ctx context.Context, d *model.Data, db *sqlite.DB, source string, tables map[string]bool) {
+	a := model.Dim
+	sessions := map[string]*model.Session{}
+	for _, r := range query(ctx, d, a, db, "dim_desktop_sessions", "SELECT sessionId, cwd, title, createdAt, updatedAt FROM sessions") {
+		id := str(r["sessionId"])
+		if id == "" {
 			continue
 		}
-		if s.Title == "" {
-			s.Title = s.ID
+		s := dimOpen(sessions, source, id)
+		s.Title = str(r["title"])
+		s.WorkingDirectory = str(r["cwd"])
+		s.CreatedAt = ts(r["createdAt"])
+		s.LastActivityAt = ts(r["updatedAt"])
+		if s.LastActivityAt == 0 {
+			s.LastActivityAt = s.CreatedAt
 		}
-		d.Sessions = append(d.Sessions, *s)
 	}
+	seen := map[string]bool{}
+	addRow := func(sid, provider, modelID string, at int64, prompt, out, cache, write float64, cost *float64, key string) {
+		if key == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		s := dimOpen(sessions, source, sid)
+		dimRecord(d, s, model.Turn{Agent: a, SessionKey: s.Key, CreatedAt: at, Model: modelName(provider, modelID), InputTokens: max(0, prompt-cache), OutputTokens: out, CacheReadTokens: cache, CacheCreationTokens: write, RecordedCost: cost, DedupKey: key})
+	}
+	if tables["usage_run_stats"] {
+		for _, r := range query(ctx, d, a, db, "dim_desktop_run_stats", "SELECT runId, sessionId, providerId, modelId, startedAt, endedAt, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, json_extract(cost, '$.totalCostUsd') AS total_cost FROM usage_run_stats") {
+			addRow(str(r["sessionId"]), str(r["providerId"]), str(r["modelId"]), ts(first(r["endedAt"], r["startedAt"])), num(r["inputTokens"]), num(r["outputTokens"]), num(r["cacheReadTokens"]), num(r["cacheWriteTokens"]), dimCost(r["total_cost"]), str(r["runId"]))
+		}
+	}
+	if len(seen) == 0 && tables["usage_ledger"] {
+		for _, r := range query(ctx, d, a, db, "dim_desktop_ledger", "SELECT ledgerId, sessionId, runId, providerId, modelId, createdAt, json_extract(usage, '$.promptTokens') AS prompt_tokens, json_extract(usage, '$.completionTokens') AS completion_tokens, json_extract(usage, '$.cacheReadTokens') AS cache_read_tokens, json_extract(cost, '$.totalCostUsd') AS total_cost FROM usage_ledger WHERE ledgerId NOT LIKE 'plugin_%' OR coalesce(runId, '') NOT IN (SELECT runId FROM usage_ledger WHERE ledgerId NOT LIKE 'plugin_%' AND ifnull(runId, '') != '')") {
+			key := str(r["runId"])
+			if key == "" {
+				key = str(r["ledgerId"])
+			}
+			addRow(str(r["sessionId"]), str(r["providerId"]), str(r["modelId"]), ts(r["createdAt"]), num(r["prompt_tokens"]), num(r["completion_tokens"]), num(r["cache_read_tokens"]), 0, dimCost(r["total_cost"]), key)
+		}
+	}
+	dimKeep(d, sessions)
 }

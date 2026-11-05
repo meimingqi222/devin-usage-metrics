@@ -701,3 +701,118 @@ func TestDimModelUsageTurns(t *testing.T) {
 		t.Fatalf("turn %+v", r)
 	}
 }
+
+func TestDimDesktopRunStatsIgnoresPluginLedger(t *testing.T) {
+	h := env(t)
+	conn := db(t, h, ".dimcode/v2/dimcode.sqlite")
+	exec(t, conn, "CREATE TABLE sessions (sessionId TEXT, cwd TEXT, title TEXT, createdAt TEXT, updatedAt TEXT)")
+	exec(t, conn, "CREATE TABLE usage_run_stats (runId TEXT, sessionId TEXT, providerId TEXT, modelId TEXT, status TEXT, startedAt TEXT, endedAt TEXT, inputTokens REAL, outputTokens REAL, totalTokens REAL, cacheReadTokens REAL, cacheWriteTokens REAL, cost TEXT)")
+	exec(t, conn, "CREATE TABLE usage_ledger (ledgerId TEXT, sessionId TEXT, runId TEXT, providerId TEXT, modelId TEXT, usage TEXT, cost TEXT, createdAt TEXT)")
+	exec(t, conn, "INSERT INTO sessions VALUES ('desk-1', '/work', 'Desktop chat', '2023-11-14T22:13:20Z', '2023-11-14T22:14:00Z')")
+	exec(t, conn, "INSERT INTO sessions VALUES ('desk-empty', '/work', 'Idle', '2023-11-14T22:13:20Z', '2023-11-14T22:13:20Z')")
+	exec(t, conn, "INSERT INTO usage_run_stats VALUES ('run-1', 'desk-1', 'grok-build', 'grok-4.6', 'completed', '2023-11-14T22:13:20Z', '2023-11-14T22:14:00Z', 100, 20, 120, 30, 0, '{\"totalCostUsd\":0.01}')")
+	exec(t, conn, "INSERT INTO usage_ledger VALUES ('plugin_ledger_1', 'desk-1', 'run-1', 'grok-build', 'grok-4.6', '{\"promptTokens\":740,\"completionTokens\":9,\"totalTokens\":749,\"cacheReadTokens\":512}', NULL, '2023-11-14T22:13:21Z')")
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d := data.Load(model.Dim, 0, 2000000000, true)
+	check(t, d, 1)
+	if len(d.Sessions) != 1 || d.Sessions[0].Key != "dimcode-desktop/desk-1" || d.Sessions[0].Title != "Desktop chat" {
+		t.Fatalf("sessions %+v", d.Sessions)
+	}
+	r := d.Turns[0]
+	if r.InputTokens != 70 || r.OutputTokens != 20 || r.CacheReadTokens != 30 || r.Model != "grok-build/grok-4.6" || r.DedupKey != "run-1" || r.RecordedCost == nil || *r.RecordedCost != 0.01 {
+		t.Fatalf("turn %+v", r)
+	}
+}
+
+func TestDimDesktopLedgerSkipsPluginWhenRunExists(t *testing.T) {
+	h := env(t)
+	conn := db(t, h, ".dimcode/v2/dimcode.sqlite")
+	exec(t, conn, "CREATE TABLE sessions (sessionId TEXT, cwd TEXT, title TEXT, createdAt TEXT, updatedAt TEXT)")
+	exec(t, conn, "CREATE TABLE usage_ledger (ledgerId TEXT, sessionId TEXT, runId TEXT, providerId TEXT, modelId TEXT, usage TEXT, cost TEXT, createdAt TEXT)")
+	exec(t, conn, "INSERT INTO sessions VALUES ('desk-1', '/work', 'Ledger only', '2023-11-14T22:13:20Z', '2023-11-14T22:14:00Z')")
+	exec(t, conn, "INSERT INTO usage_ledger VALUES ('usage_run_1', 'desk-1', 'run-1', 'grok-build', 'grok-4.6', ?, NULL, '2023-11-14T22:14:00Z')", `{"promptTokens":100,"completionTokens":20,"totalTokens":120,"cacheReadTokens":30}`)
+	exec(t, conn, "INSERT INTO usage_ledger VALUES ('plugin_ledger_1', 'desk-1', 'run-1', 'grok-build', 'grok-4.6', ?, NULL, '2023-11-14T22:13:21Z')", `{"promptTokens":740,"completionTokens":9,"totalTokens":749,"cacheReadTokens":512}`)
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d := data.Load(model.Dim, 0, 2000000000, true)
+	check(t, d, 1)
+	r := d.Turns[0]
+	if r.InputTokens != 70 || r.DedupKey != "run-1" {
+		t.Fatalf("turn %+v", r)
+	}
+}
+
+func TestDimLoadsCLIAndDesktopTogether(t *testing.T) {
+	h := env(t)
+	cli := db(t, h, ".dimcode-alpha/rust/dimcode.sqlite")
+	exec(t, cli, "CREATE TABLE agent_sessions (session_id TEXT PRIMARY KEY, config TEXT, created_at_ms INTEGER, origin TEXT)")
+	exec(t, cli, "CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, revision INTEGER, title TEXT, title_source TEXT)")
+	exec(t, cli, "CREATE TABLE session_catalog (session_id TEXT PRIMARY KEY, updated_at_ms INTEGER, preview TEXT, cwd TEXT)")
+	exec(t, cli, "CREATE TABLE timeline_events (session_id TEXT, branch_id TEXT, sequence INTEGER, last_sequence INTEGER, kind TEXT, body TEXT, event_id TEXT)")
+	exec(t, cli, "INSERT INTO agent_sessions VALUES ('cli-1', '{\"model\":{\"providerId\":\"grok-build\",\"modelId\":\"grok-4.6\"}}', 1700000000000, 'client')")
+	exec(t, cli, "INSERT INTO session_metadata VALUES ('cli-1', 1, 'CLI', 'auto')")
+	exec(t, cli, "INSERT INTO session_catalog VALUES ('cli-1', 1700000100000, 'hi', '/cli')")
+	usage := `{"encoding":"event","record":{"event":{"id":"u1","sequence":1,"create_at":1700000060000,"type":"model","name":"usage","data":{"request_id":"req-cli","usage":{"promptTokens":10,"completionTokens":2,"totalTokens":12,"cacheReadTokens":0}}}}}`
+	exec(t, cli, "INSERT INTO timeline_events VALUES ('cli-1','main',1,1,'model/usage',?, 'u1')", usage)
+	if err := cli.Close(); err != nil {
+		t.Fatal(err)
+	}
+	desk := db(t, h, ".dimcode/v2/dimcode.sqlite")
+	exec(t, desk, "CREATE TABLE sessions (sessionId TEXT, cwd TEXT, title TEXT, createdAt TEXT, updatedAt TEXT)")
+	exec(t, desk, "CREATE TABLE usage_run_stats (runId TEXT, sessionId TEXT, providerId TEXT, modelId TEXT, startedAt TEXT, endedAt TEXT, inputTokens REAL, outputTokens REAL, cacheReadTokens REAL, cacheWriteTokens REAL, cost TEXT)")
+	exec(t, desk, "INSERT INTO sessions VALUES ('desk-1', '/desk', 'Desktop', '2023-11-14T22:13:20Z', '2023-11-14T22:14:00Z')")
+	exec(t, desk, "INSERT INTO usage_run_stats VALUES ('run-1', 'desk-1', 'grok-build', 'grok-4.6', '2023-11-14T22:13:20Z', '2023-11-14T22:14:00Z', 8, 1, 0, 0, NULL)")
+	if err := desk.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d := data.Load(model.Dim, 0, 2000000000, true)
+	check(t, d, 2)
+	keys := map[string]bool{}
+	for _, s := range d.Sessions {
+		keys[s.Key] = true
+	}
+	if !keys["dimcode-alpha/cli-1"] || !keys["dimcode-desktop/desk-1"] || len(d.Sessions) != 2 {
+		t.Fatalf("keys %+v sessions %+v", keys, d.Sessions)
+	}
+}
+
+func TestDimDroppingDesktopDoesNotKeepStaleSessions(t *testing.T) {
+	h := env(t)
+	cli := db(t, h, ".dimcode-alpha/rust/dimcode.sqlite")
+	exec(t, cli, "CREATE TABLE agent_sessions (session_id TEXT PRIMARY KEY, config TEXT, created_at_ms INTEGER, origin TEXT)")
+	exec(t, cli, "CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, revision INTEGER, title TEXT, title_source TEXT)")
+	exec(t, cli, "CREATE TABLE session_catalog (session_id TEXT PRIMARY KEY, updated_at_ms INTEGER, preview TEXT, cwd TEXT)")
+	exec(t, cli, "CREATE TABLE timeline_events (session_id TEXT, branch_id TEXT, sequence INTEGER, last_sequence INTEGER, kind TEXT, body TEXT, event_id TEXT)")
+	exec(t, cli, "INSERT INTO agent_sessions VALUES ('cli-1', '{}', 1700000000000, 'client')")
+	exec(t, cli, "INSERT INTO session_metadata VALUES ('cli-1', 1, 'CLI', 'auto')")
+	exec(t, cli, "INSERT INTO session_catalog VALUES ('cli-1', 1700000100000, 'hi', '/cli')")
+	usage := `{"encoding":"event","record":{"event":{"id":"u1","sequence":1,"create_at":1700000060000,"type":"model","name":"usage","data":{"request_id":"req-cli","usage":{"promptTokens":10,"completionTokens":2,"totalTokens":12,"cacheReadTokens":0}}}}}`
+	exec(t, cli, "INSERT INTO timeline_events VALUES ('cli-1','main',1,1,'model/usage',?, 'u1')", usage)
+	if err := cli.Close(); err != nil {
+		t.Fatal(err)
+	}
+	desk := db(t, h, ".dimcode/v2/dimcode.sqlite")
+	exec(t, desk, "CREATE TABLE sessions (sessionId TEXT, cwd TEXT, title TEXT, createdAt TEXT, updatedAt TEXT)")
+	exec(t, desk, "CREATE TABLE usage_run_stats (runId TEXT, sessionId TEXT, providerId TEXT, modelId TEXT, startedAt TEXT, endedAt TEXT, inputTokens REAL, outputTokens REAL, cacheReadTokens REAL, cacheWriteTokens REAL, cost TEXT)")
+	exec(t, desk, "INSERT INTO sessions VALUES ('desk-1', '/desk', 'Desktop', '2023-11-14T22:13:20Z', '2023-11-14T22:14:00Z')")
+	exec(t, desk, "INSERT INTO usage_run_stats VALUES ('run-1', 'desk-1', 'grok-build', 'grok-4.6', '2023-11-14T22:13:20Z', '2023-11-14T22:14:00Z', 8, 1, 0, 0, NULL)")
+	if err := desk.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d := data.Load(model.Dim, 0, 2000000000, true)
+	if len(d.Sessions) != 2 {
+		t.Fatalf("setup sessions %+v", d.Sessions)
+	}
+	deskPath := filepath.Join(h, ".dimcode/v2/dimcode.sqlite")
+	for _, p := range []string{deskPath, deskPath + "-wal", deskPath + "-shm"} {
+		_ = os.Remove(p)
+	}
+	d = data.Reload(model.Dim, 0, 2000000000)
+	check(t, d, 1)
+	if len(d.Sessions) != 1 || d.Sessions[0].Key != "dimcode-alpha/cli-1" {
+		t.Fatalf("stale desktop session remained: %+v", d.Sessions)
+	}
+}

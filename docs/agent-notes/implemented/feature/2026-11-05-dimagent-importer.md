@@ -4,20 +4,29 @@ Status: implemented
 
 ## Problem
 
-DimAgent stores turns in `~/.dimcode-alpha/rust/dimcode.sqlite` (stable: `~/.dimcode/rust/dimcode.sqlite`) as timeline events, not JSONL. Without an importer those sessions are invisible in Agent Usage Metrics.
+DimAgent stores usage in two product homes with different schemas. The alpha CLI (`dima`) writes `~/.dimcode-alpha/rust/dimcode.sqlite` timeline events; the desktop app writes `~/.dimcode/v2/dimcode.sqlite` (`usage_run_stats` / `usage_ledger`). Treating them as two agents would split one product; reading only the CLI home hides desktop sessions.
 
 ## Decision
 
-`model.Dim` (`dim`, label DimAgent) is the twelfth local agent. `parseDim` reads `agent_sessions` plus `model/call` and `model/usage` rows on branch `main`. Each `request_id` becomes one turn: `promptTokens - cacheReadTokens` as input, `completionTokens` as output, `cacheReadTokens` as cache reads. The model id comes from the matching `model/call` (`providerId/modelId`). Titles and cwd come from `session_metadata` / `session_catalog`. Both product-home databases are scanned when present. No Rust counterpart.
+One agent: `model.Dim` (`dim`, label DimAgent). Both homes are scanned when present. Session keys keep the source (`dimcode-alpha/…`, `dimcode-desktop/…`) so CLI and desktop rows never collide.
+
+- **CLI.** `parseDimCLI` reads `model/call` + `model/usage` on branch `main`. One turn per `request_id`. Input is `promptTokens - cacheReadTokens`.
+- **Desktop.** `parseDimDesktop` prefers `usage_run_stats` (one turn per `runId`). `plugin_` ledger rows for the same run are ignored; ledger is only a fallback when run stats are absent. `inputTokens` on run stats is the prompt total (includes cache), same split as CLI. Recorded cost is `cost.totalCostUsd` when present.
+
+Empty sessions with no usage are omitted. Snapshot version 8 rebuilds caches that only knew the CLI home. A mixed CLI+desktop snapshot is not reused as a single remaining database; dropping the desktop file must not keep those sessions.
 
 ## Alternatives considered
 
-Treating Dim as Devin sessions.db would miss the timeline event schema. Counting `context/budget` estimates would invent tokens that were never billed.
+Two sidebar agents (dima vs DimAgent). Same company and product name; users would think they installed two tools. Per-call desktop rows from `messages` are not a usage log.
 
 ## Consequences
 
-Missing Dim databases surface as the usual source-not-found error. Compacted or failed model calls still count when a `model/usage` event exists.
+Failed compaction without `model/usage` is still omitted. Desktop granularity is per run, not per inner model call.
 
 ## Verification
 
 - `internal/data/data_test.go::TestDimModelUsageTurns`
+- `internal/data/data_test.go::TestDimDesktopRunStatsIgnoresPluginLedger`
+- `internal/data/data_test.go::TestDimDesktopLedgerSkipsPluginWhenRunExists`
+- `internal/data/data_test.go::TestDimLoadsCLIAndDesktopTogether`
+- `internal/data/data_test.go::TestDimDroppingDesktopDoesNotKeepStaleSessions`
