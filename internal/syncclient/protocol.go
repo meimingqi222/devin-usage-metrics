@@ -622,3 +622,14 @@ func (t transport) put(ctx context.Context, name string, b []byte, h map[string]
 	}
 	return statusError(s)
 }
+
+func (t transport) delete(ctx context.Context, name string) error {
+	_, _, s, e := t.request(ctx, "DELETE", "/v1/objects/"+url.PathEscape(name), nil, nil)
+	if e != nil {
+		return e
+	}
+	if s == 200 || s == 204 || s == 404 {
+		return nil
+	}
+	return statusError(s)
+}

@@ -52,7 +52,7 @@ func (m *memoryAccountPasswords) Delete(scope string) error {
 func settleAccountSync(t *testing.T, a *App) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
-	for a.busy["account-sync"] || a.busy["account-restore"] {
+	for a.busy["account-sync"] || a.busy["account-restore"] || a.busy["account-prune"] || a.busy["account-drop-own"] {
 		a.drain()
 		if time.Now().After(deadline) {
 			t.Fatal("account sync worker did not finish")

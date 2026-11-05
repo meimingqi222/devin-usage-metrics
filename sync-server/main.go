@@ -478,8 +478,14 @@ func (s *server) object(w http.ResponseWriter, r *http.Request) {
 		s.read(w, r, path)
 	case http.MethodPut:
 		s.write(w, r, path)
+	case http.MethodDelete:
+		s.removeAccountBackup(w, path, name)
 	default:
-		w.Header().Set("Allow", "GET, HEAD, PUT")
+		allow := "GET, HEAD, PUT"
+		if accountBackupObject(name) {
+			allow += ", DELETE"
+		}
+		w.Header().Set("Allow", allow)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
@@ -637,6 +643,41 @@ func (s *server) write(w http.ResponseWriter, r *http.Request, path string) {
 		_ = s.writeMigrationMarker(filepath.Dir(path), filepath.Base(path), time.Now())
 	}
 	w.Header().Set("ETag", etag)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// removeAccountBackup deletes one encrypted account snapshot. Usage CAS
+// objects stay undeletable so a client cannot punch holes in the manifest graph.
+func (s *server) removeAccountBackup(w http.ResponseWriter, path, name string) {
+	if !accountBackupObject(name) {
+		w.Header().Set("Allow", "GET, HEAD, PUT")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	tenant := filepath.Base(filepath.Dir(path))
+	state := s.tenantState(tenant)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err != nil {
+		http.Error(w, "read object", http.StatusInternalServerError)
+		return
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		http.Error(w, "delete object", http.StatusInternalServerError)
+		return
+	}
+	s.etags.Delete(path)
+	if state.usageReady {
+		state.bytes -= info.Size()
+		if state.objects > 0 {
+			state.objects--
+		}
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

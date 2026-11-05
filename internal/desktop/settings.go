@@ -34,6 +34,8 @@ func (a *App) cancelSettings() {
 	// Closing settings abandons an unanswered disable confirmation; the switch
 	// stays on and sync continues.
 	a.accountSync.pendingOff = false
+	a.accountSync.pendingDropUnreadable = false
+	a.accountSync.pendingDropForeign = false
 }
 
 func (a *App) saveSettings() bool {
@@ -143,11 +145,23 @@ func (a *App) settingsView(c *ui.Context) {
 		a.cancelSettings()
 	}
 	if a.settings && a.accountSync.pendingOff {
-		text := a.t("Turn off account sync? This device stops sending account changes to your other devices, and the sync password remembered here is removed. Saved accounts stay on this device.", "关闭账号同步？本设备将停止向其他设备同步账号更改，并删除本机记住的同步密码。已保存的账号不受影响。")
+		text := a.t("Turn off account sync? This device stops sending account changes to your other devices, removes its encrypted snapshot from the server, and deletes the sync password remembered here. Saved accounts stay on this device.", "关闭账号同步？本设备将停止向其他设备同步账号更改，删除服务器上本机的加密快照，并删除本机记住的同步密码。已保存的账号不受影响。")
 		if ui.AlertDialog(c, &a.accountSync.pendingOff, a.t("Turn off account sync", "关闭账号同步"), text, a.t("Cancel", "取消"), a.t("Turn off", "关闭同步")) == 1 {
 			if err := a.disableAccountSync(); err != nil {
 				a.message = err.Error()
 			}
+		}
+	}
+	if a.settings && a.accountSync.pendingDropUnreadable {
+		text := a.t("Remove cloud copies this password cannot open? Devices still using the old password will re-upload after they enter the new one. Accounts already on this device stay.", "移除当前密码无法解开的云端快照？仍使用旧密码的设备在输入新密码后会重新上传。本机已保存的账号不受影响。")
+		if ui.AlertDialog(c, &a.accountSync.pendingDropUnreadable, a.t("Remove unread snapshots", "移除无法解开的快照"), text, a.t("Cancel", "取消"), a.t("Remove", "移除")) == 1 {
+			a.dropUnreadableAccountSnapshots()
+		}
+	}
+	if a.settings && a.accountSync.pendingDropForeign {
+		text := a.t("Remove other devices' encrypted snapshots from the server? Those devices re-upload on their next sync. This device's snapshot and saved accounts stay.", "从服务器移除其他设备的加密快照？那些设备下次同步时会重新上传。本机快照和已保存账号不受影响。")
+		if ui.AlertDialog(c, &a.accountSync.pendingDropForeign, a.t("Remove other devices' snapshots", "移除其他设备的快照"), text, a.t("Cancel", "取消"), a.t("Remove", "移除")) == 1 {
+			a.dropForeignAccountSnapshots()
 		}
 	}
 	a.updateDialog(c)

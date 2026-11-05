@@ -206,3 +206,27 @@ func TestAccountBackupFreshnessAndEncryptedFile(t *testing.T) {
 		t.Fatal("newest credential snapshot did not win")
 	}
 }
+
+func TestCredentialTimeDoesNotAdvanceOnReload(t *testing.T) {
+	fixture(t)
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	doc := backupFixture().Entries[0].Credential
+	if _, err := s.Add("claude", doc, "file"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s = Open()
+	if _, err := s.Add("claude", doc, "file"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.Snapshot()
+	if err != nil || after.Entries[0].ModifiedAt != before.Entries[0].ModifiedAt {
+		t.Fatal("reloading the store advanced credential time for an unchanged document")
+	}
+}

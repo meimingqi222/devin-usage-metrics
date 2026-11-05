@@ -130,8 +130,8 @@ func TestAccountSyncMergesConcurrentRenameAndTokenRefresh(t *testing.T) {
 	refresh := backupFixture()
 	refresh.Entries[0].ModifiedAt = 400
 	obj(refresh.Entries[0].Credential["claudeAiOauth"])["accessToken"] = "refreshed"
-	a := MergeBackups(base, rename, refresh)
-	b := MergeBackups(refresh, rename, base)
+	a := MergeSync(base, rename, refresh)
+	b := MergeSync(refresh, rename, base)
 	aj, _ := json.Marshal(a)
 	bj, _ := json.Marshal(b)
 	if !bytes.Equal(aj, bj) {
@@ -167,5 +167,119 @@ func TestAccountSyncDeletionSurvivesQuotaDiscoveryAndExplicitRestore(t *testing.
 	r, err := s.ApplySync(deleted)
 	if err != nil || r.Removed != 0 || len(s.List()) != 1 {
 		t.Fatal("explicit capture could not restore a previously deleted account")
+	}
+}
+
+func TestAccountSyncStableIdentityAndReadd(t *testing.T) {
+	token1 := backupFixture()
+	token2 := backupFixture()
+	obj(token2.Entries[0].Credential["claudeAiOauth"])["accessToken"] = "rotated-token"
+	token2.Entries[0].ModifiedAt = token1.Entries[0].ModifiedAt + 10
+	merged := MergeSync(token1, token2)
+	claude := 0
+	for _, e := range merged.Entries {
+		if e.Provider != "claude" {
+			continue
+		}
+		claude++
+		if str(obj(e.Credential["claudeAiOauth"])["accessToken"]) != "rotated-token" {
+			t.Fatal("token refresh did not keep the newer credential")
+		}
+	}
+	if claude != 1 {
+		t.Fatalf("token refresh forked a second account: %d", claude)
+	}
+	opaque := Backup{Version: 1, Entries: []BackupEntry{
+		{Provider: "codex", ModifiedAt: 1, Credential: map[string]any{"tokens": map[string]any{"access_token": "one"}}},
+		{Provider: "codex", ModifiedAt: 2, Credential: map[string]any{"tokens": map[string]any{"access_token": "two"}}},
+	}}
+	if n := len(MergeBackups(opaque).Entries); n != 2 {
+		t.Fatalf("file merge dropped opaque credentials: %d", n)
+	}
+	if n := len(MergeSync(opaque).Entries); n != 0 {
+		t.Fatalf("sync merge published accounts without a stable identity: %d", n)
+	}
+
+	s, first := syncStore(t)
+	second, err := s.Add("claude", map[string]any{"claudeAiOauth": map[string]any{"emailAddress": "other@example.test", "accessToken": "other-access", "refreshToken": "other-refresh"}}, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, err := s.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var remoteEntries []BackupEntry
+	for _, e := range local.Entries {
+		if e.Provider == first.Provider && str(obj(e.Credential["claudeAiOauth"])["emailAddress"]) == first.Email {
+			remoteEntries = append(remoteEntries, e)
+		}
+	}
+	r, err := s.ApplySync(Backup{Version: 1, Entries: remoteEntries})
+	if err != nil || r.Removed != 0 || len(s.List()) != 2 {
+		t.Fatalf("absence deleted an account the user never removed: %+v %v", r, err)
+	}
+
+	if err := s.Remove("claude", second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Add("claude", map[string]any{"claudeAiOauth": map[string]any{"emailAddress": "other@example.test", "accessToken": "restored-access", "refreshToken": "other-refresh"}}, "file"); err != nil {
+		t.Fatal(err)
+	}
+	stale := Backup{Version: 1, Deleted: map[string]int64{syncIdentity(BackupEntry{Provider: "claude", Credential: map[string]any{"claudeAiOauth": map[string]any{"emailAddress": "other@example.test", "accessToken": "other-access", "refreshToken": "other-refresh"}}}): 1}}
+	r, err = s.ApplySync(stale)
+	if err != nil || r.Removed != 0 {
+		t.Fatalf("re-added account lost to an older tombstone: %+v %v", r, err)
+	}
+	found := false
+	for _, p := range s.List() {
+		if p.Email == "other@example.test" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("re-added account was not kept")
+	}
+}
+
+func TestAccountSyncMatchesStableIDAndIgnoresUntouchedMtime(t *testing.T) {
+	fixture(t)
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.Add("codex", map[string]any{"tokens": map[string]any{"access_token": "one"}}, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.data.Profiles[0].StableID = "codex@example.test"
+	s.data.Profiles[0].Email = "codex@example.test"
+	before, err := s.Snapshot()
+	if err != nil || len(before.Entries) != 1 {
+		t.Fatalf("file snapshot: %v", err)
+	}
+	if len(Syncable(before).Entries) != 0 {
+		t.Fatal("sync snapshot published an account without a stable identity claim")
+	}
+	future := time.Now().Add(time.Hour)
+	if err := os.Chtimes(s.CredentialPath(p.Provider, p.ID), future, future); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.Snapshot()
+	if err != nil || after.Entries[0].ModifiedAt != before.Entries[0].ModifiedAt {
+		t.Fatal("mtime-only touch advanced credential time")
+	}
+	remote := Backup{Version: 1, Entries: []BackupEntry{{
+		Provider:   "codex",
+		ModifiedAt: time.Now().Add(time.Second).UnixNano(),
+		Credential: map[string]any{"tokens": map[string]any{"access_token": "two"}, "email": "codex@example.test"},
+	}}}
+	r, err := s.ApplySync(remote)
+	if err != nil || r.Added != 0 || r.Updated != 1 || len(s.List()) != 1 {
+		t.Fatalf("stable identity was not matched in place: %+v %v", r, err)
+	}
+	doc, err := s.ProfileCredential("codex", p.ID)
+	if err != nil || str(obj(doc["tokens"])["access_token"]) != "two" {
+		t.Fatal("matched account did not take the newer credential")
 	}
 }

@@ -46,3 +46,31 @@ func TestEncryptedAccountBackupRetentionAndCapability(t *testing.T) {
 		t.Fatal("capability bypassed sync authentication")
 	}
 }
+
+func TestDeleteEncryptedAccountBackupOnly(t *testing.T) {
+	handler := newTestServer(t)
+	valid := "accounts-v1-" + strings.Repeat("a", 64) + ".json"
+	if got := request(handler, http.MethodPut, "/v1/objects/"+valid, `{"ciphertext":"fixture"}`, nil); got.Code != http.StatusNoContent {
+		t.Fatalf("put backup: %d", got.Code)
+	}
+	if got := request(handler, http.MethodDelete, "/v1/objects/"+valid, "", nil); got.Code != http.StatusNoContent {
+		t.Fatalf("delete backup: %d", got.Code)
+	}
+	if got := request(handler, http.MethodGet, "/v1/objects/"+valid, "", nil); got.Code != http.StatusNotFound {
+		t.Fatalf("deleted backup still present: %d", got.Code)
+	}
+	if got := request(handler, http.MethodDelete, "/v1/objects/"+valid, "", nil); got.Code != http.StatusNoContent {
+		t.Fatalf("idempotent delete: %d", got.Code)
+	}
+	if got := request(handler, http.MethodPut, "/v1/objects/orphan", "usage", nil); got.Code != http.StatusNoContent {
+		t.Fatalf("put usage: %d", got.Code)
+	}
+	if got := request(handler, http.MethodDelete, "/v1/objects/orphan", "", nil); got.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("usage delete allowed: %d", got.Code)
+	}
+	unauthorized := httptest.NewRecorder()
+	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodDelete, "/v1/objects/"+valid, nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatal("delete bypassed sync authentication")
+	}
+}

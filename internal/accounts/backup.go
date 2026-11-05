@@ -22,11 +22,12 @@ import (
 )
 
 const (
-	MaxBackupBytes    = 16 << 20
-	MaxBackupAccounts = 512
-	maxPlainBytes     = 8 << 20
-	backupRounds      = 600_000
-	backupDomain      = "aum-account-backup-v1"
+	MaxBackupBytes     = 16 << 20
+	MaxSyncObjectBytes = 8 << 20 // matches sync-server maxObjectBytes
+	MaxBackupAccounts  = 512
+	maxPlainBytes      = 8 << 20
+	backupRounds       = 600_000
+	backupDomain       = "aum-account-backup-v1"
 )
 
 var (
@@ -213,10 +214,15 @@ func (s *Store) snapshotLocked() (Backup, error) {
 			continue
 		}
 		stamp := p.ModifiedAt
-		// Quota refresh can rotate the saved credential directly. The file's
-		// timestamp catches those writes as well as changes through this Store.
-		if info, err := os.Stat(s.credentialPath(p.Provider, p.ID)); err == nil {
-			stamp = max(stamp, info.ModTime().UnixNano())
+		hash := docHash(doc)
+		// Advance credTime only when the document bytes changed. A quota
+		// refresh that rewrites the file with new tokens is a change; a
+		// touch that only bumps mtime is not.
+		if p.Credentials != "" && hash != p.Credentials {
+			stamp = max(stamp, time.Now().UnixNano())
+			if info, err := os.Stat(s.credentialPath(p.Provider, p.ID)); err == nil {
+				stamp = max(stamp, info.ModTime().UnixNano())
+			}
 		}
 		b.Entries = append(b.Entries, BackupEntry{Provider: p.Provider, Name: p.Name, ModifiedAt: stamp, Credential: doc, NameModifiedAt: p.NameModifiedAt})
 	}
@@ -228,13 +234,63 @@ func backupIdentity(e BackupEntry) string {
 	return e.Provider + "/" + profileID(e.Provider, id, e.Credential, docHash(e.Credential))
 }
 
-// MergeBackups reconciles credentials, names and deletions independently.
+// syncIdentity is the LWW key for cross-device sync: provider plus the
+// provider's stable account claim. Token bytes never participate, so a
+// refresh cannot fork a second account. Credentials without a stable
+// claim are local-only and must not enter the merged snapshot.
+func syncIdentity(e BackupEntry) string {
+	id := credentialid.Of(e.Provider, e.Credential)
+	if id.Stable == "" {
+		return ""
+	}
+	return e.Provider + "/" + profileID(e.Provider, id, e.Credential, "")
+}
+
+func profileSyncKey(p Profile, doc map[string]any) string {
+	if key := syncIdentity(BackupEntry{Provider: p.Provider, Credential: doc}); key != "" {
+		return key
+	}
+	if p.StableID != "" {
+		return p.Provider + "/" + profileID(p.Provider, credentialid.Identity{Stable: p.StableID}, nil, "")
+	}
+	return ""
+}
+
+// Syncable drops credentials that have no stable identity. File import still
+// carries them; account sync must not, because a token hash is not an identity.
+func Syncable(b Backup) Backup {
+	out := Backup{Version: b.Version, Entries: []BackupEntry{}, Deleted: maps.Clone(b.Deleted)}
+	for _, e := range b.Entries {
+		if syncIdentity(e) == "" {
+			continue
+		}
+		out.Entries = append(out.Entries, e)
+	}
+	return out
+}
+
+// MergeBackups unions portable file backups, including opaque credentials
+// keyed by document hash so a manual import can still restore them.
 func MergeBackups(backups ...Backup) Backup {
+	return mergeBackups(backupIdentity, backups...)
+}
+
+// MergeSync is the account-sync merge: LWW on credential time and name time
+// independently, tombstones versus credTime, identity by StableID only.
+// Absence of an account is not a deletion.
+func MergeSync(backups ...Backup) Backup {
+	return mergeBackups(syncIdentity, backups...)
+}
+
+func mergeBackups(identity func(BackupEntry) string, backups ...Backup) Backup {
 	entries := map[string]BackupEntry{}
 	deleted := map[string]int64{}
 	for _, b := range backups {
 		for _, e := range b.Entries {
-			key := backupIdentity(e)
+			key := identity(e)
+			if key == "" {
+				continue
+			}
 			old, exists := entries[key]
 			if !exists {
 				entries[key] = e
@@ -333,7 +389,7 @@ func (s *Store) ImportBackup(b Backup) (added, kept int, err error) {
 			doc = maps.Clone(doc)
 			doc["email"] = id.Email
 		}
-		p := Profile{ID: pid, Provider: e.Provider, Label: profileLabel(e.Provider, id, pid), Email: id.Email, StableID: id.Stable, Plan: id.Plan, Name: e.Name, Kind: kind, CreatedAt: time.Now().Unix(), ModifiedAt: e.ModifiedAt, NameModifiedAt: e.NameModifiedAt, Imported: true}
+		p := Profile{ID: pid, Provider: e.Provider, Label: profileLabel(e.Provider, id, pid), Email: id.Email, StableID: id.Stable, Plan: id.Plan, Name: e.Name, Kind: kind, CreatedAt: time.Now().Unix(), ModifiedAt: e.ModifiedAt, NameModifiedAt: e.NameModifiedAt, Credentials: docHash(doc), Imported: true}
 		if beforeDeleted[key] > 0 {
 			p.ModifiedAt = max(time.Now().UnixNano(), beforeDeleted[key]+1)
 		}

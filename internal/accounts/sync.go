@@ -45,22 +45,28 @@ func (s *Store) ApplySync(remote Backup) (result SyncResult, err error) {
 	if err != nil {
 		return result, err
 	}
-	merged := MergeBackups(local, remote)
+	merged := MergeSync(Syncable(local), Syncable(remote))
 	if err = validateBackup(merged); err != nil {
 		return
 	}
 	wanted := map[string]BackupEntry{}
 	for _, e := range merged.Entries {
-		wanted[backupIdentity(e)] = e
+		if key := syncIdentity(e); key != "" {
+			wanted[key] = e
+		}
 	}
-	profiles := make([]Profile, 0, len(wanted))
+	profiles := make([]Profile, 0, len(s.data.Profiles)+len(wanted))
 	var changes []credentialChange
 	for _, p := range s.data.Profiles {
 		doc, readErr := s.readCredential(p)
 		if readErr != nil {
 			return result, errors.New("could not read a saved account during sync")
 		}
-		key := backupIdentity(BackupEntry{Provider: p.Provider, Credential: doc})
+		key := profileSyncKey(p, doc)
+		if key == "" {
+			profiles = append(profiles, p)
+			continue
+		}
 		e, exists := wanted[key]
 		active := s.active[p.Provider] == p.ID
 		if !exists {
@@ -100,7 +106,7 @@ func (s *Store) ApplySync(remote Backup) (result SyncResult, err error) {
 		profiles = append(profiles, p)
 	}
 	for _, e := range merged.Entries {
-		if _, exists := wanted[backupIdentity(e)]; !exists {
+		if _, exists := wanted[syncIdentity(e)]; !exists {
 			continue
 		}
 		id := credentialid.Of(e.Provider, e.Credential)
@@ -108,7 +114,7 @@ func (s *Store) ApplySync(remote Backup) (result SyncResult, err error) {
 		if runtime.GOOS == "darwin" && (e.Provider == "claude" || e.Provider == "antigravity") {
 			kind = "keychain"
 		}
-		p := Profile{ID: profileID(e.Provider, id, e.Credential, docHash(e.Credential)), Provider: e.Provider, Kind: kind, Label: credentialid.Label(e.Provider, id), Email: id.Email, StableID: id.Stable, Plan: id.Plan, Name: e.Name, NameModifiedAt: e.NameModifiedAt, ModifiedAt: e.ModifiedAt, CreatedAt: time.Now().Unix(), Imported: true}
+		p := Profile{ID: profileID(e.Provider, id, e.Credential, docHash(e.Credential)), Provider: e.Provider, Kind: kind, Label: credentialid.Label(e.Provider, id), Email: id.Email, StableID: id.Stable, Plan: id.Plan, Name: e.Name, NameModifiedAt: e.NameModifiedAt, ModifiedAt: e.ModifiedAt, CreatedAt: time.Now().Unix(), Credentials: docHash(e.Credential), Imported: true}
 		path := s.credentialPath(p.Provider, p.ID)
 		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
 			return result, ErrBackupFileConflict

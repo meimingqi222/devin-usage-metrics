@@ -41,7 +41,7 @@ type Profile struct {
 	ModifiedAt     int64  `json:"credential_modified_at,omitempty"`
 	NameModifiedAt int64  `json:"name_modified_at,omitempty"`
 	Imported       bool   `json:"imported_backup,omitempty"`
-	Credentials    string `json:"-"` // runtime document hash for fallback matching
+	Credentials    string `json:"-"` // last saved document hash; sync credTime advances only when this changes
 	Active         bool   `json:"-"`
 	Writable       bool   `json:"-"`
 	Reason         string `json:"-"`
@@ -153,7 +153,11 @@ func (s *Store) Add(provider string, doc map[string]any, kind string) (Profile, 
 	if err != nil {
 		return Profile{}, err
 	}
-	key := backupIdentity(BackupEntry{Provider: provider, Credential: doc})
+	entry := BackupEntry{Provider: provider, Credential: doc}
+	key := syncIdentity(entry)
+	if key == "" {
+		key = backupIdentity(entry)
+	}
 	if deletedAt := s.data.Deleted[key]; deletedAt > 0 {
 		p.ModifiedAt = max(time.Now().UnixNano(), deletedAt+1)
 		for i := range s.data.Profiles {
@@ -247,7 +251,11 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 		hash := docHash(doc)
 		// A normal quota refresh must not recreate an account removed by sync.
 		// Signing in/capturing explicitly goes through Add and restores it.
-		key := backupIdentity(BackupEntry{Provider: a.Provider, Credential: doc})
+		entry := BackupEntry{Provider: a.Provider, Credential: doc}
+		key := syncIdentity(entry)
+		if key == "" {
+			key = backupIdentity(entry)
+		}
 		if s.data.Deleted[key] > 0 {
 			for _, p := range s.data.Profiles {
 				if p.Provider != a.Provider {
@@ -684,7 +692,12 @@ func (s *Store) upsertLocked(provider string, doc map[string]any, kind, hash str
 			continue
 		}
 		p.Kind = kind
-		p.Credentials = hash
+		if p.Credentials != hash {
+			if p.Credentials != "" {
+				p.ModifiedAt = time.Now().UnixNano()
+			}
+			p.Credentials = hash
+		}
 		if id.Email != "" && !strings.EqualFold(p.Email, id.Email) {
 			p.Email = id.Email
 		}
@@ -708,7 +721,7 @@ func (s *Store) upsertLocked(provider string, doc map[string]any, kind, hash str
 	p := Profile{
 		ID: pid, Provider: provider, Label: profileLabel(provider, id, pid),
 		Email: id.Email, StableID: id.Stable, Plan: id.Plan, Kind: kind,
-		CreatedAt: now, Credentials: hash,
+		CreatedAt: now, ModifiedAt: time.Now().UnixNano(), Credentials: hash,
 	}
 	if err := s.writeCredential(p, doc); err != nil {
 		return Profile{}, err

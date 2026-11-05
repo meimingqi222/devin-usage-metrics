@@ -40,8 +40,10 @@ type accountSyncState struct {
 	// pendingOff holds the switch-off confirmation; disabling happens only
 	// after the user accepts, because it also deletes the remembered password.
 	pendingOff bool
-	lastAt     time.Time
-	result     syncclient.AccountSyncResult
+	// pendingDropUnreadable / pendingDropForeign confirm pruning remote snapshots.
+	pendingDropUnreadable, pendingDropForeign bool
+	lastAt                                    time.Time
+	result                                    syncclient.AccountSyncResult
 }
 
 func (a *App) openAccountBackup(mode string) {
@@ -69,7 +71,83 @@ func (a *App) disableAccountSync() error {
 		return err
 	}
 	a.forgetAccountPassword(scope)
+	a.dropOwnAccountSnapshot()
 	return nil
+}
+
+func (a *App) dropOwnAccountSnapshot() {
+	if a.busy["account-drop-own"] {
+		return
+	}
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.work("account-drop-own", func() func() {
+		err := syncclient.DeleteOwnAccountSnapshotIfDisabled(ctx)
+		return func() {
+			if err != nil && !errors.Is(err, syncclient.ErrNotSignedIn) && !errors.Is(err, context.Canceled) {
+				a.accountSync.detail = err.Error()
+			}
+		}
+	})
+}
+
+func (a *App) dropUnreadableAccountSnapshots() {
+	if a.busy["account-prune"] || a.accountSync.password == "" {
+		return
+	}
+	password, prev, generation := a.accountSync.password, a.accountSync.prevPassword, a.accountSync.generation
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.work("account-prune", func() func() {
+		dropped, err := syncclient.DropUnreadableAccountSnapshots(ctx, password, prev)
+		return func() {
+			if generation != a.accountSync.generation {
+				return
+			}
+			if err != nil {
+				a.accountSync.message, a.accountSync.detail, a.accountSync.failed = a.accountBackupError(err), a.accountBackupErrorDetail(err), true
+				return
+			}
+			a.accountSync.result.Unreadable = 0
+			if dropped > 0 {
+				a.accountSync.message = fmt.Sprintf(a.t("Removed %d unread snapshot(s).", "已移除 %d 个无法解开的快照。"), dropped)
+				a.accountSync.failed = false
+			}
+			a.syncAccounts()
+		}
+	})
+}
+
+func (a *App) dropForeignAccountSnapshots() {
+	if a.busy["account-prune"] {
+		return
+	}
+	generation := a.accountSync.generation
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.work("account-prune", func() func() {
+		dropped, err := syncclient.DropForeignAccountSnapshots(ctx)
+		return func() {
+			if generation != a.accountSync.generation {
+				return
+			}
+			if err != nil {
+				a.accountSync.message, a.accountSync.detail, a.accountSync.failed = a.accountBackupError(err), a.accountBackupErrorDetail(err), true
+				return
+			}
+			if dropped > 0 {
+				a.accountSync.message = fmt.Sprintf(a.t("Removed %d other device snapshot(s).", "已移除 %d 台其他设备的快照。"), dropped)
+				a.accountSync.failed = false
+			}
+			a.syncAccounts()
+		}
+	})
 }
 
 func (a *App) forgetAccountPassword(scope string) {
@@ -252,7 +330,7 @@ func (a *App) accountBackupError(err error) string {
 	case errors.Is(err, syncclient.ErrServerTooOld):
 		return a.t("Update your sync server to use encrypted account sync.", "请先升级同步服务器，再使用加密账号同步。")
 	case errors.Is(err, syncclient.ErrTooManyDevices):
-		return a.t("Too many devices are syncing accounts (up to 64). Remove unused devices on the server first.", "同步账号的设备太多（最多 64 台），请先清理服务器上不再使用的设备。")
+		return a.t("Too many devices are syncing accounts (up to 64). Remove other devices' snapshots in Account sync details.", "同步账号的设备太多（最多 64 台），请在账号同步详情中移除其他设备的快照。")
 	case errors.Is(err, syncclient.ErrTooManyRemote), errors.Is(err, accounts.ErrTooManySavedAccounts):
 		return a.t("Too many saved accounts to sync (up to 512).", "要同步的账号太多（最多 512 个）。")
 	case errors.Is(err, accounts.ErrBackupFileConflict):
@@ -608,6 +686,9 @@ func (a *App) accountSyncSettings(c *ui.Context) {
 		}
 		if st.result.Unreadable > 0 && !st.failed && !st.locked {
 			ui.Text(c, fmt.Sprintf(a.t("Snapshots from %d device(s) could not be read with the current password; they may still use the old one. Enter the new password there to finish the change.", "%d 台设备的快照无法用当前密码解开，可能仍在使用旧密码；在那边输入新密码即完成更换。"), st.result.Unreadable)).FontSize(10.5).TextColor(c.Theme().TextMuted)
+			if settingsButton(c, a.t("Remove unread snapshots", "移除无法解开的快照"), false).Disabled(a.busy["account-prune"]).Clicked() {
+				a.accountSync.pendingDropUnreadable = true
+			}
 		}
 		ui.Row(c).Gap(8).Children(func() {
 			if cfg.Enabled && ready {
@@ -642,6 +723,11 @@ func (a *App) accountSyncSettings(c *ui.Context) {
 			ui.Text(c, a.t("Your current agent sign-ins stay unchanged.", "Agent 当前的登录不会被切换。")).FontSize(10.5).TextColor(faint(c.Theme()))
 			if settingsButton(c, a.t("Sync password settings", "同步密码设置"), false).Clicked() {
 				a.openAccountBackup("sync")
+			}
+			if st.failed && strings.Contains(st.message, "64") {
+				if settingsButton(c, a.t("Remove other devices' snapshots", "移除其他设备的快照"), false).Disabled(a.busy["account-prune"]).Clicked() {
+					a.accountSync.pendingDropForeign = true
+				}
 			}
 		}
 	})

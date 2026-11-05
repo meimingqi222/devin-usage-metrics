@@ -21,10 +21,10 @@ import (
 const accountTestPassword = "fixture123" // Exercise sync at the 10-character minimum.
 
 type accountServerFixture struct {
-	mu      sync.Mutex
-	objects map[string][]byte
-	writes  int
-	capable bool
+	mu              sync.Mutex
+	objects         map[string][]byte
+	writes, deletes int
+	capable         bool
 }
 
 func (s *accountServerFixture) serve(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +52,10 @@ func (s *accountServerFixture) serve(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "PUT" {
 			s.objects[name], _ = io.ReadAll(r.Body)
 			s.writes++
+			w.WriteHeader(http.StatusNoContent)
+		} else if r.Method == "DELETE" {
+			delete(s.objects, name)
+			s.deletes++
 			w.WriteHeader(http.StatusNoContent)
 		} else if raw, ok := s.objects[name]; ok {
 			w.Write(raw)
@@ -285,5 +289,106 @@ func TestSyncAccountsPasswordRotation(t *testing.T) {
 		if bytes.Contains(raw, []byte(accountTestPassword)) || bytes.Contains(raw, []byte(newPassword)) {
 			t.Error("server received a password")
 		}
+	}
+}
+
+func TestDeleteOwnAccountSnapshotAndUnreadable(t *testing.T) {
+	cloud := &accountServerFixture{objects: map[string][]byte{}, capable: true}
+	ts := httptest.NewServer(http.HandlerFunc(cloud.serve))
+	defer ts.Close()
+	first, scope := accountSyncDevice(t, ts.URL, "device-one")
+	addSyncAccount(t, first, "first@example.test", "private-first-token")
+	if _, err := SyncAccounts(context.Background(), first, accountTestPassword, scope, ""); err != nil {
+		t.Fatal(err)
+	}
+	second, scope := accountSyncDevice(t, ts.URL, "device-two")
+	addSyncAccount(t, second, "second@example.test", "private-second-token")
+	if _, err := SyncAccounts(context.Background(), second, accountTestPassword, scope, ""); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := accounts.SealBackup(accounts.Backup{Version: 1}, "stale-password-xx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleName := "accounts-v1-" + strings.Repeat("b", 64) + ".json"
+	cloud.mu.Lock()
+	cloud.objects[staleName] = stale
+	cloud.mu.Unlock()
+	if dropped, err := DropUnreadableAccountSnapshots(context.Background(), accountTestPassword, ""); err != nil || dropped != 1 {
+		t.Fatalf("drop unreadable: dropped=%d err=%v", dropped, err)
+	}
+	cloud.mu.Lock()
+	if _, ok := cloud.objects[staleName]; ok {
+		t.Fatal("unreadable snapshot remains")
+	}
+	kept := len(cloud.objects)
+	cloud.mu.Unlock()
+	if kept != 2 {
+		t.Fatalf("readable snapshots were deleted: %d", kept)
+	}
+	if dropped, err := DropUnreadableAccountSnapshots(context.Background(), "incorrect-password", ""); !errors.Is(err, accounts.ErrBackupPassword) || dropped != 0 {
+		t.Fatalf("wrong password deleted snapshots: dropped=%d err=%v", dropped, err)
+	}
+	if err := DeleteAccountSnapshot(context.Background(), "v3-head-deadbeef.json"); err == nil {
+		t.Fatal("usage object name was accepted")
+	}
+	own, err := accountSnapshotName()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := DeleteOwnAccountSnapshotIfDisabled(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cloud.mu.Lock()
+	if _, ok := cloud.objects[own]; !ok {
+		t.Fatal("enabled sync still deleted this device snapshot")
+	}
+	cloud.mu.Unlock()
+	if err := SaveAccountSyncConfig(AccountSyncConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteOwnAccountSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cloud.mu.Lock()
+	defer cloud.mu.Unlock()
+	if _, ok := cloud.objects[own]; ok {
+		t.Fatal("this device's snapshot remains after DeleteOwn")
+	}
+	if cloud.deletes < 2 {
+		t.Fatalf("expected deletes, got %d", cloud.deletes)
+	}
+}
+
+func TestDropForeignAccountSnapshots(t *testing.T) {
+	cloud := &accountServerFixture{objects: map[string][]byte{}, capable: true}
+	ts := httptest.NewServer(http.HandlerFunc(cloud.serve))
+	defer ts.Close()
+	first, scope := accountSyncDevice(t, ts.URL, "device-one")
+	addSyncAccount(t, first, "first@example.test", "private-first-token")
+	if _, err := SyncAccounts(context.Background(), first, accountTestPassword, scope, ""); err != nil {
+		t.Fatal(err)
+	}
+	second, scope := accountSyncDevice(t, ts.URL, "device-two")
+	addSyncAccount(t, second, "second@example.test", "private-second-token")
+	if _, err := SyncAccounts(context.Background(), second, accountTestPassword, scope, ""); err != nil {
+		t.Fatal(err)
+	}
+	dropped, err := DropForeignAccountSnapshots(context.Background())
+	if err != nil || dropped != 1 {
+		t.Fatalf("drop foreign: dropped=%d err=%v", dropped, err)
+	}
+	own, err := accountSnapshotName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloud.mu.Lock()
+	defer cloud.mu.Unlock()
+	if len(cloud.objects) != 1 {
+		t.Fatalf("want 1 snapshot, got %d", len(cloud.objects))
+	}
+	if _, ok := cloud.objects[own]; !ok {
+		t.Fatal("this device's snapshot was deleted")
 	}
 }
