@@ -16,12 +16,13 @@ const (
 	Omp         Agent = "omp"
 	MimoCode    Agent = "mimocode"
 	WorkBuddy   Agent = "workbuddy"
+	Dim         Agent = "dim"
 )
 
-var Agents = []Agent{Devin, Claude, Codex, Antigravity, Grok, ZCode, OpenCode, Pi, Omp, MimoCode, WorkBuddy}
+var Agents = []Agent{Devin, Claude, Codex, Antigravity, Grok, ZCode, OpenCode, Pi, Omp, MimoCode, WorkBuddy, Dim}
 
 func (a Agent) Label() string {
-	labels := map[Agent]string{Devin: "Devin", Claude: "Claude Code", Codex: "Codex", Antigravity: "Antigravity", Grok: "Grok Build", ZCode: "ZCode", OpenCode: "OpenCode", Pi: "pi-agent", Omp: "omp", MimoCode: "MimoCode", WorkBuddy: "WorkBuddy"}
+	labels := map[Agent]string{Devin: "Devin", Claude: "Claude Code", Codex: "Codex", Antigravity: "Antigravity", Grok: "Grok Build", ZCode: "ZCode", OpenCode: "OpenCode", Pi: "pi-agent", Omp: "omp", MimoCode: "MimoCode", WorkBuddy: "WorkBuddy", Dim: "DimAgent"}
 	if s, ok := labels[a]; ok {
 		return s
 	}

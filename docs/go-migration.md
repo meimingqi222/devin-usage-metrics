@@ -6,7 +6,7 @@ The default desktop entry point, CI and release workflow now use Go. The new exe
 
 | Surface | Go owner | Validation |
 | --- | --- | --- |
-| Eleven local importers (omp is Go-only, no Rust counterpart), five-minute snapshots, device identity | `internal/data` | JSONL and read-only SQLite fixtures for all eleven agents |
+| Twelve local importers (omp and DimAgent are Go-only, no Rust counterpart), five-minute snapshots, device identity | `internal/data` | JSONL and read-only SQLite fixtures for the original eleven agents plus DimAgent `model/usage` events |
 | Pricing and local calendar aggregation | `internal/pricing`, `internal/analytics` | catalog, tier, missing-price, timezone/DST and device fixtures |
 | CLI arguments, inclusive dates, CSV/table output | `internal/cli` | public CLI tests using actual temporary transcripts |
 | Native usage/session/quota/compaction/settings views | `internal/desktop` | MyGo renderer and pointer/keyboard tests; Linux native window exercised |

@@ -252,7 +252,7 @@ func load(ctx context.Context, a model.Agent, start, end int64, lm loadMode) (re
 		// Decoded transcripts are keyed by size and mtime (and appends are
 		// verified), so a reload reuses them; only a full refresh decodes all.
 		sourceFiles = loadFiles(ctx, &d, a, refresh && !reuseUnchanged, previous, old.Files)
-	case model.Devin, model.ZCode, model.OpenCode, model.MimoCode, model.Antigravity:
+	case model.Devin, model.ZCode, model.OpenCode, model.MimoCode, model.Antigravity, model.Dim:
 		databases = loadDBs(ctx, &d, a, refresh, previous, old.Databases)
 	default:
 		fail(&d, a, "unsupported agent")

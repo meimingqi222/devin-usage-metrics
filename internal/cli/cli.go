@@ -68,7 +68,7 @@ func parse(args []string) (options, error) {
 		switch key {
 		case "--agent":
 			a := strings.ReplaceAll(strings.ToLower(v), "_", "-")
-			aliases := map[string]model.Agent{"all": "", "claude-code": model.Claude, "grok-build": model.Grok, "z-code": model.ZCode, "open-code": model.OpenCode, "pi-agent": model.Pi, "mimo-code": model.MimoCode, "mimo": model.MimoCode, "work-buddy": model.WorkBuddy, "wb": model.WorkBuddy, "codebuddy": model.WorkBuddy, "code-buddy": model.WorkBuddy}
+			aliases := map[string]model.Agent{"all": "", "claude-code": model.Claude, "grok-build": model.Grok, "z-code": model.ZCode, "open-code": model.OpenCode, "pi-agent": model.Pi, "mimo-code": model.MimoCode, "mimo": model.MimoCode, "work-buddy": model.WorkBuddy, "wb": model.WorkBuddy, "codebuddy": model.WorkBuddy, "code-buddy": model.WorkBuddy, "dimagent": model.Dim, "dim-agent": model.Dim, "dimcode": model.Dim}
 			for _, agent := range model.Agents {
 				aliases[string(agent)] = agent
 			}

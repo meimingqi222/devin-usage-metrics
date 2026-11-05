@@ -106,6 +106,8 @@ func loadDBs(ctx context.Context, d *model.Data, a model.Agent, refresh bool, pr
 		paths = files(d, a, []string{home(".gemini/antigravity/conversations"), home(".gemini/antigravity-cli/conversations")}, ".db")
 	case model.ZCode:
 		paths = []string{home(".zcode/cli/db/db.sqlite"), home("Library/Application Support/zcode/cli/db/db.sqlite")}
+	case model.Dim:
+		paths = []string{home(".dimcode-alpha/rust/dimcode.sqlite"), home(".dimcode/rust/dimcode.sqlite")}
 	default:
 		base := os.Getenv("XDG_DATA_HOME")
 		if base == "" {
@@ -129,7 +131,7 @@ func loadDBs(ctx context.Context, d *model.Data, a model.Agent, refresh bool, pr
 			continue
 		}
 		existing = append(existing, p)
-		if a != model.Devin && a != model.Antigravity {
+		if a != model.Devin && a != model.Antigravity && a != model.Dim {
 			break
 		}
 	}
@@ -211,6 +213,8 @@ func loadDBs(ctx context.Context, d *model.Data, a model.Agent, refresh bool, pr
 						parseDevin(sourceCtx, &part, db, filepath.Base(filepath.Dir(p)), baseline)
 					case model.Antigravity:
 						parseAG(sourceCtx, &part, db, strings.TrimSuffix(filepath.Base(p), ".db"), antigravitySource(p))
+					case model.Dim:
+						parseDim(sourceCtx, &part, db, dimSource(p))
 					default:
 						parseSQLAgent(sourceCtx, &part, a, db)
 					}
@@ -740,6 +744,89 @@ func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source strin
 		s.Title = id
 	}
 	if s.AgentMessages > 0 {
+		d.Sessions = append(d.Sessions, *s)
+	}
+}
+
+func dimSource(p string) string {
+	if strings.Contains(p, "dimcode-alpha") {
+		return "dimcode-alpha"
+	}
+	return "dimcode"
+}
+
+func parseDim(ctx context.Context, d *model.Data, db *sqlite.DB, source string) {
+	a := model.Dim
+	sessions := map[string]*model.Session{}
+	for _, r := range query(ctx, d, a, db, "dim_sessions", "SELECT s.session_id, s.created_at_ms, m.title, c.cwd, c.updated_at_ms, json_extract(s.config, '$.model.providerId') AS provider_id, json_extract(s.config, '$.model.modelId') AS model_id FROM agent_sessions s LEFT JOIN session_metadata m ON m.session_id = s.session_id LEFT JOIN session_catalog c ON c.session_id = s.session_id") {
+		id := str(r["session_id"])
+		if id == "" {
+			continue
+		}
+		s := session(a, id)
+		s.Source = source
+		s.Key = source + "/" + id
+		s.Title = str(r["title"])
+		s.WorkingDirectory = str(r["cwd"])
+		s.CreatedAt = ts(r["created_at_ms"])
+		s.LastActivityAt = ts(r["updated_at_ms"])
+		if s.LastActivityAt == 0 {
+			s.LastActivityAt = s.CreatedAt
+		}
+		s.SelectedModel = modelName(str(r["provider_id"]), str(r["model_id"]))
+		sessions[id] = s
+	}
+	models := map[string]string{}
+	for _, r := range query(ctx, d, a, db, "dim_model_calls", "SELECT json_extract(body, '$.record.event.data.request_id') AS request_id, json_extract(body, '$.record.event.data.request.providerId') AS provider_id, json_extract(body, '$.record.event.data.request.modelId') AS model_id FROM timeline_events WHERE branch_id = 'main' AND kind = 'model/call'") {
+		id := str(r["request_id"])
+		if id == "" {
+			continue
+		}
+		models[id] = modelName(str(r["provider_id"]), str(r["model_id"]))
+	}
+	seen := map[string]bool{}
+	for _, r := range query(ctx, d, a, db, "dim_model_usage", "SELECT session_id, json_extract(body, '$.record.event.id') AS event_id, json_extract(body, '$.record.event.create_at') AS create_at, json_extract(body, '$.record.event.data.request_id') AS request_id, json_extract(body, '$.record.event.data.usage.promptTokens') AS prompt_tokens, json_extract(body, '$.record.event.data.usage.completionTokens') AS completion_tokens, json_extract(body, '$.record.event.data.usage.cacheReadTokens') AS cache_read_tokens FROM timeline_events WHERE branch_id = 'main' AND kind = 'model/usage'") {
+		req := str(r["request_id"])
+		key := req
+		if key == "" {
+			key = str(r["event_id"])
+		}
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		at := ts(r["create_at"])
+		if at < d.TurnsStart || at >= d.TurnsEnd {
+			continue
+		}
+		sid := str(r["session_id"])
+		s := sessions[sid]
+		if s == nil {
+			s = session(a, sid)
+			s.Source = source
+			s.Key = source + "/" + sid
+			sessions[sid] = s
+		}
+		cache := num(r["cache_read_tokens"])
+		prompt := num(r["prompt_tokens"])
+		t := model.Turn{Agent: a, SessionKey: s.Key, CreatedAt: at, Model: models[req], InputTokens: max(0, prompt-cache), OutputTokens: num(r["completion_tokens"]), CacheReadTokens: cache, DedupKey: key}
+		if t.Model == "" {
+			t.Model = s.SelectedModel
+		}
+		if t.Model == "" {
+			t.Model = "unknown"
+		}
+		observe(s, at)
+		add(s, t)
+		d.Turns = append(d.Turns, t)
+	}
+	for _, s := range sessions {
+		if s.AgentMessages == 0 {
+			continue
+		}
+		if s.Title == "" {
+			s.Title = s.ID
+		}
 		d.Sessions = append(d.Sessions, *s)
 	}
 }

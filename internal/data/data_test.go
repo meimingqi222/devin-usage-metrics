@@ -670,3 +670,34 @@ func setDeviceName(t *testing.T, name string) {
 		t.Fatal(err)
 	}
 }
+
+func TestDimModelUsageTurns(t *testing.T) {
+	h := env(t)
+	conn := db(t, h, ".dimcode-alpha/rust/dimcode.sqlite")
+	exec(t, conn, "CREATE TABLE agent_sessions (session_id TEXT PRIMARY KEY, config TEXT, created_at_ms INTEGER, origin TEXT)")
+	exec(t, conn, "CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, revision INTEGER, title TEXT, title_source TEXT)")
+	exec(t, conn, "CREATE TABLE session_catalog (session_id TEXT PRIMARY KEY, updated_at_ms INTEGER, preview TEXT, cwd TEXT)")
+	exec(t, conn, "CREATE TABLE timeline_events (session_id TEXT, branch_id TEXT, sequence INTEGER, last_sequence INTEGER, kind TEXT, body TEXT, event_id TEXT)")
+	exec(t, conn, "INSERT INTO agent_sessions VALUES ('sess-1', ?, 1700000000000, 'client')", `{"model":{"providerId":"grok-build","modelId":"grok-4.6"},"cwd":"/work"}`)
+	exec(t, conn, "INSERT INTO agent_sessions VALUES ('sess-empty', '{}', 1700000000000, 'client')")
+	exec(t, conn, "INSERT INTO session_metadata VALUES ('sess-1', 1, 'Ask identity', 'auto')")
+	exec(t, conn, "INSERT INTO session_catalog VALUES ('sess-1', 1700000100000, 'hello', '/work')")
+	call := `{"encoding":"event","record":{"event":{"id":"c1","sequence":1,"create_at":1700000050000,"type":"model","name":"call","data":{"turn_id":"t1","request_id":"req-1","request":{"providerId":"grok-build","modelId":"grok-4.6"}}}}}`
+	usage := `{"encoding":"event","record":{"event":{"id":"u1","sequence":2,"create_at":1700000060000,"type":"model","name":"usage","data":{"turn_id":"t1","request_id":"req-1","usage":{"promptTokens":100,"completionTokens":20,"totalTokens":120,"cacheReadTokens":30}}}}}`
+	dup := `{"encoding":"event","record":{"event":{"id":"u2","sequence":3,"create_at":1700000061000,"type":"model","name":"usage","data":{"turn_id":"t1","request_id":"req-1","usage":{"promptTokens":100,"completionTokens":20,"totalTokens":120,"cacheReadTokens":30}}}}}`
+	exec(t, conn, "INSERT INTO timeline_events VALUES ('sess-1','main',1,1,'model/call',?, 'c1')", call)
+	exec(t, conn, "INSERT INTO timeline_events VALUES ('sess-1','main',2,2,'model/usage',?, 'u1')", usage)
+	exec(t, conn, "INSERT INTO timeline_events VALUES ('sess-1','main',3,3,'model/usage',?, 'u2')", dup)
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d := data.Load(model.Dim, 0, 2000000000, true)
+	check(t, d, 1)
+	if len(d.Sessions) != 1 || d.Sessions[0].Title != "Ask identity" || d.Sessions[0].WorkingDirectory != "/work" || d.Sessions[0].Key != "dimcode-alpha/sess-1" {
+		t.Fatalf("session %+v", d.Sessions)
+	}
+	r := d.Turns[0]
+	if r.InputTokens != 70 || r.OutputTokens != 20 || r.CacheReadTokens != 30 || r.Model != "grok-build/grok-4.6" || r.DedupKey != "req-1" {
+		t.Fatalf("turn %+v", r)
+	}
+}
