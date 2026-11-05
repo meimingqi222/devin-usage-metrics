@@ -9,7 +9,7 @@
 
 检查：`gofmt -l main.go internal`、`go vet ./...`、`go test -race ./...`、`CGO_ENABLED=0 go build ./...`。
 同步服务是独立 Go module，另在 `sync-server/` 执行 `go test -race ./...`、`go vet ./...`。
-打包：`go tool mygo build`。SQLite 通过 `internal/sqlite`（纯 Go 的 `github.com/ncruces/go-sqlite3`）编译进程序，包里不带原生动态库；不要重新引入 MyGo SQLite 插件或任何 SQLite DLL/dylib。Windows 发布包使用 `Agent-Usage-Metrics-windows-x64.zip`（资产名不带空格，发布时空格会被替换成点号导致更新器找不到），包内程序为 `Agent Usage Metrics.exe`；这是用户确认的命名变更。更新器可读取旧命名以兼容历史包，但新发布包不再生成旧名别名。旧版 Rust 更新器需要手动升级到新命名版本。
+打包：`go tool mygo build`。SQLite 通过 `internal/sqlite`（纯 Go 的 `github.com/ncruces/go-sqlite3`）编译进程序，包里不带原生动态库；不要重新引入 MyGo SQLite 插件或任何 SQLite DLL/dylib。Windows 发布包使用 `Agent-Usage-Metrics-windows-x64.zip`（资产名不带空格，发布时空格会被替换成点号导致更新器找不到），包内程序为 `Agent Usage Metrics.exe`；同时发布一个字节相同的旧名别名 `devin-usage-metrics-windows-x64.zip`，让只认旧名的老客户端仍能更新。更新器按分隔符归一化匹配资产名，可读取历史包。旧版 Rust 更新器需要手动升级到新命名版本。
 原生 UI 回归：`go test ./internal/desktop`；`AUM_SCREENSHOTS=/absolute/path` 可保存 fixture 渲染截图。
 
 项目已完成 Rust → Go 迁移并移除旧代码；`src/`、`Cargo.toml`、`examples/`、`tests/*.rs` 不再保留在仓库中，历史实现以 git 历史与 `docs/go-migration.md` 为准。不要把交叉编译当作原生平台安装/更新验证。

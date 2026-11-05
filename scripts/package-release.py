@@ -4,8 +4,21 @@
 import argparse
 import hashlib
 from pathlib import Path
+import shutil
 import subprocess
 import zipfile
+
+# Windows releases also publish a copy under the pre-branding archive name.
+# Release publishing rewrites spaces in asset filenames, so the branded name
+# cannot use them; clients older than this rename discover only the legacy
+# name and would otherwise keep failing with "no matching asset".
+WINDOWS_LEGACY_ARCHIVE = "devin-usage-metrics-windows-x64.zip"
+
+
+def write_sidecar(archive: Path, digest: str) -> None:
+    archive.with_suffix(".zip.sha256").write_text(
+        f"{digest}  {archive.name}\n", encoding="utf-8"
+    )
 
 
 def package(target: str, build_root: Path, output: Path) -> Path:
@@ -33,7 +46,13 @@ def package(target: str, build_root: Path, output: Path) -> Path:
         subprocess.run(["zip", "-r", "-q", str(archive), app.name], cwd=source, check=True)
     with archive.open("rb") as content:
         digest = hashlib.file_digest(content, "sha256").hexdigest()
-    archive.with_suffix(".zip.sha256").write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+    write_sidecar(archive, digest)
+    if target == "windows/amd64":
+        # Byte-identical alias so pre-rename clients can still find an asset.
+        legacy = output.resolve() / WINDOWS_LEGACY_ARCHIVE
+        shutil.copyfile(archive, legacy)
+        write_sidecar(legacy, digest)
+        print(legacy)
     print(archive)
     return archive
 

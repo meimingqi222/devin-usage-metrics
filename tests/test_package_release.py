@@ -31,7 +31,14 @@ class WindowsPackageTests(unittest.TestCase):
                 archive.with_suffix(".zip.sha256").read_text(encoding="utf-8"),
                 f"{expected}  {archive.name}\n",
             )
-            self.assertFalse(list((root / "out").glob("devin-usage-metrics*")))
+            # Pre-rename clients discover only the legacy name, so the Windows
+            # release publishes a byte-identical alias under it.
+            legacy = root / "out" / "devin-usage-metrics-windows-x64.zip"
+            self.assertEqual(legacy.read_bytes(), archive.read_bytes())
+            self.assertEqual(
+                legacy.with_suffix(".zip.sha256").read_text(encoding="utf-8"),
+                f"{expected}  {legacy.name}\n",
+            )
 
 
 if __name__ == "__main__":

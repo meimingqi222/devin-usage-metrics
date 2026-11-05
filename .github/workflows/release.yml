@@ -60,9 +60,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
+          # Glob so the Windows job also publishes its legacy-named alias and
+          # both checksum sidecars; a clean checkout holds no other archives.
           path: |
-            ${{ matrix.artifact }}
-            ${{ matrix.artifact }}.sha256
+            *.zip
+            *.sha256
 
   release:
     name: Create GitHub Release
