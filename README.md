@@ -4,7 +4,7 @@
 
 Local coding-agent analytics, now implemented in **Go + [MyGo native UI](https://github.com/egoist/mygo)**. No Rust compilation, WebView, JavaScript runtime, or cgo is required to build the desktop application.
 
-> The Go implementation is a migration candidate, not a claim of proven Rust feature parity. The previous Rust sources remain as a behavior reference and do not participate in the Go build or release workflow. See [migration status and limitations](docs/go-migration.md).
+> The Go implementation is a migration candidate, not a claim of proven Rust feature parity. The previous Rust sources were removed once the migration was declared complete; the historical implementation is preserved in git history and [migration status and limitations](docs/go-migration.md).
 
 ## Features
 

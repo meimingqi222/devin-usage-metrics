@@ -33,6 +33,6 @@ A skill that exists only in `~/.agents/skills` shows Codex, OpenCode and Pi on. 
 - `internal/ext/skills_test.go::TestInventorySkillsOpenCodeInheritsClaude`
 - `internal/ext/skills_test.go::TestEnableSkillRefusesInheritedShared`
 - `internal/ext/skills_test.go::TestRemoveSkillSkipsSharedForInheritedAgent`
-- `internal/desktop/ext_test.go::TestExtSkillsInheritedFromShared` (inherited pill click keeps `~/.agents/skills` and shows 取消共享)
+- `internal/desktop/ext_test.go::TestExtSkillsInheritedFromShared` (inherited pill click keeps the shared skills folder and shows 取消共享)
 
 Proved: `inheritedSkillDirs` returned nil → `TestInventorySkillsMarksInheritedShared` failed with Codex missing from `ByAgent` and `TestInventorySkillsOpenCodeInheritsClaude` failed with OpenCode off; guard restored and both tests re-run green. Output saved to `docs/agent-notes-evidence/skill-inherited-agents-red.txt`.

@@ -20,9 +20,10 @@ Model fees no longer compete for space inside summary labels. Numeric detail col
 
 ## Verification
 
-- `tests/model_distribution_layout.rs::long_model_labels_wrap_inside_the_column`
-- `tests/model_distribution_layout.rs::summary_layout_renders_correctly_without_abnormal_gaps`
+- `internal/desktop/visual_test.go::TestAdaptiveSessionModelDisplay`
+- `internal/desktop/sessions_visual_test.go::TestSessionsOriginalControlsAndEmptyStates`
+- `internal/desktop/visual_test.go::TestOriginalDenseVisualStates`
 
-The interactive Windows test checks ordinary String entry widths, shaped glyph positions, complete wrapped labels, and full summary/detail table rows. Run cargo test --test model_distribution_layout -- --ignored --test-threads=1.
+The Go desktop no longer has a dedicated model-distribution integration test; the rendered-layout fixtures in `internal/desktop` cover long model labels and summary/detail rows. The original Windows interactive layout test was removed with the Rust tree.
 
 Proved: Restoring the preceding committed component made the strengthened test fail: a plain entry occupied only 109.333336px of a 160px column. Restoring the fix passed all 16 plain-entry probes and 20 shaped-label/full-row probes. Native application previews at default and narrower widths were separately captured and inspected; actual clicks collapsed and re-expanded the September 23 details, including the free compactor fee.

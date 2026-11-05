@@ -4,7 +4,7 @@
 
 本地编码 Agent 用量统计工具，主实现已迁移到 **Go + [MyGo 原生 UI](https://github.com/egoist/mygo)**。桌面构建不再需要编译 Rust、WebView、JavaScript 运行时或 cgo。
 
-> 当前是 Go 迁移候选实现，不代表已经证明与 Rust 完全等价。旧 Rust 源码暂留作行为对照，不参与 Go 构建和发布。已知差异和验证边界见 [迁移状态](docs/go-migration.md)。
+> 当前是 Go 实现，不代表已经证明与旧 Rust 版本完全等价。旧 Rust 源码已随迁移完成从仓库移除，历史实现以 git 历史与 `docs/go-migration.md` 为准。已知差异和验证边界见 [迁移状态](docs/go-migration.md)。
 
 ## 功能
 

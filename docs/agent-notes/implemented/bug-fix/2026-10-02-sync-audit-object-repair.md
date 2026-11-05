@@ -22,10 +22,11 @@ Audited objects can recover without changing record identities. Repair requires 
 
 ## Verification
 
-- `src/sync/v3.rs::audit_repairs_missing_and_corrupt_objects_from_local_source`
-- `src/sync/v3.rs::immutable_manifest_cache_reuses_verified_bytes_and_refetches_corruption`
 - `internal/syncclient/efficiency_test.go::TestPublishSendsOnlyNewObjectsAndRepairsMissingOnes`
 - `internal/syncclient/client_test.go::TestCycleV1MigrationReuseAndReadOnlyMerge`
+- `internal/syncclient/efficiency_test.go::TestDiskCacheSurvivesRestartAndRejectsDamage`
+
+The local audit/repair contract moved to `internal/syncclient`; the Rust v3 implementation was removed with the old tree.
 
 Proved: Temporarily disabling the repair source made this test fail on the missing block. Restoring it passes missing, corrupt and oversized object cases for both turns and sessions; read-only checks still fail.
 

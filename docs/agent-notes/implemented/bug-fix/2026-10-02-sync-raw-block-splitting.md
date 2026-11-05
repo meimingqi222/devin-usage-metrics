@@ -20,6 +20,11 @@ Highly compressible groups create more blocks while retaining every record and t
 
 ## Verification
 
-- `src/sync/v3.rs::highly_compressible_records_split_at_raw_limit`
+- `internal/syncclient/compression_performance_test.go::TestCompressionRepeatedBlocksStayIndependent`
+- `internal/syncclient/zstd_test.go::TestBlockRefIncludesZeroTurnCount`
+- `sync-server/main_test.go::TestCachedUsageTracksOverwriteAndGC`
+- `sync-server/main_test.go::TestQuotaStillAllowsUsageAndRejectsNewWrite`
+
+The Go client encodes blocks in `internal/syncclient`; the Rust raw-limit splitting implementation was removed with the old tree. Decoded-size limits and per-block independence are now exercised in `internal/syncclient` and `sync-server` rather than one dedicated splitting test.
 
 Proved: Before the fix, twelve repetitive records failed with the decoded 8 MiB limit error. After the fix, turns and sessions split, preserve all twelve records and decode within the limit.

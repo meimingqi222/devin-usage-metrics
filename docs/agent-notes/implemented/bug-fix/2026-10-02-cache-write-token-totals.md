@@ -20,6 +20,6 @@ Desktop totals increase by the previously omitted cache writes and agree with th
 
 ## Verification
 
-- `src/agg.rs::totals_include_cache_writes_once_across_periods_and_models`
+- `internal/analytics/analytics_test.go::TestTotalsFiltersAdaptiveAndSessionIdentity`
 
-Proved: With the new regression test and the old aggregation, cargo test --lib totals_include_cache_writes_once_across_periods_and_models failed with 840 instead of 1840. After adding cache creation to aggregation and totals, the test passed. The test covers day, week, month, repeated model accumulation, and avoids counting the 5-minute and 1-hour subdivisions twice.
+Proved: With the new regression test and the old aggregation, cargo test --lib totals_include_cache_writes_once_across_periods_and_models failed with 840 instead of 1840. After adding cache creation to aggregation and totals, the test passed. The Go contract lives in `internal/analytics`: `TestTotalsFiltersAdaptiveAndSessionIdentity` asserts `CacheCreationTokens` and the 5-minute/1-hour subdivisions are each counted once across day, week and month, per model and per device filter.

@@ -20,7 +20,12 @@ A persistent source error requires attention before the local device can publish
 
 ## Verification
 
-- `src/sync/v3.rs::collection_errors_prevent_any_remote_write`
-- `src/main.rs::successful_source_does_not_hide_another_sources_failure`
+- `internal/data/data.go` (collector merges each source's `Errors` and marks `freshSources` only when `len(d.Errors) == 0`)
+- `internal/data/data_test.go::TestLoadAllReportsMissingSources`
+- `internal/data/diagnostics_test.go::TestCollectionDiagnosticsCorrelateSourcesWithoutPayloads`
+- `internal/syncclient/efficiency_test.go::TestRemoteFailureNeitherBlocksPublishNorDropsOtherDevices`
+- `internal/syncclient/log_test.go::TestCycleLogCapturesPublicationAndFailureWithoutCredentials`
+
+The Rust sync/export guards were removed with the old tree; the Go contract keeps collection errors in `model.Data.Errors` and lets remote import continue after local export fails.
 
 Proved: Before adding the export guard, the test failed because the error did not contain the collection failure. After the guard, it passes and no remote directory is created. Temporarily discarding source errors in the collector made the mixed-source test fail with zero errors instead of one; restoring propagation passes it.

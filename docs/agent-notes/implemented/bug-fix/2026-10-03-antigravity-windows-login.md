@@ -20,8 +20,11 @@ Current Windows login can query quota even when the old file has expired. OAuth 
 
 ## Verification
 
-- `src/quota.rs::antigravity_state_token_reads_current_access_and_refresh`
-- `src/quota.rs::antigravity_windows_client_pairs_config_references`
-- `tests/antigravity_live_quota.rs::current_windows_login_can_fetch_quota`
+- `internal/quota/quota_test.go::TestAntigravityStateTokenCarriesEmail`
+- `internal/quota/quota_test.go::TestDiscoveryAndPrivateStore`
+- `internal/quota/gaps_test.go::TestAntigravityStateReadOnly`
+- `internal/accounts/login_test.go::TestAntigravityOAuthFlow`
+
+The Rust Antigravity parser and live-quota tests were removed with the old tree; the Go contract lives in `internal/quota` and `internal/accounts`.
 
 Proved: Temporarily dropping the parsed refresh token caused the bound token test to fail with empty refresh versus fake-refresh, then the change was reverted. Synthetic parser tests cover truncated state, invalid PE data and absent client references. On the user's actual installation, the current access token first returned 401; refresh and quota queries returned HTTP 200. The Rust live integration test then passed and returned nonempty quota windows without printing credentials or writing the login database.

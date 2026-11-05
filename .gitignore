@@ -1,4 +1,4 @@
-# 构建产物（Rust 仅保留迁移对照）
+# 构建产物
 /target/
 /dist/
 /build/
@@ -9,7 +9,6 @@
 # Go 同步服务本地构建产物
 /sync-server/sync-server
 /sync-server/sync-server.exe
-**/*.rs.bk
 *.pdb
 *.dSYM/
 *.profraw
@@ -20,9 +19,6 @@ coverage/
 *.app/
 *.dmg
 *.pkg
-
-# Cargo 锁文件（库项目可选，二进制项目保留 Cargo.lock）
-# 当前为二进制项目，保留 Cargo.lock
 
 # macOS 系统文件
 .DS_Store

@@ -29,9 +29,6 @@ Cold sync overlaps network requests; unchanged manifests and blocks avoid downlo
 - `internal/syncclient/efficiency_test.go::TestUnchangedHeadsSkipManifestAndListOnlyHeads`
 - `internal/syncclient/efficiency_test.go::TestDiskCacheSurvivesRestartAndRejectsDamage`
 
-- `src/sync/v3.rs::remote_downloads_are_bounded_parallel_and_fail_as_a_unit`
-- `src/sync/v3.rs::immutable_manifest_cache_reuses_verified_bytes_and_refetches_corruption`
-
 Proved: Forcing one download worker failed the concurrency assertion. Disabling manifest cache reuse failed the request-count assertion. Restoring both passes bounded concurrency, warm-cache reuse, corruption recovery and package failure checks.
 
 Go proof: Reducing the worker count to one failed both transfer tests at their concurrency/completion assertions; restored four workers and reran with the race detector. Evidence: `docs/agent-notes-evidence/go-sync-serial-red.txt`.
