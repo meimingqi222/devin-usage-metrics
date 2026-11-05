@@ -1,6 +1,7 @@
 # Agent Note: Use Agent Usage Metrics for Windows release filenames
 
 Status: implemented
+Partly-superseded-by: 2026-11-05-windows-release-asset-separators.md
 
 ## Problem
 
@@ -19,3 +20,7 @@ Publishing both names would preserve old Rust auto-updates but contradict the us
 ## Consequences
 
 Already-released Rust clients and older Go clients that only discover the old asset name need a one-time manual upgrade. This source change cannot alter those installed clients. Installer naming already follows the branded name. Package naming and checksum behavior are covered by `tests/test_package_release.py`; discovery preference, legacy fallback and executable extraction are covered by `internal/updater/updater_test.go::TestWindowsReleaseNamesPreferBrandingAndAcceptLegacy` and `internal/updater/updater_test.go::TestReleaseDownload`. The Python packaging regression runs in CI and Release before the real package is created. Native installed update/restart acceptance remains separate from archive and HTTP-fixture checks.
+
+## Superseded
+
+The archive name is superseded: `2026-11-05-windows-release-asset-separators.md` records that Windows releases are now `Agent-Usage-Metrics-windows-x64.zip`, because publishing rewrote the spaces in `Agent Usage Metrics-windows-x64.zip` into dots and exact asset matching then failed. Everything else here still holds — the archive contains exactly `Agent Usage Metrics.exe`, branded discovery still precedes the legacy `devin-usage-metrics-windows-x64.zip` fallback, extraction and apply still accept historical executable names, and an existing installation keeps its running filename.

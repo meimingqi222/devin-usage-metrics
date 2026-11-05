@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // CurrentVersion is set at startup from mygo.json, the single source of the
@@ -28,6 +29,29 @@ var CurrentVersion = "0.0.0"
 
 const latestURL = "https://api.github.com/repos/meimingqi222/devin-usage-metrics/releases/latest"
 const maxArchive = 512 << 20
+
+// Release asset names carry no spaces. Publishing normalizes separators in
+// asset filenames, so a space in the packaged name is published as a dot and
+// exact matching then finds no asset at all. Hyphens keep the branding readable
+// and survive publishing unchanged.
+const (
+	windowsAssetName       = "Agent-Usage-Metrics-windows-x64.zip"
+	legacyWindowsAssetName = "devin-usage-metrics-windows-x64.zip"
+)
+
+// assetKey canonicalizes a release asset name for comparison. A publisher that
+// normalizes separators turns "Agent Usage Metrics-windows-x64.zip" into
+// "Agent.Usage.Metrics-windows-x64.zip", so spaces, dots and underscores must
+// compare equal for asset discovery to keep working.
+func assetKey(name string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '.', '_':
+			return '-'
+		}
+		return unicode.ToLower(r)
+	}, name)
+}
 
 // URL is the release page, not a download URL. Private asset metadata is supplied
 // by Check; a hand-constructed Release cannot bypass asset selection.
@@ -42,7 +66,7 @@ func assetName(goos, arch string) (string, error) {
 	suffix := ""
 	switch {
 	case goos == "windows" && arch == "amd64":
-		return "Agent Usage Metrics-windows-x64.zip", nil
+		return windowsAssetName, nil
 	case goos == "darwin" && arch == "amd64":
 		suffix = "macos-x64"
 	case goos == "darwin" && arch == "arm64":
@@ -151,11 +175,12 @@ func check(ctx context.Context, current, url, goos, arch string) (Release, error
 	if goos == "windows" {
 		// Prefer current branding regardless of asset order, while allowing
 		// this client to download releases published before the rename.
-		names = append(names, "devin-usage-metrics-windows-x64.zip")
+		names = append(names, legacyWindowsAssetName)
 	}
 	for _, candidate := range names {
+		key := assetKey(candidate)
 		for _, a := range d.Assets {
-			if a.Name == candidate && a.URL != "" {
+			if a.URL != "" && assetKey(a.Name) == key {
 				return Release{strings.TrimPrefix(d.Tag, "v"), d.URL, d.Body, a.URL, candidate, goos}, nil
 			}
 		}

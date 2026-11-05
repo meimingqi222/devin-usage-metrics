@@ -15,7 +15,10 @@ def package(target: str, build_root: Path, output: Path) -> Path:
     }[target]
     source = build_root.resolve() / directory
     output.mkdir(parents=True, exist_ok=True)
-    product = "Agent Usage Metrics" if target == "windows/amd64" else "devin-usage-metrics"
+    # Windows release branding follows the native app's executable name. The
+    # archive name avoids spaces because publishing replaces them with dots,
+    # which breaks clients that match the asset name exactly.
+    product = "Agent-Usage-Metrics" if target == "windows/amd64" else "devin-usage-metrics"
     archive = output.resolve() / f"{product}-{asset}.zip"
     if target == "windows/amd64":
         # Windows release branding follows the native app's executable name.

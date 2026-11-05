@@ -23,7 +23,7 @@ jobs:
           - target: windows/amd64
             os: windows-latest
             directory: windows-amd64
-            artifact: Agent Usage Metrics-windows-x64.zip
+            artifact: Agent-Usage-Metrics-windows-x64.zip
           - target: darwin/arm64
             os: macos-latest
             directory: darwin-arm64

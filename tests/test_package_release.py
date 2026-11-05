@@ -22,7 +22,7 @@ class WindowsPackageTests(unittest.TestCase):
             executable = source / "Agent Usage Metrics.exe"
             executable.write_bytes(b"packaged executable fixture")
             archive = package_release.package("windows/amd64", root / "build", root / "out")
-            self.assertEqual(archive.name, "Agent Usage Metrics-windows-x64.zip")
+            self.assertEqual(archive.name, "Agent-Usage-Metrics-windows-x64.zip")
             with zipfile.ZipFile(archive) as bundle:
                 self.assertEqual(bundle.namelist(), ["Agent Usage Metrics.exe"])
                 self.assertEqual(bundle.read("Agent Usage Metrics.exe"), executable.read_bytes())

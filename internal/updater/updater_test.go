@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -39,7 +40,7 @@ func TestReleaseDownload(t *testing.T) {
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/latest":
-			fmt.Fprintf(w, `{"tag_name":"v0.2.12","html_url":"https://example.test/release","body":"notes","assets":[{"name":"Agent Usage Metrics-windows-x64.zip","browser_download_url":%q}]}`, server.URL+"/asset")
+			fmt.Fprintf(w, `{"tag_name":"v0.2.12","html_url":"https://example.test/release","body":"notes","assets":[{"name":"Agent.Usage.Metrics-windows-x64.zip","browser_download_url":%q}]}`, server.URL+"/asset")
 		case "/asset":
 			w.Write(b)
 		case "/asset.sha256":
@@ -87,7 +88,7 @@ func TestReleaseDownload(t *testing.T) {
 
 func TestWindowsReleaseNamesPreferBrandingAndAcceptLegacy(t *testing.T) {
 	canonical, err := assetName("windows", "amd64")
-	if err != nil || canonical != "Agent Usage Metrics-windows-x64.zip" {
+	if err != nil || canonical != "Agent-Usage-Metrics-windows-x64.zip" {
 		t.Fatalf("Windows asset: %q %v", canonical, err)
 	}
 	for _, legacyOnly := range []bool{false, true} {
@@ -95,7 +96,7 @@ func TestWindowsReleaseNamesPreferBrandingAndAcceptLegacy(t *testing.T) {
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				assets := `{"name":"devin-usage-metrics-windows-x64.zip","browser_download_url":"https://example.test/old"}`
 				if !legacyOnly {
-					assets += `,{"name":"Agent Usage Metrics-windows-x64.zip","browser_download_url":"https://example.test/new"}`
+					assets += `,{"name":"Agent-Usage-Metrics-windows-x64.zip","browser_download_url":"https://example.test/new"}`
 				}
 				fmt.Fprintf(w, `{"tag_name":"v1.0.0","assets":[%s]}`, assets)
 			}))
@@ -124,6 +125,43 @@ func TestWindowsReleaseNamesPreferBrandingAndAcceptLegacy(t *testing.T) {
 		})
 	}
 }
+func TestWindowsAssetDiscoverySurvivesSeparatorNormalization(t *testing.T) {
+	// Publishing replaces separators in asset filenames, so a package built as
+	// "Agent Usage Metrics-windows-x64.zip" reaches the release as
+	// "Agent.Usage.Metrics-windows-x64.zip". Discovery must still find it.
+	for _, published := range []string{
+		"Agent-Usage-Metrics-windows-x64.zip",
+		"Agent.Usage.Metrics-windows-x64.zip",
+		"Agent Usage Metrics-windows-x64.zip",
+		"agent_usage_metrics-windows-x64.zip",
+	} {
+		t.Run(published, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprintf(w, `{"tag_name":"v1.0.0","assets":[{"name":%q,"browser_download_url":"https://example.test/new"}]}`, published)
+			}))
+			defer ts.Close()
+			r, err := check(context.Background(), "0.9.0", ts.URL, "windows", "amd64")
+			if err != nil || r.Version != "1.0.0" {
+				t.Fatalf("published %q not discovered: %v", published, err)
+			}
+			if !strings.HasSuffix(r.assetURL, "/new") {
+				t.Fatalf("selected %q", r.assetURL)
+			}
+		})
+	}
+	for _, other := range []string{"devin-usage-metrics-macos-arm64.zip", "Agent-Usage-Metrics-macos-x64.zip"} {
+		t.Run("rejects "+other, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprintf(w, `{"tag_name":"v1.0.0","assets":[{"name":%q,"browser_download_url":"https://example.test/other"}]}`, other)
+			}))
+			defer ts.Close()
+			if _, err := check(context.Background(), "0.9.0", ts.URL, "windows", "amd64"); err == nil {
+				t.Fatalf("%q accepted as the Windows asset", other)
+			}
+		})
+	}
+}
+
 func TestUnsafeArchives(t *testing.T) {
 	for _, names := range [][]string{{"../escape"}, {"/absolute"}, {"C:/evil"}, {"a\\b"}, {"a", "A"}, {"devin-usage-metrics"}, {"a/../b"}, {"a", "a/b"}, {"NUL.txt"}} {
 		t.Run(names[0], func(t *testing.T) {
