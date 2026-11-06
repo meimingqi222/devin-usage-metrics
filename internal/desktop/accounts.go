@@ -170,7 +170,10 @@ func (a *App) switchAccountNow(provider, id string, live quota.Account) {
 	a.work("switch/"+provider, func() func() {
 		var err error
 		if provider == "antigravity" {
-			ctx, cancel := context.WithTimeout(a.ctx, 60*time.Second)
+			// Quitting, restarting and waiting for the client to come back
+			// must all fit: the switch worker waits up to 15s for the
+			// language service and again for the client itself.
+			ctx, cancel := context.WithTimeout(a.ctx, 90*time.Second)
 			defer cancel()
 			err = a.accountStore.SwitchApp(ctx, provider, id, live)
 		} else {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -45,49 +47,84 @@ func (s *Store) SwitchApp(ctx context.Context, provider, id string, live quota.A
 	if err != nil {
 		return err
 	}
+	targetDoc, err := s.ProfileCredential(provider, id)
+	if err != nil {
+		return errors.New("this account has no saved sign-in; sign in again")
+	}
+	targetEmail := s.ProfileEmail(provider, id)
 	if !app.running {
-		return s.Switch(provider, id, live)
+		// The client is closed: nothing competes for the stores. Write the
+		// keychain plus every mirror the client restores a session from, or
+		// the next launch brings the previous account back.
+		if err := s.Switch(provider, id, live); err != nil {
+			return err
+		}
+		return applyAntigravityMirrors(ctx, targetEmail, targetDoc)
 	}
 	// Native Antigravity keeps its window and an Electron supervisor:
 	// write the keychain, kill only language_server, and let the supervisor
 	// start a child with the new credential. Restarting the whole app
 	// re-triggers its first-run Security Notice.
-	targetDoc, _ := s.ProfileCredential(provider, id)
-	targetEmail := s.ProfileEmail(provider, id)
 	if len(languageServers(ctx, app)) > 0 && !strings.Contains(strings.ToLower(app.path), "antigravity ide") {
+		// Capture the current login and write the target before stopping the
+		// child: the supervisor respawns it within seconds and the new child
+		// reads the keychain on start.
 		if err := s.Switch(provider, id, live); err != nil {
 			return err
 		}
 		old := languageServers(ctx, app)
 		killLanguageServer(ctx, old)
-		writeAntigravityState(ctx, targetEmail, targetDoc)
-		_ = s.Reapply(provider, id, live)
+		// The child is gone; this write is the one the respawned child
+		// reads, and it must hold before reporting anything.
+		if err := s.Reapply(provider, id, live); err != nil {
+			return fmt.Errorf("assert the new sign-in after stopping the language service: %w", err)
+		}
+		// The running client keeps the state database locked at times; a
+		// failed mirror stays best-effort while the keychain is the truth
+		// source the client itself re-reads.
+		_ = applyAntigravityMirrors(ctx, targetEmail, targetDoc)
 		if waitLanguageServerRespawn(ctx, app, old, 15*time.Second) {
 			// The main process may write its in-memory token back just after
-			// the child starts; reassert once more after it settles.
+			// the child starts; reassert once more after it settles and make
+			// sure the selected account actually won before reporting success.
 			time.Sleep(time.Second)
-			writeAntigravityState(ctx, targetEmail, targetDoc)
-			_ = s.Reapply(provider, id, live)
-			return nil
+			if err := s.Reapply(provider, id, live); err != nil {
+				return fmt.Errorf("re-assert the new sign-in: %w", err)
+			}
+			_ = applyAntigravityMirrors(ctx, targetEmail, targetDoc)
+			return s.verifySwitched(provider, id, live)
 		}
 		// No supervisor respawn: fall back to the authoritative full
 		// restart, which also avoids a window without an engine.
 	}
+	// Full restart. The client writes its previous sign-in on shutdown, so
+	// quit first, and capture the previous login while the live store still
+	// holds it: marking the target active before that capture let the next
+	// refresh file the old tokens under the target's profile and overwrite
+	// that account's saved copy.
 	if err := stopAntigravity(ctx, app); err != nil {
 		return fmt.Errorf("quit Antigravity: %w", err)
 	}
-	writeAntigravityState(ctx, targetEmail, targetDoc)
-	switched := s.Reapply(provider, id, live)
-	if switched == nil {
-		switched = s.Switch(provider, id, live)
+	werr := s.Switch(provider, id, live)
+	if werr != nil {
+		// A compare-and-swap or write failure: fall back to the plain write
+		// without capture so a half-finished switch still ends on the target.
+		werr = s.Reapply(provider, id, live)
+	}
+	if werr != nil {
+		return fmt.Errorf("write the selected sign-in: %w", werr)
+	}
+	if err := applyAntigravityMirrors(ctx, targetEmail, targetDoc); err != nil {
+		return err
 	}
 	if err := startAntigravity(ctx, app); err != nil {
-		if switched != nil {
-			return fmt.Errorf("%v; reopening Antigravity failed: %w", switched, err)
-		}
 		return fmt.Errorf("sign-in switched, but reopening Antigravity failed: %w", err)
 	}
-	return switched
+	// The restart is part of the switch: give the client time to show up
+	// again before the caller refreshes accounts, or its card is missing
+	// until the next periodic refresh.
+	waitAntigravityRunning(ctx, 15*time.Second)
+	return nil
 }
 
 func listLanguageServers(ctx context.Context, app antigravityApp) []int {
@@ -383,41 +420,345 @@ func startAntigravityApp(ctx context.Context, app antigravityApp) error {
 	}
 }
 
-// writeAntigravityOnboarding marks the switched account as onboarded. The
-// desktop client keeps this flag in its state database; a switch without
-// it shows the Security Notice on the next reconnect.
-func writeAntigravityOnboarding(ctx context.Context, email string) {
-	if email == "" {
-		return
+// applyAntigravityMirrors writes the state database and the file fallbacks
+// the client restores a session from. The keychain is the signed-in
+// desktop client's truth source; the mirrors keep a restart, a fresh
+// launch or an unreachable keyring on the switched account.
+func applyAntigravityMirrors(ctx context.Context, email string, doc map[string]any) error {
+	if doc == nil {
+		return nil
 	}
-	path := antigravityStateDB()
-	if path == "" {
-		return
+	if err := writeAntigravityState(ctx, email, doc); err != nil {
+		return err
 	}
-	if _, err := os.Stat(path); err != nil {
-		return
+	return writeAntigravityFiles(email, doc)
+}
+
+// antigravityTokenSet is a login's tokens pulled out of either of
+// Antigravity's credential shapes.
+type antigravityTokenSet struct {
+	access, refresh, idToken string
+	expiry                   time.Time
+}
+
+func antigravityTokens(doc map[string]any) antigravityTokenSet {
+	token := obj(doc["token"])
+	if token == nil {
+		token = doc
 	}
+	t := antigravityTokenSet{
+		access:  str(token["access_token"]),
+		refresh: str(token["refresh_token"]),
+	}
+	t.idToken = str(token["id_token"])
+	if t.idToken == "" {
+		t.idToken = str(doc["id_token"])
+	}
+	if exp, ok := expiryTime(token["expiry"]); ok {
+		t.expiry = exp
+	} else if exp, ok := expiryTime(doc["expiry_date"]); ok {
+		t.expiry = exp
+	}
+	return t
+}
+
+// writeAntigravityFiles refreshes the file fallbacks under ~/.gemini, the
+// same trio Antigravity Tools writes: the language service reads
+// jetski-standalone-oauth-token when the keyring is unreachable, the CLI
+// shape keeps command-line sign-ins on the same account, and
+// google_accounts.json names the active account.
+func writeAntigravityFiles(email string, doc map[string]any) error {
+	tok := antigravityTokens(doc)
+	if tok.access == "" && tok.refresh == "" {
+		return nil
+	}
+	dir := filepath.Join(homeDir(), ".gemini")
+	standalone := map[string]any{
+		"token": map[string]any{
+			"access_token": tok.access, "token_type": "Bearer", "refresh_token": tok.refresh,
+		},
+		"auth_method": "consumer",
+	}
+	if !tok.expiry.IsZero() {
+		standalone["token"].(map[string]any)["expiry"] = tok.expiry.UTC().Format("2006-01-02T15:04:05.000000Z07:00")
+		standalone["token"].(map[string]any)["expires_in"] = int64(3599)
+	}
+	if tok.idToken != "" {
+		standalone["id_token"] = tok.idToken
+	}
+	if email != "" {
+		standalone["id_token_email"] = email
+	}
+	if err := writeGeminiFile(dir, "jetski-standalone-oauth-token", standalone); err != nil {
+		return err
+	}
+	creds := map[string]any{
+		"access_token": tok.access, "refresh_token": tok.refresh, "token_type": "Bearer",
+		"scope": "https://www.googleapis.com/auth/userinfo.email openid https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.profile",
+	}
+	if !tok.expiry.IsZero() {
+		creds["expiry_date"] = tok.expiry.UnixMilli()
+	}
+	if tok.idToken != "" {
+		creds["id_token"] = tok.idToken
+	}
+	if err := writeGeminiFile(dir, "oauth_creds.json", creds); err != nil {
+		return err
+	}
+	if email != "" {
+		return writeGeminiFile(dir, "google_accounts.json", map[string]any{"active": email, "old": []string{}})
+	}
+	return nil
+}
+
+func writeGeminiFile(dir, name string, doc map[string]any) error {
+	b, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writePrivate(filepath.Join(dir, name), append(b, '\n'))
+}
+
+func homeDir() string {
+	if h, err := os.UserHomeDir(); err == nil && h != "" {
+		return h
+	}
+	return os.Getenv("HOME")
+}
+
+// verifySwitched reports whether the live store now holds the selected
+// account's login. The client's main process can write the previous
+// account back right after the respawned child settles, which must not
+// report success.
+func (s *Store) verifySwitched(provider, id string, live quota.Account) error {
+	doc, err := live.CredentialDoc()
+	if err != nil {
+		return fmt.Errorf("read back the switched sign-in: %w", err)
+	}
+	target, err := s.ProfileCredential(provider, id)
+	if err != nil {
+		return err
+	}
+	// The client may refresh an expired access token immediately; the
+	// refresh token is what identifies the account (Google's never
+	// rotates), so either token matching counts.
+	if !sameSavedTokens(provider, doc, target) {
+		return errors.New("Antigravity went back to the previous sign-in; quit Antigravity fully and switch again")
+	}
+	return nil
+}
+
+// waitAntigravityRunning waits for the desktop client to appear in the
+// process list again after a restart. A slow launch only delays the next
+// account refresh, so this never fails.
+func waitAntigravityRunning(ctx context.Context, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for {
+		if app, err := findAntigravity(ctx); err == nil && app.running {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// writeAntigravityState updates the desktop client's state database with
+// the target token and account. The client keeps an in-memory copy of the
+// old account and restores the unified-state mirror on launch; without
+// this it writes the old Keychain value back and the UI still queries the
+// previous account's quota.
+func writeAntigravityState(ctx context.Context, email string, doc map[string]any) error {
+	entry := antigravityOAuthEntry(doc)
+	status := ""
+	if email != "" {
+		status = antigravityUserStatus(email)
+	}
+	if len(entry) == 0 && status == "" {
+		return nil
+	}
+	var firstErr error
+	for _, path := range antigravityStateDBs() {
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+		if err := writeAntigravityStateDB(ctx, path, entry, status); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// antigravityStateDBs lists the desktop client's state databases, the
+// classic client first. The IDE variant keeps its own copy under a
+// differently named folder; whichever exists gets the mirror.
+func antigravityStateDBs() []string {
+	var base string
+	var dirs []string
+	switch runtime.GOOS {
+	case "darwin":
+		base = filepath.Join(os.Getenv("HOME"), "Library", "Application Support")
+		dirs = []string{"Antigravity", "Antigravity IDE", "antigravity-ide"}
+	case "windows":
+		base = os.Getenv("APPDATA")
+		dirs = []string{"Antigravity", "Antigravity IDE"}
+	default:
+		base = filepath.Join(os.Getenv("HOME"), ".config")
+		dirs = []string{"Antigravity", "antigravity-ide", "antigravity_ide"}
+	}
+	out := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		out = append(out, filepath.Join(base, d, "User", "globalStorage", "state.vscdb"))
+	}
+	return out
+}
+
+func writeAntigravityStateDB(ctx context.Context, path string, oauthEntry []byte, userStatus string) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	db, err := sqlite.Open(ctx, path, sqlite.OpenOptions{})
 	if err != nil {
-		return
+		return fmt.Errorf("open the Antigravity state database: %w", err)
 	}
 	defer db.Close()
-	_, _ = db.Execute(ctx, "PRAGMA busy_timeout=2000")
-	_, _ = db.Execute(ctx, "INSERT OR REPLACE INTO ItemTable(key,value) VALUES(?,?)", "antigravityUnifiedStateSync.userStatus", antigravityUserStatus(email))
-	_, _ = db.Execute(ctx, "INSERT OR REPLACE INTO ItemTable(key,value) VALUES(?,?)", "antigravityOnboarding", "true")
+	if _, err := db.Execute(ctx, "PRAGMA busy_timeout=2000"); err != nil {
+		return fmt.Errorf("lock the Antigravity state database: %w", err)
+	}
+	set := func(key, value string) error {
+		if _, err := db.Execute(ctx, "INSERT OR REPLACE INTO ItemTable(key,value) VALUES(?,?)", key, value); err != nil {
+			return fmt.Errorf("write %s in the Antigravity state database: %w", key, err)
+		}
+		return nil
+	}
+	remove := func(key string) error {
+		if _, err := db.Execute(ctx, "DELETE FROM ItemTable WHERE key = ?", key); err != nil {
+			return fmt.Errorf("clear %s in the Antigravity state database: %w", key, err)
+		}
+		return nil
+	}
+	if len(oauthEntry) > 0 {
+		// The row holds one protobuf map entry per sentinel key: drop the
+		// old oauthTokenInfo entry and keep every other one, or rewriting
+		// the row loses the rest of the topic.
+		merged := mergeAntigravityTopic(readAntigravityTopic(ctx, db), oauthEntry)
+		if err := set("antigravityUnifiedStateSync.oauthToken", base64.StdEncoding.EncodeToString(merged)); err != nil {
+			return err
+		}
+	}
+	if userStatus != "" {
+		if err := set("antigravityUnifiedStateSync.userStatus", userStatus); err != nil {
+			return err
+		}
+	}
+	// A stale init state pins the previous user id and breaks history
+	// fetching after a switch; the client rebuilds it.
+	if err := remove("jetskiStateSync.agentManagerInitState"); err != nil {
+		return err
+	}
+	// An enterprise project preference left by a previous account breaks a
+	// personal one, and this app only switches personal accounts.
+	if err := remove("antigravityUnifiedStateSync.enterprisePreferences"); err != nil {
+		return err
+	}
+	// A switch without the flag shows the first-run Security Notice on the
+	// next reconnect.
+	return set("antigravityOnboarding", "true")
 }
 
-func antigravityStateDB() string {
-	switch runtime.GOOS {
-	case "darwin":
-		return filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "Antigravity", "User", "globalStorage", "state.vscdb")
-	case "windows":
-		return filepath.Join(os.Getenv("APPDATA"), "Antigravity", "User", "globalStorage", "state.vscdb")
-	default:
-		return filepath.Join(os.Getenv("HOME"), ".config", "Antigravity", "User", "globalStorage", "state.vscdb")
+func readAntigravityTopic(ctx context.Context, db *sqlite.DB) []byte {
+	rows, err := db.Query(ctx, "SELECT value FROM ItemTable WHERE key = ?", "antigravityUnifiedStateSync.oauthToken")
+	if err != nil || len(rows.Values) == 0 || len(rows.Values[0]) == 0 {
+		return nil
 	}
+	text, ok := rows.Values[0][0].(string)
+	if !ok {
+		return nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(text))
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+// mergeAntigravityTopic replaces the oauthTokenInfoSentinelKey entry in the
+// client's unified-state topic while keeping every other sentinel row.
+func mergeAntigravityTopic(current, entry []byte) []byte {
+	out := make([]byte, 0, len(current)+len(entry))
+	for _, f := range pbFields(current) {
+		if f.wire == 2 && antigravityTopicEntryKey(f.data) == "oauthTokenInfoSentinelKey" {
+			continue
+		}
+		out = append(out, current[f.start:f.end]...)
+	}
+	return append(out, entry...)
+}
+
+// antigravityTopicEntryKey reads the sentinel key of one Topic.data entry
+// (field 1 key, field 2 row).
+func antigravityTopicEntryKey(entry []byte) string {
+	for _, f := range pbFields(entry) {
+		if f.num == 1 && f.wire == 2 {
+			return string(f.data)
+		}
+	}
+	return ""
+}
+
+// pbField is one top-level field of a protobuf message.
+type pbField struct {
+	num, wire  int
+	start, end int
+	data       []byte // wire type 2 payload
+}
+
+// pbFields walks a protobuf message. It stops at the first malformed byte,
+// which yields the readable prefix.
+func pbFields(data []byte) []pbField {
+	var out []pbField
+	i := 0
+	for i < len(data) {
+		tag, n := binary.Uvarint(data[i:])
+		if n <= 0 {
+			break
+		}
+		start := i
+		i += n
+		num, wire := int(tag>>3), int(tag&7)
+		switch wire {
+		case 0:
+			_, n = binary.Uvarint(data[i:])
+			if n <= 0 {
+				return out
+			}
+			i += n
+		case 1:
+			i += 8
+		case 2:
+			l, n := binary.Uvarint(data[i:])
+			if n <= 0 {
+				return out
+			}
+			i += n
+			if l > uint64(len(data)-i) {
+				return out
+			}
+			out = append(out, pbField{num: num, wire: wire, start: start, end: i + int(l), data: data[i : i+int(l)]})
+			i += int(l)
+			continue
+		case 5:
+			i += 4
+		default:
+			return out
+		}
+		out = append(out, pbField{num: num, wire: wire, start: start, end: i})
+	}
+	return out
 }
 
 func antigravityUserStatus(email string) string {
@@ -438,69 +779,28 @@ func pbLen(field int, value []byte) []byte {
 	return append(out, value...)
 }
 
-// writeAntigravityState updates the desktop client's state database with
-// the target token and account. The client keeps an in-memory copy of the
-// old account; without this it writes the old Keychain value back and the
-// UI still queries the previous account's quota.
-func writeAntigravityState(ctx context.Context, email string, doc map[string]any) {
-	if email == "" || doc == nil {
-		return
-	}
-	path := antigravityStateDB()
-	if path == "" {
-		return
-	}
-	if _, err := os.Stat(path); err != nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	db, err := sqlite.Open(ctx, path, sqlite.OpenOptions{})
-	if err != nil {
-		return
-	}
-	defer db.Close()
-	_, _ = db.Execute(ctx, "PRAGMA busy_timeout=2000")
-	if tok := antigravityOAuthEntry(doc); tok != "" {
-		_, _ = db.Execute(ctx, "INSERT OR REPLACE INTO ItemTable(key,value) VALUES(?,?)", "antigravityUnifiedStateSync.oauthToken", tok)
-	}
-	_, _ = db.Execute(ctx, "INSERT OR REPLACE INTO ItemTable(key,value) VALUES(?,?)", "antigravityUnifiedStateSync.userStatus", antigravityUserStatus(email))
-	_, _ = db.Execute(ctx, "INSERT OR REPLACE INTO ItemTable(key,value) VALUES(?,?)", "antigravityOnboarding", "true")
-}
-
-func antigravityOAuthEntry(doc map[string]any) string {
-	token := obj(doc["token"])
-	if token == nil {
-		token = doc
-	}
-	access := str(token["access_token"])
-	refresh := str(token["refresh_token"])
-	idToken := str(doc["id_token"])
-	if idToken == "" {
-		idToken = str(token["id_token"])
-	}
-	if access == "" || refresh == "" {
-		return ""
-	}
-	seconds := int64(0)
-	if exp, ok := expiryTime(token["expiry"]); ok {
-		seconds = exp.Unix()
-	} else if exp, ok := expiryTime(doc["expiry_date"]); ok {
-		seconds = exp.Unix()
+// antigravityOAuthEntry builds the unified-state oauthTokenInfo row for the
+// account's credential document. It returns the raw topic bytes; the row is
+// one map entry keyed by oauthTokenInfoSentinelKey. The client's own
+// GCP enterprise flag has no counterpart here, so it stays unset, which is
+// what personal accounts carry.
+func antigravityOAuthEntry(doc map[string]any) []byte {
+	tok := antigravityTokens(doc)
+	if tok.access == "" || tok.refresh == "" {
+		return nil
 	}
 	timestamp := binary.AppendUvarint(nil, uint64(1<<3|0))
-	timestamp = binary.AppendUvarint(timestamp, uint64(max(0, seconds)))
+	timestamp = binary.AppendUvarint(timestamp, uint64(max(0, tok.expiry.Unix())))
 	timestamp = binary.AppendUvarint(timestamp, uint64(2<<3|0))
 	timestamp = binary.AppendUvarint(timestamp, 0)
-	info := pbString(1, access)
+	info := pbString(1, tok.access)
 	info = append(info, pbString(2, "Bearer")...)
-	info = append(info, pbString(3, refresh)...)
+	info = append(info, pbString(3, tok.refresh)...)
 	info = append(info, pbLen(4, timestamp)...)
-	if idToken != "" {
-		info = append(info, pbString(5, idToken)...)
+	if tok.idToken != "" {
+		info = append(info, pbString(5, tok.idToken)...)
 	}
 	row := pbString(1, base64.StdEncoding.EncodeToString(info))
 	entry := append(pbString(1, "oauthTokenInfoSentinelKey"), pbLen(2, row)...)
-	topic := pbLen(1, entry)
-	return base64.StdEncoding.EncodeToString(topic)
+	return pbLen(1, entry)
 }

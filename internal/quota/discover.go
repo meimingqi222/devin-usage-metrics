@@ -152,8 +152,17 @@ func keyWriteDoc(provider, service string, d object) error {
 		if existing := keychainAccountName(service); existing != "" {
 			account = existing
 		}
+		_, err = security("add-generic-password", "-U", "-s", service, "-a", account, "-w", value)
+	} else if provider == "antigravity" {
+		// Recreate the item like the client's own writes do: an open access
+		// list lets the desktop client and language service read the new
+		// sign-in without a prompt, and an updated item would keep the old
+		// access list.
+		_, _ = security("delete-generic-password", "-s", service, "-a", account)
+		_, err = security("add-generic-password", "-s", service, "-a", account, "-w", value, "-A")
+	} else {
+		_, err = security("add-generic-password", "-U", "-s", service, "-a", account, "-w", value)
 	}
-	_, err = security("add-generic-password", "-U", "-s", service, "-a", account, "-w", value)
 	if err != nil {
 		return errors.New("keychain update failed")
 	}

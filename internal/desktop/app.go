@@ -323,7 +323,11 @@ func (a *App) refreshQuota(force bool) {
 
 		if a.accountStore.Enabled() {
 			for _, p := range profiles {
-				if !seenProvider[p.Provider] && !p.Hidden && !p.Active {
+				// A provider without a live sign-in keeps every saved
+				// account on screen, the active one included: while the
+				// agent is closed, restarting, or signed out, its card must
+				// not disappear until the next refresh finds it again.
+				if !seenProvider[p.Provider] && !p.Hidden {
 					credPath := a.accountStore.CredentialPath(p.Provider, p.ID)
 					if _, err := os.Stat(credPath); err == nil {
 						key := "profile-" + p.ID

@@ -234,7 +234,12 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 				}
 			}
 			if credentialid.Of(a.Provider, doc).Email == "" {
-				if p := s.activeProfileLocked(a.Provider); p != nil && p.Email != "" {
+				// The active profile may name the document's account only
+				// when the two actually share tokens: after a failed
+				// switch the live store can hold the previous login, and
+				// stamping the selected account's name onto it rewrote
+				// that account's saved sign-in with the old one.
+				if p := s.activeProfileLocked(a.Provider); p != nil && p.Email != "" && s.sameSavedLocked(*p, a.Provider, doc) {
 					doc["email"] = p.Email
 				} else if strings.Contains(a.Label, "@") {
 					doc["email"] = a.Label
@@ -273,12 +278,17 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 		}
 		captured := ""
 		if s.data.Enabled && a.Writable() {
-			p, err := s.upsertLocked(a.Provider, doc, kind, hash)
-			if err != nil {
-				continue
+			if s.unattributableLocked(a.Provider, doc) {
+				// The document carries no identity and shares no token with
+				// the named active profile: it is the leftover of a different
+				// login (a dying client writing its previous sign-in back
+				// after a switch), not a refresh of the selected account.
+				// Capturing it here replaced the active profile's saved
+				// sign-in with the other account's tokens.
+			} else if p, err := s.upsertLocked(a.Provider, doc, kind, hash); err == nil {
+				captured = p.ID
+				changed = true
 			}
-			captured = p.ID
-			changed = true
 		}
 		id := s.matchLocked(a.Provider, doc, hash)
 		if id == "" {
@@ -535,6 +545,40 @@ func (s *Store) activeProfileLocked(provider string) *Profile {
 	return nil
 }
 
+// unattributableLocked reports whether a credential document without
+// identity claims is known to belong to a different login than the active
+// profile. The active profile naming its account makes the document a
+// leftover of another sign-in (see ReconcileContext); a profile without
+// identity cannot tell, and the capture keeps working as before.
+func (s *Store) unattributableLocked(provider string, doc map[string]any) bool {
+	if id := credentialid.Of(provider, doc); id.Stable != "" || id.Email != "" {
+		return false
+	}
+	p := s.activeProfileLocked(provider)
+	if p == nil || (p.StableID == "" && p.Email == "") {
+		return false
+	}
+	return !s.sameSavedLocked(*p, provider, doc)
+}
+
+// sameAccountClaims says a credential document's identity claims do not
+// contradict a profile's own. A document without claims stays compatible
+// only with a profile without them: once both name an account, the names
+// must agree.
+func sameAccountClaims(id credentialid.Identity, p Profile) bool {
+	if id.Stable == "" && id.Email == "" {
+		return p.StableID == "" && p.Email == ""
+	}
+	if id.Email != "" && p.Email != "" && !strings.EqualFold(id.Email, p.Email) {
+		return false
+	}
+	if id.Stable != "" && p.StableID != "" && id.Stable != p.StableID &&
+		!strings.HasPrefix(p.StableID, id.Stable+"|") && !strings.HasPrefix(id.Stable, p.StableID+"|") {
+		return false
+	}
+	return true
+}
+
 func (s *Store) savedEmailLocked(provider string, doc map[string]any) string {
 	for _, p := range s.data.Profiles {
 		if p.Provider != provider || p.Email == "" {
@@ -642,8 +686,11 @@ func (s *Store) repairLocked() bool {
 	return changed
 }
 
-// hideLegacyDuplicatesLocked hides unnamed copies once the active profile
-// has an identity. Files stay on disk; the UI can show hidden entries.
+// hideLegacyDuplicatesLocked hides extra copies of the active login once it
+// has an identity. A copy counts as a duplicate only when its saved tokens
+// match the active profile's; saved accounts that are merely unnamed stay
+// visible instead of disappearing from the list, and broken files stay
+// visible so the user can remove them. Files stay on disk either way.
 func (s *Store) hideLegacyDuplicatesLocked(provider string) bool {
 	active := s.active[provider]
 	if active == "" {
@@ -659,14 +706,36 @@ func (s *Store) hideLegacyDuplicatesLocked(provider string) bool {
 	if current == nil || (current.Email == "" && current.StableID == "") {
 		return false
 	}
+	currentDoc, err := s.readCredential(*current)
+	if err != nil {
+		return false
+	}
 	changed := false
 	for i := range s.data.Profiles {
 		p := &s.data.Profiles[i]
-		if p.Provider == provider && p.ID != active && p.StableID == "" && p.Email == "" && !p.Hidden {
+		if p.Provider != provider || p.ID == active || p.Hidden {
+			continue
+		}
+		if p.StableID != "" || p.Email != "" {
+			continue
+		}
+		doc, err := s.readCredential(*p)
+		if err != nil {
+			continue
+		}
+		if sameSavedTokens(provider, currentDoc, doc) {
 			p.Hidden, changed = true, true
 		}
 	}
 	return changed
+}
+
+// sameSavedTokens reports whether two saved documents carry the same login
+// by their token pair alone, without naming either profile.
+func sameSavedTokens(provider string, a, b map[string]any) bool {
+	access, refresh := tokenPair(provider, a)
+	otherAccess, otherRefresh := tokenPair(provider, b)
+	return (access != "" && access == otherAccess) || (refresh != "" && refresh == otherRefresh)
 }
 
 func (s *Store) upsertLocked(provider string, doc map[string]any, kind, hash string) (Profile, error) {
@@ -686,7 +755,13 @@ func (s *Store) upsertLocked(provider string, doc map[string]any, kind, hash str
 		sameEmail := !sameID && !sameStable && !sameTokens && provider == "antigravity" &&
 			id.Email != "" && strings.EqualFold(p.Email, id.Email) &&
 			(!strings.Contains(id.Stable, "|") || !strings.Contains(p.StableID, "|"))
+		// The active-profile fallback never rewrites a profile with a
+		// document of a different login: an unidentified document must not
+		// replace the saved sign-in of a named account, and a named one
+		// must not file itself under a differently named profile. Either
+		// merge replaced the account the user just switched to.
 		sameActive := !sameID && !sameStable && !sameTokens && !sameEmail && s.active[provider] == p.ID &&
+			sameAccountClaims(id, *p) &&
 			(id.Stable == "" || p.StableID == "" || (!strings.Contains(id.Stable, "|") && strings.HasPrefix(p.StableID, id.Stable+"|")))
 		if !sameID && !sameStable && !sameTokens && !sameEmail && !sameActive {
 			continue
