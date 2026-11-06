@@ -223,6 +223,36 @@ func TestAccountSyncSettingsAreReadable(t *testing.T) {
 	capture(t, tt, "go-account-sync-change")
 }
 
+func TestAccountSyncSetupOffersSignInWhenCachedSessionIsInvalid(t *testing.T) {
+	a := fixture(t)
+	a.lang = "zh"
+	if err := syncclient.SaveConfig(syncclient.Config{APIURL: "https://sync.example.test"}); err != nil {
+		t.Fatal(err)
+	}
+	dir, _ := os.UserConfigDir()
+	dir = filepath.Join(dir, "devin-usage-metrics")
+	if err := os.WriteFile(filepath.Join(dir, "github-sync-session.meta.json"), []byte(`{"login":"fixture-user"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a.openAccountBackup("sync")
+	a.backupUI.password = "fixture123"
+	a.runAccountBackup()
+	if !a.backupUI.open || !a.accountSync.authRequired || syncclient.ReadAccountSyncConfig().Enabled {
+		t.Fatal("invalid sign-in did not leave setup recoverable")
+	}
+	tt := ui.NewTester(func(c *ui.Context) { a.theme(c); a.settingsView(c); a.accountBackupDialog(c) }, 800, 780)
+	if !tt.HasText("前往 GitHub 登录") {
+		t.Fatal("setup has no sign-in recovery action")
+	}
+	click(t, tt, "前往 GitHub 登录")
+	if a.backupUI.open || !a.settings || a.settingsUI.tab != "sync" {
+		t.Fatal("recovery did not navigate to sync settings")
+	}
+	if !tt.HasText("重新登录 GitHub") {
+		t.Fatal("cached username hid the sign-in button")
+	}
+}
+
 func TestSystemAccountPasswordRoundTrip(t *testing.T) {
 	if os.Getenv("AUM_NATIVE_SECRETS") != "1" || runtime.GOOS != "windows" {
 		t.Skip("explicit native Windows credential-store acceptance")

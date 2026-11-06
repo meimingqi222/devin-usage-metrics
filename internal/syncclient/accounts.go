@@ -51,15 +51,14 @@ func SaveAccountSyncConfig(c AccountSyncConfig) error {
 
 func accountTransport() (transport, error) {
 	c := ReadConfig()
-	if !c.Enabled {
-		return transport{}, ErrNotSignedIn
-	}
+	// Config.Enabled controls usage sync only. Account sync has its own
+	// consent in AccountSyncConfig and shares only the server and sign-in.
 	base, err := baseURL(c.APIURL)
 	if err != nil {
 		return transport{}, err
 	}
 	s, err := loadSession()
-	if err != nil || s.Expires <= time.Now().Unix() {
+	if err != nil || s.Token == "" || s.Expires <= time.Now().Unix() {
 		return transport{}, ErrNotSignedIn
 	}
 	return transport{base, s.Token}, nil

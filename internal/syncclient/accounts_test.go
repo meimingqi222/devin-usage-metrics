@@ -101,6 +101,37 @@ func addSyncAccount(t *testing.T, store *accounts.Store, email, access string) {
 	}
 }
 
+func TestAccountSyncWorksWithUsageSyncDisabled(t *testing.T) {
+	cloud := &accountServerFixture{objects: map[string][]byte{}, capable: true}
+	server := httptest.NewServer(http.HandlerFunc(cloud.serve))
+	defer server.Close()
+	store, scope := accountSyncDevice(t, server.URL, "independent-sync-device")
+	if err := SaveConfig(Config{Enabled: false, APIURL: server.URL}); err != nil {
+		t.Fatal(err)
+	}
+	if current, err := AccountSyncScope(); err != nil || current != scope {
+		t.Fatal("disabling usage sync invalidated account sign-in")
+	}
+	if _, err := SyncAccounts(context.Background(), store, accountTestPassword, scope, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ReadConfig().Enabled {
+		t.Fatal("account sync enabled usage sync")
+	}
+	if err := SaveAccountSyncConfig(AccountSyncConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SyncAccounts(context.Background(), store, accountTestPassword, scope, ""); !errors.Is(err, ErrSyncReenabled) {
+		t.Fatal("account sync bypassed its own consent")
+	}
+	if err := saveSession(session{"token", "fixture-user", time.Now().Add(-time.Hour).Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AccountSyncScope(); !errors.Is(err, ErrNotSignedIn) {
+		t.Fatal("expired sign-in was accepted")
+	}
+}
+
 func TestEncryptedAccountSyncTwoDevicesAndWrongPassword(t *testing.T) {
 	cloud := &accountServerFixture{objects: map[string][]byte{}, capable: true}
 	ts := httptest.NewServer(http.HandlerFunc(cloud.serve))

@@ -222,8 +222,8 @@ func (a *App) syncAccounts() {
 	scope, err := syncclient.AccountSyncScope()
 	if err != nil {
 		a.lockAccountSync()
-		a.accountSync.failed, a.accountSync.authRequired = true, true
-		a.accountSync.message = a.t("Your sync sign-in has expired. Sign in to GitHub above to continue.", "同步登录已失效，请在上方重新登录 GitHub。")
+		a.accountSync.failed, a.accountSync.authRequired = true, errors.Is(err, syncclient.ErrNotSignedIn)
+		a.accountSync.message = a.accountBackupError(err)
 		return
 	}
 	if consent.Scope != scope {
@@ -271,6 +271,7 @@ func (a *App) syncAccounts() {
 			a.accountSync.cancel = nil
 			a.accountSync.failed = err != nil
 			if err != nil {
+				a.accountSync.authRequired = errors.Is(err, syncclient.ErrNotSignedIn)
 				if errors.Is(err, accounts.ErrBackupPassword) {
 					a.accountSync.password, a.accountSync.prevPassword = "", ""
 					if rememberConfigured {
@@ -324,7 +325,7 @@ func (a *App) accountBackupError(err error) string {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, syncclient.ErrTransport):
 		return a.t("Could not reach the sync server. Your password is kept, and syncing retries automatically.", "暂时无法连接同步服务器；密码已保留，稍后会自动重试。")
 	case errors.Is(err, syncclient.ErrNotSignedIn):
-		return a.t("Your GitHub sync sign-in has expired. Sign in to GitHub above to continue.", "GitHub 同步登录已失效，请在上方重新登录 GitHub。")
+		return a.t("Your GitHub sync sign-in has expired. Sign in to GitHub again in Settings to continue.", "GitHub 同步登录已失效，请前往设置重新登录 GitHub。")
 	case errors.Is(err, syncclient.ErrSyncReenabled), errors.Is(err, syncclient.ErrSyncAborted):
 		return a.t("Account sync stopped because it was turned off or its account changed.", "同步已停止：账号同步被关闭或账号发生变更。")
 	case errors.Is(err, syncclient.ErrServerTooOld):
@@ -558,6 +559,7 @@ func (a *App) runAccountBackup() {
 			err = syncclient.SaveAccountSyncConfig(syncclient.AccountSyncConfig{Enabled: true, Scope: scope, Remember: draft.remember})
 		}
 		if err != nil {
+			a.accountSync.authRequired = errors.Is(err, syncclient.ErrNotSignedIn)
 			a.backupUI.message = a.accountBackupError(err)
 			return
 		}
@@ -826,6 +828,13 @@ func (a *App) accountBackupDialog(c *ui.Context) {
 		if a.backupUI.message != "" {
 			ui.Text(c, a.backupUI.message).FontSize(11).TextColor(quotaRose)
 		}
+		if syncMode && a.accountSync.authRequired {
+			if settingsButton(c, a.t("Go to GitHub sign-in", "前往 GitHub 登录"), true).Clicked() {
+				a.closeAccountBackup()
+				a.openSettings("sync")
+				return
+			}
+		}
 		ui.Row(c).Gap(8).Justify(ui.End).Children(func() {
 			if settingsButton(c, a.t("Cancel", "取消"), false).Disabled(busy).Clicked() {
 				a.closeAccountBackup()
@@ -843,7 +852,7 @@ func (a *App) accountBackupDialog(c *ui.Context) {
 			} else if syncMode {
 				label = a.t("Start syncing", "开始同步")
 			}
-			disabled := busy || needSwitching || a.backupUI.mode != "sync" && a.backupUI.file == ""
+			disabled := busy || needSwitching || syncMode && a.accountSync.authRequired || a.backupUI.mode != "sync" && a.backupUI.file == ""
 			if a.backupUI.preview == nil {
 				disabled = disabled || accounts.CheckBackupPassword(a.backupUI.password) != nil || confirmPassword && a.backupUI.password != a.backupUI.confirm
 			}
