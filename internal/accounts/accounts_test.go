@@ -479,9 +479,10 @@ func writeAntigravityStateFixture(t *testing.T, access, refresh, email string) s
 // The login Antigravity keeps in its state database is read locally; enabling
 // switching must file it as a recognized, switchable account without a
 // manual capture step.
-// A record whose credential file went missing must be rebuilt from a
-// sibling record of the same account, or its switch button can only fail.
-func TestHealMissingCredentialFromSibling(t *testing.T) {
+// A record whose credential file went missing is folded into the sibling
+// record of the same account instead of keeping a switch button that can
+// only fail.
+func TestFoldRetiresMissingCopyRecord(t *testing.T) {
 	fixture(t)
 	s := Open()
 	if err := s.SetEnabled(true); err != nil {
@@ -508,19 +509,14 @@ func TestHealMissingCredentialFromSibling(t *testing.T) {
 	}
 	s.mu.Unlock()
 	for _, p := range s.List() {
-		if p.ID != broken.ID {
-			continue
+		if p.ID == broken.ID {
+			t.Fatalf("broken record survived: %+v", p)
 		}
-		if !p.Writable {
-			t.Fatalf("broken record was not healed: %+v", p)
-		}
-		doc, err := s.ProfileCredential("antigravity", broken.ID)
-		if err != nil || doc["refresh_token"] != "r1" {
-			t.Fatalf("healed copy is wrong: %v %v", doc, err)
-		}
-		return
 	}
-	t.Fatal("broken record missing from the list")
+	// The account itself stays switchable through the healthy record.
+	if _, err := s.ProfileCredential("antigravity", first.ID); err != nil {
+		t.Fatalf("healthy record lost: %v", err)
+	}
 }
 
 // Without a sibling copy the record stays visible but must not offer a
@@ -547,11 +543,16 @@ func TestMissingCredentialIsNotSwitchable(t *testing.T) {
 }
 
 // googleUserInfoFake serves the userinfo oracle so a state-database login
-// without identity claims can be named offline.
-func googleUserInfoFake(t *testing.T, email string) {
+// without identity claims can be named offline. The issuer's answers are
+// per token: access-1 and access-2 belong to one@example.test, access-3 to
+// three@example.test.
+func googleUserInfoFake(t *testing.T) {
 	t.Helper()
+	emails := map[string]string{"access-1": "one@example.test", "access-2": "one@example.test", "access-3": "three@example.test"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer access-1" {
+		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		email, ok := emails[auth]
+		if !ok {
 			w.WriteHeader(401)
 			return
 		}
@@ -565,7 +566,7 @@ func googleUserInfoFake(t *testing.T, email string) {
 
 func TestStateLoginIsCapturedAndSwitchable(t *testing.T) {
 	fixture(t)
-	googleUserInfoFake(t, "one@example.test")
+	googleUserInfoFake(t)
 	state := writeAntigravityStateFixture(t, "access-1", "refresh-1", "one@example.test")
 	live := quota.ProfileAccount("antigravity-local", "antigravity", "one@example.test", state)
 	s := Open()
@@ -584,12 +585,59 @@ func TestStateLoginIsCapturedAndSwitchable(t *testing.T) {
 	}
 }
 
+// Two records of the same account are one account with two copies; repair
+// keeps the authoritative one and retires the other everywhere.
+func TestFoldDuplicateAccounts(t *testing.T) {
+	fixture(t)
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.Add("antigravity", map[string]any{
+		"access_token": "a1", "refresh_token": "r1",
+		"id_token": jwt(map[string]any{"email": "one@example.test"}),
+	}, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dup := Profile{ID: "dup000000000001", Provider: "antigravity", StableID: first.StableID, Email: first.Email, Kind: "vscdb", CreatedAt: 1, ModifiedAt: 1}
+	dup.Name = "我的备用"
+	s.mu.Lock()
+	s.data.Profiles = append(s.data.Profiles, dup)
+	if err := s.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+	got := s.List()
+	count := 0
+	for _, p := range got {
+		if p.Provider == "antigravity" {
+			count++
+			if p.ID != first.ID {
+				t.Fatalf("duplicate survived: %+v", p)
+			}
+			if p.Name != "我的备用" {
+				t.Fatalf("survivor lost the duplicate's name: %+v", p)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected one record, got %d", count)
+	}
+	if _, err := os.Stat(s.CredentialPath("antigravity", dup.ID)); !os.IsNotExist(err) {
+		t.Fatal("duplicate file still present")
+	}
+	if _, err := s.ProfileCredential("antigravity", first.ID); err != nil {
+		t.Fatalf("survivor copy lost: %v", err)
+	}
+}
+
 // A saved copy holding the live account's tokens under another account's
 // name must refuse to switch instead of silently restoring the copied
 // account.
 func TestSwitchRejectsContaminatedCopy(t *testing.T) {
 	fixture(t)
-	googleUserInfoFake(t, "one@example.test")
+	googleUserInfoFake(t)
 	state := writeAntigravityStateFixture(t, "access-1", "refresh-1", "one@example.test")
 	live := quota.ProfileAccount("antigravity-local", "antigravity", "one@example.test", state)
 	s := Open()
@@ -630,6 +678,37 @@ func TestSwitchRejectsContaminatedCopy(t *testing.T) {
 	if err := s.Switch("antigravity", bad.ID, live); err == nil || !strings.Contains(err.Error(), "holds the current account's sign-in") {
 		t.Fatalf("contaminated copy switched: %v", err)
 	}
+	// A copy whose tokens belong to another account is caught by the issuer
+	// after the write, and the switch is put back.
+	misfiled := Profile{ID: "misf00000000001", Provider: "antigravity", StableID: "two@example.test", Email: "two@example.test", Kind: "file", CreatedAt: 1}
+	misDoc := map[string]any{
+		"access_token": "access-2", "refresh_token": "refresh-2",
+		"id_token": jwt(map[string]any{"email": "two@example.test"}),
+	}
+	misRaw, err := json.Marshal(misDoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.data.Profiles = append(s.data.Profiles, misfiled)
+	if err := s.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+	if err := os.WriteFile(s.CredentialPath("antigravity", misfiled.ID), misRaw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Switch("antigravity", misfiled.ID, live); err == nil || !strings.Contains(err.Error(), "holds one@example.test's sign-in") {
+		t.Fatalf("misfiled copy switched: %v", err)
+	}
+	if d, err := live.CredentialDoc(); err != nil || d["refresh_token"] != "refresh-1" {
+		t.Fatalf("switch was not put back: %#v %v", d, err)
+	}
+	for _, p := range s.List() {
+		if p.ID == misfiled.ID && p.Writable {
+			t.Fatalf("misfiled copy not retired: %+v", p)
+		}
+	}
 	// An honest copy of a different account still switches.
 	good, err := s.Add("antigravity", map[string]any{
 		"access_token": "access-3", "refresh_token": "refresh-3",
@@ -648,7 +727,7 @@ func TestSwitchRejectsContaminatedCopy(t *testing.T) {
 
 func TestSwitchAppWritesStateDatabase(t *testing.T) {
 	fixture(t)
-	googleUserInfoFake(t, "one@example.test")
+	googleUserInfoFake(t)
 	state := writeAntigravityStateFixture(t, "access-1", "refresh-1", "one@example.test")
 	live := quota.ProfileAccount("antigravity-local", "antigravity", "one@example.test", state)
 	s := Open()
@@ -659,7 +738,7 @@ func TestSwitchAppWritesStateDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	target, err := s.Add("antigravity", map[string]any{
-		"access_token": "access-2", "refresh_token": "refresh-2",
+		"access_token": "access-9", "refresh_token": "refresh-9",
 		"id_token": jwt(map[string]any{"email": "two@example.test"}),
 	}, "keychain")
 	if err != nil {
@@ -683,7 +762,7 @@ func TestSwitchAppWritesStateDatabase(t *testing.T) {
 		t.Fatalf("app lifecycle: stopped=%v started=%v", stopped, started)
 	}
 	doc, err := live.CredentialDoc()
-	if err != nil || doc["refresh_token"] != "refresh-2" {
+	if err != nil || doc["refresh_token"] != "refresh-9" {
 		t.Fatalf("state database kept the old sign-in: %#v %v", doc, err)
 	}
 	for _, p := range s.List() {

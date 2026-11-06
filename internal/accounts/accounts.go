@@ -489,6 +489,23 @@ func (s *Store) Switch(provider, id string, live quota.Account) error {
 	if err != nil || readBackHash(provider, live.CredentialKind(), after) != readBackHash(provider, live.CredentialKind(), targetDoc) {
 		return errors.New("the sign-in did not read back as the selected account")
 	}
+	// The issuer settles what the written tokens actually are. A copy that
+	// claims one account while holding another's tokens would switch
+	// "successfully" and only restore the copied sign-in, which reads as
+	// "switching does not work"; put the previous login back and retire the
+	// copy from the switcher.
+	if provider == "antigravity" {
+		if email := googleAccountEmail(context.Background(), accessTokenOf(targetDoc)); email != "" {
+			if id := credentialid.Of(provider, targetDoc); id.Email != "" && !strings.EqualFold(email, id.Email) {
+				if live.WriteCredential(before) != nil {
+					return fmt.Errorf("this saved copy holds %s's sign-in; sign in again to refresh it", email)
+				}
+				_ = os.Remove(s.journalPath())
+				s.suspect[provider+"/"+target.ID] = true
+				return fmt.Errorf("this saved copy holds %s's sign-in; sign in again to refresh it", email)
+			}
+		}
+	}
 	_ = os.Remove(s.journalPath())
 	target.LastUsedAt = time.Now().Unix()
 	s.active[provider] = id
@@ -764,44 +781,68 @@ func (s *Store) repairLocked() bool {
 			changed = true
 		}
 	}
-	if s.healMissingCredentialsLocked() {
+	if s.foldDuplicateAccountsLocked() {
 		changed = true
 	}
 	return changed
 }
 
-// healMissingCredentialsLocked rebuilds a record whose credential file went
-// missing (a crashed write or an interrupted removal) from a sibling record
-// of the same account whose copy survived. Without this the record keeps a
-// switch button whose only possible outcome is "no saved sign-in".
-func (s *Store) healMissingCredentialsLocked() bool {
+// foldDuplicateAccountsLocked merges records of the same provider carrying
+// the same stable identity: they are one account with two copies, and the
+// pair reads as a duplicate in every list. A record whose credential file
+// survived outranks one whose copy is gone; then the record the live login
+// is filed under, else the more recently modified one. The loser is removed
+// with its file, and its removal is recorded so sync retires it on other
+// devices instead of filing it back.
+func (s *Store) foldDuplicateAccountsLocked() bool {
 	changed := false
-	for i := range s.data.Profiles {
-		p := &s.data.Profiles[i]
-		if !supported(p.Provider) || p.StableID == "" {
-			continue
+	for {
+		folded := false
+		seen := map[string]int{}
+		for i := range s.data.Profiles {
+			p := &s.data.Profiles[i]
+			if !supported(p.Provider) || p.StableID == "" {
+				continue
+			}
+			key := p.Provider + "\x00" + p.StableID
+			j, ok := seen[key]
+			if !ok {
+				seen[key] = i
+				continue
+			}
+			keep, drop := j, i
+			keepFile, dropFile := s.credentialPath(p.Provider, s.data.Profiles[j].ID), s.credentialPath(p.Provider, p.ID)
+			_, keepErr := os.Stat(keepFile)
+			_, dropErr := os.Stat(dropFile)
+			switch {
+			case os.IsNotExist(keepErr) && dropErr == nil:
+				keep, drop = i, j
+			case keepErr == nil && os.IsNotExist(dropErr):
+				// keep stays
+			case s.active[p.Provider] == p.ID ||
+				(s.active[p.Provider] != s.data.Profiles[j].ID && p.ModifiedAt > s.data.Profiles[j].ModifiedAt):
+				keep, drop = i, j
+			}
+			kd, dd := &s.data.Profiles[keep], &s.data.Profiles[drop]
+			if kd.Name == "" && dd.Name != "" {
+				kd.Name, kd.NameModifiedAt = dd.Name, dd.NameModifiedAt
+			}
+			if dd.LastUsedAt > kd.LastUsedAt {
+				kd.LastUsedAt = dd.LastUsedAt
+			}
+			if s.active[p.Provider] == dd.ID {
+				s.active[p.Provider] = kd.ID
+			}
+			s.suppressBackupLocked(*dd)
+			_ = os.Remove(s.credentialPath(dd.Provider, dd.ID))
+			s.data.Profiles = append(s.data.Profiles[:drop], s.data.Profiles[drop+1:]...)
+			changed, folded = true, true
+			break // indexes shifted; rescan until no pair remains
 		}
-		if _, err := os.Stat(s.credentialPath(p.Provider, p.ID)); err == nil {
-			continue
-		}
-		for j := range s.data.Profiles {
-			q := &s.data.Profiles[j]
-			if i == j || q.Provider != p.Provider || q.StableID != p.StableID {
-				continue
-			}
-			doc, err := s.readCredential(*q)
-			if err != nil || !accountDocument(p.Provider, doc) {
-				continue
-			}
-			if err := s.writeCredential(*p, doc); err != nil {
-				continue
-			}
-			p.Credentials = docHash(doc)
-			changed = true
-			break
+		if !folded {
+			return changed
 		}
 	}
-	return changed
 }
 
 // hideLegacyDuplicatesLocked hides extra copies of the active login once it
