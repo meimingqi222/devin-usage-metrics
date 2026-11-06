@@ -1,6 +1,7 @@
 # Agent Note: Preserve provider identity when resolving model prices
 
 Status: implemented
+Partly-superseded-by: 2026-11-06-agent-local-route-pricing.md
 
 ## Problem
 
@@ -13,6 +14,10 @@ Preserve provider, complete model ID, and provenance in the API catalog. Resolve
 API usage uses find_api, independently of Devin's Pro source and legacy enterprise inspection. Preserve explicit context tiers and select them per full request prompt, including cache reads/writes. Preserve unspecified cache-rate information and return unknown when actual cache usage cannot be priced. The compression replay uses the same API source and resolves rates for each simulated call. Replace complete catalogs rather than extending stale aliases; reject legacy flattened caches lacking provenance while retaining last good data after failed refreshes. Regenerate the offline snapshot through the same extractor.
 
 Fix Claude empty/partial cache breakdowns, MimoCode's lost provider prefixes, and Pi's missing-cost-as-free behavior. Preserve positive OpenCode recorded costs in both database schemas, matching MimoCode's treatment of zero placeholders. Increment the usage cache schema to 13 so old parser results cannot remain the incremental baseline. Valid recorded costs, including explicit Pi zero, keep precedence; invalid recorded values cannot be summed.
+
+## Superseded
+
+The Go catalog still preserves provider identity, exact channel keys, reseller quotes, and GPT/Claude-only effort inheritance. Two edges moved to `2026-11-06-agent-local-route-pricing.md`: a prefix that is not a models.dev billing channel falls back to the origin alias (`unknown-provider/claude-sonnet-5-5` is no longer required to stay unpriced), and Grok `costUsdTicks` no longer override a catalog quote. Valid recorded costs still win for every other agent.
 
 ## Alternatives considered
 

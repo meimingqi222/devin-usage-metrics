@@ -107,7 +107,12 @@ func normalize(s string) string {
 	id := bare(s)
 	prefix := strings.TrimSuffix(s, id)
 	if strings.HasPrefix(id, "gk-") {
-		return prefix + "grok-" + strings.TrimPrefix(id, "gk-")
+		id = "grok-" + strings.TrimPrefix(id, "gk-")
+	}
+	// Grok Build logs coding SKUs as grok-4.6-build; that is the same
+	// product as grok-4.6, not a distinct rate table.
+	if strings.HasPrefix(id, "grok-") && strings.HasSuffix(id, "-build") {
+		id = strings.TrimSuffix(id, "-build")
 	}
 	return prefix + gptVersion.ReplaceAllString(id, "gpt-${1}.${2}${3}")
 }
@@ -145,7 +150,34 @@ func lookup(m map[string]Price, s string) (Price, bool) {
 			}
 		}
 	}
+	// Agent-local routing prefixes (DimAgent grok-build/, custom-provider/,
+	// OpenCode custom ids) are not models.dev billing channels. Fall back
+	// to the remainder as an origin alias. A prefix that already exists as
+	// a catalog provider keeps its channel identity, even if this model is
+	// missing from that channel.
+	if i := strings.IndexByte(s, '/'); i > 0 {
+		rest := s[i+1:]
+		if rest != "" && !catalogProvider(m, s[:i]) {
+			return lookup(m, rest)
+		}
+	}
 	return Price{}, false
+}
+
+func catalogProvider(m map[string]Price, prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	if _, ok := m[prefix]; ok {
+		return true
+	}
+	want := prefix + "/"
+	for k := range m {
+		if strings.HasPrefix(k, want) {
+			return true
+		}
+	}
+	return false
 }
 
 // Lookup inspects quotes, including legacy Devin labels. Cost always selects the billing channel explicitly.
@@ -186,14 +218,27 @@ func devin(s string) (Price, bool) {
 }
 func valid(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 }
 
-// Cost prices one request. Adaptive requests use the router's rate; otherwise
-// valid recorded billing (including zero) takes precedence.
+// Cost prices one request. Adaptive requests use the router's rate.
+// Valid recorded billing (including zero) otherwise takes precedence,
+// except Grok's costUsdTicks, which are an internal estimate rather than
+// an API invoice: catalog quotes win when the model can be priced.
 func Cost(t model.Turn, fallbackModel string) (float64, bool) {
-	if !t.IsAdaptive() && t.RecordedCost != nil && valid(*t.RecordedCost) {
+	return costResolved(t, fallbackModel, resolve)
+}
+
+func costResolved(t model.Turn, fallbackModel string, resolveFn func(model.Agent, string) (Price, bool)) (float64, bool) {
+	recorded := !t.IsAdaptive() && t.RecordedCost != nil && valid(*t.RecordedCost)
+	if recorded && t.Agent != model.Grok {
 		return *t.RecordedCost, true
 	}
-	p, ok := resolve(t.Agent, costModel(t, fallbackModel))
-	return costWithPrice(t, p, ok)
+	p, ok := resolveFn(t.Agent, costModel(t, fallbackModel))
+	if cost, priced := costWithPrice(t, p, ok); priced {
+		return cost, true
+	}
+	if recorded {
+		return *t.RecordedCost, true
+	}
+	return 0, false
 }
 
 func costModel(t model.Turn, fallback string) string {

@@ -193,7 +193,7 @@ func (a *App) load(agent model.Agent, refresh bool) {
 // but the model.Data itself is kept only for the agent still selected.
 func (a *App) storeLoaded(agent model.Agent, d model.Data) {
 	a.counts[agent] = len(d.Sessions)
-	a.trayEntries[agent] = trayEntriesOf(d.Turns, a.localID)
+	a.trayEntries[agent] = trayEntriesOf(d.Turns, a.localID, d.Sessions)
 	if agent != a.agent {
 		return
 	}

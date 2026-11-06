@@ -21,10 +21,11 @@ type Calculator struct {
 }
 
 func (c *Calculator) Cost(t model.Turn, fallback string) (float64, bool) {
-	if !t.IsAdaptive() && t.RecordedCost != nil && valid(*t.RecordedCost) {
-		return *t.RecordedCost, true
-	}
-	key := quoteKey{t.Agent, costModel(t, fallback)}
+	return costResolved(t, fallback, c.resolve)
+}
+
+func (c *Calculator) resolve(agent model.Agent, name string) (Price, bool) {
+	key := quoteKey{agent, name}
 	mu.RLock()
 	if c.revision != catalogRevision {
 		c.quotes = nil
@@ -42,5 +43,5 @@ func (c *Calculator) Cost(t model.Turn, fallback string) (float64, bool) {
 		c.quotes[key] = q
 	}
 	mu.RUnlock()
-	return costWithPrice(t, q.price, q.found)
+	return q.price, q.found
 }

@@ -1,0 +1,5 @@
+--- FAIL: TestTrayAntigravitySessionModelPricesEmptyTurns (0.00s)
+    tray_test.go:114: session model should price empty-turn Antigravity: [{at:1793959850 cost:0 tokens:1e+06}]
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/desktop	0.624s
+FAIL

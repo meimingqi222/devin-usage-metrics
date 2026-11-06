@@ -685,9 +685,10 @@ func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source strin
 		at := int64(pb(b, 1, 1).v)
 		observe(s, at)
 		// Field 9 is the step's usage and each field 28 a retried attempt,
-		// whose usage is its field 2: {1: model ID, 2: input, 3: output
+		// whose usage is its field 2: {1: numeric model enum, 2: input, 3: output
 		// including thinking, 4: cache write, 5: cache read, 7: message ID,
-		// 9: thinking, 10: visible output, 11: response ID}.
+		// 9: thinking, 10: visible output, 11: response ID}. The model string
+		// lives on gen_metadata, stamped onto turns at emit.
 		var usages [][]byte
 		protoWalk(b, func(f field) bool {
 			if f.n == 9 && f.b != nil {
@@ -735,6 +736,10 @@ func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source strin
 		full = fallback
 	}
 	for _, t := range full {
+		// Usage protobuf field 1 is a numeric enum, not a model string.
+		// Stamp the session's last selected model so Cost/tray/compaction
+		// do not treat Antigravity turns as unknown.
+		t.Model = s.SelectedModel
 		add(s, t)
 		if t.CreatedAt >= d.TurnsStart && t.CreatedAt < d.TurnsEnd {
 			d.Turns = append(d.Turns, t)
@@ -771,8 +776,8 @@ func dimOpen(sessions map[string]*model.Session, source, id string) *model.Sessi
 	return s
 }
 
-func dimCost(v any) *float64 {
-	if v == nil {
+func dimCost(v any, quality any) *float64 {
+	if v == nil || str(quality) == "missing_price" {
 		return nil
 	}
 	n := num(v)
@@ -896,17 +901,17 @@ func parseDimDesktop(ctx context.Context, d *model.Data, db *sqlite.DB, source s
 		dimRecord(d, s, model.Turn{Agent: a, SessionKey: s.Key, CreatedAt: at, Model: modelName(provider, modelID), InputTokens: max(0, prompt-cache), OutputTokens: out, CacheReadTokens: cache, CacheCreationTokens: write, RecordedCost: cost, DedupKey: key})
 	}
 	if tables["usage_run_stats"] {
-		for _, r := range query(ctx, d, a, db, "dim_desktop_run_stats", "SELECT runId, sessionId, providerId, modelId, startedAt, endedAt, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, json_extract(cost, '$.totalCostUsd') AS total_cost FROM usage_run_stats") {
-			addRow(str(r["sessionId"]), str(r["providerId"]), str(r["modelId"]), ts(first(r["endedAt"], r["startedAt"])), num(r["inputTokens"]), num(r["outputTokens"]), num(r["cacheReadTokens"]), num(r["cacheWriteTokens"]), dimCost(r["total_cost"]), str(r["runId"]))
+		for _, r := range query(ctx, d, a, db, "dim_desktop_run_stats", "SELECT runId, sessionId, providerId, modelId, startedAt, endedAt, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, json_extract(cost, '$.totalCostUsd') AS total_cost, json_extract(cost, '$.quality') AS cost_quality FROM usage_run_stats") {
+			addRow(str(r["sessionId"]), str(r["providerId"]), str(r["modelId"]), ts(first(r["endedAt"], r["startedAt"])), num(r["inputTokens"]), num(r["outputTokens"]), num(r["cacheReadTokens"]), num(r["cacheWriteTokens"]), dimCost(r["total_cost"], r["cost_quality"]), str(r["runId"]))
 		}
 	}
 	if len(seen) == 0 && tables["usage_ledger"] {
-		for _, r := range query(ctx, d, a, db, "dim_desktop_ledger", "SELECT ledgerId, sessionId, runId, providerId, modelId, createdAt, json_extract(usage, '$.promptTokens') AS prompt_tokens, json_extract(usage, '$.completionTokens') AS completion_tokens, json_extract(usage, '$.cacheReadTokens') AS cache_read_tokens, json_extract(cost, '$.totalCostUsd') AS total_cost FROM usage_ledger WHERE ledgerId NOT LIKE 'plugin_%' OR coalesce(runId, '') NOT IN (SELECT runId FROM usage_ledger WHERE ledgerId NOT LIKE 'plugin_%' AND ifnull(runId, '') != '')") {
+		for _, r := range query(ctx, d, a, db, "dim_desktop_ledger", "SELECT ledgerId, sessionId, runId, providerId, modelId, createdAt, json_extract(usage, '$.promptTokens') AS prompt_tokens, json_extract(usage, '$.completionTokens') AS completion_tokens, json_extract(usage, '$.cacheReadTokens') AS cache_read_tokens, json_extract(cost, '$.totalCostUsd') AS total_cost, json_extract(cost, '$.quality') AS cost_quality FROM usage_ledger WHERE ledgerId NOT LIKE 'plugin_%' OR coalesce(runId, '') NOT IN (SELECT runId FROM usage_ledger WHERE ledgerId NOT LIKE 'plugin_%' AND ifnull(runId, '') != '')") {
 			key := str(r["runId"])
 			if key == "" {
 				key = str(r["ledgerId"])
 			}
-			addRow(str(r["sessionId"]), str(r["providerId"]), str(r["modelId"]), ts(r["createdAt"]), num(r["prompt_tokens"]), num(r["completion_tokens"]), num(r["cache_read_tokens"]), 0, dimCost(r["total_cost"]), key)
+			addRow(str(r["sessionId"]), str(r["providerId"]), str(r["modelId"]), ts(r["createdAt"]), num(r["prompt_tokens"]), num(r["completion_tokens"]), num(r["cache_read_tokens"]), 0, dimCost(r["total_cost"], r["cost_quality"]), key)
 		}
 	}
 	dimKeep(d, sessions)

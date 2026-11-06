@@ -105,6 +105,20 @@ func TestTrayOverviewIndependentOfDashboardAndRemote(t *testing.T) {
 	}
 }
 
+func TestTrayAntigravitySessionModelPricesEmptyTurns(t *testing.T) {
+	now := time.Now().Unix()
+	sessions := []model.Session{{Agent: model.Antigravity, Key: "antigravity/s", SelectedModel: "gemini-3-flash"}}
+	turns := []model.Turn{{Agent: model.Antigravity, SessionKey: "antigravity/s", CreatedAt: now, InputTokens: 1e6}}
+	entries := trayEntriesOf(turns, "", sessions)
+	if len(entries) != 1 || entries[0].cost <= 0 {
+		t.Fatalf("session model should price empty-turn Antigravity: %+v", entries)
+	}
+	unpriced := trayEntriesOf(turns, "", nil)
+	if len(unpriced) != 1 || unpriced[0].cost != 0 {
+		t.Fatalf("empty model without session stays unpriced: %+v", unpriced)
+	}
+}
+
 // A Claude reset can be asked from the tray; its confirmation opens there,
 // not in the dashboard, and cancelling spends nothing.
 func TestTrayRefreshShowsProgress(t *testing.T) {

@@ -90,10 +90,33 @@ func TestRequestBillingRegressions(t *testing.T) {
 			t.Fatal("invalid bill accepted")
 		}
 	}
-	for _, name := range []string{"adaptive", "swe-1-7-high", "unknown-provider/claude-sonnet-5-5", "claude-opus", "gpt-5.1-fast", "gpt-5.1-free", "glm-5.3-unknown-flash"} {
+	for _, name := range []string{"adaptive", "swe-1-7-high", "claude-opus", "gpt-5.1-fast", "gpt-5.1-free", "glm-5.3-unknown-flash"} {
 		if _, ok := pricing.Cost(model.Turn{Agent: model.Codex, Model: name}, ""); ok {
 			t.Fatalf("unsafe API fallback %s", name)
 		}
+	}
+	origin, ok := pricing.Cost(model.Turn{Agent: model.Dim, Model: "grok-4.6", InputTokens: 1e6, OutputTokens: 1e6, CacheReadTokens: 1e6}, "")
+	if !ok {
+		t.Fatal("missing grok-4.6 origin")
+	}
+	for _, name := range []string{"grok-build/grok-4.6", "custom-provider/grok-4.6", "grok-4.6-build", "grok-build/grok-4.6-build"} {
+		got, priced := pricing.Cost(model.Turn{Agent: model.Dim, Model: name, InputTokens: 1e6, OutputTokens: 1e6, CacheReadTokens: 1e6}, "")
+		if !priced {
+			t.Fatalf("local route unpriced: %s", name)
+		}
+		near(t, got, origin)
+	}
+	sonnet, ok := pricing.Cost(model.Turn{Agent: model.Codex, Model: "claude-sonnet-5-5", CacheReadTokens: 1e6}, "")
+	if !ok {
+		t.Fatal("missing sonnet origin")
+	}
+	got, priced := pricing.Cost(model.Turn{Agent: model.Codex, Model: "unknown-provider/claude-sonnet-5-5", CacheReadTokens: 1e6}, "")
+	if !priced {
+		t.Fatal("unknown routing prefix should use origin")
+	}
+	near(t, got, sonnet)
+	if _, priced := pricing.Cost(model.Turn{Agent: model.Codex, Model: "openai/claude-sonnet-5-5", CacheReadTokens: 1e6}, ""); priced {
+		t.Fatal("known channel must not inherit another origin")
 	}
 	for name, want := range map[string]float64{"anthropic/claude-sonnet-5-5": .1, "vivgrid/claude-sonnet-5-5": .2} {
 		p, ok := pricing.Lookup(name)
@@ -134,6 +157,44 @@ func TestRequestBillingRegressions(t *testing.T) {
 	}
 	if _, ok := pricing.Cost(model.Turn{Agent: model.Codex, Model: "gemini-3-flash-a", InputTokens: 1}, ""); ok {
 		t.Fatal("rollout arm priced outside Antigravity")
+	}
+}
+
+func TestGrokRecordedTicksYieldToCatalog(t *testing.T) {
+	var calculator pricing.Calculator
+	ticks := 0.01
+	turn := model.Turn{Agent: model.Grok, Model: "grok-4.6", InputTokens: 1e6, OutputTokens: 0, CacheReadTokens: 0, RecordedCost: &ticks}
+	want, ok := pricing.Cost(model.Turn{Agent: model.Grok, Model: "grok-4.6", InputTokens: 1e6}, "")
+	if !ok {
+		t.Fatal("missing grok-4.6")
+	}
+	for _, cost := range []func(model.Turn, string) (float64, bool){pricing.Cost, calculator.Cost} {
+		got, priced := cost(turn, "")
+		if !priced {
+			t.Fatal("catalog should price Grok")
+		}
+		near(t, got, want)
+		if got == ticks {
+			t.Fatal("Grok ticks overrode the catalog")
+		}
+	}
+	unknown := model.Turn{Agent: model.Grok, Model: "grok-not-a-model", InputTokens: 1e6, RecordedCost: &ticks}
+	got, priced := pricing.Cost(unknown, "")
+	if !priced || got != ticks {
+		t.Fatalf("unpriced Grok should keep ticks: %v %v", got, priced)
+	}
+	writes := model.Turn{Agent: model.Grok, Model: "grok-4.6", InputTokens: 1e6, CacheCreationTokens: 1, RecordedCost: &ticks}
+	if _, ok := pricing.Cost(model.Turn{Agent: model.Grok, Model: "grok-4.6", InputTokens: 1e6, CacheCreationTokens: 1}, ""); ok {
+		t.Fatal("grok-4.6 quotes no cache write rate")
+	}
+	got, priced = pricing.Cost(writes, "")
+	if !priced || got != ticks {
+		t.Fatalf("unpriceable cache write should keep Grok ticks: %v %v", got, priced)
+	}
+	open := model.Turn{Agent: model.OpenCode, Model: "grok-4.6", InputTokens: 1e6, RecordedCost: &ticks}
+	got, priced = pricing.Cost(open, "")
+	if !priced || got != ticks {
+		t.Fatalf("non-Grok recorded billing still wins: %v %v", got, priced)
 	}
 }
 

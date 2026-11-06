@@ -104,13 +104,17 @@ type trayEntry struct {
 	cost, tokens float64
 }
 
-func trayEntriesOf(turns []model.Turn, localID string) []trayEntry {
+func trayEntriesOf(turns []model.Turn, localID string, sessions []model.Session) []trayEntry {
+	models := map[string]string{}
+	for _, s := range sessions {
+		models[s.Key] = s.DisplayModel()
+	}
 	var out []trayEntry
 	for _, turn := range turns {
 		if turn.DeviceID != "" && localID != "" && turn.DeviceID != localID {
 			continue
 		}
-		v, _ := pricing.Cost(turn, turn.Model)
+		v, _ := pricing.Cost(turn, models[turn.SessionKey])
 		out = append(out, trayEntry{at: turn.CreatedAt, cost: v, tokens: turn.InputTokens + turn.OutputTokens + turn.CacheReadTokens + turn.CacheCreationTokens})
 	}
 	return out

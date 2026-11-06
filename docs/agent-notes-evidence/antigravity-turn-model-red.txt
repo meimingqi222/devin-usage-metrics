@@ -1,0 +1,5 @@
+--- FAIL: TestAntigravityFullUsageSuppressesEcho (0.01s)
+    data_test.go:463: turns should inherit session model: {Agent:antigravity SessionKey:antigravity/s CreatedAt:100 InputTokens:4 OutputTokens:7 CacheReadTokens:6 CacheCreationTokens:1 CacheCreation5mTokens:0 CacheCreation1hTokens:0 Model: BillingModel: ContextStream: ContextOrder:0 TTFTMs:0 TotalTimeMs:0 RecordedCost:<nil> DeviceID:ad745b6d-b7d7-47b7-a168-4afa7535ec0a DeviceName:yuqiangdeMacBook-Pro.local DedupKey:} {Agent:antigravity SessionKey:antigravity/s CreatedAt:102 InputTokens:9 OutputTokens:2 CacheReadTokens:0 CacheCreationTokens:0 CacheCreation5mTokens:0 CacheCreation1hTokens:0 Model: BillingModel: ContextStream: ContextOrder:0 TTFTMs:0 TotalTimeMs:0 RecordedCost:<nil> DeviceID:ad745b6d-b7d7-47b7-a168-4afa7535ec0a DeviceName:yuqiangdeMacBook-Pro.local DedupKey:}
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/data	0.870s
+FAIL

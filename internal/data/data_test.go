@@ -443,6 +443,7 @@ func TestAntigravityFullUsageSuppressesEcho(t *testing.T) {
 	exec(t, conn, "CREATE TABLE trajectory_metadata_blob(id TEXT,data BLOB)")
 	exec(t, conn, "CREATE TABLE gen_metadata(idx INTEGER,data BLOB)")
 	exec(t, conn, "CREATE TABLE steps(idx INTEGER,step_type INTEGER,step_payload BLOB,metadata BLOB)")
+	exec(t, conn, "INSERT INTO gen_metadata VALUES (0,?)", []byte{0x0A, 0x11, 0x9A, 0x01, 0x0E, 'g', 'e', 'm', 'i', 'n', 'i', '-', '3', '-', 'f', 'l', 'a', 's', 'h'})
 	// Usage: {1: model ID, 2: input, 3: output with thinking, 4: cache
 	// write, 5: cache read, 7: message ID, 9: thinking, 10: visible output}.
 	usage := []byte{8, 3, 16, 4, 24, 7, 32, 1, 40, 6, 58, 1, 'a', 72, 2, 80, 5}
@@ -457,6 +458,9 @@ func TestAntigravityFullUsageSuppressesEcho(t *testing.T) {
 	check(t, d, 2)
 	if d.Turns[0].InputTokens != 4 || d.Turns[0].OutputTokens != 7 || d.Turns[0].CacheReadTokens != 6 || d.Turns[0].CacheCreationTokens != 1 {
 		t.Fatal(d)
+	}
+	if d.Turns[0].Model != "gemini-3-flash" || d.Turns[1].Model != "gemini-3-flash" {
+		t.Fatalf("turns should inherit session model: %+v %+v", d.Turns[0], d.Turns[1])
 	}
 	if d.Turns[1].InputTokens != 9 || d.Turns[1].OutputTokens != 2 || d.Turns[1].CreatedAt != 102 {
 		t.Fatal(d)
@@ -700,6 +704,11 @@ func TestDimModelUsageTurns(t *testing.T) {
 	if r.InputTokens != 70 || r.OutputTokens != 20 || r.CacheReadTokens != 30 || r.Model != "grok-build/grok-4.6" || r.DedupKey != "req-1" {
 		t.Fatalf("turn %+v", r)
 	}
+	cost, ok := pricing.Cost(r, "")
+	origin, originOK := pricing.Cost(model.Turn{Agent: model.Dim, Model: "grok-4.6", InputTokens: 70, OutputTokens: 20, CacheReadTokens: 30}, "")
+	if !ok || !originOK || cost != origin {
+		t.Fatalf("grok-build priced %v %v, origin %v %v", cost, ok, origin, originOK)
+	}
 }
 
 func TestDimDesktopRunStatsIgnoresPluginLedger(t *testing.T) {
@@ -723,6 +732,33 @@ func TestDimDesktopRunStatsIgnoresPluginLedger(t *testing.T) {
 	r := d.Turns[0]
 	if r.InputTokens != 70 || r.OutputTokens != 20 || r.CacheReadTokens != 30 || r.Model != "grok-build/grok-4.6" || r.DedupKey != "run-1" || r.RecordedCost == nil || *r.RecordedCost != 0.01 {
 		t.Fatalf("turn %+v", r)
+	}
+}
+
+func TestDimDesktopMissingPriceIsNotRecordedZero(t *testing.T) {
+	h := env(t)
+	conn := db(t, h, ".dimcode/v2/dimcode.sqlite")
+	exec(t, conn, "CREATE TABLE sessions (sessionId TEXT, cwd TEXT, title TEXT, createdAt TEXT, updatedAt TEXT)")
+	exec(t, conn, "CREATE TABLE usage_run_stats (runId TEXT, sessionId TEXT, providerId TEXT, modelId TEXT, status TEXT, startedAt TEXT, endedAt TEXT, inputTokens REAL, outputTokens REAL, totalTokens REAL, cacheReadTokens REAL, cacheWriteTokens REAL, cost TEXT)")
+	exec(t, conn, "INSERT INTO sessions VALUES ('desk-1', '/work', 'Desktop chat', '2023-11-14T22:13:20Z', '2023-11-14T22:14:00Z')")
+	exec(t, conn, "INSERT INTO usage_run_stats VALUES ('run-free', 'desk-1', 'grok-build', 'grok-4.6', 'completed', '2023-11-14T22:13:20Z', '2023-11-14T22:14:00Z', 10, 2, 12, 0, 0, '{\"totalCostUsd\":0,\"quality\":\"exact\"}')")
+	exec(t, conn, "INSERT INTO usage_run_stats VALUES ('run-unknown', 'desk-1', 'custom-copilot-api', 'hy4free', 'completed', '2023-11-14T22:13:21Z', '2023-11-14T22:14:01Z', 20, 3, 23, 0, 0, '{\"totalCostUsd\":0,\"quality\":\"missing_price\"}')")
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d := data.Load(model.Dim, 0, 2000000000, true)
+	check(t, d, 2)
+	by := map[string]model.Turn{}
+	for _, r := range d.Turns {
+		by[r.DedupKey] = r
+	}
+	free := by["run-free"]
+	unknown := by["run-unknown"]
+	if free.RecordedCost == nil || *free.RecordedCost != 0 {
+		t.Fatalf("exact zero must stay recorded: %+v", free)
+	}
+	if unknown.RecordedCost != nil {
+		t.Fatalf("missing_price must not be billed as $0: %+v", unknown)
 	}
 }
 
