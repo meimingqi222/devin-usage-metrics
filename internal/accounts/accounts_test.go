@@ -446,7 +446,7 @@ func TestSwitchAppRestartsAntigravity(t *testing.T) {
 // the path this platform resolves, holding a signed-in token and its email.
 func writeAntigravityStateFixture(t *testing.T, access, refresh, email string) string {
 	t.Helper()
-	p := antigravityStateDB()
+	p := antigravityStateDBs()[0]
 	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
 		t.Fatal(err)
 	}
