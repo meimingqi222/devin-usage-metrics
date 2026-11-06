@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 )
 
 type Account struct {
@@ -99,6 +101,24 @@ func status(e error) int {
 		return h.status
 	}
 	return 0
+}
+
+// DiagnosticErrorCode preserves HTTP status without response bodies or URLs.
+func DiagnosticErrorCode(err error) string {
+	if code := status(err); code >= 100 && code <= 599 {
+		return "http_" + strconv.Itoa(code)
+	}
+	// Cached failures retain only their display string, including the local
+	// "HTTP 429 (retry in ...s)" cooldown. Emit only the validated status.
+	if err != nil {
+		text := err.Error()
+		if strings.HasPrefix(text, "HTTP ") && len(text) >= 8 && (len(text) == 8 || text[8] == ' ') {
+			if code, parseErr := strconv.Atoi(text[5:8]); parseErr == nil && code >= 100 && code <= 599 {
+				return "http_" + strconv.Itoa(code)
+			}
+		}
+	}
+	return syncdiag.ErrorCode(err)
 }
 
 var client = &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, MaxIdleConnsPerHost: 8, IdleConnTimeout: 5 * time.Minute}, CheckRedirect: func(r *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}

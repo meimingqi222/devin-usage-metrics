@@ -240,18 +240,35 @@ func backupIdentity(e BackupEntry) string {
 // claim are local-only and must not enter the merged snapshot.
 func syncIdentity(e BackupEntry) string {
 	id := credentialid.Of(e.Provider, e.Credential)
-	if id.Stable == "" {
+	stable := syncStable(e.Provider, id)
+	if stable == "" {
 		return ""
 	}
-	return e.Provider + "/" + profileID(e.Provider, id, e.Credential, "")
+	return e.Provider + "/" + profileID(e.Provider, credentialid.Identity{Stable: stable}, nil, "")
+}
+
+// syncStable is the stable claim sync merges on. Antigravity records the
+// same Google account as "email" on one device and "email|sub" on another;
+// the email alone keys it or every sync round-trips a second record. Other
+// providers can share an email across distinct logins, so they keep the
+// full claim.
+func syncStable(provider string, id credentialid.Identity) string {
+	if provider == "antigravity" && id.Email != "" {
+		return id.Email
+	}
+	return id.Stable
 }
 
 func profileSyncKey(p Profile, doc map[string]any) string {
 	if key := syncIdentity(BackupEntry{Provider: p.Provider, Credential: doc}); key != "" {
 		return key
 	}
-	if p.StableID != "" {
-		return p.Provider + "/" + profileID(p.Provider, credentialid.Identity{Stable: p.StableID}, nil, "")
+	stable := p.StableID
+	if p.Provider == "antigravity" && p.Email != "" {
+		stable = p.Email
+	}
+	if stable != "" {
+		return p.Provider + "/" + profileID(p.Provider, credentialid.Identity{Stable: stable}, nil, "")
 	}
 	return ""
 }
@@ -417,8 +434,59 @@ func (s *Store) ImportBackup(b Backup) (added, kept int, err error) {
 func (s *Store) suppressBackupLocked(p Profile) {
 	keys := []string{p.Provider + "/" + p.ID}
 	if doc, err := s.readCredential(p); err == nil {
-		keys = append(keys, backupIdentity(BackupEntry{Provider: p.Provider, Credential: doc}))
+		keys = append(keys, s.identityKeysLocked(p, doc)...)
 	}
+	s.tombstoneLocked(keys)
+}
+
+// suppressRecordBackupLocked retires a duplicate record without tombstoning
+// identities a surviving record still claims. Folding writes the shared
+// account's sync key otherwise, and the tombstone deletes the surviving
+// profile on every device at the next sync.
+func (s *Store) suppressRecordBackupLocked(p Profile) {
+	keys := []string{p.Provider + "/" + p.ID}
+	if doc, err := s.readCredential(p); err == nil {
+		keys = append(keys, s.identityKeysLocked(p, doc)...)
+	}
+	for _, q := range s.data.Profiles {
+		if q.ID == p.ID {
+			continue
+		}
+		survivor := map[string]bool{}
+		if qDoc, err := s.readCredential(q); err == nil {
+			for _, key := range s.identityKeysLocked(q, qDoc) {
+				survivor[key] = true
+			}
+		} else if key := profileSyncKey(q, nil); key != "" {
+			survivor[key] = true
+		}
+		kept := keys[:0]
+		for _, key := range keys {
+			if !survivor[key] {
+				kept = append(kept, key)
+			}
+		}
+		keys = kept
+	}
+	s.tombstoneLocked(keys)
+}
+
+// identityKeysLocked is every identity-space key this credential answers
+// to: the document identity used by file backups, the stable sync key, and
+// the profile-level key used when the document has no claims of its own.
+func (s *Store) identityKeysLocked(p Profile, doc map[string]any) []string {
+	entry := BackupEntry{Provider: p.Provider, Credential: doc}
+	out := []string{backupIdentity(entry)}
+	if key := syncIdentity(entry); key != "" {
+		out = append(out, key)
+	}
+	if key := profileSyncKey(p, doc); key != "" {
+		out = append(out, key)
+	}
+	return out
+}
+
+func (s *Store) tombstoneLocked(keys []string) {
 	if s.data.Deleted == nil {
 		s.data.Deleted = map[string]int64{}
 	}

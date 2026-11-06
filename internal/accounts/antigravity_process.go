@@ -42,9 +42,11 @@ var (
 // Tools also falls back to for the IDE and older clients. Every run is
 // logged to the diagnostics log: a silent switch failure is undiagnosable.
 func (s *Store) SwitchApp(ctx context.Context, provider, id string, live quota.Account) error {
+	ctx = syncdiag.WithFields(syncdiag.WithRun(ctx), "provider", provider, "target_profile", diagnosticRef(id))
 	start := time.Now()
+	syncdiag.Log(ctx, "account_switch_start", "source_kind", live.CredentialKind())
 	err := s.switchApp(ctx, provider, id, live)
-	syncdiag.Log(ctx, "account_switch_end", "provider", provider, "elapsed_ms", time.Since(start).Milliseconds(), "error", syncdiag.ErrorCode(err))
+	syncdiag.Log(ctx, "account_switch_end", "elapsed_ms", time.Since(start).Milliseconds(), "error", DiagnosticErrorCode(err))
 	return err
 }
 
@@ -62,6 +64,7 @@ func (s *Store) switchApp(ctx context.Context, provider, id string, live quota.A
 	}
 	targetEmail := s.ProfileEmail(provider, id)
 	if !app.running {
+		syncdiag.Log(ctx, "account_switch_mode", "mode", "client_closed")
 		// The client is closed: nothing competes for the stores. Write the
 		// keychain plus every mirror the client restores a session from, or
 		// the next launch brings the previous account back.
@@ -75,6 +78,7 @@ func (s *Store) switchApp(ctx context.Context, provider, id string, live quota.A
 	// start a child with the new credential. Restarting the whole app
 	// re-triggers its first-run Security Notice.
 	if len(languageServers(ctx, app)) > 0 && !strings.Contains(strings.ToLower(app.path), "antigravity ide") {
+		syncdiag.Log(ctx, "account_switch_mode", "mode", "language_service_restart")
 		// Capture the current login and write the target before stopping the
 		// child: the supervisor respawns it within seconds and the new child
 		// reads the keychain on start.
@@ -91,7 +95,8 @@ func (s *Store) switchApp(ctx context.Context, provider, id string, live quota.A
 		// The running client keeps the state database locked at times; a
 		// failed mirror stays best-effort while the keychain is the truth
 		// source the client itself re-reads.
-		_ = applyAntigravityMirrors(ctx, targetEmail, targetDoc)
+		mirrorErr := applyAntigravityMirrors(ctx, targetEmail, targetDoc)
+		syncdiag.Log(ctx, "account_switch_mirrors", "error", DiagnosticErrorCode(mirrorErr))
 		if waitLanguageServerRespawn(ctx, app, old, 15*time.Second) {
 			// The main process may write its in-memory token back just after
 			// the child starts; reassert once more after it settles and make
@@ -100,7 +105,8 @@ func (s *Store) switchApp(ctx context.Context, provider, id string, live quota.A
 			if err := s.Reapply(provider, id, live); err != nil {
 				return fmt.Errorf("re-assert the new sign-in: %w", err)
 			}
-			_ = applyAntigravityMirrors(ctx, targetEmail, targetDoc)
+			mirrorErr := applyAntigravityMirrors(ctx, targetEmail, targetDoc)
+			syncdiag.Log(ctx, "account_switch_mirrors", "error", DiagnosticErrorCode(mirrorErr))
 			return s.verifySwitched(provider, id, live)
 		}
 		// No supervisor respawn: fall back to the authoritative full
@@ -111,6 +117,7 @@ func (s *Store) switchApp(ctx context.Context, provider, id string, live quota.A
 	// holds it: marking the target active before that capture let the next
 	// refresh file the old tokens under the target's profile and overwrite
 	// that account's saved copy.
+	syncdiag.Log(ctx, "account_switch_mode", "mode", "full_restart")
 	if err := stopAntigravity(ctx, app); err != nil {
 		return fmt.Errorf("quit Antigravity: %w", err)
 	}

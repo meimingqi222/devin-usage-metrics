@@ -19,6 +19,7 @@ import (
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/credentialid"
 	"github.com/meimingqi222/devin-usage-metrics/internal/quota"
+	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 )
 
 // ErrDisabled means account switching was not enabled; the app must stay
@@ -263,56 +264,73 @@ func (s *Store) Reconcile(live []quota.Account) ([]Profile, error) {
 
 // ReconcileContext is Reconcile with a caller's cancellation and timeout.
 func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]Profile, error) {
+	ctx = syncdiag.WithRun(ctx)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loadLocked()
+	before := len(s.data.Profiles)
 	changed := s.repairLocked()
+	syncdiag.Log(ctx, "account_reconcile_start", "saved_before", before, "saved_after_repair", len(s.data.Profiles), "repaired", changed, "enabled", s.data.Enabled)
 	seen := map[string]bool{}
 	for _, a := range live {
 		if !supported(a.Provider) || seen[a.Provider] {
 			continue
 		}
 		seen[a.Provider] = true
+		accountCtx := syncdiag.WithFields(ctx, "provider", a.Provider, "source", syncdiag.ID(a.Key), "source_kind", a.CredentialKind())
+		previous := s.active[a.Provider]
 		doc, err := a.CredentialDoc()
 		if err != nil {
+			syncdiag.Log(accountCtx, "account_reconcile_skipped", "reason", "credential_read_failed", "error", syncdiag.ErrorCode(err))
 			continue
 		}
 		if !accountDocument(a.Provider, doc) {
+			syncdiag.Log(accountCtx, "account_reconcile_skipped", "reason", "not_switchable_document")
 			if a.Provider == "codex" {
 				delete(s.active, a.Provider)
 			}
 			continue
 		}
+		identitySource := "credential_document"
 		if credentialid.Of(a.Provider, doc).Email == "" {
+			identitySource = "unresolved"
 			// The active profile, the agent's own label or our saved copy
 			// may name the account even when the credential has no identity
 			// claims. Keep the email in our copy only; a switch strips it.
 			if a.Provider == "claude" {
 				if email := claudeProfileEmail(); email != "" {
 					doc["email"] = email
+					identitySource = "claude_profile"
 				}
 			}
 			if credentialid.Of(a.Provider, doc).Email == "" {
-				// The active profile may name the document's account only
-				// when the two actually share tokens: after a failed
-				// switch the live store can hold the previous login, and
-				// stamping the selected account's name onto it rewrote
-				// that account's saved sign-in with the old one.
-				if p := s.activeProfileLocked(a.Provider); p != nil && p.Email != "" && s.sameSavedLocked(*p, a.Provider, doc) {
-					doc["email"] = p.Email
-				} else if email := s.savedEmailLocked(a.Provider, doc); email != "" {
-					doc["email"] = email
-				} else if a.Provider == "antigravity" {
-					// Antigravity's agent-facing label is its UI's auth
-					// status, which runs ahead of or behind the token row
-					// while an account switch settles; stamping it here
-					// filed tokens under the wrong account. Ask Google
-					// whom the access token belongs to instead.
+				if a.Provider == "antigravity" {
+					// The issuer outranks every recorded name: a crossed
+					// saved copy claims one account while holding these
+					// tokens, and the auth-status label runs ahead of or
+					// behind the token row. An expired access token still
+					// answers through a refresh exchange.
 					if email := googleAccountEmail(ctx, accessTokenOf(doc)); email != "" {
 						doc["email"] = email
+						identitySource = "google_userinfo"
+					} else if email := googleRefreshedEmail(ctx, doc); email != "" {
+						doc["email"] = email
+						identitySource = "google_refresh_exchange"
 					}
-				} else if strings.Contains(a.Label, "@") {
-					doc["email"] = a.Label
+				}
+				if credentialid.Of(a.Provider, doc).Email == "" {
+					// Recorded names stay a guess behind the issuer: the
+					// active profile first - the most recent attribution -
+					// then any other saved copy sharing the tokens. The
+					// agent's label names Antigravity's UI, not its tokens,
+					// so it is never used there.
+					if email := s.unattestedSavedEmailLocked(a.Provider, doc); email != "" {
+						doc["email"] = email
+						identitySource = "saved_tokens"
+					} else if a.Provider != "antigravity" && strings.Contains(a.Label, "@") {
+						doc["email"] = a.Label
+						identitySource = "agent_label"
+					}
 				}
 			}
 		}
@@ -326,23 +344,52 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 			key = backupIdentity(entry)
 		}
 		if s.data.Deleted[key] > 0 {
+			// The tombstone suppresses capturing or recreating this account,
+			// but a record removed on another device can still be the live
+			// login here: bind the matching profile anyway so the switcher
+			// and quota card name the account, and flag copies that hold
+			// these tokens under another name.
+			id, matchReason := "", "unmatched"
 			for _, p := range s.data.Profiles {
 				if p.Provider != a.Provider {
 					continue
 				}
-				if saved, err := s.readCredential(p); err == nil && backupIdentity(BackupEntry{Provider: p.Provider, Credential: saved}) == key {
-					s.active[a.Provider] = p.ID
+				if saved, err := s.readCredential(p); err == nil && profileSyncKey(p, saved) == key {
+					id, matchReason = p.ID, "sync_tombstone_record"
 					break
 				}
 			}
+			if id == "" {
+				id, matchReason = s.matchReasonLocked(a.Provider, doc, hash)
+				if matchReason != "unmatched" {
+					matchReason = "tombstoned_" + matchReason
+				}
+			}
+			if id != "" {
+				if s.active[a.Provider] != id {
+					s.active[a.Provider] = id
+					changed = true
+				}
+				for i := range s.data.Profiles {
+					if s.data.Profiles[i].ID == id {
+						s.data.Profiles[i].LastUsedAt = time.Now().Unix()
+					}
+				}
+			}
+			s.flagContaminatedLocked(a.Provider, doc)
+			syncdiag.Log(accountCtx, "account_reconcile_decision", "identity_source", identitySource,
+				"match_reason", matchReason, "capture", "tombstoned", "matched", id != "",
+				"previous_profile", diagnosticRef(previous), "profile", diagnosticRef(id), "active_changed", previous != s.active[a.Provider])
 			continue
 		}
 		if s.recoverLocked(a.Provider, doc, hash) {
 			changed = true
 		}
 		captured := ""
+		captureStatus := "disabled_or_readonly"
 		if s.data.Enabled && a.Writable() {
 			if s.unattributableLocked(a.Provider, doc) {
+				captureStatus = "unattributable"
 				// The document carries no identity and shares no token with
 				// the named active profile: it is the leftover of a different
 				// login (a dying client writing its previous sign-in back
@@ -350,13 +397,20 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 				// Capturing it here replaced the active profile's saved
 				// sign-in with the other account's tokens.
 			} else if p, err := s.upsertLocked(a.Provider, doc, kind, hash); err == nil {
+				captureStatus = "saved"
 				captured = p.ID
 				changed = true
+			} else {
+				captureStatus = "write_failed"
+				syncdiag.Log(accountCtx, "account_capture_failed", "error", syncdiag.ErrorCode(err))
 			}
 		}
-		id := s.matchLocked(a.Provider, doc, hash)
+		id, matchReason := s.matchReasonLocked(a.Provider, doc, hash)
 		if id == "" {
 			id = captured
+			if captured != "" {
+				matchReason = "captured_profile"
+			}
 		}
 		if id != "" {
 			if s.active[a.Provider] != id {
@@ -370,6 +424,9 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 			}
 		}
 		s.flagContaminatedLocked(a.Provider, doc)
+		syncdiag.Log(accountCtx, "account_reconcile_decision", "identity_source", identitySource,
+			"match_reason", matchReason, "capture", captureStatus, "matched", id != "",
+			"previous_profile", diagnosticRef(previous), "profile", diagnosticRef(id), "active_changed", previous != s.active[a.Provider])
 	}
 	for _, provider := range []string{"claude", "codex", "antigravity", "grok"} {
 		if s.hideLegacyDuplicatesLocked(provider) {
@@ -377,9 +434,13 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 		}
 	}
 	if changed {
-		_ = s.saveLocked()
+		if err := s.saveLocked(); err != nil {
+			syncdiag.Log(ctx, "account_manifest_save_failed", "error", syncdiag.ErrorCode(err))
+		}
 	}
-	return s.decorateLocked(append([]Profile(nil), s.data.Profiles...)), nil
+	out := s.decorateLocked(append([]Profile(nil), s.data.Profiles...))
+	syncdiag.Log(ctx, "account_reconcile_end", "saved", len(out), "suspect", len(s.suspect))
+	return out, nil
 }
 
 // Switch moves the target profile's credential into the live store. The
@@ -677,7 +738,13 @@ func sameAccountClaims(id credentialid.Identity, p Profile) bool {
 	return true
 }
 
-func (s *Store) savedEmailLocked(provider string, doc map[string]any) string {
+// unattestedSavedEmailLocked falls back to recorded names: the active
+// profile first (the most recent attribution), then any other saved copy
+// sharing the tokens.
+func (s *Store) unattestedSavedEmailLocked(provider string, doc map[string]any) string {
+	if p := s.activeProfileLocked(provider); p != nil && p.Email != "" && s.sameSavedLocked(*p, provider, doc) {
+		return p.Email
+	}
 	for _, p := range s.data.Profiles {
 		if p.Provider != provider || p.Email == "" {
 			continue
@@ -695,6 +762,17 @@ func accessTokenOf(doc map[string]any) string {
 		t = doc
 	}
 	return str(t["access_token"])
+}
+
+// SameSavedAccount reports whether this profile's saved credential shares
+// a token with the given live document - it holds a copy of that login. It
+// takes the store lock; callers must not pass it credentials they would not
+// want compared.
+func (s *Store) SameSavedAccount(p Profile, doc map[string]any) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadLocked()
+	return s.sameSavedLocked(p, p.Provider, doc)
 }
 
 // sameSavedLocked recognizes a profile saved before its identity claims
@@ -764,7 +842,7 @@ func (s *Store) repairLocked() bool {
 		if id.Stable == "" {
 			continue
 		}
-		if p.StableID != id.Stable {
+		if stableUpgrade(p.StableID, id.Stable) {
 			p.StableID, changed = id.Stable, true
 		}
 		if id.Email != "" && !strings.EqualFold(p.Email, id.Email) {
@@ -783,6 +861,34 @@ func (s *Store) repairLocked() bool {
 	}
 	if s.foldDuplicateAccountsLocked() {
 		changed = true
+	}
+	if s.unsuppressSurvivorsLocked() {
+		changed = true
+	}
+	return changed
+}
+
+// unsuppressSurvivorsLocked drops tombstones that collide with a profile
+// still present: a surviving record means the account was never deleted,
+// and the leftover key both keeps a live sign-in from binding to it and
+// would remove the survivor on every device at the next sync.
+func (s *Store) unsuppressSurvivorsLocked() bool {
+	changed := false
+	for _, p := range s.data.Profiles {
+		if s.data.Deleted[p.Provider+"/"+p.ID] > 0 {
+			delete(s.data.Deleted, p.Provider+"/"+p.ID)
+			changed = true
+		}
+		doc, err := s.readCredential(p)
+		if err != nil {
+			continue
+		}
+		for _, key := range s.identityKeysLocked(p, doc) {
+			if s.data.Deleted[key] > 0 {
+				delete(s.data.Deleted, key)
+				changed = true
+			}
+		}
 	}
 	return changed
 }
@@ -805,6 +911,13 @@ func (s *Store) foldDuplicateAccountsLocked() bool {
 				continue
 			}
 			key := p.Provider + "\x00" + p.StableID
+			// An Antigravity record may carry only the email where another
+			// holds email|sub: one Google account, two records, so the
+			// email keys them. Other providers can share an email across
+			// distinct logins and keep the strict stable key.
+			if p.Provider == "antigravity" && p.Email != "" {
+				key = p.Provider + "\x00mail\x00" + strings.ToLower(p.Email)
+			}
 			j, ok := seen[key]
 			if !ok {
 				seen[key] = i
@@ -833,7 +946,7 @@ func (s *Store) foldDuplicateAccountsLocked() bool {
 			if s.active[p.Provider] == dd.ID {
 				s.active[p.Provider] = kd.ID
 			}
-			s.suppressBackupLocked(*dd)
+			s.suppressRecordBackupLocked(*dd)
 			_ = os.Remove(s.credentialPath(dd.Provider, dd.ID))
 			s.data.Profiles = append(s.data.Profiles[:drop], s.data.Profiles[drop+1:]...)
 			changed, folded = true, true
@@ -908,7 +1021,11 @@ func (s *Store) upsertLocked(provider string, doc map[string]any, kind, hash str
 		}
 		sameID := p.ID == pid
 		sameStable := id.Stable != "" && p.StableID == id.Stable
-		sameTokens := !sameID && !sameStable && s.sameSavedLocked(*p, provider, doc)
+		// A claims-less document may merge into any sharing account - the
+		// tokens say it is the same login. A document carrying claims must
+		// not overwrite a profile whose identity contradicts them, or a
+		// wrongly stamped copy keeps being rewritten under the wrong name.
+		sameTokens := !sameID && !sameStable && (id.Stable == "" && id.Email == "" || sameAccountClaims(id, *p)) && s.sameSavedLocked(*p, provider, doc)
 		// A legacy email-only identity may match an email|sub profile, but
 		// never a different known account (Codex workspace, Claude org).
 		sameEmail := !sameID && !sameStable && !sameTokens && provider == "antigravity" &&
@@ -941,7 +1058,10 @@ func (s *Store) upsertLocked(provider string, doc map[string]any, kind, hash str
 		if id.Plan != "" {
 			p.Plan = id.Plan
 		}
-		if id.Stable != "" {
+		// Keep the richer stable key: email|sub names the account more
+		// precisely than the email an email-only claim leaves, and either
+		// direction can arrive from differently stamped documents.
+		if stableUpgrade(p.StableID, id.Stable) {
 			p.StableID = id.Stable
 		}
 		if p.CreatedAt == 0 {
@@ -965,33 +1085,53 @@ func (s *Store) upsertLocked(provider string, doc map[string]any, kind, hash str
 }
 
 func (s *Store) matchLocked(provider string, doc map[string]any, hash string) string {
+	id, _ := s.matchReasonLocked(provider, doc, hash)
+	return id
+}
+
+func (s *Store) matchReasonLocked(provider string, doc map[string]any, hash string) (string, string) {
 	id := credentialid.Of(provider, doc)
 	for _, p := range s.data.Profiles {
 		if p.Provider != provider {
 			continue
 		}
 		if id.Stable != "" && p.StableID == id.Stable {
-			return p.ID
+			return p.ID, "stable_identity"
 		}
 		if p.Credentials != "" && p.Credentials == hash {
-			return p.ID
+			return p.ID, "document_match"
 		}
 	}
-	active := s.active[provider]
-	if active == "" {
-		return ""
-	}
-	if id.Stable == "" {
-		return active
+	if id.Stable == "" && id.Email == "" {
+		// A claims-less document belongs to whichever saved copy shares its
+		// tokens - not only the active one's: Antigravity's state-database
+		// login reads back as bare tokens, and its account is whichever
+		// profile captured the same refresh token.
+		for _, p := range s.data.Profiles {
+			if p.Provider == provider && s.sameSavedLocked(p, provider, doc) {
+				return p.ID, "saved_tokens"
+			}
+		}
+		// An unprovable login keeps the previous attribution: a dying client
+		// can write a stale sign-in back over a finished switch, and clearing
+		// the active record on that write loses which account was switched
+		// to.
+		return s.active[provider], "previous_active_unverified"
 	}
 	if !strings.Contains(id.Stable, "|") {
 		for _, p := range s.data.Profiles {
-			if p.Provider == provider && p.ID == active && strings.HasPrefix(p.StableID, id.Stable+"|") {
-				return p.ID
+			if p.Provider != provider {
+				continue
+			}
+			if provider == "antigravity" && id.Email != "" && strings.EqualFold(p.Email, id.Email) {
+				return p.ID, "antigravity_email"
+			}
+			if p.ID == s.active[provider] && strings.HasPrefix(p.StableID, id.Stable+"|") {
+				return p.ID, "active_identity_prefix"
 			}
 		}
 	}
-	return ""
+	return "", "unmatched"
 }
 
 func (s *Store) matchID(provider string, doc map[string]any, hash string) string {
@@ -1146,6 +1286,12 @@ func accountDocument(provider string, doc map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// stableUpgrade reports whether next names the account more precisely than
+// cur: a fresh claim, or the |suffixed form of the same stable key.
+func stableUpgrade(cur, next string) bool {
+	return next != "" && next != cur && (cur == "" || strings.HasPrefix(next, cur+"|"))
 }
 
 func profileID(provider string, id credentialid.Identity, doc map[string]any, hash string) string {
@@ -1332,4 +1478,12 @@ func obj(v any) map[string]any {
 func str(v any) string {
 	s, _ := v.(string)
 	return strings.TrimSpace(s)
+}
+
+// diagnosticRef never emits credential-derived document hashes.
+func diagnosticRef(id string) string {
+	if id == "" {
+		return ""
+	}
+	return syncdiag.ID(id)
 }

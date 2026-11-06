@@ -26,6 +26,7 @@ func fixture(t *testing.T) string {
 		"HOME": h, "USERPROFILE": h,
 		"APPDATA":         filepath.Join(h, "appdata"),
 		"XDG_CONFIG_HOME": filepath.Join(h, "config"),
+		"XDG_CACHE_HOME":  filepath.Join(h, "cache"),
 		"USER":            "tester",
 	} {
 		t.Setenv(k, v)
@@ -542,16 +543,37 @@ func TestMissingCredentialIsNotSwitchable(t *testing.T) {
 	t.Fatal("record missing from the list")
 }
 
-// googleUserInfoFake serves the userinfo oracle so a state-database login
-// without identity claims can be named offline. The issuer's answers are
-// per token: access-1 and access-2 belong to one@example.test, access-3 to
-// three@example.test.
+// googleUserInfoFake serves the userinfo and token endpoints so a
+// state-database login without identity claims can be named offline. The
+// issuer's answers are per token: access-1 and access-2 belong to
+// one@example.test, access-3 to three@example.test. A refresh_token POST is
+// answered with access token "fx:<refresh>", which userinfo resolves
+// through refreshEmails.
 func googleUserInfoFake(t *testing.T) {
 	t.Helper()
-	emails := map[string]string{"access-1": "one@example.test", "access-2": "one@example.test", "access-3": "three@example.test"}
+	emails := map[string]string{"access-1": "one@example.test", "access-2": "one@example.test", "access-3": "three@example.test", "b1x": "b@example.com"}
+	refreshEmails := map[string]string{"rb1": "b@example.com", "rnb": "b@example.com", "r-2": "two@example.test"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			if err := r.ParseForm(); err != nil || r.PostForm.Get("grant_type") != "refresh_token" {
+				w.WriteHeader(400)
+				return
+			}
+			rt := r.PostForm.Get("refresh_token")
+			if _, ok := refreshEmails[rt]; !ok {
+				w.WriteHeader(401)
+				return
+			}
+			fmt.Fprint(w, `{"access_token":"fx:`+rt+`"}`)
+			return
+		}
 		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		email, ok := emails[auth]
+		if !ok {
+			if rt, ok := strings.CutPrefix(auth, "fx:"); ok {
+				email, ok = refreshEmails[rt]
+			}
+		}
 		if !ok {
 			w.WriteHeader(401)
 			return
@@ -559,9 +581,9 @@ func googleUserInfoFake(t *testing.T) {
 		fmt.Fprint(w, `{"email":"`+email+`"}`)
 	}))
 	t.Cleanup(srv.Close)
-	old := googleUserInfoURL
-	googleUserInfoURL = srv.URL
-	t.Cleanup(func() { googleUserInfoURL = old })
+	oldInfo, oldToken := googleUserInfoURL, googleTokenURL
+	googleUserInfoURL, googleTokenURL = srv.URL, srv.URL
+	t.Cleanup(func() { googleUserInfoURL, googleTokenURL = oldInfo, oldToken })
 }
 
 func TestStateLoginIsCapturedAndSwitchable(t *testing.T) {
@@ -632,7 +654,115 @@ func TestFoldDuplicateAccounts(t *testing.T) {
 	}
 }
 
-// A saved copy holding the live account's tokens under another account's
+// Folding a duplicate record retires the record, not the account: the
+// surviving copy claims the same identity keys, so no tombstone may be
+// left for them. A tombstoned identity suppressed the live sign-in from
+// binding to the survivor - the account showed as a duplicate - and let
+// the next sync delete the surviving record on every device.
+func TestFoldDoesNotTombstoneSurvivingAccount(t *testing.T) {
+	h := fixture(t)
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.Add("antigravity", map[string]any{
+		"access_token": "a1", "refresh_token": "r1",
+		"id_token": jwt(map[string]any{"email": "one@example.test"}),
+	}, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The duplicate carries its own copy of the same account's sign-in.
+	dupDoc := map[string]any{
+		"access_token": "a1-old", "refresh_token": "r1-old",
+		"id_token": jwt(map[string]any{"email": "one@example.test"}),
+	}
+	raw, err := json.Marshal(dupDoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dup := Profile{ID: "dup000000000001", Provider: "antigravity", StableID: first.StableID, Email: first.Email, Kind: "file", CreatedAt: 1, ModifiedAt: 1}
+	s.mu.Lock()
+	s.data.Profiles = append(s.data.Profiles, dup)
+	if err := s.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+	if err := os.WriteFile(s.CredentialPath("antigravity", dup.ID), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.List()
+	s.mu.Lock()
+	doc, err := s.readCredential(first)
+	if err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	entry := BackupEntry{Provider: "antigravity", Credential: doc}
+	for _, key := range []string{syncIdentity(entry), backupIdentity(entry), profileSyncKey(first, doc)} {
+		if key != "" && s.data.Deleted[key] > 0 {
+			s.mu.Unlock()
+			t.Fatalf("surviving account's identity tombstoned by the fold: %s", key)
+		}
+	}
+	s.mu.Unlock()
+	// The account's next login still reconciles against the survivor.
+	write(t, h, ".gemini/oauth_creds.json", `{"access_token":"a2","refresh_token":"r2","id_token":"`+jwt(map[string]any{"email": "one@example.test"})+`"}`)
+	profiles, err := s.Reconcile(quota.Discover(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range profiles {
+		if p.ID == first.ID && !p.Active {
+			t.Fatalf("live sign-in did not bind to the surviving record: %+v", profiles)
+		}
+	}
+}
+
+// A manifest already poisoned by a folded duplicate's tombstone heals on
+// the next repair: the surviving record proves the account was never
+// deleted, so its identity keys leave Deleted.
+func TestRepairDropsTombstoneOnSurvivingAccount(t *testing.T) {
+	fixture(t)
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.Add("antigravity", map[string]any{
+		"access_token": "a1", "refresh_token": "r1",
+		"id_token": jwt(map[string]any{"email": "one@example.test"}),
+	}, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	doc, err := s.readCredential(first)
+	if err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	key := syncIdentity(BackupEntry{Provider: "antigravity", Credential: doc})
+	if key == "" {
+		s.mu.Unlock()
+		t.Fatal("account has no sync identity")
+	}
+	if s.data.Deleted == nil {
+		s.data.Deleted = map[string]int64{}
+	}
+	s.data.Deleted[key] = time.Now().UnixNano()
+	if err := s.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+	_ = s.List()
+	s.mu.Lock()
+	left := s.data.Deleted[key]
+	s.mu.Unlock()
+	if left > 0 {
+		t.Fatal("tombstone on the surviving account's identity was not repaired")
+	}
+}
+
 // name must refuse to switch instead of silently restoring the copied
 // account.
 func TestSwitchRejectsContaminatedCopy(t *testing.T) {

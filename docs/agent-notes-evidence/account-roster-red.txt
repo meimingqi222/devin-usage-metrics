@@ -1,0 +1,9 @@
+--- FAIL: TestQuotaRosterKeepsEverySavedProfile (0.28s)
+    account_roster_test.go:58: quota has 1 accounts, manager has 3; want all 3
+--- FAIL: TestAccountChangesUpdateQuotaRosterImmediately (0.05s)
+    account_roster_test.go:80: new account absent: quota has 1, manager has 2
+--- FAIL: TestQuotaActiveBadgeUsesProfileID (0.02s)
+    account_roster_test.go:102: same email marked a different saved profile active
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/desktop	2.296s
+FAIL

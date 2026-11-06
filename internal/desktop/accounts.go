@@ -70,10 +70,14 @@ func (a *App) allProfilesFor(provider string) []accounts.Profile {
 // profileName keeps two accounts with the same detected name apart in the
 // menu, even before the user renames one.
 func (a *App) profileName(provider string, p accounts.Profile) string {
+	return profileName(a.profiles, provider, p)
+}
+
+func profileName(profiles []accounts.Profile, provider string, p accounts.Profile) string {
 	name := p.DisplayName()
 	count := 0
-	for _, q := range a.profilesFor(provider) {
-		if q.DisplayName() == name {
+	for _, q := range profiles {
+		if q.Provider == provider && !q.Hidden && q.DisplayName() == name {
 			count++
 		}
 	}
@@ -90,7 +94,7 @@ func (a *App) liveAccount(provider string) (quota.Account, bool) {
 		}
 	}
 	for _, ar := range a.accounts {
-		if ar.account.Provider == provider {
+		if ar.account.Provider == provider && ar.profileID == "" {
 			return ar.account, true
 		}
 	}
@@ -168,18 +172,23 @@ func (a *App) switchAccountNow(provider, id string, live quota.Account) {
 		a.setAccountMessage(provider, a.t("Switching Antigravity and reconnecting its language service…", "正在切换 Antigravity 并重连语言服务…"), false)
 	}
 	a.work("switch/"+provider, func() func() {
+		ctx := accountDiagnosticContext(a.ctx, "account_switch")
+		ctx = syncdiag.WithFields(ctx, "provider", provider, "target_profile", accountRef(id), "source", accountRef(live.Key))
+		started := time.Now()
+		syncdiag.Log(ctx, "desktop_account_switch_start")
 		var err error
 		if provider == "antigravity" {
 			// Quitting, restarting and waiting for the client to come back
 			// must all fit: the switch worker waits up to 15s for the
 			// language service and again for the client itself.
-			ctx, cancel := context.WithTimeout(a.ctx, 90*time.Second)
+			ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 			defer cancel()
 			ctx = syncdiag.WithFields(syncdiag.WithRun(ctx), "operation", "account_switch", "provider", provider)
 			err = a.accountStore.SwitchApp(ctx, provider, id, live)
 		} else {
 			err = a.accountStore.Switch(provider, id, live)
 		}
+		syncdiag.Log(ctx, "desktop_account_switch_result", "elapsed_ms", time.Since(started).Milliseconds(), "error", accounts.DiagnosticErrorCode(err))
 		return func() {
 			delete(a.accountUI.switching, provider)
 			if err != nil {
@@ -194,6 +203,8 @@ func (a *App) switchAccountNow(provider, id string, live quota.Account) {
 				a.accountUI.managerMsg, a.accountUI.managerErr = a.t("Switched · new sessions use this account.", "已切换，新会话将使用该账号。"), false
 			}
 			a.profiles = a.accountStore.List()
+			a.updateQuotaRoster()
+			syncdiag.Log(ctx, "desktop_account_switch_applied", "revision", a.quotaUI.rosterRevision)
 			a.refreshQuota(true)
 		}
 	})
@@ -518,6 +529,10 @@ func (a *App) accountsDialog(c *ui.Context) {
 		panel.Width(560).MaxHeight(620).Padding(16).Gap(10).Radius(8).Background(t.Surface).Border(1, t.Border)
 		ui.Row(c).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, a.t("Accounts", "账号")).FontSize(14).Bold().Grow(1)
+			if settingsButton(c, a.t("Diagnostic log", "诊断日志"), false).Clicked() {
+				a.recordAccountDiagnostics()
+				a.openFolder(filepath.Dir(syncdiag.Path()))
+			}
 			close := settingsButton(c, "", false).Padding(4, 8).Label(a.t("Close", "关闭"))
 			close.Children(func() { ui.Icon(c, closeIcon).Size(13, 13) })
 			if close.Clicked() {

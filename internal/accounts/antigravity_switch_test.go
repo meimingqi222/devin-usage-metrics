@@ -29,6 +29,9 @@ func antigravityDoc(access, refresh, email string) string {
 // user just switched to.
 func TestReconcileDoesNotFileUnknownLoginUnderSwitchedProfile(t *testing.T) {
 	h := fixture(t)
+	// The issuer does not answer the planted stale tokens, so the login
+	// stays claims-less and unprovable.
+	googleUserInfoFake(t)
 	write(t, h, ".gemini/oauth_creds.json", antigravityDoc("a1", "ra1", "a@example.com"))
 	s := Open()
 	if err := s.SetEnabled(true); err != nil {
@@ -70,6 +73,218 @@ func TestReconcileDoesNotFileUnknownLoginUnderSwitchedProfile(t *testing.T) {
 	for _, p := range got {
 		if p.Email == "b@example.com" && !p.Active {
 			t.Fatalf("switched account lost the active flag: %+v", got)
+		}
+	}
+}
+
+// TestClaimsLessLiveAttributesBySavedTokens files a state-database login
+// that carries no identity claims under the saved copy holding its tokens,
+// not under whichever account was active before. Without the token match a
+// claims-less login fell back to the previous active record, which both
+// showed the wrong "in use" account and rendered the real profile as a
+// duplicate tab beside the live one.
+func TestClaimsLessLiveAttributesBySavedTokens(t *testing.T) {
+	h := fixture(t)
+	googleUserInfoFake(t)
+	write(t, h, ".gemini/oauth_creds.json", antigravityDoc("a1", "ra1", "a@example.com"))
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Reconcile(quota.Discover(false)); err != nil {
+		t.Fatal(err)
+	}
+	// An unnamed copy of a second login, as a pre-identity capture left it.
+	unnamed, err := s.Add("antigravity", map[string]any{
+		"token": map[string]any{"access_token": "b1", "refresh_token": "rb1"},
+	}, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The live store now holds the second login as bare tokens: no claims,
+	// and the issuer does not answer this access token.
+	write(t, h, ".gemini/oauth_creds.json", `{"access_token":"b1","refresh_token":"rb1"}`)
+	profiles, err := s.Reconcile(quota.Discover(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawUnnamed bool
+	for _, p := range profiles {
+		switch p.ID {
+		case unnamed.ID:
+			sawUnnamed = true
+			if !p.Active {
+				t.Fatalf("the token-sharing copy was not filed as active: %+v", profiles)
+			}
+		default:
+			if p.Active {
+				t.Fatalf("the previous account stayed active under another login: %+v", profiles)
+			}
+		}
+	}
+	if !sawUnnamed || len(profiles) != 2 {
+		t.Fatalf("profiles drifted: %+v", profiles)
+	}
+}
+
+// TestClaimsLessLiveNamedByAttestedCopy reproduces the crossed-copy
+// corruption: the active profile's saved copy was overwritten with a
+// second account's tokens and stamped with the first account's name. A
+// claims-less live document sharing those tokens must be named by the
+// claims its own copies carry, not by the poisoned active record - the
+// stamp files the live login under the real account and leaves the
+// crossed copy flagged instead of relabeling it once more.
+func TestClaimsLessLiveNamedByAttestedCopy(t *testing.T) {
+	h := fixture(t)
+	googleUserInfoFake(t)
+	write(t, h, ".gemini/oauth_creds.json", antigravityDoc("a1", "ra1", "a@example.com"))
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := s.Reconcile(quota.Discover(false))
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("capture: %+v %v", profiles, err)
+	}
+	crossed := profiles[0]
+	// B's real account, signed in once so its copy holds signed claims.
+	b, err := s.Add("antigravity", map[string]any{
+		"token":    map[string]any{"access_token": "b1", "refresh_token": "rb1"},
+		"id_token": loginJWT(map[string]any{"email": "b@example.com", "sub": "sub-b"}),
+	}, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The capture bug: A's saved file now holds B's refresh token under an
+	// "email" stamp naming A. Nothing signed calls this copy A's.
+	if err := s.writeCredential(crossed, map[string]any{
+		"access_token": "b1x", "refresh_token": "rb1", "email": "a@example.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The live store holds the same login as bare tokens; the issuer does
+	// not answer this access token.
+	write(t, h, ".gemini/oauth_creds.json", `{"access_token":"b1x","refresh_token":"rb1"}`)
+	profiles, err = s.Reconcile(quota.Discover(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawB, sawCrossed bool
+	for _, p := range profiles {
+		switch p.ID {
+		case b.ID:
+			sawB = true
+			if !p.Active || p.Email != "b@example.com" {
+				t.Fatalf("the tokens' own account was not filed as active: %+v", profiles)
+			}
+		case crossed.ID:
+			sawCrossed = true
+			if p.Active {
+				t.Fatalf("the crossed copy stayed filed as the live login: %+v", profiles)
+			}
+			if p.Email != "a@example.com" {
+				t.Fatalf("the crossed copy was relabeled again instead of flagged: %+v", profiles)
+			}
+			if !s.suspect["antigravity/"+crossed.ID] {
+				t.Fatalf("the crossed copy was not retired from switching: %+v", profiles)
+			}
+		}
+		doc, err := s.readCredential(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.ID == crossed.ID {
+			if _, refresh := tokenPair("antigravity", doc); refresh != "rb1" {
+				t.Fatalf("the crossed copy's tokens were touched: %#v", doc)
+			}
+		}
+	}
+	if !sawB || !sawCrossed || len(profiles) != 2 {
+		t.Fatalf("profiles drifted: %+v", profiles)
+	}
+}
+
+// TestAntigravityEmailStableRecordsFold merges the pair sync creates when
+// one device records a Google account as "email" and another as
+// "email|sub": one account, two records, both labelled with the address.
+func TestAntigravityEmailStableRecordsFold(t *testing.T) {
+	fixture(t)
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	rich := Profile{ID: "rich000000000001", Provider: "antigravity", Label: "a@example.com", Email: "a@example.com", StableID: "a@example.com|sub-a", Kind: "file", CreatedAt: 1}
+	bare := Profile{ID: "bare000000000001", Provider: "antigravity", Label: "a@example.com", Email: "a@example.com", StableID: "a@example.com", Kind: "file", CreatedAt: 2}
+	s.data.Profiles = append(s.data.Profiles, rich, bare)
+	s.data.Version = 1
+	// The rich copy carries signed claims (email|sub); the bare one only a
+	// stamped email, the shape a sync-imported record can take.
+	if err := s.writeCredential(rich, map[string]any{
+		"token":    map[string]any{"access_token": "a1", "refresh_token": "ra1"},
+		"id_token": loginJWT(map[string]any{"email": "a@example.com", "sub": "sub-a"}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeCredential(bare, map[string]any{
+		"access_token": "a1", "refresh_token": "ra1", "email": "a@example.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// writeCredential stamps ModifiedAt at write time; the rich record is
+	// the newer copy of the pair, so it must win the fold.
+	s.data.Profiles[0].ModifiedAt = 2
+	s.data.Profiles[1].ModifiedAt = 1
+	if err := s.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	got := s.List()
+	if len(got) != 1 {
+		t.Fatalf("the two records of one account did not fold: %+v", got)
+	}
+	if got[0].ID != rich.ID {
+		t.Fatalf("the newer copy should survive the fold: %+v", got)
+	}
+}
+
+// TestEmailOnlyLiveAttributesByEmail files a login whose identity claims
+// name only an email under the profile of that account, wherever the
+// previous active flag pointed. Upsert already merges on email; matching
+// must reach the same profile so the live login is filed under it instead
+// of reading as a second copy.
+func TestEmailOnlyLiveAttributesByEmail(t *testing.T) {
+	h := fixture(t)
+	write(t, h, ".gemini/oauth_creds.json", antigravityDoc("a1", "ra1", "a@example.com"))
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Reconcile(quota.Discover(false)); err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.Add("antigravity", map[string]any{
+		"token":    map[string]any{"access_token": "b1", "refresh_token": "rb1"},
+		"id_token": loginJWT(map[string]any{"email": "b@example.com", "sub": "sub-b"}),
+	}, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Capture is off: matching alone must file the live login, so the
+	// email-only identity cannot fall back to the previous active record.
+	if err := s.SetEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+	write(t, h, ".gemini/oauth_creds.json", `{"access_token":"nb","refresh_token":"rnb","email":"b@example.com"}`)
+	profiles, err := s.Reconcile(quota.Discover(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range profiles {
+		active := p.Active
+		if p.ID == second.ID && !active {
+			t.Fatalf("the email's own profile was not filed as active: %+v", profiles)
+		}
+		if p.ID != second.ID && active {
+			t.Fatalf("the previous account stayed active under another login: %+v", profiles)
 		}
 	}
 }

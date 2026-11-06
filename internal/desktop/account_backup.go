@@ -194,11 +194,13 @@ func (a *App) restoreAccountSync(scope string) {
 }
 
 func (a *App) accountChanged() {
+	a.updateQuotaRoster()
 	if a.busy["account-sync"] {
 		a.accountSync.dirty = true
-		return
+	} else {
+		a.syncAccounts()
 	}
-	a.syncAccounts()
+	a.refreshQuota(false)
 }
 
 func (a *App) syncAccounts() {
@@ -296,6 +298,10 @@ func (a *App) syncAccounts() {
 					a.accountSync.message = a.t("Synced. Could not save the password on this device.", "已同步，但系统未能记住密码，下次启动时需再次输入。")
 				}
 				a.profiles = a.accountStore.List()
+				if result.Added > 0 || result.Updated > 0 || result.Removed > 0 {
+					a.updateQuotaRoster()
+					a.accountSync.quotaPending = true
+				}
 			}
 			if a.accountSync.quotaPending {
 				force := a.accountSync.quotaForce

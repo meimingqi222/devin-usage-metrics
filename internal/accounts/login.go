@@ -227,8 +227,10 @@ var (
 // googleAccountEmail names an Antigravity login that carries no id_token.
 func googleAccountEmail(ctx context.Context, access string) string {
 	if access == "" {
+		syncdiag.Log(ctx, "account_identity_lookup", "outcome", "no_access_token")
 		return ""
 	}
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "GET", googleUserInfoURL, nil)
@@ -238,14 +240,55 @@ func googleAccountEmail(ctx context.Context, access string) string {
 	req.Header.Set("Authorization", "Bearer "+access)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		syncdiag.Log(ctx, "account_identity_lookup", "outcome", "request_failed", "elapsed_ms", time.Since(started).Milliseconds(), "error", syncdiag.ErrorCode(err))
 		return ""
 	}
 	defer resp.Body.Close()
 	var v struct {
 		Email string `json:"email"`
 	}
-	_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&v)
+	decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&v)
+	syncdiag.Log(ctx, "account_identity_lookup", "outcome", "response", "status_code", resp.StatusCode,
+		"elapsed_ms", time.Since(started).Milliseconds(), "has_email", strings.TrimSpace(v.Email) != "", "error", syncdiag.ErrorCode(decodeErr))
 	return strings.TrimSpace(v.Email)
+}
+
+// googleRefreshedEmail answers whom an Antigravity login belongs to when
+// its access token has expired: the refresh token exchanges for a fresh
+// access token, and the issuer still names the account. The exchanged
+// tokens are thrown away - naming the login must not mint credentials.
+func googleRefreshedEmail(ctx context.Context, doc map[string]any) string {
+	_, refresh := tokenPair("antigravity", doc)
+	if refresh == "" {
+		return ""
+	}
+	clientID, clientSecret := quota.AntigravityOAuthClient()
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	form := url.Values{
+		"client_id": {clientID}, "client_secret": {clientSecret},
+		"refresh_token": {refresh}, "grant_type": {"refresh_token"},
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", googleTokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		syncdiag.Log(ctx, "account_identity_lookup", "outcome", "refresh_exchange_failed", "error", syncdiag.ErrorCode(err))
+		return ""
+	}
+	defer resp.Body.Close()
+	var tok struct {
+		AccessToken string `json:"access_token"`
+	}
+	_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&tok)
+	syncdiag.Log(ctx, "account_identity_lookup", "outcome", "refresh_exchange", "status_code", resp.StatusCode, "has_token", tok.AccessToken != "")
+	if tok.AccessToken == "" {
+		return ""
+	}
+	return googleAccountEmail(ctx, tok.AccessToken)
 }
 
 // AntigravityLogin signs in with Google in the browser and returns the

@@ -15,6 +15,8 @@ import (
 // quotaUIState is the quota page's own state.
 type quotaUIState struct {
 	keychainDismissed, keychainLikely bool
+	rosterRevision                    uint64
+	refreshPending, refreshForce      bool
 	// queriedAt is when the accounts were last queried.
 	queriedAt string
 	// The reset dialog: the account a confirmation would spend a grant of,
@@ -161,12 +163,12 @@ func (a *App) quotaView(c *ui.Context) {
 		summary := fmt.Sprintf(a.t("%d accounts", "%d 个已授权账号"), len(a.accounts))
 		if len(a.profiles) > 0 {
 			active := 0
-			for _, p := range a.profiles {
-				if p.Active {
+			for _, ar := range a.accounts {
+				if a.isAccountLive(ar.account.Provider, ar) {
 					active++
 				}
 			}
-			summary = fmt.Sprintf(a.t("%d accounts · %d active", "%d 个账号 · %d 个当前使用"), len(a.profiles), active)
+			summary = fmt.Sprintf(a.t("%d accounts · %d active", "%d 个账号 · %d 个当前使用"), len(a.accounts), active)
 		}
 		if alerts > 0 {
 			summary += fmt.Sprintf(a.t(" · %d high-usage alerts", " · %d 个高用量告警"), alerts)
@@ -328,6 +330,9 @@ func (a *App) isAccountLive(provider string, ar accountResult) bool {
 	if ar.isLive {
 		return true
 	}
+	if ar.profileID != "" {
+		return false
+	}
 	profiles := a.profilesFor(provider)
 	if len(profiles) > 0 {
 		for _, p := range profiles {
@@ -450,17 +455,9 @@ func (a *App) tabbedAccountBody(c *ui.Context, grp providerQuotaGroup) {
 			}
 			ui.Spacer(c)
 			profileID := selected.profileID
-			if profileID == "" {
-				for _, p := range a.profiles {
-					if p.Provider == grp.provider && !p.Active && (p.Label == selected.account.Label || p.DisplayName() == selected.account.Label || p.Email == selected.account.Label) {
-						profileID = p.ID
-						break
-					}
-				}
-			}
 			if !selectedLive && profileID != "" {
 				switching := a.accountUI.switching[grp.provider]
-				sw := ui.ButtonBase(c.Key("sw/"+profileID)).Label(a.t("Switch to this account", "切为此账号")).Padding(3, 10).Radius(4).Background(t.Accent.Alpha(.15)).Border(1, t.Accent.Alpha(.35)).Disabled(switching)
+				sw := ui.ButtonBase(c.Key("sw/"+profileID)).Label(a.t("Switch to this account", "切为此账号")).Padding(3, 10).Radius(4).Background(t.Accent.Alpha(.15)).Border(1, t.Accent.Alpha(.35)).Disabled(switching || !a.canSwitchProfile(grp.provider, profileID))
 				if sw.Hovered() {
 					sw.Background(t.Accent.Alpha(.25))
 				}
@@ -501,6 +498,10 @@ func (a *App) singleAccountBody(c *ui.Context, ar accountResult) {
 	t := c.Theme()
 	faintText := faint(t)
 	if ar.err != nil {
+		if errors.Is(ar.err, errSavedSignInUnavailable) {
+			ui.Text(c, a.t("Saved sign-in unavailable on this device. Sign in again to query quota.", "本机缺少此账号的登录凭据，请重新登录以查询配额。")).FontSize(11.5).TextColor(quotaAmber)
+			return
+		}
 		ui.Text(c, fmt.Sprintf(a.t("Query failed: %s", "查询失败：%s"), ar.err)).FontSize(11.5).TextColor(quotaRose)
 		return
 	}

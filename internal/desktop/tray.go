@@ -400,7 +400,7 @@ func (a *App) trayDenseCard(c *ui.Context, ar accountResult) {
 			}
 			if !ar.isLive && ar.profileID != "" {
 				switching := a.accountUI.switching[ar.account.Provider]
-				sw := ui.ButtonBase(c).Label(a.t("Switch", "切换")).Padding(1, 6).Radius(3).Background(c.Theme().Accent.Alpha(.15)).Border(1, c.Theme().Accent.Alpha(.3)).Disabled(switching)
+				sw := ui.ButtonBase(c).Label(a.t("Switch", "切换")).Padding(1, 6).Radius(3).Background(c.Theme().Accent.Alpha(.15)).Border(1, c.Theme().Accent.Alpha(.3)).Disabled(switching || !a.canSwitchProfile(ar.account.Provider, ar.profileID))
 				sw.Children(func() {
 					if switching {
 						ui.Spinner(c)

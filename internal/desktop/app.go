@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -272,9 +271,17 @@ func (a *App) sync() {
 }
 
 func (a *App) refreshQuota(force bool) {
+	ctx := accountDiagnosticContext(a.ctx, "quota_refresh")
 	// Saved credentials may refresh during quota reads. Do not replace the
 	// same files concurrently while account changes are being synchronized.
+	if a.busy["quota"] {
+		syncdiag.Log(ctx, "quota_refresh_deferred", "reason", "quota_busy", "force", force, "revision", a.quotaUI.rosterRevision)
+		a.quotaUI.refreshPending = true
+		a.quotaUI.refreshForce = a.quotaUI.refreshForce || force
+		return
+	}
 	if a.busy["account-sync"] {
+		syncdiag.Log(ctx, "quota_refresh_deferred", "reason", "account_sync_busy", "force", force, "revision", a.quotaUI.rosterRevision)
 		a.accountSync.quotaPending = true
 		a.accountSync.quotaForce = a.accountSync.quotaForce || force
 		return
@@ -283,81 +290,33 @@ func (a *App) refreshQuota(force bool) {
 	for _, ar := range a.accounts {
 		existing[ar.account.Key] = ar
 	}
+	revision := a.quotaUI.rosterRevision
+	ctx = syncdiag.WithFields(ctx, "revision", revision, "force", force)
+	started := time.Now()
+	syncdiag.Log(ctx, "quota_refresh_start", "previous_targets", len(existing))
 	a.work("quota", func() func() {
+		_, discovered := syncdiag.Watch(ctx, "quota_discover")
 		liveAccounts := quota.Discover(quota.KeychainAllowed())
-		profiles, profileErr := a.accountStore.ReconcileContext(a.ctx, liveAccounts)
-
-		type target struct {
-			account   quota.Account
-			profileID string
-			isLive    bool
-		}
-		var targets []target
-		seenProvider := map[string]bool{}
-
+		discovered(nil)
 		for _, acc := range liveAccounts {
-			seenProvider[acc.Provider] = true
-			profID := ""
-			for _, p := range profiles {
-				if p.Provider == acc.Provider && p.Active {
-					profID = p.ID
-					break
-				}
-			}
-			targets = append(targets, target{account: acc, profileID: profID, isLive: true})
-
-			if a.accountStore.Enabled() {
-				for _, p := range profiles {
-					if p.Provider == acc.Provider && !p.Hidden && !p.Active {
-						credPath := a.accountStore.CredentialPath(p.Provider, p.ID)
-						if _, err := os.Stat(credPath); err == nil {
-							key := "profile-" + p.ID
-							label := a.profileName(p.Provider, p)
-							storedAcc := quota.ProfileAccount(key, p.Provider, label, credPath)
-							targets = append(targets, target{account: storedAcc, profileID: p.ID, isLive: false})
-						}
-					}
-				}
-			}
+			syncdiag.Log(ctx, "quota_discovered", "provider", acc.Provider, "source", accountRef(acc.Key), "source_kind", acc.CredentialKind(), "label_ref", accountNameRef(acc.Label))
 		}
+		reconcileCtx, reconciled := syncdiag.Watch(ctx, "account_reconcile")
+		profiles, profileErr := a.accountStore.ReconcileContext(reconcileCtx, liveAccounts)
+		reconciled(profileErr)
 
-		if a.accountStore.Enabled() {
-			for _, p := range profiles {
-				// A provider without a live sign-in keeps every saved
-				// account on screen, the active one included: while the
-				// agent is closed, restarting, or signed out, its card must
-				// not disappear until the next refresh finds it again.
-				if !seenProvider[p.Provider] && !p.Hidden {
-					credPath := a.accountStore.CredentialPath(p.Provider, p.ID)
-					if _, err := os.Stat(credPath); err == nil {
-						key := "profile-" + p.ID
-						label := a.profileName(p.Provider, p)
-						storedAcc := quota.ProfileAccount(key, p.Provider, label, credPath)
-						targets = append(targets, target{account: storedAcc, profileID: p.ID, isLive: false})
-					}
-				}
-			}
-		}
+		targets := quotaRoster(a.accountStore, profiles, liveAccounts)
+		initial := cachedQuotaRoster(targets, existing)
+		logAccountRoster(ctx, profiles, targets)
 
-		// Frame-0 snapshot: immediately surface discovered targets and their tabbed grouping
-		// to the UI without waiting seconds for remote network queries to complete.
-		initial := make([]accountResult, len(targets))
-		for i, t := range targets {
-			if prev, ok := existing[t.account.Key]; ok {
-				initial[i] = prev
-				initial[i].isLive = t.isLive
-				initial[i].profileID = t.profileID
-			} else {
-				initial[i] = accountResult{
-					account:   t.account,
-					profileID: t.profileID,
-					isLive:    t.isLive,
-				}
-			}
-		}
 		a.post(func() {
+			if revision != a.quotaUI.rosterRevision {
+				syncdiag.Log(ctx, "quota_snapshot_discarded", "phase", "initial", "current_revision", a.quotaUI.rosterRevision)
+				return
+			}
 			a.accounts = initial
 			a.profiles = profiles
+			syncdiag.Log(ctx, "quota_snapshot_applied", "phase", "initial", "targets", len(initial))
 		})
 
 		out := make([]accountResult, len(targets))
@@ -365,10 +324,22 @@ func (a *App) refreshQuota(force bool) {
 		var wg sync.WaitGroup
 		limit := make(chan struct{}, 4)
 		for i, t := range targets {
+			if t.err != nil {
+				continue
+			}
 			wg.Go(func() {
 				limit <- struct{}{}
 				defer func() { <-limit }()
-				result, err := quota.Fetch(a.ctx, t.account, force)
+				queryStarted := time.Now()
+				syncdiag.Log(ctx, "quota_query_start", "source", accountRef(t.account.Key), "profile", accountRef(t.profileID))
+				result, err := quota.Fetch(ctx, t.account, force)
+				var staleErr error
+				if result.Stale != "" {
+					staleErr = errors.New(result.Stale)
+				}
+				syncdiag.Log(ctx, "quota_query_result", "provider", t.account.Provider, "source", accountRef(t.account.Key),
+					"profile", accountRef(t.profileID), "is_live", t.isLive, "elapsed_ms", time.Since(queryStarted).Milliseconds(),
+					"error", quotaDiagnosticError(err), "cached", result.Stale != "", "stale_error", quotaDiagnosticError(staleErr), "cache_age_secs", result.StaleAge, "retry_secs", result.RetryIn, "windows", len(result.Windows))
 				res := accountResult{
 					account:   t.account,
 					result:    result,
@@ -378,7 +349,7 @@ func (a *App) refreshQuota(force bool) {
 				}
 				out[i] = res
 				a.post(func() {
-					if i < len(a.accounts) && a.accounts[i].account.Key == res.account.Key {
+					if revision == a.quotaUI.rosterRevision && i < len(a.accounts) && a.accounts[i].account.Key == res.account.Key {
 						a.accounts[i] = res
 					}
 				})
@@ -386,12 +357,22 @@ func (a *App) refreshQuota(force bool) {
 		}
 		wg.Wait()
 		return func() {
-			a.accounts, a.quotaUI.queriedAt = out, time.Now().Format("15:04:05")
-			a.profiles = profiles
+			if revision == a.quotaUI.rosterRevision {
+				a.accounts, a.quotaUI.queriedAt = out, time.Now().Format("15:04:05")
+				a.profiles = profiles
+				syncdiag.Log(ctx, "quota_snapshot_applied", "phase", "complete", "targets", len(out))
+			} else {
+				syncdiag.Log(ctx, "quota_snapshot_discarded", "phase", "complete", "current_revision", a.quotaUI.rosterRevision)
+			}
+			syncdiag.Log(ctx, "quota_refresh_end", "elapsed_ms", time.Since(started).Milliseconds(), "error", syncdiag.ErrorCode(profileErr), "refresh_pending", a.quotaUI.refreshPending)
 			if profileErr != nil {
 				a.message = profileErr.Error()
 			}
-			if a.accountSync.dirty {
+			if a.quotaUI.refreshPending {
+				force := a.quotaUI.refreshForce
+				a.quotaUI.refreshPending, a.quotaUI.refreshForce = false, false
+				a.refreshQuota(force)
+			} else if a.accountSync.dirty {
 				a.syncAccounts()
 			}
 		}

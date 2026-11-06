@@ -1,9 +1,42 @@
-# 同步耗时诊断
+# 同步与账号诊断
 
 桌面加载与同步使用同一套 JSONL 日志。macOS 默认位置为
 `~/Library/Caches/devin-usage-metrics/sync.log`；设置 `XDG_CACHE_HOME` 时，
 位置为 `$XDG_CACHE_HOME/devin-usage-metrics/sync.log`。
 单文件上限 4 MiB，另保留一份 `.1` 轮转文件。
+Windows 默认位置为 `%LOCALAPPDATA%\devin-usage-metrics\sync.log`。
+
+## 账号数量、身份与切换异常
+
+运行包含新日志的新构建后，刷新配额会自动记录发现、身份匹配、列表生成、查询和界面应用过程。
+账号管理右上角的 **诊断日志** 按钮会记录当前界面快照，然后打开日志目录；遇到异常时先点一次，保留问题现场。
+账号日志带 `account_diagnostics_version: 1`，相同 `run` 属于同一次操作，`pid` 与构建信息用于区分同时运行的新旧程序。
+
+| 事件 | 排查内容 |
+| --- | --- |
+| `quota_refresh_start` / `quota_refresh_deferred` / `quota_refresh_end` | 刷新是否执行、等待查询还是等待同步、耗时与待处理请求 |
+| `quota_discovered` | 发现的本机登录来源、文件/钥匙串/状态库类型、名称指纹 |
+| `account_identity_lookup` | Google 身份查询是否缺 Token、网络失败、HTTP 状态与是否返回邮箱；不记录返回的邮箱 |
+| `account_reconcile_start` / `account_reconcile_end` | 身份修复前后的记录数、可疑凭据副本数量 |
+| `account_reconcile_decision` | 身份来自凭据、已有副本还是 Google；匹配依靠稳定身份、相同文档、相同 Token、旧邮箱兼容或未经确认的前次账号；记录是否捕获以及活动账号是否改变 |
+| `account_reconcile_skipped` / `account_capture_failed` / `account_manifest_save_failed` | 无法读取凭据、不支持的登录形式、同步删除记录或保存失败 |
+| `account_profile` / `quota_target` | 保存记录与实际标签逐项对应；`binding=unmatched_live` 表示当前登录尚未绑定到保存记录 |
+| `quota_roster` / `quota_roster_anomaly` | 保存数、可见数、标签数、未匹配的当前登录、重复名称组与未显示的保存记录数量 |
+| `quota_query_start` / `quota_query_result` | 每个标签是否已开始查询、耗时、脱敏错误码、是否使用缓存、缓存年龄与限流等待时间；`stale_error` 保留缓存回退时的错误类别 |
+| `quota_snapshot_applied` / `quota_snapshot_discarded` | 后台结果是否显示，或因账号列表版本变化被丢弃；比较 `revision` 与 `current_revision` |
+| `desktop_account_switch_*` / `account_switch_*` | 目标账号指纹、切换模式、镜像写入、结束错误与界面应用；可区分登录回退、读回不一致、凭据冲突等 |
+| `account_snapshot` / `account_roster_updated` | 手动现场记录或账号变更后立即生成的列表 |
+
+例如 `saved=3, targets=4, unmatched_live=1, duplicate_labels=1` 表示三个保存记录之外，另有一个未绑定的当前登录与某个标签同名。
+对照 `quota_target.label_ref` 与 `account_profile.email_ref`，再看该次 `account_reconcile_decision` 和 `account_identity_lookup`，可以判断为什么没有绑定；不能只按同名自动删除记录。
+同一邮箱可能对应不同组织，名称相同只是诊断线索，不是合并依据。
+
+日志不记录邮箱明文、自定义名称、完整账号 ID、Token、Token 指纹、凭据文档、HTTP 正文或任意错误文本。
+账号、稳定身份与名称仅保留哈希关联值；HTTP 错误只保留状态码。
+每份列表快照最多记录 64 个保存记录和 64 个标签明细，汇总仍计算全部记录，并给出截断数量。
+日志只在操作和刷新时写入，不随每一帧渲染写入；耗时阶段每 5 秒记录一次进度。
+
+## 同步耗时
 
 新增记录带 `diagnostics_version: 2`。一次同步从 `desktop_sync_start` 开始，
 本地采集与网络同步共用 `run`；后台界面加载另有独立 `run`。

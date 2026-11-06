@@ -23,6 +23,14 @@ func accountFixture(t *testing.T) *App {
 		{ID: "work", Provider: "claude", Label: "work@example.com", Kind: "file", Active: true, Writable: true, LastUsedAt: time.Now().Unix()},
 		{ID: "home", Provider: "claude", Label: "home@example.com", Plan: "Pro", Kind: "file", Writable: true, LastUsedAt: time.Now().Add(-48 * time.Hour).Unix()},
 	}
+	for i := range a.accounts {
+		switch a.accounts[i].account.Key {
+		case "claude-1":
+			a.accounts[i].profileID, a.accounts[i].isLive = "work", true
+		case "claude-2":
+			a.accounts[i].profileID = "home"
+		}
+	}
 	return a
 }
 
