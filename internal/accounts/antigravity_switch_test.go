@@ -211,8 +211,10 @@ func TestVerifySwitched(t *testing.T) {
 // database mirror: the oauthToken topic keeps unrelated sentinel rows, and
 // stale keys from the previous account are cleared.
 func TestWriteAntigravityStateMergesTopicAndClearsStaleKeys(t *testing.T) {
-	h := fixture(t)
-	path := filepath.Join(h, "Library", "Application Support", "Antigravity", "User", "globalStorage", "state.vscdb")
+	fixture(t)
+	// writeAntigravityState mirrors onto the databases this platform
+	// resolves, so the fixture must sit at the first of those.
+	path := antigravityStateDBs()[0]
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		t.Fatal(err)
 	}
