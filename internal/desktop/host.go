@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/egoist/mygo"
+	"github.com/egoist/mygo/transfer"
 	"github.com/egoist/mygo/ui"
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 	"github.com/meimingqi222/devin-usage-metrics/internal/pricing"
@@ -56,6 +57,9 @@ func Run(templateIcon, colorIcon []byte) error {
 	var tray *mygo.Tray
 	quitting := false
 	a.quit = mygo.App.Quit
+	a.writeClipboard = func(text string) error {
+		return mygo.Clipboard.Write(transfer.TextData(text))
+	}
 	a.openFolder = func(path string) {
 		if err := mygo.Shell.OpenPath(path); err != nil {
 			a.message = err.Error()

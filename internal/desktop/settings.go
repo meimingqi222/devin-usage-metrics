@@ -3,6 +3,7 @@ package desktop
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -14,12 +15,13 @@ import (
 // Settings has two tabs in the Rust UI; About is a section of General.
 // Drafts belong to an individual opening, not to the running sync client.
 type settingsUIState struct {
-	open          bool
-	tab           string
-	apiURL        string
-	updateOpen    bool
-	updateMessage string
-	updateFailed  bool
+	open             bool
+	tab              string
+	apiURL           string
+	updateOpen       bool
+	updateMessage    string
+	updateFailed     bool
+	loginCopyMessage string
 	// downloadPercent is -1 until the download reports a total size.
 	downloadPercent int
 }
@@ -196,8 +198,15 @@ func (a *App) settingsSync(c *ui.Context) {
 				a.beginLogin()
 			}
 			if a.busy["login"] && a.auth.UserCode != "" {
+				ui.Text(c, a.t("Complete authorization in your browser. If asked, enter the code shown above.", "请在浏览器完成授权；如需验证码，请使用上方代码。")).FontSize(11).TextColor(c.Theme().TextMuted)
+				if settingsButton(c, a.t("Reopen GitHub authorization", "重新打开 GitHub 授权页"), false).FillWidth().Disabled(a.openURL == nil || githubAuthorizationURL(a.auth) == "").Clicked() {
+					a.openURL(githubAuthorizationURL(a.auth))
+				}
 				if settingsButton(c, a.t("Copy code", "复制验证码"), false).FillWidth().Background(c.Theme().SurfaceHover).Border(1, c.Theme().Border).TextColor(c.Theme().Text).Clicked() {
-					c.WriteClipboard(a.auth.UserCode)
+					a.copyGitHubCode(c)
+				}
+				if a.settingsUI.loginCopyMessage != "" {
+					ui.Text(c, a.settingsUI.loginCopyMessage).FontSize(11).TextColor(c.Theme().TextMuted)
 				}
 				if settingsButton(c, a.t("Cancel login", "取消登录"), false).Clicked() && a.loginCancel != nil {
 					a.loginCancel()
@@ -445,7 +454,37 @@ func (a *App) updateDialog(c *ui.Context) {
 	})
 }
 
+func githubAuthorizationURL(auth syncclient.Authorization) string {
+	u, err := url.Parse(auth.VerificationURI)
+	if err != nil || u.Scheme != "https" || u.Host != "github.com" || u.Path != "/login/device" || u.User != nil {
+		return ""
+	}
+	query := u.Query()
+	query.Set("user_code", auth.UserCode)
+	u.RawQuery = query.Encode()
+	return u.String()
+}
+
+func (a *App) copyGitHubCode(c *ui.Context) {
+	a.settingsUI.loginCopyMessage = a.t("Could not copy the code. Select and copy the code above.", "复制失败，请选中上方验证码手动复制。")
+	if a.writeClipboard != nil {
+		if err := a.writeClipboard(a.auth.UserCode); err != nil {
+			return
+		}
+	} else {
+		c.WriteClipboard(a.auth.UserCode)
+		if c.ReadClipboard() != a.auth.UserCode {
+			return
+		}
+	}
+	a.settingsUI.loginCopyMessage = a.t("Code copied", "验证码已复制")
+}
+
 func (a *App) beginLogin() {
+	if a.busy["login"] {
+		return
+	}
+	a.settingsUI.loginCopyMessage = ""
 	// Reauthorizing can select a different tenant even at the same endpoint.
 	if err := a.disableAccountSync(); err != nil {
 		a.message = err.Error()
@@ -476,12 +515,16 @@ func (a *App) beginLogin() {
 			a.post(func() {
 				if ctx.Err() == nil {
 					a.auth = auth
+					if target := githubAuthorizationURL(auth); target != "" && a.openURL != nil {
+						a.openURL(target)
+					}
 				}
 			})
 			err = syncclient.CompleteLogin(ctx, apiURL, auth)
 		}
 		return func() {
 			a.auth = syncclient.Authorization{}
+			a.settingsUI.loginCopyMessage = ""
 			a.loginCancel = nil
 			if err != nil {
 				a.message = err.Error()

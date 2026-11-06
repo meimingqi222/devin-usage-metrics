@@ -64,6 +64,7 @@ type App struct {
 	payload                               string
 	quit                                  func()
 	openFolder, openURL                   func(string)
+	writeClipboard                        func(string) error
 	accountBackupFile                     func(save bool, title string) (string, error)
 	languageChanged                       func()
 	updatePrefs                           updatePrefs
