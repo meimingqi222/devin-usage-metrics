@@ -80,12 +80,15 @@ type Store struct {
 	loaded bool
 	data   manifest
 	active map[string]string
+	// suspect holds provider/ID keys of records that carry the live
+	// sign-in's tokens under another account's name; they cannot switch.
+	suspect map[string]bool
 }
 
 // Open returns a store rooted at the app config directory.
 func Open() *Store {
 	d, _ := os.UserConfigDir()
-	return &Store{dir: filepath.Join(d, "devin-usage-metrics"), active: map[string]string{}}
+	return &Store{dir: filepath.Join(d, "devin-usage-metrics"), active: map[string]string{}, suspect: map[string]bool{}}
 }
 
 func (s *Store) manifestPath() string { return filepath.Join(s.dir, "accounts.json") }
@@ -186,13 +189,69 @@ func (s *Store) List() []Profile {
 	if s.repairLocked() {
 		_ = s.saveLocked()
 	}
-	out := append([]Profile(nil), s.data.Profiles...)
+	return s.decorateLocked(append([]Profile(nil), s.data.Profiles...))
+}
+
+// decorateLocked fills the display fields of a profile copy and retires
+// switchability from records whose saved copy is gone: without the file such
+// a record can only fail a switch, and the failure must not look like a
+// working button.
+func (s *Store) decorateLocked(out []Profile) []Profile {
 	for i := range out {
 		out[i].Active = out[i].ID == s.active[out[i].Provider]
 		out[i].Writable, out[i].Reason = writable(out[i])
+		if out[i].Writable {
+			if _, err := os.Stat(s.credentialPath(out[i].Provider, out[i].ID)); err != nil {
+				out[i].Writable = false
+				out[i].Reason = "This account has no saved sign-in on this device"
+			} else if s.suspect[out[i].Provider+"/"+out[i].ID] {
+				out[i].Writable = false
+				out[i].Reason = "This copy holds another account's sign-in; sign in again to refresh it"
+			}
+		}
 	}
 	sortProfiles(out)
 	return out
+}
+
+// flagContaminatedLocked marks records that hold the live sign-in's tokens
+// while claiming another account. Reconcile just filed the live login under
+// the active record, so that record is the authority here; a record carrying
+// the same tokens under a different name is a stale copy that would only
+// switch back to the account it copied, which reads as "switching does
+// nothing".
+func (s *Store) flagContaminatedLocked(provider string, doc map[string]any) {
+	for key := range s.suspect {
+		if strings.HasPrefix(key, provider+"/") {
+			delete(s.suspect, key)
+		}
+	}
+	p := s.activeProfileLocked(provider)
+	if p == nil || p.StableID == "" {
+		return
+	}
+	saved, err := s.readCredential(*p)
+	if err != nil {
+		return
+	}
+	_, liveRefresh := tokenPair(provider, doc)
+	_, anchorRefresh := tokenPair(provider, saved)
+	if liveRefresh == "" || liveRefresh != anchorRefresh {
+		return
+	}
+	for i := range s.data.Profiles {
+		q := &s.data.Profiles[i]
+		if q.Provider != provider || q.ID == p.ID || q.StableID == "" || q.StableID == p.StableID {
+			continue
+		}
+		qDoc, err := s.readCredential(*q)
+		if err != nil {
+			continue
+		}
+		if _, qRefresh := tokenPair(provider, qDoc); qRefresh == liveRefresh {
+			s.suspect[provider+"/"+q.ID] = true
+		}
+	}
 }
 
 // Reconcile reads each live account and, when switching is enabled,
@@ -241,14 +300,19 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 				// that account's saved sign-in with the old one.
 				if p := s.activeProfileLocked(a.Provider); p != nil && p.Email != "" && s.sameSavedLocked(*p, a.Provider, doc) {
 					doc["email"] = p.Email
-				} else if strings.Contains(a.Label, "@") {
-					doc["email"] = a.Label
 				} else if email := s.savedEmailLocked(a.Provider, doc); email != "" {
 					doc["email"] = email
 				} else if a.Provider == "antigravity" {
+					// Antigravity's agent-facing label is its UI's auth
+					// status, which runs ahead of or behind the token row
+					// while an account switch settles; stamping it here
+					// filed tokens under the wrong account. Ask Google
+					// whom the access token belongs to instead.
 					if email := googleAccountEmail(ctx, accessTokenOf(doc)); email != "" {
 						doc["email"] = email
 					}
+				} else if strings.Contains(a.Label, "@") {
+					doc["email"] = a.Label
 				}
 			}
 		}
@@ -305,6 +369,7 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 				}
 			}
 		}
+		s.flagContaminatedLocked(a.Provider, doc)
 	}
 	for _, provider := range []string{"claude", "codex", "antigravity", "grok"} {
 		if s.hideLegacyDuplicatesLocked(provider) {
@@ -314,13 +379,7 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 	if changed {
 		_ = s.saveLocked()
 	}
-	out := append([]Profile(nil), s.data.Profiles...)
-	for i := range out {
-		out[i].Active = out[i].ID == s.active[out[i].Provider]
-		out[i].Writable, out[i].Reason = writable(out[i])
-	}
-	sortProfiles(out)
-	return out, nil
+	return s.decorateLocked(append([]Profile(nil), s.data.Profiles...)), nil
 }
 
 // Switch moves the target profile's credential into the live store. The
@@ -379,6 +438,28 @@ func (s *Store) Switch(provider, id string, live quota.Account) error {
 	}
 	if id := credentialid.Of(provider, targetDoc); target.StableID != "" && id.Stable != "" && id.Stable != target.StableID {
 		return errors.New("the saved sign-in belongs to a different account; sign in again")
+	}
+	// A copy whose tokens already are the live sign-in cannot deliver this
+	// switch when another record holding those same tokens claims a
+	// different account: the write would succeed and only restore the
+	// account it copied, which reads as "switching does not work".
+	if _, liveRefresh := tokenPair(provider, before); liveRefresh != "" {
+		if _, targetRefresh := tokenPair(provider, targetDoc); targetRefresh == liveRefresh {
+			if id := credentialid.Of(provider, targetDoc); id.Stable != "" {
+				for _, p := range s.data.Profiles {
+					if p.Provider != provider || p.StableID == "" || p.StableID == id.Stable {
+						continue
+					}
+					saved, err := s.readCredential(p)
+					if err != nil {
+						continue
+					}
+					if _, savedRefresh := tokenPair(provider, saved); savedRefresh == liveRefresh {
+						return errors.New("this saved copy holds the current account's sign-in; sign in again to refresh it")
+					}
+				}
+			}
+		}
 	}
 	targetDoc = switchDocument(provider, targetDoc)
 	targetHash := docHash(targetDoc)
@@ -681,6 +762,43 @@ func (s *Store) repairLocked() bool {
 	for _, provider := range []string{"claude", "codex", "antigravity", "grok"} {
 		if s.hideLegacyDuplicatesLocked(provider) {
 			changed = true
+		}
+	}
+	if s.healMissingCredentialsLocked() {
+		changed = true
+	}
+	return changed
+}
+
+// healMissingCredentialsLocked rebuilds a record whose credential file went
+// missing (a crashed write or an interrupted removal) from a sibling record
+// of the same account whose copy survived. Without this the record keeps a
+// switch button whose only possible outcome is "no saved sign-in".
+func (s *Store) healMissingCredentialsLocked() bool {
+	changed := false
+	for i := range s.data.Profiles {
+		p := &s.data.Profiles[i]
+		if !supported(p.Provider) || p.StableID == "" {
+			continue
+		}
+		if _, err := os.Stat(s.credentialPath(p.Provider, p.ID)); err == nil {
+			continue
+		}
+		for j := range s.data.Profiles {
+			q := &s.data.Profiles[j]
+			if i == j || q.Provider != p.Provider || q.StableID != p.StableID {
+				continue
+			}
+			doc, err := s.readCredential(*q)
+			if err != nil || !accountDocument(p.Provider, doc) {
+				continue
+			}
+			if err := s.writeCredential(*p, doc); err != nil {
+				continue
+			}
+			p.Credentials = docHash(doc)
+			changed = true
+			break
 		}
 	}
 	return changed

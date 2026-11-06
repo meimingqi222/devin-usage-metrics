@@ -443,8 +443,14 @@ func TestAntigravityStateTokenCarriesEmail(t *testing.T) {
 		}
 	}
 	doc, err := readAntigravityStateToken(path)
-	if err != nil || doc["email"] != "g@example.com" || doc["access_token"] != "access" {
+	if err != nil || doc["access_token"] != "access" || doc["refresh_token"] != "refresh" {
 		t.Fatalf("state token: %#v %v", doc, err)
+	}
+	// The auth-status email must not ride along: it names the client's UI
+	// state, which can disagree with the tokens while an account switch
+	// settles, and claims copied from it crossed saved accounts.
+	if _, ok := doc["email"]; ok {
+		t.Fatalf("state token carries unverified claims: %#v", doc)
 	}
 }
 

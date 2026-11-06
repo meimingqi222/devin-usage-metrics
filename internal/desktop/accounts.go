@@ -175,6 +175,7 @@ func (a *App) switchAccountNow(provider, id string, live quota.Account) {
 			// language service and again for the client itself.
 			ctx, cancel := context.WithTimeout(a.ctx, 90*time.Second)
 			defer cancel()
+			ctx = syncdiag.WithFields(syncdiag.WithRun(ctx), "operation", "account_switch", "provider", provider)
 			err = a.accountStore.SwitchApp(ctx, provider, id, live)
 		} else {
 			err = a.accountStore.Switch(provider, id, live)
@@ -183,9 +184,15 @@ func (a *App) switchAccountNow(provider, id string, live quota.Account) {
 			delete(a.accountUI.switching, provider)
 			if err != nil {
 				a.setAccountMessage(provider, err.Error(), true)
+				if a.accountUI.manager {
+					a.accountUI.managerMsg, a.accountUI.managerErr = err.Error(), true
+				}
 				return
 			}
 			a.setAccountMessage(provider, a.t("Switched · new sessions use this account.", "已切换，新会话将使用该账号。"), false)
+			if a.accountUI.manager {
+				a.accountUI.managerMsg, a.accountUI.managerErr = a.t("Switched · new sessions use this account.", "已切换，新会话将使用该账号。"), false
+			}
 			a.profiles = a.accountStore.List()
 			a.refreshQuota(true)
 		}

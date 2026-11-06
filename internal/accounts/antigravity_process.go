@@ -17,6 +17,7 @@ import (
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/quota"
 	"github.com/meimingqi222/devin-usage-metrics/internal/sqlite"
+	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 )
 
 // antigravityApp is the desktop client as found on this machine.
@@ -38,8 +39,16 @@ var (
 // SwitchApp switches Antigravity after quitting the desktop client. The
 // client writes its old token on shutdown, so writing the keychain first
 // would be overwritten. Full restart is the authoritative path Antigravity
-// Tools also falls back to for the IDE and older clients.
+// Tools also falls back to for the IDE and older clients. Every run is
+// logged to the diagnostics log: a silent switch failure is undiagnosable.
 func (s *Store) SwitchApp(ctx context.Context, provider, id string, live quota.Account) error {
+	start := time.Now()
+	err := s.switchApp(ctx, provider, id, live)
+	syncdiag.Log(ctx, "account_switch_end", "provider", provider, "elapsed_ms", time.Since(start).Milliseconds(), "error", syncdiag.ErrorCode(err))
+	return err
+}
+
+func (s *Store) switchApp(ctx context.Context, provider, id string, live quota.Account) error {
 	if provider != "antigravity" {
 		return s.Switch(provider, id, live)
 	}

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -477,8 +479,93 @@ func writeAntigravityStateFixture(t *testing.T, access, refresh, email string) s
 // The login Antigravity keeps in its state database is read locally; enabling
 // switching must file it as a recognized, switchable account without a
 // manual capture step.
+// A record whose credential file went missing must be rebuilt from a
+// sibling record of the same account, or its switch button can only fail.
+func TestHealMissingCredentialFromSibling(t *testing.T) {
+	fixture(t)
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.Add("antigravity", map[string]any{
+		"access_token": "a1", "refresh_token": "r1",
+		"id_token": jwt(map[string]any{"email": "one@example.test"}),
+	}, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Add("antigravity", map[string]any{
+		"access_token": "a2", "refresh_token": "r2",
+	}, "file"); err != nil {
+		t.Fatal(err)
+	}
+	// A duplicate record of the first account whose copy was lost.
+	broken := Profile{ID: "broken000000001", Provider: "antigravity", StableID: first.StableID, Email: first.Email, Kind: "vscdb", CreatedAt: 1}
+	s.mu.Lock()
+	s.data.Profiles = append(s.data.Profiles, broken)
+	if err := s.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+	for _, p := range s.List() {
+		if p.ID != broken.ID {
+			continue
+		}
+		if !p.Writable {
+			t.Fatalf("broken record was not healed: %+v", p)
+		}
+		doc, err := s.ProfileCredential("antigravity", broken.ID)
+		if err != nil || doc["refresh_token"] != "r1" {
+			t.Fatalf("healed copy is wrong: %v %v", doc, err)
+		}
+		return
+	}
+	t.Fatal("broken record missing from the list")
+}
+
+// Without a sibling copy the record stays visible but must not offer a
+// switch that cannot succeed.
+func TestMissingCredentialIsNotSwitchable(t *testing.T) {
+	fixture(t)
+	s := Open()
+	s.mu.Lock()
+	s.data.Profiles = append(s.data.Profiles, Profile{ID: "gone00000000001", Provider: "antigravity", StableID: "x@example.test", Email: "x@example.test", Kind: "file", CreatedAt: 1})
+	if err := s.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+	for _, p := range s.List() {
+		if p.ID != "gone00000000001" {
+			continue
+		}
+		if p.Writable || p.Reason == "" {
+			t.Fatalf("missing-copy record still switchable: %+v", p)
+		}
+		return
+	}
+	t.Fatal("record missing from the list")
+}
+
+// googleUserInfoFake serves the userinfo oracle so a state-database login
+// without identity claims can be named offline.
+func googleUserInfoFake(t *testing.T, email string) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer access-1" {
+			w.WriteHeader(401)
+			return
+		}
+		fmt.Fprint(w, `{"email":"`+email+`"}`)
+	}))
+	t.Cleanup(srv.Close)
+	old := googleUserInfoURL
+	googleUserInfoURL = srv.URL
+	t.Cleanup(func() { googleUserInfoURL = old })
+}
+
 func TestStateLoginIsCapturedAndSwitchable(t *testing.T) {
 	fixture(t)
+	googleUserInfoFake(t, "one@example.test")
 	state := writeAntigravityStateFixture(t, "access-1", "refresh-1", "one@example.test")
 	live := quota.ProfileAccount("antigravity-local", "antigravity", "one@example.test", state)
 	s := Open()
@@ -497,8 +584,71 @@ func TestStateLoginIsCapturedAndSwitchable(t *testing.T) {
 	}
 }
 
+// A saved copy holding the live account's tokens under another account's
+// name must refuse to switch instead of silently restoring the copied
+// account.
+func TestSwitchRejectsContaminatedCopy(t *testing.T) {
+	fixture(t)
+	googleUserInfoFake(t, "one@example.test")
+	state := writeAntigravityStateFixture(t, "access-1", "refresh-1", "one@example.test")
+	live := quota.ProfileAccount("antigravity-local", "antigravity", "one@example.test", state)
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Reconcile([]quota.Account{live}); err != nil {
+		t.Fatal(err)
+	}
+	bad := Profile{ID: "bad000000000001", Provider: "antigravity", StableID: "two@example.test", Email: "two@example.test", Kind: "file", CreatedAt: 1}
+	doc := map[string]any{
+		"access_token": "access-1", "refresh_token": "refresh-1",
+		"id_token": jwt(map[string]any{"email": "two@example.test"}),
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.data.Profiles = append(s.data.Profiles, bad)
+	if err := s.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+	if err := os.WriteFile(s.CredentialPath("antigravity", bad.ID), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Reconcile files the live login under the authoritative record and
+	// marks the copy that carries the same tokens under another name.
+	if _, err := s.Reconcile([]quota.Account{live}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range s.List() {
+		if p.ID == bad.ID && p.Writable {
+			t.Fatalf("contaminated copy not flagged: %+v", p)
+		}
+	}
+	if err := s.Switch("antigravity", bad.ID, live); err == nil || !strings.Contains(err.Error(), "holds the current account's sign-in") {
+		t.Fatalf("contaminated copy switched: %v", err)
+	}
+	// An honest copy of a different account still switches.
+	good, err := s.Add("antigravity", map[string]any{
+		"access_token": "access-3", "refresh_token": "refresh-3",
+		"id_token": jwt(map[string]any{"email": "three@example.test"}),
+	}, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Switch("antigravity", good.ID, live); err != nil {
+		t.Fatalf("honest switch failed: %v", err)
+	}
+	if d, err := live.CredentialDoc(); err != nil || d["refresh_token"] != "refresh-3" {
+		t.Fatalf("switch did not deliver: %#v %v", d, err)
+	}
+}
+
 func TestSwitchAppWritesStateDatabase(t *testing.T) {
 	fixture(t)
+	googleUserInfoFake(t, "one@example.test")
 	state := writeAntigravityStateFixture(t, "access-1", "refresh-1", "one@example.test")
 	live := quota.ProfileAccount("antigravity-local", "antigravity", "one@example.test", state)
 	s := Open()
