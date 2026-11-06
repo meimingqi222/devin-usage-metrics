@@ -405,7 +405,7 @@ func (s *Store) Switch(provider, id string, live quota.Account) error {
 		return fmt.Errorf("write the account sign-in: %w", err)
 	}
 	after, err := live.CredentialDoc()
-	if err != nil || docHash(after) != targetHash {
+	if err != nil || readBackHash(provider, live.CredentialKind(), after) != readBackHash(provider, live.CredentialKind(), targetDoc) {
 		return errors.New("the sign-in did not read back as the selected account")
 	}
 	_ = os.Remove(s.journalPath())
@@ -447,7 +447,7 @@ func (s *Store) Reapply(provider, id string, live quota.Account) error {
 		return err
 	}
 	after, err := live.CredentialDoc()
-	if err != nil || docHash(after) != docHash(doc) {
+	if err != nil || readBackHash(provider, live.CredentialKind(), after) != readBackHash(provider, live.CredentialKind(), doc) {
 		return errors.New("the sign-in did not read back as the selected account")
 	}
 	target.LastUsedAt = time.Now().Unix()
@@ -1013,13 +1013,32 @@ func supported(provider string) bool {
 }
 
 func writable(p Profile) (bool, string) {
-	if p.Kind == "vscdb" {
-		return false, "Antigravity stores this login in its database; switching is not supported"
-	}
 	if p.Kind == "stored" || p.Kind == "" {
 		return false, "This account has no switchable sign-in"
 	}
 	return true, ""
+}
+
+// readBackHash hashes a credential the way its live store reports it after a
+// write. Antigravity's state database round-trips only the opaque tokens and
+// names the account itself, so the read-back comparison there covers just the
+// tokens; everywhere else a written document reads back unchanged.
+func readBackHash(provider, kind string, doc map[string]any) string {
+	if provider == "antigravity" && kind == "vscdb" {
+		token := obj(doc["token"])
+		if token == nil {
+			token = doc
+		}
+		out := map[string]any{}
+		if v := str(token["access_token"]); v != "" {
+			out["access_token"] = v
+		}
+		if v := str(token["refresh_token"]); v != "" {
+			out["refresh_token"] = v
+		}
+		return docHash(out)
+	}
+	return docHash(switchDocument(provider, doc))
 }
 
 func sortProfiles(p []Profile) {

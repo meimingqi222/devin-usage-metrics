@@ -499,10 +499,13 @@ func (a Account) Writable() bool { return a.ReadOnlyReason() == "" }
 func (a Account) ReadOnlyReason() string {
 	switch a.Provider {
 	case "claude", "codex", "antigravity", "grok":
+		if a.Provider == "antigravity" && a.CredentialKind() == "vscdb" {
+			// Antigravity's state database is the store this app reads and
+			// writes on Windows; a switch quits the client first so its
+			// in-memory token cannot be written back.
+			return ""
+		}
 		if a.CredentialKind() != "file" && a.CredentialKind() != "keychain" {
-			if a.CredentialKind() == "vscdb" {
-				return "Antigravity keeps this sign-in in its database; switching is not supported here"
-			}
 			return "this account store is read-only"
 		}
 		if a.Provider == "codex" {
@@ -603,8 +606,10 @@ func (a Account) WriteCredential(d object) error {
 	switch {
 	case strings.HasPrefix(a.source, "keychain:"):
 		return keyWriteDoc(a.Provider, strings.TrimPrefix(a.source, "keychain:"), d)
-	case strings.HasPrefix(a.source, "stored:"), filepath.Ext(a.source) == ".vscdb":
+	case strings.HasPrefix(a.source, "stored:"):
 		return errors.New("this account store is read-only")
+	case filepath.Ext(a.source) == ".vscdb":
+		return WriteAntigravityStateToken(a.source, d)
 	default:
 		return atomicWrite(a.source, d)
 	}

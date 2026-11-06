@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/quota"
+	"github.com/meimingqi222/devin-usage-metrics/internal/sqlite"
 )
 
 func fixture(t *testing.T) string {
@@ -438,6 +439,107 @@ func TestSwitchAppRestartsAntigravity(t *testing.T) {
 	doc, err := live.CredentialDoc()
 	if err != nil || doc["refresh_token"] != "new-r" {
 		t.Fatalf("live credential: %#v %v", doc, err)
+	}
+}
+
+// writeAntigravityStateFixture creates the desktop client's state database at
+// the path this platform resolves, holding a signed-in token and its email.
+func writeAntigravityStateFixture(t *testing.T, access, refresh, email string) string {
+	t.Helper()
+	p := antigravityStateDB()
+	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	db, err := sqlite.Open(ctx, p, sqlite.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err = db.Execute(ctx, "CREATE TABLE ItemTable(key TEXT PRIMARY KEY,value TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	info := append(pbString(1, access), pbString(3, refresh)...)
+	wrapped := pbLen(2, pbString(1, base64.StdEncoding.EncodeToString(info)))
+	entry := append(pbString(1, "oauthTokenInfoSentinelKey"), wrapped...)
+	status, _ := json.Marshal(map[string]string{"email": email})
+	for k, v := range map[string]string{
+		"antigravityUnifiedStateSync.oauthToken": base64.StdEncoding.EncodeToString(pbLen(1, entry)),
+		"antigravityAuthStatus":                  string(status),
+	} {
+		if _, err = db.Execute(ctx, "INSERT INTO ItemTable VALUES(?,?)", k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return p
+}
+
+// The login Antigravity keeps in its state database is read locally; enabling
+// switching must file it as a recognized, switchable account without a
+// manual capture step.
+func TestStateLoginIsCapturedAndSwitchable(t *testing.T) {
+	fixture(t)
+	state := writeAntigravityStateFixture(t, "access-1", "refresh-1", "one@example.test")
+	live := quota.ProfileAccount("antigravity-local", "antigravity", "one@example.test", state)
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := s.Reconcile([]quota.Account{live})
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("capture: %+v %v", profiles, err)
+	}
+	if !profiles[0].Active || profiles[0].Email != "one@example.test" || profiles[0].Kind != "vscdb" {
+		t.Fatalf("state login was not recognized: %+v", profiles[0])
+	}
+	if !profiles[0].Writable {
+		t.Fatalf("state login should be switchable: %s", profiles[0].Reason)
+	}
+}
+
+func TestSwitchAppWritesStateDatabase(t *testing.T) {
+	fixture(t)
+	state := writeAntigravityStateFixture(t, "access-1", "refresh-1", "one@example.test")
+	live := quota.ProfileAccount("antigravity-local", "antigravity", "one@example.test", state)
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Reconcile([]quota.Account{live}); err != nil {
+		t.Fatal(err)
+	}
+	target, err := s.Add("antigravity", map[string]any{
+		"access_token": "access-2", "refresh_token": "refresh-2",
+		"id_token": jwt(map[string]any{"email": "two@example.test"}),
+	}, "keychain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFind, oldStop, oldStart, oldLS := findAntigravity, stopAntigravity, startAntigravity, languageServers
+	defer func() {
+		findAntigravity, stopAntigravity, startAntigravity, languageServers = oldFind, oldStop, oldStart, oldLS
+	}()
+	findAntigravity = func(context.Context) (antigravityApp, error) {
+		return antigravityApp{running: true, pids: []int{1}}, nil
+	}
+	languageServers = func(context.Context, antigravityApp) []int { return nil }
+	stopped, started := false, false
+	stopAntigravity = func(context.Context, antigravityApp) error { stopped = true; return nil }
+	startAntigravity = func(context.Context, antigravityApp) error { started = true; return nil }
+	if err := s.SwitchApp(context.Background(), "antigravity", target.ID, live); err != nil {
+		t.Fatal(err)
+	}
+	if !stopped || !started {
+		t.Fatalf("app lifecycle: stopped=%v started=%v", stopped, started)
+	}
+	doc, err := live.CredentialDoc()
+	if err != nil || doc["refresh_token"] != "refresh-2" {
+		t.Fatalf("state database kept the old sign-in: %#v %v", doc, err)
+	}
+	for _, p := range s.List() {
+		if p.ID == target.ID && !p.Active {
+			t.Fatal("target was not marked active")
+		}
 	}
 }
 
