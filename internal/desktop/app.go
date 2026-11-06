@@ -106,7 +106,16 @@ func New(ctx context.Context) *App {
 	// Like Rust, start on this device's data; All devices is one click away.
 	id := data.DeviceID()
 	store := accounts.Open()
-	return &App{ctx: ctx, events: make(chan func(), 64), agent: model.Devin, loadedAgent: model.Agent(""), period: analytics.Day, tab: "usage", screen: "history", lang: language(), counts: map[model.Agent]int{}, trayEntries: map[model.Agent][]trayEntry{}, busy: map[string]bool{}, apiURL: syncclient.ReadConfig().APIURL, deviceName: data.DeviceName(), localID: id, device: id, usageUI: usageUIState{expandedBuckets: map[int64]bool{}}, sessionsUI: loadSessionUI(), installed: installedAgents(), quotaUI: quotaUIState{keychainLikely: quota.MacOSMayHaveKeychainAccounts()}, accountStore: store, profiles: store.List(), updatePrefs: loadUpdatePrefs()}
+	installed := installedAgents()
+	// Prefer the first agent with local history, in sidebar order.
+	agent := model.Devin
+	for _, candidate := range model.Agents {
+		if installed[candidate] {
+			agent = candidate
+			break
+		}
+	}
+	return &App{ctx: ctx, events: make(chan func(), 64), agent: agent, loadedAgent: model.Agent(""), period: analytics.Day, tab: "usage", screen: "history", lang: language(), counts: map[model.Agent]int{}, trayEntries: map[model.Agent][]trayEntry{}, busy: map[string]bool{}, apiURL: syncclient.ReadConfig().APIURL, deviceName: data.DeviceName(), localID: id, device: id, usageUI: usageUIState{expandedBuckets: map[int64]bool{}}, sessionsUI: loadSessionUI(), installed: installed, quotaUI: quotaUIState{keychainLikely: quota.MacOSMayHaveKeychainAccounts()}, accountStore: store, profiles: store.List(), updatePrefs: loadUpdatePrefs()}
 }
 
 func (a *App) t(en, zh string) string {

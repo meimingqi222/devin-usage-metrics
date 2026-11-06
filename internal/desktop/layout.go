@@ -176,7 +176,7 @@ func (a *App) sidebar(c *ui.Context) {
 		ui.Scroll(c).Grow(1).Padding(0, 10).Gap(2).Children(func() {
 			var shown, other []model.Agent
 			for _, agent := range model.Agents {
-				if a.installed[agent] || a.counts[agent] > 0 || agent == a.agent {
+				if a.installed[agent] || a.counts[agent] > 0 {
 					shown = append(shown, agent)
 				} else {
 					other = append(other, agent)
