@@ -268,3 +268,34 @@ func signInFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestTruncatedAccountNameShowsInFull pins the hover tooltip on account
+// names cut with an ellipsis: the card header has room for only part of a
+// long address.
+func TestTruncatedAccountNameShowsInFull(t *testing.T) {
+	a := quotaFixture(t)
+	tt := ui.NewTester(a.View, 1240, 1000)
+	tt.SetScale(2)
+	const long = "a-very-long-account-label-that-must-ellipsize@example.com"
+	count := func() int {
+		n := 0
+		for _, s := range tt.Texts() {
+			if s == long {
+				n++
+			}
+		}
+		return n
+	}
+	before := count()
+	r, ok := tt.Find(long)
+	if !ok {
+		t.Fatalf("long label missing: %q", tt.Texts())
+	}
+	tt.Move(r.X+r.W/2, r.Y+r.H/2)
+	tt.Advance(2 * time.Second)
+	tt.Frame()
+	if count() <= before {
+		t.Fatalf("hovering a truncated name showed no tooltip: %q", tt.Texts())
+	}
+	capture(t, tt, "go-account-name-tooltip")
+}

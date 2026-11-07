@@ -456,7 +456,7 @@ func (a *App) tabbedAccountBody(c *ui.Context, grp providerQuotaGroup) {
 				// Name the previewed account: the quota bars below look the
 				// same as the live account's, so the banner has to say whose
 				// numbers these are.
-				ui.Text(c, fmt.Sprintf(a.t("Previewing %s · not in use", "正在预览 %s · 未切换"), selected.account.Label)).FontSize(11).TextColor(quotaAmber).SingleLine().Ellipsis("…").MinWidth(0).Shrink(1)
+				ui.Text(c, fmt.Sprintf(a.t("Previewing %s · not in use", "正在预览 %s · 未切换"), selected.account.Label)).FontSize(11).TextColor(quotaAmber).SingleLine().Ellipsis("…").Tooltip(selected.account.Label).MinWidth(0).Shrink(1)
 			}
 			ui.Spacer(c)
 			profileID := selected.profileID

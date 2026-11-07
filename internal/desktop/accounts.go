@@ -326,7 +326,7 @@ func (a *App) accountsConfirm(c *ui.Context) {
 func (a *App) accountLabel(c *ui.Context, ar accountResult, compact bool) ui.Element {
 	t := c.Theme()
 	if !ar.isLive && ar.profileID != "" {
-		return ui.Text(c, ar.account.Label).FontSize(fontFor(compact, 11, 10)).MinWidth(0).SingleLine().Ellipsis("…").TextColor(faint(t))
+		return ui.Text(c, ar.account.Label).FontSize(fontFor(compact, 11, 10)).MinWidth(0).SingleLine().Ellipsis("…").Tooltip(ar.account.Label).TextColor(faint(t))
 	}
 	profiles := a.profilesFor(ar.account.Provider)
 	switching := a.accountUI.switching[ar.account.Provider]
@@ -336,7 +336,7 @@ func (a *App) accountLabel(c *ui.Context, ar accountResult, compact bool) ui.Ele
 			if ar.isLive {
 				ui.Box(c).Size(fontFor(compact, 6, 5), fontFor(compact, 6, 5)).Shrink(0).Radius(3).Background(quotaGreen)
 			}
-			ui.Text(c, ar.account.Label).FontSize(fontFor(compact, 11, 10)).Shrink(1).MinWidth(0).SingleLine().Ellipsis("…").TextColor(t.TextMuted)
+			ui.Text(c, ar.account.Label).FontSize(fontFor(compact, 11, 10)).Shrink(1).MinWidth(0).SingleLine().Ellipsis("…").Tooltip(ar.account.Label).TextColor(t.TextMuted)
 		})
 	}
 	size := fontFor(compact, 11, 10)
@@ -355,7 +355,7 @@ func (a *App) accountLabel(c *ui.Context, ar accountResult, compact bool) ui.Ele
 			return
 		}
 		ui.Box(c).Size(6, 6).Shrink(0).Radius(3).Background(syncOnColor)
-		ui.Text(c, ar.account.Label).FontSize(size).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
+		ui.Text(c, ar.account.Label).FontSize(size).Grow(1).MinWidth(0).SingleLine().Ellipsis("…").Tooltip(ar.account.Label)
 		ui.Text(c, "▾").FontSize(9).Shrink(0).TextColor(faint(t))
 	})
 	if !switching && pill.Clicked() {
@@ -438,7 +438,7 @@ func (a *App) accountMenuItem(c *ui.Context, provider string, p accounts.Profile
 			ui.Box(c).Size(7, 7).Shrink(0).Radius(3.5).Border(1, faint(t).Alpha(.6))
 		}
 		ui.Column(c).Grow(1).MinWidth(0).Gap(0).Children(func() {
-			text := ui.Text(c, name).FontSize(fontFor(compact, 11, 10)).TextColor(t.Text).SingleLine().Ellipsis("…")
+			text := ui.Text(c, name).FontSize(fontFor(compact, 11, 10)).TextColor(t.Text).SingleLine().Ellipsis("…").Tooltip(name)
 			if p.Active {
 				text.TextColor(t.Accent)
 			}
@@ -850,7 +850,7 @@ func (a *App) accountManagerRow(c *ui.Context, provider string, p accounts.Profi
 		}
 		name := a.profileName(provider, p)
 		ui.Column(c).Grow(1).MinWidth(0).Gap(1).Children(func() {
-			ui.Text(c, name).FontSize(12).TextColor(t.Text).SingleLine().Ellipsis("…")
+			ui.Text(c, name).FontSize(12).TextColor(t.Text).SingleLine().Ellipsis("…").Tooltip(name)
 			var subParts []string
 			if p.Plan != "" {
 				subParts = append(subParts, strings.ToUpper(p.Plan))
