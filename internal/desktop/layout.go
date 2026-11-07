@@ -268,6 +268,9 @@ func (a *App) accountsEntry(c *ui.Context) {
 		a.openAccounts()
 	}
 	r.Children(func() {
+		// Each sidebar page carries a colored dot: green quotas, blue
+		// MCP & Skills, amber accounts.
+		ui.Box(c).Size(6, 6).Radius(3).Background(quotaAmber).Shadow(0, 0, 6, 0, quotaAmber.Alpha(.5))
 		ui.Text(c, a.t("Accounts", "账号")).FontSize(12).FontWeight(500).Grow(1)
 		n := 0
 		for _, p := range a.profiles {
