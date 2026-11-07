@@ -196,6 +196,10 @@ func (s *Store) Add(provider string, doc map[string]any, kind string) (Profile, 
 	if err := s.clearTombstoneLocked(provider, key, &p); err != nil {
 		return Profile{}, err
 	}
+	// A fresh sign-in is the repair the suspect message asks for: the copy
+	// now holds new tokens. The next repair re-flags it if they are still
+	// shared with another record.
+	delete(s.suspect, provider+"/"+p.ID)
 	if err := s.saveLocked(); err != nil {
 		return Profile{}, err
 	}

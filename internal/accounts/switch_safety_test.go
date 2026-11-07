@@ -185,3 +185,24 @@ func TestIdentityLookupsRunOutsideTheStoreLock(t *testing.T) {
 	release()
 	<-finished
 }
+
+// TestSignInAgainClearsSuspectFlag pins the repair the suspect message asks
+// for: "sign in again to refresh it". The fresh sign-in replaces the copy's
+// tokens, so the flag must go with them; it used to stay until restart.
+func TestSignInAgainClearsSuspectFlag(t *testing.T) {
+	s, _, misfiled := misfiledAntigravity(t)
+	s.mu.Lock()
+	s.suspect["antigravity/"+misfiled.ID] = true
+	s.mu.Unlock()
+	if _, err := s.Add("antigravity", map[string]any{
+		"access_token": "access-fresh", "refresh_token": "refresh-fresh",
+		"id_token": jwt(map[string]any{"email": "two@example.test"}),
+	}, "file"); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range s.List() {
+		if p.ID == misfiled.ID && !p.Writable {
+			t.Fatalf("a fresh sign-in left the copy flagged: %+v", p)
+		}
+	}
+}
