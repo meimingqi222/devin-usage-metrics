@@ -92,7 +92,7 @@ func fetchCLI(ctx context.Context, token string) (Result, error) {
 	}
 	_, over, _ := pbFind(quota, 16)
 	if int64(over) > 0 {
-		r.Extra = fmt.Sprintf("%.2f ACU", float64(int64(over))/1e6)
+		r.Extra, r.ExtraKind = fmt.Sprintf("%.2f ACU", float64(int64(over))/1e6), ExtraOverage
 	}
 	if r.Plan == "" && len(r.Windows) == 0 && r.Extra == "" {
 		return Result{}, errors.New("GetUserStatus returned no quota fields")

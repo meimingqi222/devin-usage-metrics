@@ -38,9 +38,12 @@ type Window struct {
 	ResetsAt    int64   `json:"resets_at"`
 }
 type Result struct {
-	Plan    string   `json:"plan"`
-	Extra   string   `json:"extra"`
-	Windows []Window `json:"windows"`
+	Plan  string `json:"plan"`
+	Extra string `json:"extra"`
+	// ExtraKind says what Extra measures: ExtraSpend, ExtraBalance or
+	// ExtraOverage. The figures differ in meaning and must not share a label.
+	ExtraKind string   `json:"extra_kind,omitempty"`
+	Windows   []Window `json:"windows"`
 	// Stale is the refresh error when cached data is shown instead.
 	Stale string `json:"stale"`
 	// StaleAge is how old the cached data is; RetryIn is the remaining
@@ -288,3 +291,16 @@ func Fetch(ctx context.Context, a Account, force bool) (Result, error) {
 	}
 	return fallback(e)
 }
+
+// Meanings of Result.Extra.
+const (
+	// ExtraSpend is money spent beyond the plan, against a limit when set
+	// (Claude's extra usage).
+	ExtraSpend = "spend"
+	// ExtraBalance is overage credit still available (Devin's
+	// overage_balance).
+	ExtraBalance = "balance"
+	// ExtraOverage is an overage figure whose direction is not confirmed
+	// (field 16 of the Devin CLI's GetUserStatus quota); shown neutrally.
+	ExtraOverage = "overage"
+)

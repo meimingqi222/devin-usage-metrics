@@ -449,7 +449,7 @@ func ParseClaudeUsage(v object, plan string) Result {
 	x := obj(v["extra_usage"])
 	if x["is_enabled"] == true {
 		if n, ok := x["used_credits"].(float64); ok {
-			r.Extra = fmt.Sprintf("$%.2f", n)
+			r.Extra, r.ExtraKind = fmt.Sprintf("$%.2f", n), ExtraSpend
 			if l, ok := x["monthly_limit"].(float64); ok {
 				r.Extra += fmt.Sprintf(" / $%.2f", l)
 			}
@@ -514,7 +514,7 @@ func ParseDevinQuota(v object, plan string) Result {
 		}
 	}
 	if n := num(v["overage_balance"]); n > 0 {
-		r.Extra = fmt.Sprintf("%.2f ACU", n)
+		r.Extra, r.ExtraKind = fmt.Sprintf("%.2f ACU", n), ExtraBalance
 	}
 	return r
 }
