@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/meimingqi222/devin-usage-metrics/internal/credentialid"
 	"github.com/meimingqi222/devin-usage-metrics/internal/quota"
 	"github.com/meimingqi222/devin-usage-metrics/internal/syncdiag"
 )
@@ -158,6 +159,7 @@ func readClaudeDir(dir string) (map[string]any, string, error) {
 		if service := claudeDirService(dir); service != "" {
 			if b, err := securityRead(service); err == nil {
 				if doc, err := decodeJSON(b); err == nil {
+					stampClaudeDirEmail(dir, doc)
 					return doc, "keychain", nil
 				}
 			}
@@ -171,7 +173,17 @@ func readClaudeDir(dir string) (map[string]any, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	stampClaudeDirEmail(dir, doc)
 	return doc, "file", nil
+}
+
+func stampClaudeDirEmail(dir string, doc map[string]any) {
+	if credentialid.Of("claude", doc).Email != "" {
+		return
+	}
+	if email := claudeJSONEmail(filepath.Join(dir, ".claude.json")); email != "" {
+		doc["email"] = email
+	}
 }
 
 func clearClaudeDir(dir string) {
@@ -180,6 +192,7 @@ func clearClaudeDir(dir string) {
 		_ = exec.Command("security", "delete-generic-password", "-s", service, "-a", claudeAccount()).Run()
 	}
 	_ = os.Remove(filepath.Join(dir, ".credentials.json"))
+	_ = os.Remove(filepath.Join(dir, ".claude.json"))
 }
 
 func claudeDirService(dir string) string {

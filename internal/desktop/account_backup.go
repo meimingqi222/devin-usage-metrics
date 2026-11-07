@@ -617,21 +617,7 @@ func (a *App) accountSyncSettings(c *ui.Context) {
 	signedIn := syncclient.SessionLabel() != ""
 	ready := signedIn && !a.accountSync.authRequired
 	st := a.accountSyncStatus()
-	ui.Column(c).Gap(8).BorderWidth(1, 0, 0, 0).BorderColor(c.Theme().Border).Padding(12, 0, 0).Children(func() {
-		ui.Row(c).AlignItems(ui.Center).Gap(12).Children(func() {
-			ui.Text(c, a.t("Account sync", "账号同步")).FontSize(12).Bold().Grow(1)
-			enabled := cfg.Enabled
-			ui.Switch(c, &enabled).Label(a.t("Account sync", "账号同步")).Disabled(!ready && !cfg.Enabled)
-			if enabled != cfg.Enabled {
-				if enabled {
-					a.openAccountBackup("sync")
-				} else {
-					// Disabling also deletes this device's remembered password;
-					// confirm before it happens instead of doing it silently.
-					a.accountSync.pendingOff = true
-				}
-			}
-		})
+	ui.Column(c).Gap(8).BorderWidth(1, 0, 0, 0).BorderColor(c.Theme().Border).Padding(10, 14).Children(func() {
 		syncing := st.syncing || st.restoring || st.preparing
 		status := a.t("Keep your saved accounts up to date across devices.", "自动同步各设备上的账号，新增、修改和删除都会同步。")
 		switch {
@@ -663,70 +649,93 @@ func (a *App) accountSyncSettings(c *ui.Context) {
 		} else if st.enabled && !st.lastAt.IsZero() && len(st.result.Skipped) > 0 {
 			color = quotaAmber
 		}
-		statusRow := ui.Row(c).Gap(8).AlignItems(ui.Center).Label(status)
-		if st.enabled && !st.lastAt.IsZero() {
-			// Row label doubles as hover tooltip with the absolute moment.
-			statusRow.Label(status + " · " + a.t("Last sync ", "上次同步 ") + fullSyncTime(st.lastAt))
-		}
-		statusRow.Children(func() {
-			if syncing {
-				ui.Spinner(c).Size(12, 12)
-			}
-			ui.Text(c, status).FontSize(11).TextColor(color).Grow(1).MinWidth(0)
+
+		ui.Row(c).AlignItems(ui.Center).Gap(12).Children(func() {
+			ui.Column(c).Grow(1).Gap(2).Children(func() {
+				ui.Text(c, a.t("Account sync", "账号同步")).FontSize(12).FontWeight(600).TextColor(c.Theme().Text)
+				statusRow := ui.Row(c).Gap(6).AlignItems(ui.Center).Label(status)
+				if st.enabled && !st.lastAt.IsZero() {
+					// Row label doubles as hover tooltip with the absolute moment.
+					statusRow.Label(status + " · " + a.t("Last sync ", "上次同步 ") + fullSyncTime(st.lastAt))
+				}
+				statusRow.Children(func() {
+					if syncing {
+						ui.Spinner(c).Size(11, 11)
+					}
+					ui.Text(c, status).FontSize(10.5).TextColor(color).SingleLine().Ellipsis("…")
+				})
+			})
+
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				if !signedIn || a.accountSync.authRequired {
+					if accountButton(c, a.t("Open sync settings", "打开同步设置"), false).Clicked() {
+						a.openSettings("sync")
+					}
+				}
+				if cfg.Enabled && ready {
+					label := a.t("Sync now", "立即同步")
+					if st.failed {
+						label = a.t("Retry", "重试")
+					}
+					if a.accountSync.password == "" {
+						label = a.t("Enter password", "输入密码")
+					}
+					if accountButton(c, label, a.accountSync.password == "").Disabled(syncing).Clicked() {
+						if a.accountSync.password == "" {
+							a.openAccountBackup("sync")
+						} else {
+							a.syncAccounts()
+						}
+					}
+					if accountButton(c, a.t("Details", "详情"), false).Clicked() {
+						a.accountSync.details = !a.accountSync.details
+					}
+				}
+				enabled := cfg.Enabled
+				ui.Switch(c, &enabled).Label(a.t("Account sync", "账号同步")).Disabled(!ready && !cfg.Enabled)
+				if enabled != cfg.Enabled {
+					if enabled {
+						a.openAccountBackup("sync")
+					} else {
+						// Disabling also deletes this device's remembered password;
+						// confirm before it happens instead of doing it silently.
+						a.accountSync.pendingOff = true
+					}
+				}
+			})
 		})
+
 		if st.failed && st.detail != "" {
 			ui.Text(c, st.detail).FontSize(10).TextColor(faint(c.Theme())).SingleLine().Ellipsis("…")
 		}
 		if st.result.Unreadable > 0 && !st.failed && !st.locked {
-			ui.Text(c, fmt.Sprintf(a.t("Snapshots from %d device(s) could not be read with the current password; they may still use the old one. Enter the new password there to finish the change.", "%d 台设备的快照无法用当前密码解开，可能仍在使用旧密码；在那边输入新密码即完成更换。"), st.result.Unreadable)).FontSize(10.5).TextColor(c.Theme().TextMuted)
-			if settingsButton(c, a.t("Remove unread snapshots", "移除无法解开的快照"), false).Disabled(a.busy["account-prune"]).Clicked() {
-				a.accountSync.pendingDropUnreadable = true
-			}
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, fmt.Sprintf(a.t("Snapshots from %d device(s) could not be read with the current password; they may still use the old one. Enter the new password there to finish the change.", "%d 台设备的快照无法用当前密码解开，可能仍在使用旧密码；在那边输入新密码即完成更换。"), st.result.Unreadable)).FontSize(10.5).TextColor(c.Theme().TextMuted).Grow(1)
+				if accountButton(c, a.t("Remove unread snapshots", "移除无法解开的快照"), false).Disabled(a.busy["account-prune"]).Clicked() {
+					a.accountSync.pendingDropUnreadable = true
+				}
+			})
 		}
-		ui.Row(c).Gap(8).Children(func() {
-			if !signedIn || a.accountSync.authRequired {
-				if settingsButton(c, a.t("Open sync settings", "打开同步设置"), false).Clicked() {
-					a.openSettings("sync")
-				}
-			}
-			if cfg.Enabled && ready {
-				label := a.t("Sync now", "立即同步")
-				if st.failed {
-					label = a.t("Retry", "重试")
-				}
-				if a.accountSync.password == "" {
-					label = a.t("Enter password", "输入密码")
-				}
-				if settingsButton(c, label, a.accountSync.password == "").Disabled(syncing).Clicked() {
-					if a.accountSync.password == "" {
-						a.openAccountBackup("sync")
-					} else {
-						a.syncAccounts()
+		if cfg.Enabled && a.accountSync.details {
+			ui.Column(c).Gap(4).Padding(8, 10).Radius(4).Background(ui.Hex("#11131a")).Border(1, c.Theme().Border).Children(func() {
+				if !st.lastAt.IsZero() {
+					r := st.result
+					ui.Text(c, fmt.Sprintf(a.t("Last sync: %d added, %d updated, %d removed, from %d devices.", "上次同步：新增 %d 个，更新 %d 个，删除 %d 个，来自 %d 台设备。"), r.Added, r.Updated, r.Removed, r.Devices)).FontSize(10.5).TextColor(faint(c.Theme()))
+					if r.Protected > 0 {
+						ui.Text(c, a.t("Accounts currently in use were left untouched. They will update after you switch accounts.", "正在使用的账号保持原登录，切换后会继续同步更新。")).FontSize(10.5).TextColor(c.Theme().TextMuted)
 					}
 				}
-				if settingsButton(c, a.t("Details", "详情"), false).Clicked() {
-					a.accountSync.details = !a.accountSync.details
+				ui.Text(c, a.t("Saved account changes sync automatically, about once a minute while the app runs.", "同步只管理保存的账号，应用运行期间每分钟左右自动同步一次。")).FontSize(10.5).TextColor(faint(c.Theme()))
+				ui.Text(c, a.t("Your current agent sign-ins stay unchanged.", "Agent 当前的登录不会被切换。")).FontSize(10.5).TextColor(faint(c.Theme()))
+				if accountButton(c, a.t("Sync password settings", "同步密码设置"), false).Clicked() {
+					a.openAccountBackup("sync")
 				}
-			}
-		})
-		if cfg.Enabled && a.accountSync.details {
-			if !st.lastAt.IsZero() {
-				r := st.result
-				ui.Text(c, fmt.Sprintf(a.t("Last sync: %d added, %d updated, %d removed, from %d devices.", "上次同步：新增 %d 个，更新 %d 个，删除 %d 个，来自 %d 台设备。"), r.Added, r.Updated, r.Removed, r.Devices)).FontSize(10.5).TextColor(faint(c.Theme()))
-				if r.Protected > 0 {
-					ui.Text(c, a.t("Accounts currently in use were left untouched. They will update after you switch accounts.", "正在使用的账号保持原登录，切换后会继续同步更新。")).FontSize(10.5).TextColor(c.Theme().TextMuted)
+				if st.failed && strings.Contains(st.message, "64") {
+					if accountButton(c, a.t("Remove other devices' snapshots", "移除其他设备的快照"), false).Disabled(a.busy["account-prune"]).Clicked() {
+						a.accountSync.pendingDropForeign = true
+					}
 				}
-			}
-			ui.Text(c, a.t("Saved account changes sync automatically, about once a minute while the app runs.", "同步只管理保存的账号，应用运行期间每分钟左右自动同步一次。")).FontSize(10.5).TextColor(faint(c.Theme()))
-			ui.Text(c, a.t("Your current agent sign-ins stay unchanged.", "Agent 当前的登录不会被切换。")).FontSize(10.5).TextColor(faint(c.Theme()))
-			if settingsButton(c, a.t("Sync password settings", "同步密码设置"), false).Clicked() {
-				a.openAccountBackup("sync")
-			}
-			if st.failed && strings.Contains(st.message, "64") {
-				if settingsButton(c, a.t("Remove other devices' snapshots", "移除其他设备的快照"), false).Disabled(a.busy["account-prune"]).Clicked() {
-					a.accountSync.pendingDropForeign = true
-				}
-			}
+			})
 		}
 	})
 }

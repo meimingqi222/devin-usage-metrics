@@ -584,23 +584,53 @@ func (a *App) cancelAccountLogin() {
 	a.accountUI.loginStatus = a.t("Cancelling…", "正在取消…")
 }
 
+func accountButton(c *ui.Context, label string, accent bool) ui.Element {
+	t := c.Theme()
+	b := ui.Button(c, label).FontSize(11.5).FixedLineHeight(18).Padding(3, 10).Radius(4).
+		Border(1, t.Border).Shadow(0, 0, 0, 0, ui.Color{}).
+		Background(ui.Hex("#161b26")).TextColor(t.TextMuted)
+	if b.Hovered() {
+		b.Background(t.SurfaceHover).TextColor(t.Text).Border(1, strongBorder)
+	}
+	if accent {
+		b.Background(t.Accent.Alpha(.15)).Border(1, t.Accent.Alpha(.35)).TextColor(t.Accent)
+		if b.Hovered() {
+			b.Background(t.Accent.Alpha(.25))
+		}
+	}
+	return b
+}
+
 // accountsView is the Accounts page: the one place that manages saved
 // accounts, switching and account sync. It replaced a dialog that also held
 // all of this behind a 380px scroll, with sync split off into Settings and
 // its password into a third dialog.
 func (a *App) accountsView(c *ui.Context) {
 	t := c.Theme()
-	ui.Column(c).Gap(10).MaxWidth(820).Children(func() {
+	ui.Column(c).Gap(12).MaxWidth(820).Children(func() {
+		// 1. Header toolbar with title, description, and top-right actions
 		ui.Row(c).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, a.t("Accounts", "账号")).FontSize(15).Bold().Grow(1)
-			if settingsButton(c, a.t("Diagnostic log", "诊断日志"), false).Clicked() {
-				a.recordAccountDiagnostics()
-				if a.openFolder != nil {
-					a.openFolder(filepath.Dir(syncdiag.Path()))
+			ui.Column(c).Grow(1).Gap(2).Children(func() {
+				ui.Text(c, a.t("Accounts", "账号")).FontSize(16).Bold().TextColor(t.Text)
+				ui.Text(c, a.t("Switches the agent's own sign-in. Running sessions keep their account until restarted.", "切换 Agent 自己的登录。已运行的会话在重启前仍使用原账号。")).FontSize(11).TextColor(t.TextMuted)
+			})
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				imp := accountButton(c, a.t("Import accounts", "导入账号"), false).Disabled(!a.accountUI.enabled || a.busy["account-backup"])
+				if imp.Clicked() {
+					a.openAccountBackup("import")
 				}
-			}
+				exp := accountButton(c, a.t("Export accounts", "导出账号"), false).Disabled(len(a.profiles) == 0 || a.busy["account-backup"])
+				if exp.Clicked() {
+					a.openAccountBackup("export")
+				}
+				if accountButton(c, a.t("Diagnostic log", "诊断日志"), false).Clicked() {
+					a.recordAccountDiagnostics()
+					if a.openFolder != nil {
+						a.openFolder(filepath.Dir(syncdiag.Path()))
+					}
+				}
+			})
 		})
-		ui.Text(c, a.t("Switches the agent's own sign-in. Running sessions keep their account until restarted.", "切换 Agent 自己的登录。已运行的会话在重启前仍使用原账号。")).FontSize(11.5).TextColor(t.TextMuted)
 		if a.accountUI.managerMsg != "" {
 			color := quotaGreen
 			if a.accountUI.managerErr {
@@ -608,83 +638,83 @@ func (a *App) accountsView(c *ui.Context) {
 			}
 			ui.Text(c, a.accountUI.managerMsg).FontSize(11).TextColor(color)
 		}
-		before := a.accountStore.Enabled()
-		a.accountUI.enabled = before
-		ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, a.t("Account switching", "账号切换")).FontSize(12).Grow(1)
-			ui.Switch(c, &a.accountUI.enabled).Label(a.t("Account switching", "账号切换"))
-			if a.accountUI.enabled {
-				status := a.t("On", "已启用")
-				ui.Text(c, status).FontSize(10).TextColor(quotaGreen)
-			} else {
-				ui.Text(c, a.t("Off", "未启用")).FontSize(10).TextColor(faint(t))
-			}
-		})
-		if a.accountUI.enabled != before && !a.accountUI.enabled && syncclient.ReadAccountSyncConfig().Enabled {
+
+		// 2. Control panel card: account switching & sync settings
+		ui.Column(c).Radius(6).Background(t.Surface).Border(1, t.Border).Children(func() {
+			before := a.accountStore.Enabled()
 			a.accountUI.enabled = before
-			a.accountUI.disableConfirm = true
-		} else if a.accountUI.enabled != before {
-			if err := a.accountStore.SetEnabled(a.accountUI.enabled); err != nil {
-				a.message = err.Error()
-			} else if a.accountUI.enabled {
-				a.refreshQuota(true)
-			} else {
-				a.lockAccountSync()
-			}
-		}
-		if !a.accountUI.enabled {
-			ui.Text(c, a.t("Off keeps this app read-only: it only queries quotas. Enabling stores account names and copies of the agents' sign-ins on this device.", "关闭时只查询配额，不写任何登录；启用后才在本机保存账号名称和 Agent 登录副本。")).FontSize(10.5).TextColor(faint(t))
-		}
-		a.accountSyncSettings(c)
-		ui.Row(c).Gap(8).Children(func() {
-			if settingsButton(c, a.t("Import accounts", "导入账号"), false).Disabled(!a.accountUI.enabled || a.busy["account-backup"]).Clicked() {
-				a.openAccountBackup("import")
-			}
-			if settingsButton(c, a.t("Export accounts", "导出账号"), false).Disabled(len(a.profiles) == 0 || a.busy["account-backup"]).Clicked() {
-				a.openAccountBackup("export")
-			}
-		})
-		ui.Column(c).Gap(10).Padding(6, 0, 0).BorderWidth(1, 0, 0, 0).BorderColor(t.Border).Children(func() {
-			ui.Column(c).Gap(10).Children(func() {
-				hidden := 0
-				for _, p := range a.profiles {
-					if p.Hidden {
-						hidden++
+			ui.Row(c).Padding(10, 14).Gap(12).AlignItems(ui.Center).Children(func() {
+				ui.Column(c).Grow(1).Gap(2).Children(func() {
+					ui.Text(c, a.t("Account switching", "账号切换")).FontSize(12).FontWeight(600).TextColor(t.Text)
+					if !a.accountUI.enabled {
+						ui.Text(c, a.t("Off keeps this app read-only: it only queries quotas. Enabling stores account names and copies of the agents' sign-ins on this device.", "关闭时只查询配额，不写任何登录；启用后才在本机保存账号名称和 Agent 登录副本。")).FontSize(10.5).TextColor(faint(t))
+					} else {
+						ui.Text(c, a.t("Allows switching between multiple accounts for supported agents on this device.", "允许在本机保存多个 Agent 登录凭证并在新会话中切换使用。")).FontSize(10.5).TextColor(t.TextMuted)
 					}
-				}
-				for _, provider := range accountProviders {
-					a.accountSection(c, provider)
-				}
-				if hidden > 0 {
-					ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-						label := fmt.Sprintf(a.t("Show hidden legacy copies (%d)", "显示已隐藏的旧副本（%d）"), hidden)
-						if a.accountUI.showHidden {
-							label = a.t("Hide legacy copies", "隐藏旧副本")
-						}
-						if settingsButton(c, label, false).Clicked() {
-							a.accountUI.showHidden = !a.accountUI.showHidden
-						}
-					})
-				}
-				ui.Row(c).Gap(8).AlignItems(ui.Center).Padding(6, 0, 0).Children(func() {
-					ui.Text(c, a.accountStorePath()).FontSize(9.5).TextColor(faint(t)).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
-					if a.openFolder != nil {
-						if settingsButton(c, a.t("Open folder", "打开目录"), false).Clicked() {
-							a.openFolder(a.accountStorePath())
-						}
-					}
-					// Until the first refresh binds the live logins, the
-					// accounts in use are unknown and would be removed too.
-					known := a.accountStore.Reconciled()
-					removeOthers := settingsButton(c, a.t("Remove other saved accounts", "移除其他已保存账号"), false).Disabled(!known)
-					if !known {
-						removeOthers.Label(a.t("Remove other saved accounts (finding the accounts in use…)", "移除其他已保存账号（正在识别当前登录…）"))
-					}
-					if removeOthers.Clicked() {
-						a.accountUI.removeAll = true
+				})
+				ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+					ui.Switch(c, &a.accountUI.enabled).Label(a.t("Account switching", "账号切换"))
+					if a.accountUI.enabled {
+						status := a.t("On", "已启用")
+						ui.Text(c, status).FontSize(10.5).TextColor(quotaGreen).FontWeight(600)
+					} else {
+						ui.Text(c, a.t("Off", "未启用")).FontSize(10.5).TextColor(faint(t))
 					}
 				})
 			})
+			if a.accountUI.enabled != before && !a.accountUI.enabled && syncclient.ReadAccountSyncConfig().Enabled {
+				a.accountUI.enabled = before
+				a.accountUI.disableConfirm = true
+			} else if a.accountUI.enabled != before {
+				if err := a.accountStore.SetEnabled(a.accountUI.enabled); err != nil {
+					a.message = err.Error()
+				} else if a.accountUI.enabled {
+					a.refreshQuota(true)
+				} else {
+					a.lockAccountSync()
+				}
+			}
+			a.accountSyncSettings(c)
+		})
+
+		// 3. Provider account cards
+		hidden := 0
+		for _, p := range a.profiles {
+			if p.Hidden {
+				hidden++
+			}
+		}
+		for _, provider := range accountProviders {
+			a.accountSection(c, provider)
+		}
+		if hidden > 0 {
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				label := fmt.Sprintf(a.t("Show hidden legacy copies (%d)", "显示已隐藏的旧副本（%d）"), hidden)
+				if a.accountUI.showHidden {
+					label = a.t("Hide legacy copies", "隐藏旧副本")
+				}
+				if accountButton(c, label, false).Clicked() {
+					a.accountUI.showHidden = !a.accountUI.showHidden
+				}
+			})
+		}
+
+		// 4. Footer maintenance section
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Padding(6, 0, 0).Children(func() {
+			ui.Text(c, a.accountStorePath()).FontSize(9.5).TextColor(faint(t)).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
+			if a.openFolder != nil {
+				if accountButton(c, a.t("Open folder", "打开目录"), false).Clicked() {
+					a.openFolder(a.accountStorePath())
+				}
+			}
+			known := a.accountStore.Reconciled()
+			removeOthers := accountButton(c, a.t("Remove other saved accounts", "移除其他已保存账号"), false).Disabled(!known)
+			if !known {
+				removeOthers.Label(a.t("Remove other saved accounts (finding the accounts in use…)", "移除其他已保存账号（正在识别当前登录…）"))
+			}
+			if removeOthers.Clicked() {
+				a.accountUI.removeAll = true
+			}
 		})
 	})
 	if a.accountUI.removeAll {
@@ -762,19 +792,28 @@ func (a *App) accountSection(c *ui.Context, provider string) {
 	if a.accountUI.showHidden {
 		profiles = a.allProfilesFor(provider)
 	}
-	ui.Column(c).Gap(4).Children(func() {
-		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, providerTitle(provider)).FontSize(12).FontWeight(600)
-			ui.Text(c, fmt.Sprintf("%d", len(profiles))).FontSize(10).TextColor(faint(t))
+	ui.Column(c).Radius(6).Background(t.Surface).Border(1, t.Border).Children(func() {
+		// Header row with Provider icon, title, count pill, and "+ Add account" button
+		ui.Row(c).Padding(8, 12).Background(ui.Hex("#11131a")).BorderWidth(0, 0, 1, 0).BorderColor(t.Border).AlignItems(ui.Center).Gap(8).Children(func() {
+			ui.Column(c).Size(20, 20).Radius(4).Background(ui.Hex("#171b24")).Border(1, ui.Hex("#232938")).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+				if logo := providerLogos[providerName(provider)]; logo != nil {
+					ui.Image(c, logo).Size(12, 12)
+				} else {
+					ui.Text(c, strings.ToUpper(providerName(provider)[:1])).FontSize(10).Bold().TextColor(providerColor(provider))
+				}
+			})
+			ui.Text(c, providerTitle(provider)).FontSize(12).FontWeight(600).TextColor(t.Text)
+			ui.Text(c, fmt.Sprintf("%d", len(profiles))).FontSize(10).TextColor(faint(t)).Padding(1, 6).Radius(10).Background(ui.Hex("#1a1e2a")).Border(1, t.Border)
 			ui.Spacer(c)
 			if a.accountStore.Enabled() {
-				if settingsButton(c, "+ "+a.t("Add account", "添加账号"), false).Label(fmt.Sprintf(a.t("Add %s account", "添加 %s 账号"), providerTitle(provider))).Clicked() {
+				addBtn := accountButton(c, "+ "+a.t("Add account", "添加账号"), false).Label(fmt.Sprintf(a.t("Add %s account", "添加 %s 账号"), providerTitle(provider)))
+				if addBtn.Clicked() {
 					a.openAddAccount(provider)
 				}
 			}
 		})
-		for _, p := range profiles {
-			a.accountManagerRow(c, provider, p)
+		for i, p := range profiles {
+			a.accountManagerRow(c, provider, p, i > 0)
 		}
 		if len(profiles) == 0 {
 			if live, ok := a.liveAccount(provider); ok {
@@ -799,7 +838,7 @@ func (a *App) accountSection(c *ui.Context, provider string) {
 				if apiKey {
 					reason = a.t("Codex is in API-key mode; there is no account to switch", "当前为 API Key 直连模式，无需切换账号")
 				}
-				ui.Row(c).Padding(6, 10).Gap(8).Radius(4).Background(ui.Hex("#10131c")).Border(1, t.Border).AlignItems(ui.Center).Children(func() {
+				ui.Row(c).Padding(10, 14).Gap(8).AlignItems(ui.Center).Children(func() {
 					ui.Box(c).Size(6, 6).Radius(3).Background(faint(t).Alpha(.6))
 					ui.Column(c).Grow(1).MinWidth(0).Children(func() {
 						ui.Text(c, providerName(provider)).FontSize(12).SingleLine().Ellipsis("…")
@@ -814,9 +853,12 @@ func (a *App) accountSection(c *ui.Context, provider string) {
 	})
 }
 
-func (a *App) accountManagerRow(c *ui.Context, provider string, p accounts.Profile) {
+func (a *App) accountManagerRow(c *ui.Context, provider string, p accounts.Profile, hasDivider bool) {
 	t := c.Theme()
-	row := ui.Row(c.Key("manager/"+p.ID)).FillWidth().MinHeight(38).Padding(4, 8).Gap(8).Radius(4).AlignItems(ui.Center)
+	row := ui.Row(c.Key("manager/"+p.ID)).FillWidth().MinHeight(40).Padding(6, 12).Gap(10).AlignItems(ui.Center)
+	if hasDivider {
+		row.BorderWidth(1, 0, 0, 0).BorderColor(t.Border.Alpha(.5))
+	}
 	if row.Hovered() {
 		row.Background(t.SurfaceHover)
 	}
@@ -844,13 +886,21 @@ func (a *App) accountManagerRow(c *ui.Context, provider string, p accounts.Profi
 	}
 	row.Children(func() {
 		if p.Active {
-			ui.Icon(c, checkIcon).Size(11, 11).Shrink(0).TextColor(t.Accent)
+			ui.Icon(c, checkIcon).Size(12, 12).Shrink(0).TextColor(t.Accent)
 		} else {
 			ui.Box(c).Size(7, 7).Shrink(0).Radius(3.5).Border(1, faint(t).Alpha(.6))
 		}
 		name := a.profileName(provider, p)
 		ui.Column(c).Grow(1).MinWidth(0).Gap(1).Children(func() {
-			ui.Text(c, name).FontSize(12).TextColor(t.Text).SingleLine().Ellipsis("…").Tooltip(name)
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				text := ui.Text(c, name).FontSize(12).TextColor(t.Text).SingleLine().Ellipsis("…").Tooltip(name)
+				if p.Active {
+					text.FontWeight(600)
+				}
+				if p.Active {
+					ui.Text(c, a.t("Active now", "当前使用")).FontSize(9.5).TextColor(quotaGreen).Padding(0, 4).Radius(3).Background(quotaGreen.Alpha(.1)).NoWrap()
+				}
+			})
 			var subParts []string
 			if p.Plan != "" {
 				subParts = append(subParts, strings.ToUpper(p.Plan))
@@ -895,7 +945,7 @@ func (a *App) accountManagerRow(c *ui.Context, provider string, p accounts.Profi
 					a.switchAccount(provider, p.ID)
 				}
 			}
-			if settingsButton(c, a.t("Rename", "重命名"), false).Label(a.t("Rename ", "重命名 ") + a.profileName(provider, p)).Clicked() {
+			if accountButton(c, a.t("Rename", "重命名"), false).Label(a.t("Rename ", "重命名 ") + a.profileName(provider, p)).Clicked() {
 				a.accountUI.renameID, a.accountUI.renameText = p.ID, p.DisplayName()
 			}
 			// An account in use is occupied: the refresh captures it again, so
@@ -904,7 +954,7 @@ func (a *App) accountManagerRow(c *ui.Context, provider string, p accounts.Profi
 			if !p.Active {
 				// Removal is destructive and syncs: it reads as a danger
 				// action and asks first, unlike Rename beside it.
-				if settingsButton(c, a.t("Remove", "移除"), false).Label(a.t("Remove ", "移除 ") + a.profileName(provider, p)).TextColor(quotaRose.Alpha(.8)).Clicked() {
+				if accountButton(c, a.t("Remove", "移除"), false).Label(a.t("Remove ", "移除 ") + a.profileName(provider, p)).TextColor(quotaRose.Alpha(.8)).Clicked() {
 					if live, ok := a.liveAccount(provider); ok && p.Email != "" && strings.EqualFold(live.Label, p.Email) {
 						a.accountUI.managerMsg = a.t("This is the live account. Switch to another account before removing it.", "这是当前正在使用的账号。请先切换到其他账号再移除。")
 						a.accountUI.managerErr = true

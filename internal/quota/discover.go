@@ -22,7 +22,26 @@ import (
 
 func homePath(p string) string {
 	h, _ := os.UserHomeDir()
+	if h == "" {
+		h = os.Getenv("HOME")
+	}
 	return filepath.Join(h, filepath.FromSlash(p))
+}
+func claudeProfileEmail() string {
+	if dir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); dir != "" {
+		if d, err := readDoc(filepath.Join(dir, ".claude.json")); err == nil {
+			return strings.TrimSpace(str(at(d, "oauthAccount", "emailAddress")))
+		}
+		return ""
+	}
+	for _, rel := range []string{".claude.json", ".claude/.claude.json"} {
+		if d, err := readDoc(homePath(rel)); err == nil {
+			if email := strings.TrimSpace(str(at(d, "oauthAccount", "emailAddress"))); email != "" {
+				return email
+			}
+		}
+	}
+	return ""
 }
 func configPath(p string) string {
 	d, _ := os.UserConfigDir()
@@ -336,7 +355,12 @@ func Discover(allowKeychain bool) []Account {
 		}
 		email := str(d["email"])
 		if p == "claude" {
-			email = str(at(d, "claudeAiOauth", "emailAddress"))
+			if e := str(at(d, "claudeAiOauth", "emailAddress")); e != "" {
+				email = e
+			}
+			if email == "" {
+				email = claudeProfileEmail()
+			}
 		}
 		if p == "grok" {
 			_, g := grokEntry(d)

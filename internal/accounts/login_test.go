@@ -43,6 +43,23 @@ printf '%s' '{"claudeAiOauth":{"emailAddress":"new@example.com","accessToken":"a
 	}
 }
 
+func TestReadClaudeDirStampsEmailFromClaudeJSON(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","subscriptionType":"pro"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(`{"oauthAccount":{"emailAddress":"isolated@example.com"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	doc, kind, err := readClaudeDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != "file" || doc["email"] != "isolated@example.com" {
+		t.Fatalf("expected email from .claude.json, got kind=%s doc=%#v", kind, doc)
+	}
+}
+
 func TestAntigravityOAuthFlow(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	oldToken := googleTokenURL

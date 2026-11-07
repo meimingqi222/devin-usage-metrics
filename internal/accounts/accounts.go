@@ -435,35 +435,35 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 			// The active profile, the agent's own label or our saved copy
 			// may name the account even when the credential has no identity
 			// claims. Keep the email in our copy only; a switch strips it.
-			if a.Provider == "claude" {
-				if email := claudeProfileEmail(); email != "" {
-					doc["email"] = email
-					identitySource = "claude_profile"
-				}
+			if r.issuer != "" {
+				// The issuer outranks every recorded name: a crossed
+				// saved copy claims one account while holding these
+				// tokens, and the auth-status label runs ahead of or
+				// behind the token row. readLiveAccounts asked it
+				// before the lock was taken.
+				doc["email"] = r.issuer
+				identitySource = r.issuerSource
 			}
 			if credentialid.Of(a.Provider, doc).Email == "" {
-				if r.issuer != "" {
-					// The issuer outranks every recorded name: a crossed
-					// saved copy claims one account while holding these
-					// tokens, and the auth-status label runs ahead of or
-					// behind the token row. readLiveAccounts asked it
-					// before the lock was taken.
-					doc["email"] = r.issuer
-					identitySource = r.issuerSource
-				}
-				if credentialid.Of(a.Provider, doc).Email == "" {
-					// Recorded names stay a guess behind the issuer: the
-					// active profile first - the most recent attribution -
-					// then any other saved copy sharing the tokens. The
-					// agent's label names Antigravity's UI, not its tokens,
-					// so it is never used there.
-					if email := s.unattestedSavedEmailLocked(a.Provider, doc); email != "" {
+				// Recorded names stay a guess behind the issuer: the
+				// active profile first - the most recent attribution -
+				// then any other saved copy sharing the tokens. The
+				// agent's label names Antigravity's UI, not its tokens,
+				// so it is never used there.
+				if email := s.unattestedSavedEmailLocked(a.Provider, doc); email != "" {
+					doc["email"] = email
+					identitySource = "saved_tokens"
+				} else if a.Provider == "claude" {
+					if email := claudeProfileEmail(); s.claudeEmailAcceptableLocked(email, doc) {
 						doc["email"] = email
-						identitySource = "saved_tokens"
-					} else if a.Provider != "antigravity" && strings.Contains(a.Label, "@") {
+						identitySource = "claude_profile"
+					} else if strings.Contains(a.Label, "@") && s.claudeEmailAcceptableLocked(a.Label, doc) {
 						doc["email"] = a.Label
 						identitySource = "agent_label"
 					}
+				} else if a.Provider != "antigravity" && strings.Contains(a.Label, "@") {
+					doc["email"] = a.Label
+					identitySource = "agent_label"
 				}
 			}
 		}
@@ -1435,11 +1435,45 @@ func nested(v any, keys ...string) any {
 	return v
 }
 
-func claudeProfileEmail() string {
-	path := filepath.Join(os.Getenv("HOME"), ".claude.json")
-	if dir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); dir != "" {
-		path = filepath.Join(dir, ".claude.json")
+func (s *Store) claudeEmailAcceptableLocked(email string, doc map[string]any) bool {
+	if email == "" {
+		return false
 	}
+	// Switching Claude in this app rewrites .credentials.json without
+	// touching ~/.claude.json, which keeps the previous account's
+	// oauthAccount until Claude Code updates it. Never attribute that
+	// leftover email to a different saved copy's tokens.
+	hasNamedOwner := false
+	hasUnnamedTokenMatch := false
+	for _, p := range s.data.Profiles {
+		if p.Provider != "claude" {
+			continue
+		}
+		if strings.EqualFold(p.Email, email) && !s.sameSavedLocked(p, "claude", doc) {
+			hasNamedOwner = true
+		}
+		if p.Email == "" && s.sameSavedLocked(p, "claude", doc) {
+			hasUnnamedTokenMatch = true
+		}
+	}
+	return !(hasNamedOwner && hasUnnamedTokenMatch)
+}
+
+func claudeProfileEmail() string {
+	if dir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); dir != "" {
+		return claudeJSONEmail(filepath.Join(dir, ".claude.json"))
+	}
+	home := homeDir()
+	if home == "" {
+		return ""
+	}
+	if email := claudeJSONEmail(filepath.Join(home, ".claude.json")); email != "" {
+		return email
+	}
+	return claudeJSONEmail(filepath.Join(home, ".claude", ".claude.json"))
+}
+
+func claudeJSONEmail(path string) string {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return ""

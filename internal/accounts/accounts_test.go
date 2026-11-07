@@ -1038,3 +1038,70 @@ func TestSwitchAppHotSwitchesLanguageServer(t *testing.T) {
 		t.Fatalf("live credential: %#v", doc)
 	}
 }
+
+func TestClaudeProfileEmailUpgradesUnnamedProfileWithoutHomeEnv(t *testing.T) {
+	h := fixture(t)
+	if runtime.GOOS == "windows" {
+		t.Setenv("HOME", "")
+	}
+	rawCreds := `{"claudeAiOauth":{"accessToken":"a1","refreshToken":"r1","subscriptionType":"pro"}}`
+	write(t, h, ".claude/.credentials.json", rawCreds)
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	// First capture without .claude.json leaves an unnamed Claude (xxxxxx) profile.
+	first, err := s.Reconcile(quota.Discover(false))
+	if err != nil || len(first) != 1 || first[0].Email != "" || !strings.HasPrefix(first[0].Label, "Claude (") {
+		t.Fatalf("expected unnamed profile before .claude.json: %+v %v", first, err)
+	}
+	unnamedID := first[0].ID
+
+	// Once .claude.json holds oauthAccount.emailAddress, Discover and Reconcile
+	// resolve the email even when HOME is unset on Windows, upgrading the existing
+	// profile in place instead of leaving Claude (xxxxxx) or creating a second copy.
+	write(t, h, ".claude.json", `{"oauthAccount":{"emailAddress":"claude-user@example.com"}}`)
+	discovered := quota.Discover(false)
+	var liveClaude quota.Account
+	for _, a := range discovered {
+		if a.Provider == "claude" {
+			liveClaude = a
+		}
+	}
+	if liveClaude.Label != "claude-user@example.com" {
+		t.Fatalf("Discover did not read .claude.json email: %+v", liveClaude)
+	}
+	upgraded, err := s.Reconcile(discovered)
+	if err != nil || len(upgraded) != 1 {
+		t.Fatalf("upgrade reconcile: %+v %v", upgraded, err)
+	}
+	if upgraded[0].ID != unnamedID || upgraded[0].Email != "claude-user@example.com" || upgraded[0].Label != "claude-user@example.com" || !upgraded[0].Active {
+		t.Fatalf("unnamed Claude profile was not upgraded in place: %+v", upgraded[0])
+	}
+
+	// Switching to a second claims-less Claude account strips doc["email"] from
+	// .credentials.json while ~/.claude.json still names the first account;
+	// Reconcile must keep the switched account's own identity.
+	second, err := s.Add("claude", map[string]any{
+		"claudeAiOauth": map[string]any{"accessToken": "a2", "refreshToken": "r2", "subscriptionType": "pro"},
+		"email":         "second-claude@example.com",
+	}, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Switch("claude", second.ID, live(t, "claude")); err != nil {
+		t.Fatal(err)
+	}
+	afterSwitch, err := s.Reconcile(quota.Discover(false))
+	if err != nil || len(afterSwitch) != 2 {
+		t.Fatalf("reconcile after switch: %+v %v", afterSwitch, err)
+	}
+	for _, p := range afterSwitch {
+		if p.ID == second.ID && (!p.Active || p.Email != "second-claude@example.com" || p.Label != "second-claude@example.com") {
+			t.Fatalf("switched account lost active state or email: %+v", p)
+		}
+		if p.ID == unnamedID && p.Active {
+			t.Fatalf("previous account stayed active after switch: %+v", p)
+		}
+	}
+}
