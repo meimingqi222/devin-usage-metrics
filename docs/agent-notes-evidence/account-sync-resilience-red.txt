@@ -1,0 +1,11 @@
+--- FAIL: TestSyncSkipsRecordWithMissingCopy (0.02s)
+    sync_resilience_test.go:37: snapshot failed on one missing copy: could not read a saved account for backup
+--- FAIL: TestLongRenameStaysSyncable (0.01s)
+    sync_resilience_test.go:70: snapshot failed after a long rename: invalid account backup entry
+--- FAIL: TestOldTombstonesArePruned (0.00s)
+    sync_resilience_test.go:92: a deletion past retention survived
+--- FAIL: TestProtectedSurvivorOutranksRemoteTombstone (0.01s)
+    sync_resilience_test.go:128: the deleting device's snapshot still retires the in-use account: []
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/accounts	0.635s
+FAIL

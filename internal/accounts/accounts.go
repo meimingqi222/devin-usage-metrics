@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/credentialid"
@@ -25,6 +26,14 @@ import (
 // ErrDisabled means account switching was not enabled; the app must stay
 // read-only.
 var ErrDisabled = errors.New("account switching is off")
+
+// errLiveChanged and errWriteFailed are the switch failures a plain rewrite
+// may finish: the live store moved under the compare-and-swap, or the write
+// itself failed. Every other Switch error is a refusal that must stand.
+var (
+	errLiveChanged = errors.New("the live sign-in changed while switching; try again")
+	errWriteFailed = errors.New("write the account sign-in")
+)
 
 // Profile is one saved account. The credential itself is kept beside the
 // manifest, never in it.
@@ -84,7 +93,18 @@ type Store struct {
 	// suspect holds provider/ID keys of records that carry the live
 	// sign-in's tokens under another account's name; they cannot switch.
 	suspect map[string]bool
+	// enabled mirrors data.Enabled once loaded, so the UI thread can read
+	// it every frame without waiting on a refresh or switch holding mu.
+	enabled, enabledReady atomic.Bool
+	// reconciled is set once a refresh has bound the live logins; before
+	// that, which saved records are in use is unknown.
+	reconciled atomic.Bool
 }
+
+// Reconciled reports whether a refresh has bound the agents' live logins in
+// this process. Until then the in-use records are unknown, and removing
+// "every account but the ones in use" would remove those too.
+func (s *Store) Reconciled() bool { return s.reconciled.Load() }
 
 // Open returns a store rooted at the app config directory.
 func Open() *Store {
@@ -108,6 +128,10 @@ func (s *Store) loadLocked() {
 		return
 	}
 	s.loaded = true
+	defer func() {
+		s.enabled.Store(s.data.Enabled)
+		s.enabledReady.Store(true)
+	}()
 	b, err := os.ReadFile(s.manifestPath())
 	if err != nil {
 		return
@@ -120,6 +144,9 @@ func (s *Store) loadLocked() {
 
 // Enabled reports whether the user opted in to writing account credentials.
 func (s *Store) Enabled() bool {
+	if s.enabledReady.Load() {
+		return s.enabled.Load()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loadLocked()
@@ -134,7 +161,11 @@ func (s *Store) SetEnabled(on bool) error {
 	s.loadLocked()
 	s.data.Version = 1
 	s.data.Enabled = on
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		return err
+	}
+	s.enabled.Store(on)
+	return nil
 }
 
 // Add stores a credential document obtained from an in-app sign-in. The
@@ -372,21 +403,17 @@ func (s *Store) Reconcile(live []quota.Account) ([]Profile, error) {
 // ReconcileContext is Reconcile with a caller's cancellation and timeout.
 func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]Profile, error) {
 	ctx = syncdiag.WithRun(ctx)
+	reads := readLiveAccounts(ctx, live)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loadLocked()
 	before := len(s.data.Profiles)
 	changed := s.repairLocked()
 	syncdiag.Log(ctx, "account_reconcile_start", "saved_before", before, "saved_after_repair", len(s.data.Profiles), "repaired", changed, "enabled", s.data.Enabled)
-	seen := map[string]bool{}
-	for _, a := range live {
-		if !supported(a.Provider) || seen[a.Provider] {
-			continue
-		}
-		seen[a.Provider] = true
+	for _, r := range reads {
+		a, doc, err := r.account, r.doc, r.err
 		accountCtx := syncdiag.WithFields(ctx, "provider", a.Provider, "source", syncdiag.ID(a.Key), "source_kind", a.CredentialKind())
 		previous := s.active[a.Provider]
-		doc, err := a.CredentialDoc()
 		if err != nil {
 			syncdiag.Log(accountCtx, "account_reconcile_skipped", "reason", "credential_read_failed", "error", syncdiag.ErrorCode(err))
 			continue
@@ -411,19 +438,14 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 				}
 			}
 			if credentialid.Of(a.Provider, doc).Email == "" {
-				if a.Provider == "antigravity" {
+				if r.issuer != "" {
 					// The issuer outranks every recorded name: a crossed
 					// saved copy claims one account while holding these
 					// tokens, and the auth-status label runs ahead of or
-					// behind the token row. An expired access token still
-					// answers through a refresh exchange.
-					if email := googleAccountEmail(ctx, accessTokenOf(doc)); email != "" {
-						doc["email"] = email
-						identitySource = "google_userinfo"
-					} else if email := googleRefreshedEmail(ctx, doc); email != "" {
-						doc["email"] = email
-						identitySource = "google_refresh_exchange"
-					}
+					// behind the token row. readLiveAccounts asked it
+					// before the lock was taken.
+					doc["email"] = r.issuer
+					identitySource = r.issuerSource
 				}
 				if credentialid.Of(a.Provider, doc).Email == "" {
 					// Recorded names stay a guess behind the issuer: the
@@ -546,8 +568,45 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 		}
 	}
 	out := s.decorateLocked(append([]Profile(nil), s.data.Profiles...))
+	s.reconciled.Store(true)
 	syncdiag.Log(ctx, "account_reconcile_end", "saved", len(out), "suspect", len(s.suspect))
 	return out, nil
+}
+
+// liveRead is one live account read before the store lock is taken.
+type liveRead struct {
+	account      quota.Account
+	doc          map[string]any
+	err          error
+	issuer       string // the account Google names for claims-less Antigravity tokens
+	issuerSource string
+}
+
+// readLiveAccounts reads each supported provider's live login once and asks
+// Google to name a claims-less Antigravity login. It runs without the store
+// lock: the lookups can take seconds, and the UI thread reads the store
+// every frame. An expired access token still answers through a refresh
+// exchange.
+func readLiveAccounts(ctx context.Context, live []quota.Account) []liveRead {
+	var out []liveRead
+	seen := map[string]bool{}
+	for _, a := range live {
+		if !supported(a.Provider) || seen[a.Provider] {
+			continue
+		}
+		seen[a.Provider] = true
+		r := liveRead{account: a}
+		r.doc, r.err = a.CredentialDoc()
+		if r.err == nil && a.Provider == "antigravity" && accountDocument(a.Provider, r.doc) && credentialid.Of(a.Provider, r.doc).Email == "" {
+			if email := googleAccountEmail(ctx, accessTokenOf(r.doc)); email != "" {
+				r.issuer, r.issuerSource = email, "google_userinfo"
+			} else if email := googleRefreshedEmail(ctx, r.doc); email != "" {
+				r.issuer, r.issuerSource = email, "google_refresh_exchange"
+			}
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // Switch moves the target profile's credential into the live store. The
@@ -560,24 +619,24 @@ func (s *Store) Switch(provider, id string, live quota.Account) error {
 	if !live.Writable() {
 		return errors.New("the agent's sign-in store is read-only here")
 	}
+	// The issuer settles what a copy's tokens actually are. A copy that
+	// claims one account while holding another's would switch
+	// "successfully" and only restore the copied sign-in, which reads as
+	// "switching does not work". Ask before writing, and without the lock:
+	// the UI thread reads the store every frame.
+	issuer := s.targetIssuer(provider, id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loadLocked()
-	if !s.data.Enabled {
-		return ErrDisabled
+	target, targetDoc, err := s.validateTargetLocked(provider, id)
+	if err != nil {
+		return err
 	}
-	var target *Profile
-	for i := range s.data.Profiles {
-		if s.data.Profiles[i].Provider == provider && s.data.Profiles[i].ID == id {
-			target = &s.data.Profiles[i]
-			break
+	if issuer != "" {
+		if claimed := credentialid.Of(provider, targetDoc); claimed.Email != "" && !strings.EqualFold(issuer, claimed.Email) {
+			s.suspect[provider+"/"+target.ID] = true
+			return fmt.Errorf("this saved copy holds %s's sign-in; sign in again to refresh it", issuer)
 		}
-	}
-	if target == nil {
-		return errors.New("account not found")
-	}
-	if ok, reason := writable(*target); !ok {
-		return errors.New(reason)
 	}
 	before, err := live.CredentialDoc()
 	if err != nil {
@@ -597,15 +656,10 @@ func (s *Store) Switch(provider, id string, live quota.Account) error {
 	if s.active[provider] == id {
 		return nil
 	}
-	targetDoc, err := s.readCredential(*target)
-	if err != nil {
+	// The capture above may have rewritten the target's file (a merge of
+	// the same login); write the copy as it stands now.
+	if targetDoc, err = s.readCredential(*target); err != nil {
 		return errors.New("this account has no saved sign-in; sign in again")
-	}
-	if !accountDocument(provider, targetDoc) {
-		return errors.New("this profile is not a switchable account; sign in again")
-	}
-	if id := credentialid.Of(provider, targetDoc); target.StableID != "" && id.Stable != "" && id.Stable != target.StableID {
-		return errors.New("the saved sign-in belongs to a different account; sign in again")
 	}
 	// A copy whose tokens already are the live sign-in cannot deliver this
 	// switch when another record holding those same tokens claims a
@@ -630,11 +684,8 @@ func (s *Store) Switch(provider, id string, live quota.Account) error {
 		}
 	}
 	targetDoc = switchDocument(provider, targetDoc)
-	targetHash := docHash(targetDoc)
-	j := journalFile{Version: 1, Provider: provider, Target: id, BeforeHash: beforeHash, TargetHash: targetHash, At: time.Now().Unix()}
 	targetDoc = adaptCredential(provider, targetDoc, target.Kind, live.CredentialKind())
-	targetHash = docHash(targetDoc)
-	j.TargetHash = targetHash
+	j := journalFile{Version: 1, Provider: provider, Target: id, BeforeHash: beforeHash, TargetHash: docHash(targetDoc), At: time.Now().Unix()}
 	if err := s.writeJournal(j); err != nil {
 		return err
 	}
@@ -643,7 +694,7 @@ func (s *Store) Switch(provider, id string, live quota.Account) error {
 	// target was being read.
 	if current, err := live.CredentialDoc(); err != nil || docHash(current) != beforeHash {
 		_ = os.Remove(s.journalPath())
-		return errors.New("the live sign-in changed while switching; try again")
+		return errLiveChanged
 	}
 	if err := live.WriteCredential(targetDoc); err != nil {
 		// Put the previous login back so a failed write does not leave a
@@ -651,33 +702,65 @@ func (s *Store) Switch(provider, id string, live quota.Account) error {
 		if live.WriteCredential(before) == nil {
 			_ = os.Remove(s.journalPath())
 		}
-		return fmt.Errorf("write the account sign-in: %w", err)
+		return fmt.Errorf("%w: %w", errWriteFailed, err)
 	}
 	after, err := live.CredentialDoc()
 	if err != nil || readBackHash(provider, live.CredentialKind(), after) != readBackHash(provider, live.CredentialKind(), targetDoc) {
 		return errors.New("the sign-in did not read back as the selected account")
 	}
-	// The issuer settles what the written tokens actually are. A copy that
-	// claims one account while holding another's tokens would switch
-	// "successfully" and only restore the copied sign-in, which reads as
-	// "switching does not work"; put the previous login back and retire the
-	// copy from the switcher.
-	if provider == "antigravity" {
-		if email := googleAccountEmail(context.Background(), accessTokenOf(targetDoc)); email != "" {
-			if id := credentialid.Of(provider, targetDoc); id.Email != "" && !strings.EqualFold(email, id.Email) {
-				if live.WriteCredential(before) != nil {
-					return fmt.Errorf("this saved copy holds %s's sign-in; sign in again to refresh it", email)
-				}
-				_ = os.Remove(s.journalPath())
-				s.suspect[provider+"/"+target.ID] = true
-				return fmt.Errorf("this saved copy holds %s's sign-in; sign in again to refresh it", email)
-			}
-		}
-	}
 	_ = os.Remove(s.journalPath())
 	target.LastUsedAt = time.Now().Unix()
 	s.active[provider] = id
 	return s.saveLocked()
+}
+
+// targetIssuer asks Google whom an Antigravity copy's access token belongs
+// to, "" when unknown or not Antigravity. It holds the lock only to read
+// the copy.
+func (s *Store) targetIssuer(provider, id string) string {
+	if provider != "antigravity" {
+		return ""
+	}
+	doc, err := s.ProfileCredential(provider, id)
+	if err != nil {
+		return ""
+	}
+	return googleAccountEmail(context.Background(), accessTokenOf(doc))
+}
+
+// validateTargetLocked is every check a target must pass before any write
+// to the live store, shared by Switch and Reapply so no path skips them.
+func (s *Store) validateTargetLocked(provider, id string) (*Profile, map[string]any, error) {
+	if !s.data.Enabled {
+		return nil, nil, ErrDisabled
+	}
+	var target *Profile
+	for i := range s.data.Profiles {
+		if s.data.Profiles[i].Provider == provider && s.data.Profiles[i].ID == id {
+			target = &s.data.Profiles[i]
+			break
+		}
+	}
+	if target == nil {
+		return nil, nil, errors.New("account not found")
+	}
+	if ok, reason := writable(*target); !ok {
+		return nil, nil, errors.New(reason)
+	}
+	if s.suspect[provider+"/"+id] {
+		return nil, nil, errors.New("this saved copy holds another account's sign-in; sign in again to refresh it")
+	}
+	doc, err := s.readCredential(*target)
+	if err != nil {
+		return nil, nil, errors.New("this account has no saved sign-in; sign in again")
+	}
+	if !accountDocument(provider, doc) {
+		return nil, nil, errors.New("this profile is not a switchable account; sign in again")
+	}
+	if claimed := credentialid.Of(provider, doc); target.StableID != "" && claimed.Stable != "" && claimed.Stable != target.StableID {
+		return nil, nil, errors.New("the saved sign-in belongs to a different account; sign in again")
+	}
+	return target, doc, nil
 }
 
 // Reapply writes the target profile again without capturing the live
@@ -690,22 +773,9 @@ func (s *Store) Reapply(provider, id string, live quota.Account) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loadLocked()
-	var target *Profile
-	for i := range s.data.Profiles {
-		if s.data.Profiles[i].Provider == provider && s.data.Profiles[i].ID == id {
-			target = &s.data.Profiles[i]
-			break
-		}
-	}
-	if target == nil {
-		return errors.New("account not found")
-	}
-	doc, err := s.readCredential(*target)
+	target, doc, err := s.validateTargetLocked(provider, id)
 	if err != nil {
-		return errors.New("this account has no saved sign-in; sign in again")
-	}
-	if !accountDocument(provider, doc) {
-		return errors.New("this profile is not a switchable account; sign in again")
+		return err
 	}
 	doc = switchDocument(provider, doc)
 	doc = adaptCredential(provider, doc, target.Kind, live.CredentialKind())
@@ -754,7 +824,13 @@ func (s *Store) Rename(provider, id, name string) error {
 	s.loadLocked()
 	for i := range s.data.Profiles {
 		if s.data.Profiles[i].Provider == provider && s.data.Profiles[i].ID == id {
-			s.data.Profiles[i].Name = strings.TrimSpace(name)
+			// Capped here, where the user types it: the sync format allows
+			// 512 bytes, and a longer name used to fail every later sync.
+			name = strings.TrimSpace(name)
+			if r := []rune(name); len(r) > MaxAccountNameRunes {
+				name = strings.TrimSpace(string(r[:MaxAccountNameRunes]))
+			}
+			s.data.Profiles[i].Name = name
 			s.data.Profiles[i].NameModifiedAt = time.Now().UnixNano()
 			return s.saveLocked()
 		}
@@ -988,6 +1064,13 @@ func (s *Store) repairLocked() bool {
 // still present: a surviving record means the account was never deleted,
 // and the leftover key both keeps a live sign-in from binding to it and
 // would remove the survivor on every device at the next sync.
+//
+// The survivor's stamp is deliberately left alone. A record that survives
+// only because it was in use when another device deleted it ("Protected")
+// is a deferred deletion: other devices keep the tombstone, and once this
+// device switches away the next sync retires it
+// (TestAccountSyncProtectsTheLiveSignIn). Stamping it past the tombstone
+// would turn every in-use deletion into a permanent resurrection.
 func (s *Store) unsuppressSurvivorsLocked() bool {
 	changed := false
 	for _, p := range s.data.Profiles {

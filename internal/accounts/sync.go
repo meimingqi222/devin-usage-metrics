@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"runtime"
+	"sort"
 	"time"
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/credentialid"
@@ -13,6 +14,7 @@ import (
 
 type SyncResult struct {
 	Added, Updated, Removed, Protected, Total int
+	Skipped                                   []SkippedAccount
 }
 
 type credentialChange struct {
@@ -41,7 +43,7 @@ func (s *Store) ApplySync(remote Backup) (result SyncResult, err error) {
 	if !s.data.Enabled {
 		return result, ErrDisabled
 	}
-	local, err := s.snapshotLocked()
+	local, _, err := s.snapshotLocked()
 	if err != nil {
 		return result, err
 	}
@@ -57,10 +59,33 @@ func (s *Store) ApplySync(remote Backup) (result SyncResult, err error) {
 	}
 	profiles := make([]Profile, 0, len(s.data.Profiles)+len(wanted))
 	var changes []credentialChange
+	var skipped []SkippedAccount
 	for _, p := range s.data.Profiles {
 		doc, readErr := s.readCredential(p)
 		if readErr != nil {
-			return result, errors.New("could not read a saved account during sync")
+			// One broken record used to fail every sync. Another device's
+			// copy of the same account restores it; otherwise the record is
+			// kept as it is and reported, never treated as deleted.
+			key := profileSyncKey(p, nil)
+			e, exists := wanted[key]
+			if key != "" && exists && s.active[p.Provider] != p.ID {
+				incoming := backupDocument(e, p.Kind)
+				raw, marshalErr := json.Marshal(incoming)
+				if marshalErr != nil {
+					return result, errors.New("invalid account document")
+				}
+				delete(wanted, key)
+				changes = append(changes, credentialChange{path: s.credentialPath(p.Provider, p.ID), data: raw, modified: e.ModifiedAt})
+				p.Name, p.NameModifiedAt = e.Name, e.NameModifiedAt
+				p.ModifiedAt, p.Credentials = e.ModifiedAt, docHash(incoming)
+				result.Updated++
+				profiles = append(profiles, p)
+				continue
+			}
+			delete(wanted, key) // never file a second record under this ID
+			skipped = append(skipped, skippedFor(p, readErr))
+			profiles = append(profiles, p)
+			continue
 		}
 		key := profileSyncKey(p, doc)
 		if key == "" {
@@ -184,6 +209,12 @@ func (s *Store) ApplySync(remote Backup) (result SyncResult, err error) {
 	s.data.Profiles, s.data.Deleted = profiles, maps.Clone(merged.Deleted)
 	err = s.saveLocked()
 	result.Total = len(merged.Entries)
+	for _, p := range profiles {
+		if len(p.Name) > maxSyncNameBytes {
+			skipped = append(skipped, SkippedAccount{Provider: p.Provider, ProfileID: p.ID, Label: p.Label, Reason: SkipInvalidName})
+		}
+	}
+	result.Skipped = skipped
 	return
 }
 
@@ -195,4 +226,76 @@ func backupDocument(e BackupEntry, kind string) map[string]any {
 		doc["email"] = id.Email
 	}
 	return doc
+}
+
+// Skip reasons for a saved record that cannot take part in sync or export.
+const (
+	SkipMissingCopy = "missing_copy"
+	SkipUnreadable  = "unreadable"
+	SkipInvalidName = "invalid_name"
+)
+
+// SkippedAccount names a saved record left out of a sync or export and why.
+type SkippedAccount struct {
+	Provider, ProfileID, Label, Reason string
+}
+
+// MaxAccountNameRunes caps a rename well under the sync format's 512 bytes.
+const MaxAccountNameRunes = 128
+
+// TombstoneRetention and MaxTombstones bound the deletion records.
+const (
+	TombstoneRetention = 180 * 24 * time.Hour
+	MaxTombstones      = 4096
+)
+
+// maxSyncNameBytes is validateBackup's name limit.
+const maxSyncNameBytes = 512
+
+// Unsyncable lists saved records a sync or export would leave out.
+func (s *Store) Unsyncable() []SkippedAccount {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadLocked()
+	_, skipped, _ := s.snapshotLocked()
+	return skipped
+}
+
+func skippedFor(p Profile, err error) SkippedAccount {
+	reason := SkipUnreadable
+	if errors.Is(err, os.ErrNotExist) {
+		reason = SkipMissingCopy
+	}
+	return SkippedAccount{Provider: p.Provider, ProfileID: p.ID, Label: p.DisplayName(), Reason: reason}
+}
+
+// pruneTombstones drops deletion records past the retention window and
+// keeps the newest MaxTombstones. Without a bound the merged records only
+// grew, and past 4096 every snapshot failed validation on every device. A
+// device offline longer than the window can bring back an account deleted
+// meanwhile; that is the accepted cost.
+func pruneTombstones(deleted map[string]int64, now time.Time) map[string]int64 {
+	cutoff := now.Add(-TombstoneRetention).UnixNano()
+	for key, at := range deleted {
+		if at < cutoff {
+			delete(deleted, key)
+		}
+	}
+	if len(deleted) <= MaxTombstones {
+		return deleted
+	}
+	keys := make([]string, 0, len(deleted))
+	for key := range deleted {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if deleted[keys[i]] != deleted[keys[j]] {
+			return deleted[keys[i]] > deleted[keys[j]]
+		}
+		return keys[i] < keys[j]
+	})
+	for _, key := range keys[MaxTombstones:] {
+		delete(deleted, key)
+	}
+	return deleted
 }

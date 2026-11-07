@@ -121,13 +121,7 @@ func (s *Store) switchApp(ctx context.Context, provider, id string, live quota.A
 	if err := stopAntigravity(ctx, app); err != nil {
 		return fmt.Errorf("quit Antigravity: %w", err)
 	}
-	werr := s.Switch(provider, id, live)
-	if werr != nil {
-		// A compare-and-swap or write failure: fall back to the plain write
-		// without capture so a half-finished switch still ends on the target.
-		werr = s.Reapply(provider, id, live)
-	}
-	if werr != nil {
+	if werr := s.switchAfterQuit(provider, id, live); werr != nil {
 		return fmt.Errorf("write the selected sign-in: %w", werr)
 	}
 	if err := applyAntigravityMirrors(ctx, targetEmail, targetDoc); err != nil {
@@ -819,4 +813,18 @@ func antigravityOAuthEntry(doc map[string]any) []byte {
 	row := pbString(1, base64.StdEncoding.EncodeToString(info))
 	entry := append(pbString(1, "oauthTokenInfoSentinelKey"), pbLen(2, row)...)
 	return pbLen(1, entry)
+}
+
+// switchAfterQuit writes the target once the client has quit.
+func (s *Store) switchAfterQuit(provider, id string, live quota.Account) error {
+	werr := s.Switch(provider, id, live)
+	// Only a write race or a failed write may fall back to the plain
+	// rewrite, so a half-finished switch still ends on the target. Any other
+	// error is Switch refusing the target (a copy of another account, a
+	// mismatched identity, switching off) and must stand; falling back on
+	// every error wrote exactly the copies Switch had just refused.
+	if errors.Is(werr, errLiveChanged) || errors.Is(werr, errWriteFailed) {
+		werr = s.Reapply(provider, id, live)
+	}
+	return werr
 }

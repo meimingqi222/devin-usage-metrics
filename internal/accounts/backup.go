@@ -200,17 +200,31 @@ func (s *Store) Snapshot() (Backup, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loadLocked()
-	return s.snapshotLocked()
+	b, _, err := s.snapshotLocked()
+	return b, err
 }
 
-func (s *Store) snapshotLocked() (Backup, error) {
-	b := Backup{Version: 1, Entries: []BackupEntry{}, Deleted: maps.Clone(s.data.Deleted)}
+// snapshotLocked collects the saved accounts that can be synced or
+// exported. A record whose copy is missing or unreadable, or whose name is
+// past the format's limit, is left out and listed: one such record used to
+// fail every sync and export with no hint which account it was.
+func (s *Store) snapshotLocked() (Backup, []SkippedAccount, error) {
+	b := Backup{Version: 1, Entries: []BackupEntry{}, Deleted: pruneTombstones(maps.Clone(s.data.Deleted), time.Now())}
+	if b.Deleted == nil {
+		b.Deleted = map[string]int64{}
+	}
+	var skipped []SkippedAccount
 	for _, p := range s.data.Profiles {
 		doc, err := s.readCredential(p)
 		if err != nil {
-			return Backup{}, errors.New("could not read a saved account for backup")
+			skipped = append(skipped, skippedFor(p, err))
+			continue
 		}
 		if p.Hidden || !accountDocument(p.Provider, doc) {
+			continue
+		}
+		if len(p.Name) > maxSyncNameBytes {
+			skipped = append(skipped, SkippedAccount{Provider: p.Provider, ProfileID: p.ID, Label: p.Label, Reason: SkipInvalidName})
 			continue
 		}
 		stamp := p.ModifiedAt
@@ -226,7 +240,7 @@ func (s *Store) snapshotLocked() (Backup, error) {
 		}
 		b.Entries = append(b.Entries, BackupEntry{Provider: p.Provider, Name: p.Name, ModifiedAt: stamp, Credential: doc, NameModifiedAt: p.NameModifiedAt})
 	}
-	return b, validateBackup(b)
+	return b, skipped, validateBackup(b)
 }
 
 func backupIdentity(e BackupEntry) string {
@@ -333,7 +347,7 @@ func mergeBackups(identity func(BackupEntry) string, backups ...Backup) Backup {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	b := Backup{Version: 1, Entries: []BackupEntry{}, Deleted: deleted}
+	b := Backup{Version: 1, Entries: []BackupEntry{}, Deleted: pruneTombstones(deleted, time.Now())}
 	for _, key := range keys {
 		if deleted[key] < entries[key].ModifiedAt || deleted[key] == 0 {
 			b.Entries = append(b.Entries, entries[key])
@@ -493,6 +507,7 @@ func (s *Store) tombstoneLocked(keys []string) {
 	for _, key := range keys {
 		s.data.Deleted[key] = time.Now().UnixNano()
 	}
+	s.data.Deleted = pruneTombstones(s.data.Deleted, time.Now())
 }
 
 func credentialKind(doc map[string]any) string {

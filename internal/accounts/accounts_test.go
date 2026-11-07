@@ -805,7 +805,9 @@ func TestSwitchRejectsContaminatedCopy(t *testing.T) {
 			t.Fatalf("contaminated copy not flagged: %+v", p)
 		}
 	}
-	if err := s.Switch("antigravity", bad.ID, live); err == nil || !strings.Contains(err.Error(), "holds the current account's sign-in") {
+	// Flagged copies are refused by the shared target check before any
+	// capture; an unflagged one still meets the live-token check.
+	if err := s.Switch("antigravity", bad.ID, live); err == nil || (!strings.Contains(err.Error(), "holds the current account's sign-in") && !strings.Contains(err.Error(), "holds another account's sign-in")) {
 		t.Fatalf("contaminated copy switched: %v", err)
 	}
 	// A copy whose tokens belong to another account is caught by the issuer

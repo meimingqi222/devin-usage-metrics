@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/accounts"
@@ -32,12 +33,30 @@ type AccountSyncConfig struct {
 	Remember bool   `json:"remember,omitempty"`
 }
 
+// accountSyncConfigCache keeps the last read or saved consent per file. The
+// desktop reads it while drawing every frame, and only this app writes the
+// file, so reading the disk each time bought nothing. Keyed by path because
+// the config directory can change (tests point it at a fresh one).
+var accountSyncConfigCache struct {
+	sync.Mutex
+	path string
+	cfg  AccountSyncConfig
+}
+
 func ReadAccountSyncConfig() AccountSyncConfig {
+	p := path("account-sync.json")
+	cache := &accountSyncConfigCache
+	cache.Lock()
+	defer cache.Unlock()
+	if cache.path == p {
+		return cache.cfg
+	}
 	var c AccountSyncConfig
-	raw, err := os.ReadFile(path("account-sync.json"))
+	raw, err := os.ReadFile(p)
 	if err == nil {
 		_ = json.Unmarshal(raw, &c)
 	}
+	cache.path, cache.cfg = p, c
 	return c
 }
 
@@ -46,7 +65,15 @@ func SaveAccountSyncConfig(c AccountSyncConfig) error {
 	if err != nil {
 		return err
 	}
-	return atomic("account-sync.json", raw)
+	cache := &accountSyncConfigCache
+	cache.Lock()
+	defer cache.Unlock()
+	if err := atomic("account-sync.json", raw); err != nil {
+		cache.path = "" // the file's state is unknown; read it again
+		return err
+	}
+	cache.path, cache.cfg = path("account-sync.json"), c
+	return nil
 }
 
 func accountTransport() (transport, error) {

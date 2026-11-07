@@ -84,8 +84,9 @@ In `internal/accounts`:
 ## Consequences
 
 Every claims-less Antigravity refresh now performs up to two bounded
-issuer calls under the store mutex (userinfo, then refresh exchange on
-401/expiry). Crossed copies are flagged suspect once the real owner is
+issuer calls (userinfo, then refresh exchange on 401/expiry). They run in
+readLiveAccounts before the store mutex is taken; see
+2026-11-07-switch-target-checks-and-lock.md. Crossed copies are flagged suspect once the real owner is
 known and stay listed but unswitchable. Live logins whose account was
 removed elsewhere bind their remaining record instead of appearing
 nameless, and are captured when no record survived. Sync can still

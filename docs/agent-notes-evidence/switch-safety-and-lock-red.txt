@@ -1,0 +1,9 @@
+--- FAIL: TestRestartFallbackKeepsSwitchChecks (0.16s)
+    switch_safety_test.go:66: restart path switched to a copy holding another account's sign-in
+--- FAIL: TestReapplyRefusesUnswitchableTarget (0.06s)
+    switch_safety_test.go:82: Reapply wrote a copy flagged as another account's sign-in
+--- FAIL: TestIdentityLookupsRunOutsideTheStoreLock (1.04s)
+    switch_safety_test.go:161: refresh: the store lock is held across a network lookup
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/accounts	1.938s
+FAIL
