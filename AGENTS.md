@@ -1,6 +1,6 @@
 # Agent Usage Metrics
 
-主实现使用 Go 1.27.1+ 与固定版本的 `github.com/egoist/mygo` 原生 UI，不使用 WebView 或 cgo。
+主实现使用 Go 1.27.3+ 与固定版本的 `github.com/egoist/mygo` 原生 UI，不使用 WebView 或 cgo。
 迁移只替换技术栈：原版 Rust 源码（`src/`、`Cargo.toml`、`examples/`、`tests/*.rs`）已随 0.3.x 移除，布局与视觉依据以 `internal/desktop` 为准；历史实现保留在 git 历史与 `docs/go-migration.md` 中。已确认的有意改动不再回退：用量页为四张卡片（费用、Token 总量、缓存命中与节省、模型 I/O）与带坐标轴、悬停明细的 Token 趋势图，可切换不含缓存读取 / 费用；配色无紫色（`internal/desktop/usage.go`）；UI 图标规范：禁止使用 Emoji 图标，如需图标一律使用矢量 SVG 图标以保证跨平台清晰度与视觉一致性；侧栏 200px、顶栏 46px，代理为字母标识列表，设备筛选在顶栏下拉胶囊中（`internal/desktop/layout.go`）；侧栏在“实时配额”下有“账号”页入口，账号管理、账号切换开关与账号同步只在该页（`internal/desktop/accounts.go` 的 `accountsView`），设置页只保留 GitHub 登录并链接过去；删除类确认用 `dangerConfirm`（红色按钮、默认焦点在取消）。
 `internal/desktop/host.go` 独占窗口、托盘、focus/close 和应用生命周期；界面内容不持有窗口句柄。
 业务状态与后台任务在 `internal/desktop/app.go`；后台通过事件队列交付结果，只在主线程更新界面状态。

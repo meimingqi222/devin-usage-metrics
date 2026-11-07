@@ -21,7 +21,7 @@
 
 ## 环境要求
 
-- **Go 1.27.1+**。`go.mod` 固定 MyGo 精确版本，`go tool mygo` 与库版本一致。
+- **Go 1.27.3+**。`go.mod` 固定 MyGo 精确版本，`go tool mygo` 与库版本一致。
 - Windows 10/11、macOS 12+，或安装 GTK 3 的 Linux。Linux 托盘额外需要 `libayatana-appindicator3` 及支持 indicator 的桌面，使用托盘菜单打开面板，不支持与 Windows/macOS 相同的直接点击交互。
 - 本机使用过至少一种受支持的 Agent，才有真实统计数据。
 

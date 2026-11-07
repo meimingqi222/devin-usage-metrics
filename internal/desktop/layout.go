@@ -34,6 +34,10 @@ func (a *App) theme(c *ui.Context) {
 	t.Text = ui.Hex("#f3f5f9")
 	t.TextMuted = ui.Hex("#9098aa")
 	t.Accent = ui.Hex("#38bdf8")
+	// MyGo 0.8 fades the accent to gray in a window that is not in front.
+	// This is a dashboard read beside other work and a tray popup: grayed
+	// "Active" tags and switch buttons there read as disabled.
+	t.InactiveAccent = t.Accent
 	t.AccentText = ui.Hex("#0a0a0c")
 	t.Scrollbar = ui.Hex("#2c3345")
 	c.SetTheme(t)

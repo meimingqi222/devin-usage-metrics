@@ -21,7 +21,7 @@ Local coding-agent analytics, now implemented in **Go + [MyGo native UI](https:/
 
 ## Requirements
 
-- Go **1.27.1 or newer**. MyGo is pinned to an exact pseudo-version in `go.mod`; the CLI tool uses the same version.
+- Go **1.27.3 or newer**. MyGo is pinned to an exact version in `go.mod`; the CLI tool uses the same version.
 - Windows 10/11, macOS 12+, or Linux with GTK 3. Linux tray support additionally needs `libayatana-appindicator3` and a desktop with an indicator host. Linux uses a tray menu rather than direct tray-icon clicks.
 - At least one supported agent's local history for real usage data.
 
