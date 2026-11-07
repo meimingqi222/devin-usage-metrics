@@ -1,6 +1,7 @@
 # Agent Note: Query current Antigravity login on Windows
 
 Status: implemented
+Partly-superseded-by: 2026-11-07-antigravity-windows-credential-manager.md
 
 ## Problem
 
@@ -17,6 +18,15 @@ Reusing the stale Gemini file repeatedly fails and may refer to a different logi
 ## Consequences
 
 Current Windows login can query quota even when the old file has expired. OAuth refresh is in memory for the current-state source. The installed default user-level Antigravity executable and its current Windows x64 config layout are required for automatic client discovery; unsupported layouts fail closed. macOS keychain consent behavior is unchanged.
+
+## Superseded
+
+"On Windows prefer the current Antigravity globalStorage state database"
+no longer holds when the Credential Manager has Antigravity's item
+(`gemini:antigravity`): Antigravity 2.x reads its sign-in there, so
+discovery and switching use that item, and the state database is a mirror
+and the fallback when the item is absent. The OAuth client discovery and
+the read-only token parsing above still hold.
 
 ## Verification
 

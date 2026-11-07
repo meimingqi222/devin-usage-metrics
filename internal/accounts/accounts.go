@@ -687,8 +687,10 @@ func (s *Store) Switch(provider, id string, live quota.Account) error {
 			}
 		}
 	}
-	targetDoc = switchDocument(provider, targetDoc)
+	// Adapt before stripping our naming fields: the keychain shape carries
+	// the account's email as id_token_email, as the client writes it.
 	targetDoc = adaptCredential(provider, targetDoc, target.Kind, live.CredentialKind())
+	targetDoc = switchDocument(provider, targetDoc)
 	j := journalFile{Version: 1, Provider: provider, Target: id, BeforeHash: beforeHash, TargetHash: docHash(targetDoc), At: time.Now().Unix()}
 	if err := s.writeJournal(j); err != nil {
 		return err
@@ -781,8 +783,8 @@ func (s *Store) Reapply(provider, id string, live quota.Account) error {
 	if err != nil {
 		return err
 	}
-	doc = switchDocument(provider, doc)
 	doc = adaptCredential(provider, doc, target.Kind, live.CredentialKind())
+	doc = switchDocument(provider, doc)
 	if err := live.WriteCredential(doc); err != nil {
 		return err
 	}
@@ -1637,6 +1639,9 @@ func adaptCredential(provider string, doc map[string]any, from, to string) map[s
 				"refresh_token": refresh, "expiry": value,
 			},
 			"auth_method": "consumer", "id_token": idToken,
+			// The client names the signed-in account by this field;
+			// Antigravity Tools writes it too.
+			"id_token_email": antigravityEmailOf(doc, idToken),
 		}
 	}
 	var value any = expiry
@@ -1689,4 +1694,17 @@ func diagnosticRef(id string) string {
 		return ""
 	}
 	return syncdiag.ID(id)
+}
+
+// antigravityEmailOf is the account email for a credential being written to
+// Antigravity's keychain item: the item's own field, the email this app
+// stamped, or the id_token's claim; "" leaves the field empty.
+func antigravityEmailOf(doc map[string]any, idToken string) string {
+	if email := str(doc["id_token_email"]); email != "" {
+		return email
+	}
+	if email := str(doc["email"]); email != "" {
+		return email
+	}
+	return credentialid.Of("antigravity", map[string]any{"id_token": idToken}).Email
 }

@@ -38,6 +38,7 @@ func fixtureHome(t *testing.T) {
 	t.Setenv("USERPROFILE", h)
 	t.Setenv("APPDATA", filepath.Join(h, ".config"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Cleanup(ForgetTestCredential)
 	registry.Lock()
 	registry.m = map[string]*entry{}
 	registry.Unlock()

@@ -31,6 +31,7 @@ func fixture(t *testing.T) string {
 	} {
 		t.Setenv(k, v)
 	}
+	t.Cleanup(quota.ForgetTestCredential)
 	return h
 }
 

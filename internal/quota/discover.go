@@ -2,6 +2,7 @@ package quota
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/meimingqi222/devin-usage-metrics/internal/credentialid"
@@ -78,7 +80,45 @@ func security(args ...string) ([]byte, error) {
 	defer cancel()
 	return exec.CommandContext(ctx, "security", args...).Output()
 }
+
+// antigravityWinCredTarget is go-keyring's Credential Manager name for
+// Antigravity's item ("<service>:<user>").
+//
+// The Credential Manager is global: the temporary HOME and APPDATA a test
+// sets do not isolate it, and a test once overwrote a real Antigravity
+// sign-in with fixture tokens. A test binary therefore never uses the real
+// name; it gets a scratch name derived from its APPDATA, so each test's
+// fixture has its own item, and ForgetTestCredential removes it.
+func antigravityWinCredTarget() string {
+	if !testing.Testing() {
+		return "gemini:antigravity"
+	}
+	sum := sha256.Sum256([]byte(os.Getenv("APPDATA")))
+	return "aum-test:" + hex.EncodeToString(sum[:8]) + ":gemini:antigravity"
+}
+
+// ForgetTestCredential deletes the scratch Credential Manager item of the
+// current test's fixture. It does nothing outside a test binary.
+func ForgetTestCredential() {
+	if testing.Testing() {
+		_ = winCredDelete(antigravityWinCredTarget())
+	}
+}
+
+// winKeyring reports whether a keychain service lives in the Windows
+// Credential Manager. Antigravity 2.x keeps its sign-in there and reads it
+// on start; the state database is only a mirror, so writing that alone
+// left Antigravity on the previous account while this app showed the
+// switch as done.
+func winKeyring(service string) bool {
+	return runtime.GOOS == "windows" && service == "gemini"
+}
+
 func keyExists(s string) bool {
+	if winKeyring(s) {
+		_, err := winCredRead(antigravityWinCredTarget())
+		return err == nil
+	}
 	if runtime.GOOS != "darwin" {
 		return false
 	}
@@ -99,6 +139,13 @@ func keyReadItem(service, account string) (object, error) {
 // keyReadFullItem returns the whole item, including Antigravity's wrapper
 // fields. Switching must put the same shape back.
 func keyReadFullItem(service, account string) (object, error) {
+	if winKeyring(service) {
+		b, err := winCredRead(antigravityWinCredTarget())
+		if err != nil {
+			return nil, errors.New("keychain credentials unavailable")
+		}
+		return decodeDoc(goKeyringText(b))
+	}
 	args := []string{"find-generic-password", "-s", service}
 	if account != "" {
 		args = append(args, "-a", account)
@@ -109,15 +156,20 @@ func keyReadFullItem(service, account string) (object, error) {
 		return nil, errors.New("keychain credentials unavailable")
 	}
 	if service == "gemini" {
-		raw := strings.TrimSpace(string(b))
-		if strings.HasPrefix(raw, "go-keyring-base64:") {
-			raw = strings.TrimPrefix(raw, "go-keyring-base64:")
-			b, _ = base64.StdEncoding.DecodeString(raw)
-		} else {
-			b = []byte(raw)
-		}
+		b = goKeyringText(b)
 	}
 	return decodeDoc(b)
+}
+
+// goKeyringText undoes go-keyring's optional "go-keyring-base64:" wrapper,
+// which Antigravity's item carries on macOS and may carry anywhere.
+func goKeyringText(b []byte) []byte {
+	raw := strings.TrimSpace(string(b))
+	if encoded, ok := strings.CutPrefix(raw, "go-keyring-base64:"); ok {
+		decoded, _ := base64.StdEncoding.DecodeString(encoded)
+		return decoded
+	}
+	return []byte(raw)
 }
 
 // keychainAccountFor is the account name each provider's item uses. A user
@@ -141,6 +193,18 @@ func keychainAccountFor(provider string) string {
 // keyWriteDoc updates or creates a provider's keychain item. Claude Code
 // stores compact JSON; Antigravity's go-keyring item is base64 with a prefix.
 func keyWriteDoc(provider, service string, d object) error {
+	if winKeyring(service) {
+		// go-keyring on Windows stores the item's text as is, no base64
+		// prefix; Antigravity and Antigravity Tools write compact JSON.
+		data, err := json.Marshal(d)
+		if err != nil {
+			return errors.New("keychain credentials encode failed")
+		}
+		if err := winCredWrite(antigravityWinCredTarget(), keychainAccountFor(provider), data); err != nil {
+			return errors.New("keychain update failed")
+		}
+		return nil
+	}
 	value, err := keychainValue(provider, d)
 	if err != nil {
 		return err
@@ -252,7 +316,10 @@ func Discover(allowKeychain bool) []Account {
 		if p == "antigravity" {
 			service = "gemini"
 		}
-		keychain := allowKeychain && service != "" && keyExists(service)
+		// The Credential Manager raises no prompt, unlike the macOS
+		// keychain the consent exists for, and Antigravity's live sign-in
+		// is there: read it without asking, as the state database is.
+		keychain := service != "" && (allowKeychain || winKeyring(service)) && keyExists(service)
 		if keychain {
 			var kd object
 			var ke error
