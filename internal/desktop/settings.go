@@ -146,27 +146,33 @@ func (a *App) settingsView(c *ui.Context) {
 	if !a.settings && a.settingsUI.open {
 		a.cancelSettings()
 	}
-	if a.settings && a.accountSync.pendingOff {
+	a.updateDialog(c)
+}
+
+// accountSyncConfirms asks before the destructive account-sync actions. The
+// main window draws it whatever the screen: a pending "turn off" holds
+// automatic syncs, so it must never be left unanswered off screen.
+func (a *App) accountSyncConfirms(c *ui.Context) {
+	if a.accountSync.pendingOff {
 		text := a.t("Turn off account sync? This device stops sending account changes to your other devices, removes its encrypted snapshot from the server, and deletes the sync password remembered here. Saved accounts stay on this device.", "关闭账号同步？本设备将停止向其他设备同步账号更改，删除服务器上本机的加密快照，并删除本机记住的同步密码。已保存的账号不受影响。")
-		if ui.AlertDialog(c, &a.accountSync.pendingOff, a.t("Turn off account sync", "关闭账号同步"), text, a.t("Cancel", "取消"), a.t("Turn off", "关闭同步")) == 1 {
+		if dangerConfirm(c, &a.accountSync.pendingOff, a.t("Turn off account sync", "关闭账号同步"), text, a.t("Cancel", "取消"), a.t("Turn off", "关闭同步")) == 1 {
 			if err := a.disableAccountSync(); err != nil {
 				a.message = err.Error()
 			}
 		}
 	}
-	if a.settings && a.accountSync.pendingDropUnreadable {
+	if a.accountSync.pendingDropUnreadable {
 		text := a.t("Remove cloud copies this password cannot open? Devices still using the old password will re-upload after they enter the new one. Accounts already on this device stay.", "移除当前密码无法解开的云端快照？仍使用旧密码的设备在输入新密码后会重新上传。本机已保存的账号不受影响。")
-		if ui.AlertDialog(c, &a.accountSync.pendingDropUnreadable, a.t("Remove unread snapshots", "移除无法解开的快照"), text, a.t("Cancel", "取消"), a.t("Remove", "移除")) == 1 {
+		if dangerConfirm(c, &a.accountSync.pendingDropUnreadable, a.t("Remove unread snapshots", "移除无法解开的快照"), text, a.t("Cancel", "取消"), a.t("Remove", "移除")) == 1 {
 			a.dropUnreadableAccountSnapshots()
 		}
 	}
-	if a.settings && a.accountSync.pendingDropForeign {
+	if a.accountSync.pendingDropForeign {
 		text := a.t("Remove other devices' encrypted snapshots from the server? Those devices re-upload on their next sync. This device's snapshot and saved accounts stay.", "从服务器移除其他设备的加密快照？那些设备下次同步时会重新上传。本机快照和已保存账号不受影响。")
-		if ui.AlertDialog(c, &a.accountSync.pendingDropForeign, a.t("Remove other devices' snapshots", "移除其他设备的快照"), text, a.t("Cancel", "取消"), a.t("Remove", "移除")) == 1 {
+		if dangerConfirm(c, &a.accountSync.pendingDropForeign, a.t("Remove other devices' snapshots", "移除其他设备的快照"), text, a.t("Cancel", "取消"), a.t("Remove", "移除")) == 1 {
 			a.dropForeignAccountSnapshots()
 		}
 	}
-	a.updateDialog(c)
 }
 
 func (a *App) settingsSync(c *ui.Context) {
@@ -196,6 +202,11 @@ func (a *App) settingsSync(c *ui.Context) {
 			if (syncclient.SessionLabel() == "" || a.busy["login"] || a.accountSync.authRequired) && settingsButton(c, label, true).FillWidth().Padding(8, 12).Disabled(a.busy["login"] || strings.TrimSpace(a.settingsUI.apiURL) == "").Clicked() {
 				a.apiURL = strings.TrimRight(strings.TrimSpace(a.settingsUI.apiURL), "/")
 				a.beginLogin()
+			}
+			// A disabled sign-in button with no reason reads as broken; the
+			// only gate before a login starts is the missing endpoint.
+			if syncclient.SessionLabel() == "" && !a.busy["login"] && strings.TrimSpace(a.settingsUI.apiURL) == "" {
+				ui.Text(c, a.t("Enter the sync API address above to sign in.", "请先在上方填写同步 API 地址，再登录 GitHub。")).FontSize(11).TextColor(quotaAmber)
 			}
 			if a.busy["login"] && a.auth.UserCode != "" {
 				ui.Text(c, a.t("Complete authorization in your browser. If asked, enter the code shown above.", "请在浏览器完成授权；如需验证码，请使用上方代码。")).FontSize(11).TextColor(c.Theme().TextMuted)
@@ -228,7 +239,14 @@ func (a *App) settingsSync(c *ui.Context) {
 					a.remote.Turns = nil
 				}
 			}
-			a.accountSyncSettings(c)
+			// Account sync lives on the Accounts page with the accounts it
+			// syncs; this tab keeps the GitHub sign-in it depends on.
+			ui.Row(c).Gap(8).AlignItems(ui.Center).BorderWidth(1, 0, 0, 0).BorderColor(c.Theme().Border).Padding(12, 0, 0).Children(func() {
+				ui.Text(c, a.t("Account sync is managed on the Accounts page.", "账号同步在“账号”页管理。")).FontSize(11).TextColor(c.Theme().TextMuted).Grow(1).MinWidth(0)
+				if settingsButton(c, a.t("Open Accounts", "打开账号页"), false).Clicked() {
+					a.openAccounts()
+				}
+			})
 		})
 	})
 }

@@ -61,7 +61,14 @@ func (a *App) lockAccountSync() {
 	if a.accountSync.cancel != nil {
 		a.accountSync.cancel()
 	}
+	// A quota refresh deferred behind the sync belongs to the quota card,
+	// not to the sync: dropping it with the sync state left the card stale
+	// until the next manual refresh.
+	pending, force := a.accountSync.quotaPending, a.accountSync.quotaForce
 	a.accountSync = accountSyncState{generation: a.accountSync.generation + 1}
+	if pending {
+		a.refreshQuota(force)
+	}
 }
 
 func (a *App) disableAccountSync() error {
@@ -314,6 +321,38 @@ func (a *App) syncAccounts() {
 	})
 }
 
+// skippedReason is the per-account text for a record left out of a sync or
+// export, phrased with what to do about it.
+func (a *App) skippedReason(reason string) string {
+	switch reason {
+	case accounts.SkipMissingCopy:
+		return a.t("No saved sign-in on this device; not synced. Sign in again or remove it.", "本机缺少登录副本，未同步。请重新登录或移除。")
+	case accounts.SkipUnreadable:
+		return a.t("Saved sign-in is damaged; not synced. Sign in again or remove it.", "登录副本已损坏，未同步。请重新登录或移除。")
+	case accounts.SkipInvalidName:
+		return a.t("Name too long; not synced. Rename it.", "名称过长，未同步。请重命名。")
+	}
+	return a.t("Not synced.", "未同步。")
+}
+
+func (a *App) skippedNames(skipped []accounts.SkippedAccount) string {
+	names := make([]string, 0, len(skipped))
+	for _, s := range skipped {
+		names = append(names, s.Label)
+	}
+	return strings.Join(names, ", ")
+}
+
+// skippedFor finds the last sync's report for one saved record.
+func (a *App) skippedFor(provider, id string) (accounts.SkippedAccount, bool) {
+	for _, s := range a.accountSync.result.Skipped {
+		if s.Provider == provider && s.ProfileID == id {
+			return s, true
+		}
+	}
+	return accounts.SkippedAccount{}, false
+}
+
 // accountBackupError maps account-sync and backup errors to an actionable,
 // translated message. Match by errors.Is; the sentinel message text doubles as
 // the syncdiag error code. Unknown errors pass through raw, and
@@ -455,71 +494,6 @@ func (a *App) openSettings(tab string) {
 	a.settingsUI.apiURL = syncclient.ReadConfig().APIURL
 }
 
-// accountSyncManagerRow surfaces sync health where accounts are managed. The
-// settings section keeps the toggle; this row is passive status plus a quick
-// manual sync, for people who never open settings.
-func (a *App) accountSyncManagerRow(c *ui.Context) {
-	cfg := syncclient.ReadAccountSyncConfig()
-	if !cfg.Enabled {
-		r := ui.Row(c).Gap(7).Padding(2, 4).Margin(0, -4).Radius(4).AlignItems(ui.Center).Label(a.t("Account sync is off", "账号同步未开启")).Focusable()
-		if r.Hovered() {
-			r.Background(c.Theme().Text.Alpha(.04))
-		}
-		if r.Clicked() {
-			a.openSettings("sync")
-		}
-		r.Children(func() {
-			ui.Box(c).Size(6, 6).Shrink(0).Radius(3).Background(faint(c.Theme()))
-			ui.Text(c, a.t("Account sync is off. Turn it on in Settings.", "账号同步未开启，点击到设置中开启。")).FontSize(11).TextColor(faint(c.Theme())).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
-		})
-		return
-	}
-	st := a.accountSyncStatus()
-	busy := st.syncing || st.restoring || st.preparing
-	status := a.t("Waiting for the first sync…", "等待首次同步…")
-	color := faint(c.Theme())
-	switch {
-	case st.syncing:
-		status, color = a.t("Syncing accounts…", "正在同步账号…"), c.Theme().Accent
-	case st.restoring:
-		status, color = a.t("Starting automatic sync…", "正在恢复自动同步…"), c.Theme().Accent
-	case st.preparing:
-		status, color = a.t("Preparing account sync…", "正在准备同步账号…"), c.Theme().Accent
-	case st.failed:
-		status, color = st.message, quotaRose
-	case st.locked:
-		status = a.t("Enter your sync password to continue.", "输入同步密码后即可继续。")
-	case !st.lastAt.IsZero():
-		status = fmt.Sprintf(a.t("%d accounts · %d devices · %s", "%d 个账号 · %d 台设备 · %s"), st.result.Total, st.result.Devices, a.relativeSyncTime(st.lastAt))
-		color = syncOnColor
-	}
-	if st.result.Unreadable > 0 && !st.failed && !st.locked {
-		status += fmt.Sprintf(a.t(" · %d device(s) to update", " · %d 台待更新"), st.result.Unreadable)
-	}
-	r := ui.Row(c).Gap(7).AlignItems(ui.Center).Label(status)
-	if !st.lastAt.IsZero() {
-		// The row label doubles as hover tooltip with the absolute moment;
-		// the text node stays unlabeled so it remains the row's text.
-		r.Label(status + " · " + a.t("Last sync ", "上次同步 ") + fullSyncTime(st.lastAt))
-	}
-	r.Children(func() {
-		ui.Box(c).Size(6, 6).Shrink(0).Radius(3).Background(color)
-		if busy {
-			ui.Spinner(c).Size(10, 10)
-		}
-		ui.Text(c, status).FontSize(11).TextColor(color).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
-		if st.locked {
-			if settingsButton(c, a.t("Enter password", "输入密码"), true).Clicked() {
-				a.openAccountBackup("sync")
-			}
-			return
-		}
-		if settingsButton(c, a.t("Sync now", "立即同步"), false).Disabled(busy).Clicked() {
-			a.syncAccounts()
-		}
-	})
-}
-
 func (a *App) chooseAccountBackupFile() {
 	if a.accountBackupFile == nil {
 		return
@@ -594,12 +568,16 @@ func (a *App) runAccountBackup() {
 		var preview accounts.Backup
 		var added, kept int
 		var err error
+		var skipped []accounts.SkippedAccount
 		switch {
 		case draft.mode == "export":
 			var b accounts.Backup
 			b, err = a.accountStore.Snapshot()
 			if err == nil {
 				err = accounts.WriteBackupFile(draft.file, b, draft.password)
+			}
+			if err == nil {
+				skipped = a.accountStore.Unsyncable()
 			}
 		case draft.preview == nil:
 			preview, err = accounts.ReadBackupFile(draft.file, draft.password)
@@ -623,6 +601,9 @@ func (a *App) runAccountBackup() {
 			a.closeAccountBackup()
 			if draft.mode == "export" {
 				a.message = a.t("Encrypted account backup saved.", "已保存加密账号备份。")
+				if len(skipped) > 0 {
+					a.message += " " + fmt.Sprintf(a.t("%d account(s) left out: %s", "%d 个账号未导出：%s"), len(skipped), a.skippedNames(skipped))
+				}
 			} else {
 				a.message = fmt.Sprintf(a.t("Imported %d accounts; kept %d existing accounts.", "已导入 %d 个账号，保留本机已有的 %d 个账号。"), added, kept)
 				a.accountChanged()
@@ -633,9 +614,8 @@ func (a *App) runAccountBackup() {
 
 func (a *App) accountSyncSettings(c *ui.Context) {
 	cfg := syncclient.ReadAccountSyncConfig()
-	endpointChanged := strings.TrimRight(strings.TrimSpace(a.settingsUI.apiURL), "/") != strings.TrimRight(syncclient.ReadConfig().APIURL, "/")
 	signedIn := syncclient.SessionLabel() != ""
-	ready := signedIn && !endpointChanged && !a.accountSync.authRequired
+	ready := signedIn && !a.accountSync.authRequired
 	st := a.accountSyncStatus()
 	ui.Column(c).Gap(8).BorderWidth(1, 0, 0, 0).BorderColor(c.Theme().Border).Padding(12, 0, 0).Children(func() {
 		ui.Row(c).AlignItems(ui.Center).Gap(12).Children(func() {
@@ -656,9 +636,7 @@ func (a *App) accountSyncSettings(c *ui.Context) {
 		status := a.t("Keep your saved accounts up to date across devices.", "自动同步各设备上的账号，新增、修改和删除都会同步。")
 		switch {
 		case !signedIn:
-			status = a.t("Sign in to GitHub above to sync accounts.", "先登录上方的 GitHub，即可同步账号。")
-		case endpointChanged:
-			status = a.t("Save the server address before syncing.", "请先保存修改后的同步地址。")
+			status = a.t("Sign in to GitHub in Settings › Sync & Devices to sync accounts.", "先在 设置 › 多设备同步 中登录 GitHub，即可同步账号。")
 		case st.syncing:
 			status = a.t("Syncing accounts…", "正在同步账号…")
 		case st.restoring:
@@ -673,10 +651,17 @@ func (a *App) accountSyncSettings(c *ui.Context) {
 			status = a.t("Enter your sync password to continue.", "输入同步密码后即可继续。")
 		case st.enabled && !st.lastAt.IsZero():
 			status = fmt.Sprintf(a.t("%d accounts synced · %d devices · %s", "已同步 %d 个账号 · 来自 %d 台设备 · %s"), st.result.Total, st.result.Devices, a.relativeSyncTime(st.lastAt))
+			if n := len(st.result.Skipped); n > 0 {
+				// A record left out is not a failed sync: the rest synced,
+				// and its row below says which account and what to do.
+				status += fmt.Sprintf(a.t(" · %d account(s) not synced", " · %d 个账号未同步"), n)
+			}
 		}
 		color := c.Theme().TextMuted
 		if st.failed {
 			color = quotaRose
+		} else if st.enabled && !st.lastAt.IsZero() && len(st.result.Skipped) > 0 {
+			color = quotaAmber
 		}
 		statusRow := ui.Row(c).Gap(8).AlignItems(ui.Center).Label(status)
 		if st.enabled && !st.lastAt.IsZero() {
@@ -699,6 +684,11 @@ func (a *App) accountSyncSettings(c *ui.Context) {
 			}
 		}
 		ui.Row(c).Gap(8).Children(func() {
+			if !signedIn || a.accountSync.authRequired {
+				if settingsButton(c, a.t("Open sync settings", "打开同步设置"), false).Clicked() {
+					a.openSettings("sync")
+				}
+			}
 			if cfg.Enabled && ready {
 				label := a.t("Sync now", "立即同步")
 				if st.failed {

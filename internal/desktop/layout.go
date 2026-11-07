@@ -83,6 +83,10 @@ func (a *App) View(c *ui.Context) {
 				ui.Scroll(c.Key("ext")).Grow(1).Padding(16).Gap(12).Children(func() { a.extView(c) })
 				return
 			}
+			if a.screen == "accounts" {
+				ui.Scroll(c.Key("accounts")).Grow(1).Padding(16).Gap(12).Children(func() { a.accountsView(c) })
+				return
+			}
 			if a.tab == "usage" {
 				ui.Column(c).Grow(1).MinHeight(0).MinWidth(0).Padding(16).Gap(12).Children(func() { a.usageView(c) })
 				return
@@ -97,8 +101,8 @@ func (a *App) View(c *ui.Context) {
 		})
 	})
 	a.settingsView(c)
-	a.accountsDialog(c)
 	a.addAccountDialog(c)
+	a.accountSyncConfirms(c)
 	a.accountsConfirm(c)
 	a.accountBackupDialog(c)
 	if a.pending != nil {
@@ -172,6 +176,7 @@ func (a *App) sidebar(c *ui.Context) {
 			ui.Text(c, "Agent Usage Metrics").FontSize(13).FixedLineHeight(20).Bold().SingleLine().Ellipsis("…").MinWidth(0)
 		})
 		a.quotaEntry(c)
+		a.accountsEntry(c)
 		a.extEntry(c)
 		ui.Scroll(c).Grow(1).Padding(0, 10).Gap(2).Children(func() {
 			var shown, other []model.Agent
@@ -244,6 +249,34 @@ func (a *App) quotaEntry(c *ui.Context) {
 		ui.Text(c, a.t("Live quotas", "实时配额")).FontSize(12).FontWeight(500).Grow(1)
 		if len(a.accounts) > 0 {
 			ui.Text(c, fmt.Sprint(len(a.accounts))).FontSize(11).FontWeight(600).Padding(1, 6).Radius(10).Background(ui.Hex("#202737")).TextColor(t.TextMuted)
+		}
+	})
+}
+
+// accountsEntry opens the Accounts page, the one place accounts, switching
+// and account sync are managed.
+func (a *App) accountsEntry(c *ui.Context) {
+	t := c.Theme()
+	r := ui.Row(c).Margin(0, 10, 4).Padding(7, 10).Gap(7).Radius(6).Background(controlColor).Border(1, t.Border).AlignItems(ui.Center).Label(a.t("Accounts", "账号")).Focusable()
+	switch {
+	case a.screen == "accounts":
+		r.Background(t.Accent.Alpha(.12)).Border(1, t.Accent.Alpha(.35))
+	case r.Hovered():
+		r.Background(t.SurfaceHover).Border(1, strongBorder)
+	}
+	if r.Clicked() {
+		a.openAccounts()
+	}
+	r.Children(func() {
+		ui.Text(c, a.t("Accounts", "账号")).FontSize(12).FontWeight(500).Grow(1)
+		n := 0
+		for _, p := range a.profiles {
+			if !p.Hidden {
+				n++
+			}
+		}
+		if n > 0 {
+			ui.Text(c, fmt.Sprint(n)).FontSize(11).FontWeight(600).Padding(1, 6).Radius(10).Background(ui.Hex("#202737")).TextColor(t.TextMuted)
 		}
 	})
 }
@@ -422,7 +455,7 @@ func (a *App) header(c *ui.Context) {
 			a.extToolbar(c)
 			return
 		}
-		if a.screen != "quota" {
+		if a.screen != "quota" && a.screen != "accounts" {
 			control(c, 6).Children(func() {
 				for _, tab := range []struct{ key, en, zh string }{{"usage", "Usage", "用量"}, {"sessions", "Sessions", "会话"}, {"compaction", "Compaction", "压缩建议"}} {
 					if tab.key == "compaction" && a.agent != model.Claude && a.agent != model.Codex {
@@ -447,6 +480,9 @@ func (a *App) header(c *ui.Context) {
 			}
 		}
 		ui.Spacer(c)
+		if a.screen == "accounts" {
+			return
+		}
 		if a.screen == "quota" {
 			// The quota page has its own query button and time.
 			if a.busy["quota"] {

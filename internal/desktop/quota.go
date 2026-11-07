@@ -175,10 +175,6 @@ func (a *App) quotaView(c *ui.Context) {
 		}
 		ui.Text(c, summary).FontSize(11).Padding(4, 10).Radius(4).Background(ui.Hex("#161a23")).Border(1, t.Border).TextColor(t.TextMuted).NoWrap()
 		ui.Spacer(c)
-		accountsBtn := textButton(c, a.t("Accounts", "账号"), a.accountUI.manager).Height(24)
-		if accountsBtn.Clicked() {
-			a.openAccounts()
-		}
 		busy := a.busy["quota"]
 		requeryLabel := a.t("Query again", "重新查询")
 		if busy {
@@ -265,7 +261,7 @@ func (a *App) quotaProviderCard(c *ui.Context, grp providerQuotaGroup) {
 			})
 			ui.Text(c, providerName(grp.provider)).FontSize(13).FontWeight(600).NoWrap()
 			if len(grp.accounts) > 1 {
-				ui.Text(c, fmt.Sprintf(a.t("%d accounts", "%d 个已绑定账号"), len(grp.accounts))).FontSize(10.5).FontWeight(500).Padding(1, 6).Radius(3).Background(controlColor).Border(1, ui.Hex("#242c3d")).TextColor(faintText).NoWrap()
+				ui.Text(c, fmt.Sprintf(a.t("%d accounts", "%d 个账号"), len(grp.accounts))).FontSize(10.5).FontWeight(500).Padding(1, 6).Radius(3).Background(controlColor).Border(1, ui.Hex("#242c3d")).TextColor(faintText).NoWrap()
 			} else {
 				a.accountLabel(c, grp.accounts[0], false)
 				if r := grp.accounts[0].result; r.Plan != "" && grp.accounts[0].err == nil {
@@ -279,30 +275,33 @@ func (a *App) quotaProviderCard(c *ui.Context, grp providerQuotaGroup) {
 			if a.busy["quota"] {
 				ui.Spinner(c).Size(12, 12).Label(a.t("Refreshing…", "正在刷新…"))
 			}
-			if a.accountStore.Enabled() && switchableProvider(grp.provider) {
-				addBtn := ui.ButtonBase(c).Label(a.t("Add account", "添加账号")).Padding(2, 6).Radius(4).Background(ui.Color{}).Border(1, t.Border).TextColor(t.TextMuted)
+			// The entry stays visible with switching off: hiding it left people
+			// without a way to find where accounts are added. It then leads to
+			// the manager, where switching is turned on.
+			if switchableProvider(grp.provider) {
+				addBtn := ui.ButtonBase(c).Label(fmt.Sprintf(a.t("Add %s account", "添加 %s 账号"), providerName(grp.provider))).Padding(2, 6).Radius(4).Background(ui.Color{}).Border(1, t.Border).TextColor(t.TextMuted)
 				if addBtn.Hovered() {
 					addBtn.TextColor(t.Text).Border(1, strongBorder)
 				}
-				addBtn.Children(func() { ui.Text(c, a.t("+ Backup", "+ 备用号")).FontSize(10).NoWrap() })
+				addBtn.Children(func() { ui.Text(c, "+ "+a.t("Add account", "添加账号")).FontSize(10).NoWrap() })
 				if addBtn.Clicked() {
-					a.openAddAccount(grp.provider)
+					if a.accountStore.Enabled() {
+						a.openAddAccount(grp.provider)
+					} else {
+						a.openAccounts()
+					}
 				}
 			}
 			if len(grp.accounts) == 1 {
 				ar := grp.accounts[0]
 				if index, err := strconv.Atoi(strings.TrimPrefix(ar.account.Key, "devin-")); strings.HasPrefix(ar.account.Key, "devin-") && err == nil {
-					remove := ui.ButtonBase(c).Padding(0, 4).Border(0, ui.Color{}).Background(ui.Color{}).TextColor(faintText)
+					remove := ui.ButtonBase(c).Padding(0, 4).Border(0, ui.Color{}).Background(ui.Color{}).TextColor(quotaRose.Alpha(.75))
 					if remove.Hovered() {
 						remove.TextColor(quotaRose)
 					}
 					remove.Children(func() { ui.Text(c, a.t("Remove", "移除")).FontSize(11).NoWrap() })
 					if remove.Clicked() {
-						if err := quota.RemoveDevinAccount(index); err != nil {
-							a.message = err.Error()
-						} else {
-							a.refreshQuota(true)
-						}
+						a.askRemoveDevin(index, ar.account.Label)
 					}
 				}
 			}
@@ -397,12 +396,15 @@ func (a *App) tabbedAccountBody(c *ui.Context, grp providerQuotaGroup) {
 					ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 						dotColor := faintText.Alpha(.6)
 						switch {
+						// Live outranks high usage: the "Active" tag beside an
+						// amber dot read as two different states. Usage
+						// levels stay visible on the bars below.
 						case ar.err != nil:
 							dotColor = quotaRose
-						case quotaAlert(ar.result):
-							dotColor = quotaAmber
 						case isLive:
 							dotColor = quotaGreen
+						case quotaAlert(ar.result):
+							dotColor = quotaAmber
 						}
 						ui.Box(c).Size(6, 6).Radius(3).Background(dotColor)
 
@@ -451,7 +453,10 @@ func (a *App) tabbedAccountBody(c *ui.Context, grp providerQuotaGroup) {
 				ui.Text(c, a.t("Active now · Local sessions use this account", "本机当前使用 · 新会话即时生效")).FontSize(11).TextColor(quotaGreen).FontWeight(500)
 			} else {
 				ui.Box(c).Size(6, 6).Radius(3).Border(1, faintText.Alpha(.6))
-				ui.Text(c, a.t("Previewing inactive account quota", "预览此账号配额（未生效）")).FontSize(11).TextColor(t.TextMuted)
+				// Name the previewed account: the quota bars below look the
+				// same as the live account's, so the banner has to say whose
+				// numbers these are.
+				ui.Text(c, fmt.Sprintf(a.t("Previewing %s · not in use", "正在预览 %s · 未切换"), selected.account.Label)).FontSize(11).TextColor(quotaAmber).SingleLine().Ellipsis("…").MinWidth(0).Shrink(1)
 			}
 			ui.Spacer(c)
 			profileID := selected.profileID
@@ -474,17 +479,13 @@ func (a *App) tabbedAccountBody(c *ui.Context, grp providerQuotaGroup) {
 				}
 			}
 			if index, err := strconv.Atoi(strings.TrimPrefix(selected.account.Key, "devin-")); strings.HasPrefix(selected.account.Key, "devin-") && err == nil {
-				remove := ui.ButtonBase(c.Key("rm/"+selected.account.Key)).Padding(0, 4).Border(0, ui.Color{}).Background(ui.Color{}).TextColor(faintText)
+				remove := ui.ButtonBase(c.Key("rm/"+selected.account.Key)).Padding(0, 4).Border(0, ui.Color{}).Background(ui.Color{}).TextColor(quotaRose.Alpha(.75))
 				if remove.Hovered() {
 					remove.TextColor(quotaRose)
 				}
 				remove.Children(func() { ui.Text(c, a.t("Remove", "移除")).FontSize(11).NoWrap() })
 				if remove.Clicked() {
-					if err := quota.RemoveDevinAccount(index); err != nil {
-						a.message = err.Error()
-					} else {
-						a.refreshQuota(true)
-					}
+					a.askRemoveDevin(index, selected.account.Label)
 				}
 			}
 		})
@@ -534,7 +535,7 @@ func (a *App) singleAccountBody(c *ui.Context, ar accountResult) {
 			a.claudeResetBar(c, ar.account, *r.Reset, r.Windows)
 		}
 		if r.Extra != "" {
-			ui.Text(c, fmt.Sprintf(a.t("Extra: %s", "附加：%s"), r.Extra)).FontSize(11).MinWidth(0).TextColor(faintText)
+			ui.Text(c, a.extraLabel(r)).FontSize(11).MinWidth(0).TextColor(faintText)
 		}
 		if r.Stale != "" {
 			age := a.duration(max(r.StaleAge, 60))
@@ -747,4 +748,20 @@ func resetWindowFull(clears []string, windows []quota.Window) bool {
 		}
 	}
 	return false
+}
+
+// extraLabel names what a provider's extra figure measures; the figures
+// differ (money spent, credit left, an unconfirmed overage) and a shared
+// "Extra:" label read as the same thing.
+func (a *App) extraLabel(r quota.Result) string {
+	switch r.ExtraKind {
+	case quota.ExtraSpend:
+		return fmt.Sprintf(a.t("Extra usage: %s", "额外用量：%s"), r.Extra)
+	case quota.ExtraBalance:
+		return fmt.Sprintf(a.t("Overage balance: %s", "超额余额：%s"), r.Extra)
+	case quota.ExtraOverage:
+		return fmt.Sprintf(a.t("Overage: %s", "超额：%s"), r.Extra)
+	}
+	// Cached results from before ExtraKind carry no meaning.
+	return fmt.Sprintf(a.t("Extra: %s", "附加：%s"), r.Extra)
 }

@@ -34,7 +34,7 @@ func TestAccountBackupExportPreviewAndImport(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.profiles = a.accountStore.List()
-	a.accountUI.manager = true
+	a.screen = "accounts"
 	file := filepath.Join(t.TempDir(), "test.aumaccounts")
 	a.accountBackupFile = func(save bool, title string) (string, error) { return file, nil }
 	tt := ui.NewTester(a.View, 1240, 780)
@@ -82,8 +82,10 @@ func TestAccountSyncSettingsLockAndEndpointChange(t *testing.T) {
 	a := fixture(t)
 	a.settings = true
 	tt := ui.NewTester(func(c *ui.Context) { a.theme(c); a.settingsView(c); a.accountBackupDialog(c) }, 800, 780)
-	if !tt.HasText("Account sync") || !tt.HasText("Sign in to GitHub above to sync accounts.") {
-		t.Fatal("independent opt-in account sync controls missing")
+	// Settings keeps the GitHub sign-in; account sync itself moved to the
+	// Accounts page, and the sync tab points there.
+	if !tt.HasText("Account sync is managed on the Accounts page.") {
+		t.Fatalf("settings does not point to account sync: %q", tt.Texts())
 	}
 	capture(t, tt, "go-account-sync-settings")
 	ctx, cancel := context.WithCancel(context.Background())

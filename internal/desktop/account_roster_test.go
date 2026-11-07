@@ -153,7 +153,7 @@ func TestAntigravityRosterMatchesManager(t *testing.T) {
 	a.accounts = quotaRoster(a.accountStore, profiles, []quota.Account{live})
 	tt := ui.NewTester(a.View, 1240, 780)
 	tt.SetScale(2)
-	if !tt.HasText("4 个已绑定账号") {
+	if !tt.HasText("4 个账号") {
 		t.Fatalf("incorrect count: %q", tt.Texts())
 	}
 	if !tt.HasText("4 个账号 · 1 个当前使用") || !tt.HasText("当前使用") {

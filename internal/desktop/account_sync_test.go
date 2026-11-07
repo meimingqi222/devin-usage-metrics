@@ -201,7 +201,7 @@ func TestAccountSyncSettingsAreReadable(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.accountSync = accountSyncState{password: "fixture123", scope: "fixture-scope", lastAt: time.Now().Add(-2 * time.Minute), result: syncclient.AccountSyncResult{SyncResult: accounts.SyncResult{Total: 3}, Devices: 2, Unreadable: 1}}
-	tt := ui.NewTester(func(c *ui.Context) { a.theme(c); a.settingsView(c); a.accountBackupDialog(c) }, 800, 780)
+	tt := ui.NewTester(func(c *ui.Context) { a.theme(c); a.accountsView(c); a.accountBackupDialog(c) }, 800, 780)
 	for _, old := range []string{"锁定", "停用", "保留本机", "加密账号同步", "新增 0 个"} {
 		if tt.HasText(old) {
 			t.Fatalf("unnecessary default control or copy: %s", old)
@@ -346,7 +346,7 @@ func TestAccountSyncDisableRequiresConfirmation(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.accountSync = accountSyncState{password: "fixture123", scope: "fixture-scope"}
-	tt := ui.NewTester(func(c *ui.Context) { a.theme(c); a.settingsView(c); a.accountBackupDialog(c) }, 800, 780)
+	tt := ui.NewTester(func(c *ui.Context) { a.theme(c); a.accountsView(c); a.accountSyncConfirms(c); a.accountBackupDialog(c) }, 800, 780)
 	a.accountSync.pendingOff = true
 	tt.Frame()
 	if !tt.HasText("关闭账号同步？") {
@@ -375,32 +375,46 @@ func TestAccountSyncDisableRequiresConfirmation(t *testing.T) {
 	}
 }
 
-func TestAccountsDialogShowsSyncStatus(t *testing.T) {
+// TestAccountsPageOwnsAccountSync pins that account sync is managed on the
+// Accounts page: its status, Sync now and the password unlock are there,
+// and before GitHub sign-in it points to the settings that provide it.
+func TestAccountsPageOwnsAccountSync(t *testing.T) {
 	a := fixture(t)
 	a.lang = "zh"
 	if err := a.accountStore.SetEnabled(true); err != nil {
 		t.Fatal(err)
 	}
-	a.accountUI.manager = true
-	tt := ui.NewTester(a.View, 800, 780)
-	if !tt.HasText("账号同步未开启，点击到设置中开启。") {
-		t.Fatal("the accounts dialog hides that account sync exists")
+	a.openAccounts()
+	tt := ui.NewTester(a.View, 1240, 900)
+	if !tt.HasText("先在 设置 › 多设备同步 中登录 GitHub，即可同步账号。") {
+		t.Fatalf("the accounts page hides that account sync needs a sign-in: %q", tt.Texts())
 	}
-	click(t, tt, "账号同步未开启，点击到设置中开启。")
+	click(t, tt, "打开同步设置")
 	if !a.settings || a.settingsUI.tab != "sync" {
-		t.Fatal("the off row did not open settings on the sync tab")
+		t.Fatal("the page did not open settings on the sync tab")
 	}
 	a.settings, a.settingsUI.open = false, false
+	dir, _ := os.UserConfigDir()
+	dir = filepath.Join(dir, "devin-usage-metrics")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "github-sync-session.meta.json"), []byte(`{"login":"fixture-user"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncclient.SaveConfig(syncclient.Config{Enabled: true, APIURL: "https://sync.example.test"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := syncclient.SaveAccountSyncConfig(syncclient.AccountSyncConfig{Enabled: true, Scope: "fixture-scope"}); err != nil {
 		t.Fatal(err)
 	}
 	a.accountSync = accountSyncState{password: "fixture123", scope: "fixture-scope", lastAt: time.Now().Add(-2 * time.Minute), result: syncclient.AccountSyncResult{SyncResult: accounts.SyncResult{Total: 3}, Devices: 2}}
 	tt.Frame()
-	if !tt.HasText("3 个账号 · 2 台设备 · 2 分钟前") || !tt.HasText("立即同步") {
-		t.Fatal("the accounts dialog does not show the sync status row")
+	if !tt.HasText("已同步 3 个账号 · 来自 2 台设备 · 2 分钟前") || !tt.HasText("立即同步") {
+		t.Fatalf("the accounts page does not show the sync status: %q", tt.Texts())
 	}
 	capture(t, tt, "go-account-sync-manager-row")
-	// Without the password the row offers the unlock dialog, titled as unlock.
+	// Without the password the page offers the unlock dialog, titled as unlock.
 	a.accountSync.password = ""
 	tt.Frame()
 	click(t, tt, "输入密码")

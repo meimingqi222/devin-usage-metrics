@@ -66,9 +66,9 @@ func TestAccountsManagerDialog(t *testing.T) {
 			t.Fatalf("accounts manager missing %q: %q", text, tt.Texts())
 		}
 	}
-	click(t, tt, "+ Add account")
+	click(t, tt, "Add Claude Code account")
 	tt.Frame()
-	for _, text := range []string{"Sign in with Claude Code", "Accounts already signed in on this device are added automatically."} {
+	for _, text := range []string{"Sign in with Claude Code", "Signed in on this device: work@example.com (already listed). Sign in above to add another account."} {
 		if !tt.HasText(text) {
 			t.Fatalf("add account panel missing %q: %q", text, tt.Texts())
 		}
@@ -89,7 +89,7 @@ func TestDedicatedAddBackupModalAndCleanManager(t *testing.T) {
 	a.openAddAccount("antigravity")
 	tt.Frame()
 
-	for _, text := range []string{"添加 Antigravity 备用号", "使用 Google 登录", "本机已登录的账号会被自动识别并加入，无需手动捕获。"} {
+	for _, text := range []string{"添加 Antigravity 账号", "使用 Google 登录"} {
 		if !tt.HasText(text) {
 			t.Fatalf("dedicated add modal missing %q: %q", text, tt.Texts())
 		}
@@ -100,7 +100,7 @@ func TestDedicatedAddBackupModalAndCleanManager(t *testing.T) {
 	a.accountUI.add = ""
 	a.openAddAccount("devin")
 	tt.Frame()
-	if tt.HasText("添加 Devin 备用号") {
+	if tt.HasText("添加 Devin 账号") {
 		t.Fatalf("Devin add modal must not open: %q", tt.Texts())
 	}
 
@@ -190,6 +190,16 @@ func TestAccountSwitchFromMenuWritesLive(t *testing.T) {
 	if err := tt.Click("work@example.com"); err != nil {
 		t.Fatal(err)
 	}
+	tt.Frame()
+	// A menu click names the account; everywhere else a click on a name only
+	// previews it, so the switch waits for the confirmation.
+	if !a.accountUI.confirmOpen || a.busy["switch/claude"] {
+		t.Fatalf("menu click switched without confirming: confirm=%v busy=%v", a.accountUI.confirmOpen, a.busy)
+	}
+	if b, _ := os.ReadFile(path); !strings.Contains(string(b), `"r2"`) {
+		t.Fatalf("live sign-in changed before confirming: %s", b)
+	}
+	click(t, tt, "Switch")
 	deadline := time.Now().Add(5 * time.Second)
 	for (a.accountUI.switching["claude"] || a.busy["switch/claude"]) && time.Now().Before(deadline) {
 		tt.Frame()
@@ -216,7 +226,7 @@ func TestDuplicateAccountNamesGetShortSuffix(t *testing.T) {
 		accounts.Profile{ID: "aaaa1111", Provider: "antigravity", Label: "Antigravity", Kind: "keychain", Writable: true},
 		accounts.Profile{ID: "bbbb2222", Provider: "antigravity", Label: "Antigravity", Kind: "keychain", Writable: true},
 	)
-	a.accountUI.manager = true
+	a.screen = "accounts"
 	tt := ui.NewTester(a.View, 1240, 780)
 	if !tt.HasText("Antigravity (aaaa)") || !tt.HasText("Antigravity (bbbb)") {
 		t.Fatalf("duplicate names not distinguished: %q", tt.Texts())
@@ -268,7 +278,7 @@ func TestParallelQuotaDashboardAndSwitch(t *testing.T) {
 	if !trayTester.HasText("work@example.com") || !trayTester.HasText("home@example.com") {
 		t.Fatalf("tray should show both accounts: %q", trayTester.Texts())
 	}
-	if !trayTester.HasText("当前") {
+	if !trayTester.HasText("当前使用") {
 		t.Fatalf("tray active tag missing: %q", trayTester.Texts())
 	}
 	if !trayTester.HasText("切换") {

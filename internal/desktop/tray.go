@@ -412,7 +412,7 @@ func (a *App) trayDenseCard(c *ui.Context, ar accountResult) {
 					a.switchAccount(ar.account.Provider, ar.profileID)
 				}
 			} else if ar.isLive && len(a.profilesFor(ar.account.Provider)) > 1 {
-				ui.Text(c, a.t("Active", "当前")).FontSize(9).FontWeight(600).Padding(1, 4).Radius(3).Background(quotaGreen.Alpha(.1)).Border(1, quotaGreen.Alpha(.3)).TextColor(quotaGreen).NoWrap()
+				ui.Text(c, a.t("Active", "当前使用")).FontSize(9).FontWeight(600).Padding(1, 4).Radius(3).Background(quotaGreen.Alpha(.1)).Border(1, quotaGreen.Alpha(.3)).TextColor(quotaGreen).NoWrap()
 			}
 		})
 		ui.Column(c).Gap(6).Children(func() {
