@@ -1,0 +1,6 @@
+=== RUN   TestQuotaDiscoveryRestoresDeletedLiveAccountAndSyncKeepsIt
+    sync_test.go:167: quota discovery did not restore the live account: [] <nil>
+--- FAIL: TestQuotaDiscoveryRestoresDeletedLiveAccountAndSyncKeepsIt (0.06s)
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/accounts	0.650s
+FAIL

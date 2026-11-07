@@ -253,7 +253,7 @@ func (a *App) accountLabel(c *ui.Context, ar accountResult, compact bool) ui.Ele
 	}
 	pill.Children(func() {
 		if switching {
-			ui.Spinner(c)
+			ui.Spinner(c).Size(size, size)
 			ui.Text(c, a.t("Switching…", "正在切换…")).FontSize(size).TextColor(t.TextMuted).NoWrap()
 			return
 		}
@@ -303,7 +303,9 @@ func (a *App) accountMenu(c *ui.Context, panel ui.Element, ar accountResult, com
 			ui.Text(c, ar.account.Label).FontSize(11).TextColor(t.Text).Padding(6, 8)
 		}
 		ui.Box(c).Height(1).Shrink(0).Margin(3, 0).Background(t.Border)
-		if menuButton(c, "+ "+a.t("Add account…", "添加账号…"), compact).Clicked() {
+		// Only a switchable agent can take another saved account; the menu is
+		// reachable from every quota card, Devin included.
+		if switchableProvider(ar.account.Provider) && menuButton(c, "+ "+a.t("Add account…", "添加账号…"), compact).Clicked() {
 			a.accountUI.menuOpen = false
 			a.openAccounts()
 			a.accountUI.add = ar.account.Provider
@@ -477,40 +479,6 @@ func (a *App) startAccountLogin(provider string) {
 	}()
 }
 
-func (a *App) captureCurrentAccount(provider string) {
-	a.work("capture/"+provider, func() func() {
-		var err error
-		found := false
-		for _, live := range quota.Discover(quota.KeychainAllowed()) {
-			if live.Provider != provider {
-				continue
-			}
-			found = true
-			doc, readErr := live.CredentialDoc()
-			err = readErr
-			if err == nil {
-				_, err = a.accountStore.Add(provider, doc, live.CredentialKind())
-			}
-			break
-		}
-		return func() {
-			if !found {
-				a.message = a.t("No current sign-in found. Sign in to this agent first.", "未找到当前登录，请先在这个 Agent 中登录。")
-				return
-			}
-			if err != nil {
-				a.message = a.accountBackupError(err)
-				return
-			}
-			a.accountUI.add = ""
-			a.profiles = a.accountStore.List()
-			a.message = a.t("Current account saved.", "已保存当前账号。")
-			a.refreshQuota(true)
-			a.accountChanged()
-		}
-	})
-}
-
 func (a *App) cancelAccountLogin() {
 	if a.accountUI.loginCancel != nil {
 		a.accountUI.loginCancel()
@@ -609,7 +577,7 @@ func (a *App) accountsDialog(c *ui.Context) {
 							a.openFolder(a.accountStorePath())
 						}
 					}
-					if settingsButton(c, a.t("Remove all saved accounts", "移除全部已保存账号"), false).Clicked() {
+					if settingsButton(c, a.t("Remove other saved accounts", "移除其他已保存账号"), false).Clicked() {
 						a.accountUI.removeAll = true
 					}
 				})
@@ -617,9 +585,11 @@ func (a *App) accountsDialog(c *ui.Context) {
 		})
 	})
 	if a.accountUI.removeAll {
-		text := a.t("Remove every account name and saved sign-in copy from this device? The agents' current sign-ins stay as they are.", "移除本机保存的全部账号名称和登录副本？Agent 当前的登录保持不变。")
+		// The accounts the agents are signed in to are occupied and stay; only
+		// the saved copies of the others go, and those removals sync.
+		text := a.t("Remove every saved account except the ones the agents are signed in to? The accounts in use stay listed.", "移除除各 Agent 当前登录之外的全部已保存账号？正在使用的账号会保留。")
 		if syncclient.ReadAccountSyncConfig().Enabled {
-			text = a.t("Remove all saved accounts and sync the removals to your other devices? Current agent sign-ins stay unchanged.", "移除全部已保存账号，并同步删除其他设备上的副本？Agent 当前的登录保持不变。")
+			text = a.t("Remove every saved account except the ones the agents are signed in to, and sync the removals to your other devices? The accounts in use stay listed.", "移除除各 Agent 当前登录之外的全部已保存账号，并同步删除其他设备上的副本？正在使用的账号会保留。")
 		}
 		if ui.AlertDialog(c, &a.accountUI.removeAll, a.t("Remove saved accounts", "移除已保存账号"), text, a.t("Cancel", "取消"), a.t("Remove", "移除")) == 1 {
 			if err := a.accountStore.RemoveAll(); err != nil {
@@ -666,7 +636,11 @@ func (a *App) accountSection(c *ui.Context, provider string) {
 					reason = live.ReadOnlyReason()
 				}
 				if reason == "" {
-					reason = a.t("Not captured yet; enable switching and refresh quotas.", "尚未捕获；启用账号切换并刷新配额。")
+					if a.accountStore.Enabled() {
+						reason = a.t("Waiting for the next refresh to add this sign-in.", "等待下次刷新自动加入该登录。")
+					} else {
+						reason = a.t("Enable account switching to add this sign-in.", "启用账号切换即可自动加入该登录。")
+					}
 				}
 				if strings.Contains(reason, "API-key mode") {
 					reason = a.t("Codex is in API-key mode; there is no account to switch", "当前为 API Key 直连模式，无需切换账号")
@@ -747,13 +721,13 @@ func (a *App) accountManagerRow(c *ui.Context, provider string, p accounts.Profi
 		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 			if !p.Active {
 				switching := a.accountUI.switching[provider]
-				swBtn := ui.ButtonBase(c.Key("sw-row/"+p.ID)).Label(a.t("Switch to this account", "切为此账号")).Padding(2, 8).Radius(4).Background(t.Accent.Alpha(.15)).Border(1, t.Accent.Alpha(.35)).Disabled(!p.Writable || switching)
+				swBtn := ui.ButtonBase(c.Key("sw-row/"+p.ID)).Label(a.t("Switch to this account", "切为此账号")).Gap(4).Padding(2, 8).Radius(4).Background(t.Accent.Alpha(.15)).Border(1, t.Accent.Alpha(.35)).Disabled(!p.Writable || switching)
 				if swBtn.Hovered() {
 					swBtn.Background(t.Accent.Alpha(.25))
 				}
 				swBtn.Children(func() {
 					if switching {
-						ui.Spinner(c)
+						ui.Spinner(c).Size(10, 10)
 						ui.Text(c, a.t("Switching…", "正在切换…")).FontSize(10).TextColor(t.TextMuted).NoWrap()
 					} else {
 						ui.Text(c, a.t("Switch", "切换")).FontSize(10.5).FontWeight(600).TextColor(t.Accent).NoWrap()
@@ -766,6 +740,9 @@ func (a *App) accountManagerRow(c *ui.Context, provider string, p accounts.Profi
 			if settingsButton(c, a.t("Rename", "重命名"), false).Clicked() {
 				a.accountUI.renameID, a.accountUI.renameText = p.ID, p.DisplayName()
 			}
+			// An account in use is occupied: the refresh captures it again, so
+			// removing its copy only undoes itself. The label check also covers a
+			// sign-in switched outside the app before the refresh bound it here.
 			if !p.Active {
 				if settingsButton(c, a.t("Remove", "移除"), false).Clicked() {
 					if live, ok := a.liveAccount(provider); ok && p.Email != "" && strings.EqualFold(live.Label, p.Email) {
@@ -792,7 +769,6 @@ func (a *App) addAccountDialog(c *ui.Context) {
 	t := c.Theme()
 	faintText := faint(t)
 	isLoggingIn := a.accountUI.loginProvider == provider
-	canDirectLogin := provider == "claude" || provider == "codex" || provider == "antigravity" || provider == "grok"
 
 	open := true
 	ui.DialogBase(c.Key("dialog/add/"+provider), &open, func(back, panel ui.Element) {
@@ -831,14 +807,10 @@ func (a *App) addAccountDialog(c *ui.Context) {
 				text = a.t(
 					"Opens Google sign-in in your system browser. Google refresh tokens don't rotate, so the saved copy stays valid. You can switch to this account anytime.",
 					"将在系统默认浏览器中打开 Google 账户授权页。授权完成后副本将自动保存在本机，可在卡片顶部随时切换预览或激活。")
-			case "claude", "codex", "grok":
+			default:
 				text = a.t(
 					"Signs in through the agent's own browser flow, in a separate config folder. Your current sign-in stays as it is.",
 					"通过 Agent 自己的浏览器登录流程，在独立配置目录中登录；当前登录保持不变。")
-			default:
-				text = a.t(
-					"This agent does not support direct browser login here. Please log in via terminal first, then capture the login.",
-					fmt.Sprintf("%s 暂不支持在此直接发起浏览器登录。请先在终端中完成登录，然后点击下方按钮捕获凭证作为备用副本。", providerTitle(provider)))
 			}
 			ui.Text(c, text).FontSize(11).FixedLineHeight(16).TextColor(t.TextMuted)
 		})
@@ -866,7 +838,7 @@ func (a *App) addAccountDialog(c *ui.Context) {
 						a.cancelAccountLogin()
 					}
 				})
-			} else if canDirectLogin {
+			} else {
 				label := a.t("Sign in with ", "登录 ") + providerTitle(provider)
 				if provider == "antigravity" {
 					label = a.t("Sign in with Google", "使用 Google 登录")
@@ -886,35 +858,12 @@ func (a *App) addAccountDialog(c *ui.Context) {
 				if provider == "antigravity" {
 					ui.Text(c, a.t("Google refresh token does not rotate and remains valid long term.", "Google Refresh Token 不会轮换，授权后可长期有效查询")).FontSize(10).TextColor(faintText)
 				}
-			} else {
-				// Agents like Devin without direct browser OAuth: capture is the primary action!
-				btn := ui.ButtonBase(c.Key("btn/primary-capture/" + provider)).FillWidth().Height(34).Radius(5).Background(t.Accent).TextColor(t.AccentText).Label(a.t("Capture current login", "捕获本机当前登录凭证"))
-				if btn.Hovered() {
-					btn.Background(t.Accent.Alpha(.85))
-				}
-				btn.Children(func() {
-					ui.Row(c).Gap(6).AlignItems(ui.Center).Justify(ui.Center).Children(func() {
-						ui.Text(c, a.t("Capture current login", "捕获本机当前登录凭证")).FontSize(12.5).FontWeight(600).TextColor(t.AccentText)
-					})
-				})
-				if btn.Clicked() {
-					a.captureCurrentAccount(provider)
-				}
-				ui.Text(c, a.t("Detects active credentials on this device and saves a switchable copy.", "自动读取本机该 Agent 的当前活跃凭证并另存为可切换的独立副本")).FontSize(10).TextColor(faintText)
+				// The sign-in this device already has needs no button: the refresh
+				// captures it into the roster on its own, so the only reason to
+				// be here is adding an account that is not signed in yet.
+				ui.Text(c, a.t("Accounts already signed in on this device are added automatically.", "本机已登录的账号会被自动识别并加入，无需手动捕获。")).FontSize(10).TextColor(faintText)
 			}
 		})
-
-		// 4. Secondary capture entry (only when direct browser login is available)
-		if canDirectLogin {
-			ui.Row(c).Padding(6, 2, 0, 2).BorderWidth(1, 0, 0, 0).BorderColor(t.Border.Alpha(.7)).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, a.t("Already logged in via terminal?", "已经在其他终端中完成过登录？")).FontSize(11).TextColor(faintText)
-				ui.Spacer(c)
-				capBtn := settingsButton(c, a.t("Capture current login", "捕获当前登录"), false)
-				if capBtn.Clicked() {
-					a.captureCurrentAccount(provider)
-				}
-			})
-		}
 	})
 	if !open {
 		if isLoggingIn {

@@ -61,17 +61,20 @@ func TestAccountsManagerDialog(t *testing.T) {
 	tt.SetScale(2)
 	click(t, tt, "Accounts")
 	tt.Frame()
-	for _, text := range []string{"Account switching", "Claude Code", "work@example.com", "home@example.com", "Add account", "Remove all saved accounts"} {
+	for _, text := range []string{"Account switching", "Claude Code", "work@example.com", "home@example.com", "Add account", "Remove other saved accounts"} {
 		if !tt.HasText(text) {
 			t.Fatalf("accounts manager missing %q: %q", text, tt.Texts())
 		}
 	}
 	click(t, tt, "+ Add account")
 	tt.Frame()
-	for _, text := range []string{"Sign in with Claude Code", "Capture current login"} {
+	for _, text := range []string{"Sign in with Claude Code", "Accounts already signed in on this device are added automatically."} {
 		if !tt.HasText(text) {
 			t.Fatalf("add account panel missing %q: %q", text, tt.Texts())
 		}
+	}
+	if tt.HasText("Capture current login") {
+		t.Fatalf("manual capture is back in the add panel: %q", tt.Texts())
 	}
 	capture(t, tt, "go-accounts-dialog")
 }
@@ -86,7 +89,7 @@ func TestDedicatedAddBackupModalAndCleanManager(t *testing.T) {
 	a.openAddAccount("antigravity")
 	tt.Frame()
 
-	for _, text := range []string{"添加 Antigravity 备用号", "使用 Google 登录", "捕获当前登录"} {
+	for _, text := range []string{"添加 Antigravity 备用号", "使用 Google 登录", "本机已登录的账号会被自动识别并加入，无需手动捕获。"} {
 		if !tt.HasText(text) {
 			t.Fatalf("dedicated add modal missing %q: %q", text, tt.Texts())
 		}

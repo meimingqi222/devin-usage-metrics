@@ -162,23 +162,36 @@ func (s *Store) Add(provider string, doc map[string]any, kind string) (Profile, 
 	if key == "" {
 		key = backupIdentity(entry)
 	}
-	if deletedAt := s.data.Deleted[key]; deletedAt > 0 {
-		p.ModifiedAt = max(time.Now().UnixNano(), deletedAt+1)
-		for i := range s.data.Profiles {
-			if s.data.Profiles[i].ID == p.ID && s.data.Profiles[i].Provider == provider {
-				s.data.Profiles[i].ModifiedAt = p.ModifiedAt
-			}
-		}
-		stamp := time.Unix(0, p.ModifiedAt)
-		if err := os.Chtimes(s.credentialPath(provider, p.ID), stamp, stamp); err != nil {
-			return Profile{}, err
-		}
-		delete(s.data.Deleted, key)
+	if err := s.clearTombstoneLocked(provider, key, &p); err != nil {
+		return Profile{}, err
 	}
 	if err := s.saveLocked(); err != nil {
 		return Profile{}, err
 	}
 	return p, nil
+}
+
+// clearTombstoneLocked drops the deletion record for a key the live login
+// still uses, and stamps the profile newer than the record so the next sync
+// does not retire the account again. The credential file's modification time
+// follows, since backups compare it.
+func (s *Store) clearTombstoneLocked(provider, key string, p *Profile) error {
+	deletedAt := s.data.Deleted[key]
+	if deletedAt == 0 {
+		return nil
+	}
+	p.ModifiedAt = max(time.Now().UnixNano(), deletedAt+1)
+	for i := range s.data.Profiles {
+		if s.data.Profiles[i].ID == p.ID && s.data.Profiles[i].Provider == provider {
+			s.data.Profiles[i].ModifiedAt = p.ModifiedAt
+		}
+	}
+	stamp := time.Unix(0, p.ModifiedAt)
+	if err := os.Chtimes(s.credentialPath(provider, p.ID), stamp, stamp); err != nil {
+		return err
+	}
+	delete(s.data.Deleted, key)
+	return nil
 }
 
 // List returns saved profiles with the active flag from the last
@@ -253,6 +266,100 @@ func (s *Store) flagContaminatedLocked(provider string, doc map[string]any) {
 			s.suspect[provider+"/"+q.ID] = true
 		}
 	}
+}
+
+// flagCrossedCopiesLocked marks a record whose saved sign-in is a token copy
+// of a sibling's while its record claims a different account. The live-login
+// comparison in flagContaminatedLocked only catches a copy of the account
+// currently signed in; a crossed copy of another saved login looks normal to
+// it, stays listed, and answers quota for the copied account under the wrong
+// name. Two records sharing a token pair hold one login, so exactly one of
+// the recorded names is right; the side with weaker evidence is the copy.
+// The active record is exempt: it just read the live login back and is the
+// authority for the token pair it shares. Both sides unknowable or equally
+// evidenced stay visible - a wrong quarantine is worse than a duplicate.
+func (s *Store) flagCrossedCopiesLocked(provider string) {
+	type candidate struct {
+		index int
+		doc   map[string]any
+		id    credentialid.Identity // claims the agent or issuer wrote
+	}
+	var candidates []candidate
+	for i := range s.data.Profiles {
+		p := &s.data.Profiles[i]
+		if p.Provider != provider || p.Hidden {
+			continue
+		}
+		doc, err := s.readCredential(*p)
+		if err != nil || !accountDocument(provider, doc) {
+			continue
+		}
+		if p.StableID == "" && p.Email == "" {
+			continue
+		}
+		candidates = append(candidates, candidate{index: i, doc: doc, id: credentialid.Claims(provider, doc)})
+	}
+	for a := 0; a < len(candidates); a++ {
+		for b := a + 1; b < len(candidates); b++ {
+			ca, cb := candidates[a], candidates[b]
+			if !sameSavedTokens(provider, ca.doc, cb.doc) {
+				continue
+			}
+			pa, pb := &s.data.Profiles[ca.index], &s.data.Profiles[cb.index]
+			if !crossedNameConflict(*pa, *pb) {
+				continue
+			}
+			la, lb := crossedLevel(*pa, ca.id), crossedLevel(*pb, cb.id)
+			loser := -1
+			switch {
+			case la != lb:
+				// The weaker name is the copy; a claims-only edge over the
+				// active record does not outrank it, so the active side is
+				// exempt either way.
+				loser = ca.index
+				if lb < la {
+					loser = cb.index
+				}
+			case s.active[provider] == pa.ID && s.active[provider] != pb.ID:
+				// Equal evidence, but only one side just read the live login
+				// back: the other carries that sign-in under a wrong name.
+				loser = cb.index
+			case s.active[provider] == pb.ID && s.active[provider] != pa.ID:
+				loser = ca.index
+			}
+			if loser >= 0 && s.active[provider] != s.data.Profiles[loser].ID {
+				s.suspect[provider+"/"+s.data.Profiles[loser].ID] = true
+			}
+		}
+	}
+}
+
+// crossedLevel ranks how firmly a record's name is backed: claims the agent
+// or issuer wrote outrank a stable key of the richer email|sub form (which
+// could only come from claims), which outranks a bare recorded name. Claims
+// contradicting their own record are as unreliable as a stamped name, so
+// they leave only the record's form.
+func crossedLevel(p Profile, id credentialid.Identity) int {
+	if sameAccountClaims(id, p) && (id.Stable != "" || id.Email != "") {
+		return 2
+	}
+	if strings.Contains(p.StableID, "|") {
+		return 1
+	}
+	return 0
+}
+
+// crossedNameConflict reports whether two records claim recognizably
+// different accounts. An unnamed side cannot be wrong, and an email|sub key
+// never conflicts with its own prefix.
+func crossedNameConflict(a, b Profile) bool {
+	if a.Email != "" && b.Email != "" && !strings.EqualFold(a.Email, b.Email) {
+		return true
+	}
+	if a.StableID == "" || b.StableID == "" || a.StableID == b.StableID {
+		return false
+	}
+	return !strings.HasPrefix(a.StableID, b.StableID+"|") && !strings.HasPrefix(b.StableID, a.StableID+"|")
 }
 
 // Reconcile reads each live account and, when switching is enabled,
@@ -336,58 +443,42 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 		}
 		kind := a.CredentialKind()
 		hash := docHash(doc)
-		// A normal quota refresh must not recreate an account removed by sync.
-		// Signing in/capturing explicitly goes through Add and restores it.
+		// A tombstone stops sync from filing a deleted copy back on every
+		// refresh. It must not hide the sign-in this device is actually using:
+		// that login is the account, not an imported copy, so a surviving
+		// record is bound and the account is captured like any other live
+		// login. Add used to be the only way back, which left the manual
+		// capture button as the sole repair for an account the user never
+		// stopped signing in to.
 		entry := BackupEntry{Provider: a.Provider, Credential: doc}
 		key := syncIdentity(entry)
 		if key == "" {
 			key = backupIdentity(entry)
 		}
-		if s.data.Deleted[key] > 0 {
-			// The tombstone suppresses capturing or recreating this account,
-			// but a record removed on another device can still be the live
-			// login here: bind the matching profile anyway so the switcher
-			// and quota card name the account, and flag copies that hold
-			// these tokens under another name.
-			id, matchReason := "", "unmatched"
+		tombstoned := s.data.Deleted[key] > 0
+		bound := ""
+		if tombstoned {
 			for _, p := range s.data.Profiles {
 				if p.Provider != a.Provider {
 					continue
 				}
 				if saved, err := s.readCredential(p); err == nil && profileSyncKey(p, saved) == key {
-					id, matchReason = p.ID, "sync_tombstone_record"
+					bound = p.ID
 					break
 				}
 			}
-			if id == "" {
-				id, matchReason = s.matchReasonLocked(a.Provider, doc, hash)
-				if matchReason != "unmatched" {
-					matchReason = "tombstoned_" + matchReason
-				}
-			}
-			if id != "" {
-				if s.active[a.Provider] != id {
-					s.active[a.Provider] = id
-					changed = true
-				}
-				for i := range s.data.Profiles {
-					if s.data.Profiles[i].ID == id {
-						s.data.Profiles[i].LastUsedAt = time.Now().Unix()
-					}
-				}
-			}
-			s.flagContaminatedLocked(a.Provider, doc)
-			syncdiag.Log(accountCtx, "account_reconcile_decision", "identity_source", identitySource,
-				"match_reason", matchReason, "capture", "tombstoned", "matched", id != "",
-				"previous_profile", diagnosticRef(previous), "profile", diagnosticRef(id), "active_changed", previous != s.active[a.Provider])
-			continue
 		}
 		if s.recoverLocked(a.Provider, doc, hash) {
 			changed = true
 		}
 		captured := ""
-		captureStatus := "disabled_or_readonly"
-		if s.data.Enabled && a.Writable() {
+		captureStatus := "disabled"
+		// Saving a copy needs no write to the live store, so a read-only
+		// store still lists and manages its account; whether the account can
+		// be switched to is decided at switch time. Writable used to gate the
+		// capture too, which made a read-only live login the one account the
+		// manual capture button could add and the refresh could not.
+		if s.data.Enabled {
 			if s.unattributableLocked(a.Provider, doc) {
 				captureStatus = "unattributable"
 				// The document carries no identity and shares no token with
@@ -400,12 +491,26 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 				captureStatus = "saved"
 				captured = p.ID
 				changed = true
+				if tombstoned {
+					// The live login outranks a removal recorded on
+					// another device: drop the tombstone and stamp the
+					// profile newer, or the next sync retires the account
+					// the user still signs in to.
+					if err := s.clearTombstoneLocked(a.Provider, key, &p); err != nil {
+						syncdiag.Log(accountCtx, "account_tombstone_clear_failed", "error", syncdiag.ErrorCode(err))
+					}
+				}
 			} else {
 				captureStatus = "write_failed"
 				syncdiag.Log(accountCtx, "account_capture_failed", "error", syncdiag.ErrorCode(err))
 			}
+		} else if bound != "" {
+			captureStatus = "tombstone_record"
 		}
 		id, matchReason := s.matchReasonLocked(a.Provider, doc, hash)
+		if id == "" {
+			id, matchReason = bound, "sync_tombstone_record"
+		}
 		if id == "" {
 			id = captured
 			if captured != "" {
@@ -426,12 +531,14 @@ func (s *Store) ReconcileContext(ctx context.Context, live []quota.Account) ([]P
 		s.flagContaminatedLocked(a.Provider, doc)
 		syncdiag.Log(accountCtx, "account_reconcile_decision", "identity_source", identitySource,
 			"match_reason", matchReason, "capture", captureStatus, "matched", id != "",
+			"tombstoned", tombstoned, "bound_record", bound != "",
 			"previous_profile", diagnosticRef(previous), "profile", diagnosticRef(id), "active_changed", previous != s.active[a.Provider])
 	}
 	for _, provider := range []string{"claude", "codex", "antigravity", "grok"} {
 		if s.hideLegacyDuplicatesLocked(provider) {
 			changed = true
 		}
+		s.flagCrossedCopiesLocked(provider)
 	}
 	if changed {
 		if err := s.saveLocked(); err != nil {
@@ -676,18 +783,24 @@ func (s *Store) Remove(provider, id string) error {
 	return errors.New("account not found")
 }
 
-// RemoveAll deletes every saved credential copy. It does not touch the
-// agents' live stores.
+// RemoveAll deletes every saved credential copy except the records the
+// agents are signed in to. An account in use is occupied: removing its copy
+// only makes the next refresh capture it again, and leaving it keeps the
+// roster naming the live sign-in. It does not touch the agents' live stores.
 func (s *Store) RemoveAll() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loadLocked()
+	kept := make([]Profile, 0, len(s.data.Profiles))
 	for _, p := range s.data.Profiles {
+		if s.active[p.Provider] == p.ID {
+			kept = append(kept, p)
+			continue
+		}
 		s.suppressBackupLocked(p)
 		_ = os.Remove(s.credentialPath(p.Provider, p.ID))
 	}
-	s.data.Profiles = nil
-	s.active = map[string]string{}
+	s.data.Profiles = kept
 	return s.saveLocked()
 }
 
@@ -864,6 +977,9 @@ func (s *Store) repairLocked() bool {
 	}
 	if s.unsuppressSurvivorsLocked() {
 		changed = true
+	}
+	for _, provider := range []string{"claude", "codex", "antigravity", "grok"} {
+		s.flagCrossedCopiesLocked(provider)
 	}
 	return changed
 }

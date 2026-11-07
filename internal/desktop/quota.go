@@ -457,13 +457,13 @@ func (a *App) tabbedAccountBody(c *ui.Context, grp providerQuotaGroup) {
 			profileID := selected.profileID
 			if !selectedLive && profileID != "" {
 				switching := a.accountUI.switching[grp.provider]
-				sw := ui.ButtonBase(c.Key("sw/"+profileID)).Label(a.t("Switch to this account", "切为此账号")).Padding(3, 10).Radius(4).Background(t.Accent.Alpha(.15)).Border(1, t.Accent.Alpha(.35)).Disabled(switching || !a.canSwitchProfile(grp.provider, profileID))
+				sw := ui.ButtonBase(c.Key("sw/"+profileID)).Label(a.t("Switch to this account", "切为此账号")).Gap(5).Padding(3, 10).Radius(4).Background(t.Accent.Alpha(.15)).Border(1, t.Accent.Alpha(.35)).Disabled(switching || !a.canSwitchProfile(grp.provider, profileID))
 				if sw.Hovered() {
 					sw.Background(t.Accent.Alpha(.25))
 				}
 				sw.Children(func() {
 					if switching {
-						ui.Spinner(c)
+						ui.Spinner(c).Size(10.5, 10.5)
 						ui.Text(c, a.t("Switching…", "正在切换…")).FontSize(10.5).TextColor(t.TextMuted).NoWrap()
 					} else {
 						ui.Text(c, a.t("Switch to this account", "切为此账号")).FontSize(10.5).FontWeight(600).TextColor(t.Accent).NoWrap()

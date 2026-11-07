@@ -1,0 +1,6 @@
+=== RUN   TestRemoveAllKeepsTheAccountInUse
+    sync_test.go:220: remove all did not keep the account in use: []
+--- FAIL: TestRemoveAllKeepsTheAccountInUse (0.07s)
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/accounts	0.698s
+FAIL

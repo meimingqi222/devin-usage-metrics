@@ -85,6 +85,50 @@ func Of(provider string, doc map[string]any) Identity {
 	return Identity{}
 }
 
+// Claims is the identity the agent or issuer actually wrote, without the
+// fields this app stamps for naming. Of merges those stamped values back in
+// (doc["email"], Antigravity's id_token_email row) because they are the only
+// name some documents carry; comparing two documents' provenance needs the
+// unmerged form - a stamped name cannot testify which account signed the
+// tokens.
+func Claims(provider string, doc map[string]any) Identity {
+	switch provider {
+	case "claude":
+		oauth := obj(doc["claudeAiOauth"])
+		email := str(oauth["emailAddress"])
+		org := str(doc["organizationUuid"])
+		account := str(oauth["accountUuid"])
+		return Identity{Stable: join(email, org, account), Email: email, Plan: str(oauth["subscriptionType"])}
+	case "codex":
+		tokens := obj(doc["tokens"])
+		claims := jwtClaims(str(tokens["id_token"]))
+		auth := obj(claims["https://api.openai.com/auth"])
+		email := str(claims["email"])
+		if email == "" {
+			email = str(obj(claims["https://api.openai.com/profile"])["email"])
+		}
+		account := str(tokens["account_id"])
+		if account == "" {
+			account = str(auth["chatgpt_account_id"])
+		}
+		return Identity{Stable: join(email, account), Email: email, Plan: str(auth["chatgpt_plan_type"])}
+	case "antigravity":
+		token := doc
+		if nested := obj(doc["token"]); nested != nil {
+			token = nested
+		}
+		idToken := str(token["id_token"])
+		if idToken == "" {
+			idToken = str(doc["id_token"])
+		}
+		claims := jwtClaims(idToken)
+		return Identity{Stable: join(str(claims["email"]), str(claims["sub"])), Email: str(claims["email"])}
+	case "grok":
+		return Of(provider, doc)
+	}
+	return Identity{}
+}
+
 // Label is the account name a person reads: email first, then the stable key.
 func Label(provider string, id Identity) string {
 	if id.Email != "" {

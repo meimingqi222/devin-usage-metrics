@@ -144,7 +144,12 @@ func TestAccountSyncMergesConcurrentRenameAndTokenRefresh(t *testing.T) {
 	}
 }
 
-func TestAccountSyncDeletionSurvivesQuotaDiscoveryAndExplicitRestore(t *testing.T) {
+// TestQuotaDiscoveryRestoresDeletedLiveAccountAndSyncKeepsIt pins the
+// tombstone rule: a deletion stops sync from filing a removed copy back,
+// but it must not hide the sign-in this device still uses. The refresh
+// re-adds that account and drops the tombstone, and the profile's stamp
+// then outranks the stale deletion snapshot so sync cannot retire it again.
+func TestQuotaDiscoveryRestoresDeletedLiveAccountAndSyncKeepsIt(t *testing.T) {
 	s, p := syncStore(t)
 	doc, err := s.ProfileCredential(p.Provider, p.ID)
 	if err != nil {
@@ -158,15 +163,67 @@ func TestAccountSyncDeletionSurvivesQuotaDiscoveryAndExplicitRestore(t *testing.
 	deleted, _ := s.Snapshot()
 	s = Open()
 	profiles, err := s.Reconcile(quota.Discover(false))
-	if err != nil || len(profiles) != 0 {
-		t.Fatal("quota discovery recreated a deleted account")
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("quota discovery did not restore the live account: %+v %v", profiles, err)
+	}
+	if len(s.data.Deleted) != 0 {
+		t.Fatalf("the tombstone survived the live login: %v", s.data.Deleted)
 	}
 	if _, err := s.Add(p.Provider, doc, p.Kind); err != nil {
 		t.Fatal(err)
 	}
 	r, err := s.ApplySync(deleted)
 	if err != nil || r.Removed != 0 || len(s.List()) != 1 {
-		t.Fatal("explicit capture could not restore a previously deleted account")
+		t.Fatalf("a stale deletion snapshot retired the restored account: %+v %v", r, err)
+	}
+}
+
+// TestRemoveAllKeepsTheAccountInUse pins the occupied-account rule: the
+// sign-in an agent holds is captured again by the next refresh, so removing
+// its copy would only undo itself. Everything else goes, with a tombstone.
+func TestRemoveAllKeepsTheAccountInUse(t *testing.T) {
+	h := fixture(t)
+	write(t, h, ".claude/.credentials.json", claudeDoc("live@example.com", "org-1", "a1", "r1"))
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Reconcile(quota.Discover(false)); err != nil {
+		t.Fatal(err)
+	}
+	var spareDoc map[string]any
+	if err := json.Unmarshal([]byte(claudeDoc("spare@example.com", "org-2", "a2", "r2")), &spareDoc); err != nil {
+		t.Fatal(err)
+	}
+	spare, err := s.Add("claude", spareDoc, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := s.Reconcile(quota.Discover(false))
+	if err != nil || len(live) != 2 {
+		t.Fatalf("setup: %+v %v", live, err)
+	}
+	inUse := ""
+	for _, p := range live {
+		if p.Active {
+			inUse = p.ID
+		}
+	}
+	if inUse == "" || inUse == spare.ID {
+		t.Fatalf("no live account bound: %+v", live)
+	}
+	if err := s.RemoveAll(); err != nil {
+		t.Fatal(err)
+	}
+	kept := s.List()
+	if len(kept) != 1 || kept[0].ID != inUse {
+		t.Fatalf("remove all did not keep the account in use: %+v", kept)
+	}
+	if _, err := os.Stat(s.CredentialPath("claude", spare.ID)); !os.IsNotExist(err) {
+		t.Fatal("the spare account's saved copy survived")
+	}
+	if s.data.Deleted["claude/"+spare.ID] == 0 {
+		t.Fatal("the removed account was not tombstoned for sync")
 	}
 }
 

@@ -1,0 +1,6 @@
+=== RUN   TestCrossedCopyOfSavedLoginIsFlagged
+    antigravity_switch_test.go:642: signed claims: crossed copy stayed switchable: {ID:74d399dd2d71f99e Provider:antigravity Label:agiaomei@example.test Email:agiaomei@example.test StableID:agiaomei@example.test Plan: Kind:file Name: CreatedAt:1794000103 LastUsedAt:0 ModifiedAt:1794000103639009100 NameModifiedAt:0 Imported:false Credentials:3c7ac5a1766951b92d2d08a244c1b9bec1abb2bf7074033d6c6e2774ff79a174 Active:false Writable:true Reason: Hidden:false}
+--- FAIL: TestCrossedCopyOfSavedLoginIsFlagged (0.02s)
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/accounts	0.776s
+FAIL

@@ -594,3 +594,59 @@ func TestWriteAntigravityFilesMatchesClientShapes(t *testing.T) {
 		t.Fatalf("google_accounts: %#v", accounts)
 	}
 }
+
+// TestCrossedCopyOfSavedLoginIsFlagged guards the pair live-token
+// comparison cannot see: a record stamped with one account's name while
+// holding a sibling's sign-in. The crossed copy answers quota for the
+// sibling under the wrong name and would switch back to the copied login;
+// the record with stronger identity evidence keeps the account.
+func TestCrossedCopyOfSavedLoginIsFlagged(t *testing.T) {
+	fixture(t)
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	// The crossed copy: bare tokens stamped with another account's name by
+	// a past naming pass.
+	crossed, err := s.Add("antigravity", map[string]any{
+		"access_token": "a-x", "refresh_token": "r-x",
+		"email": "agiaomei@example.test",
+	}, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The true record of the copied login: the issuer's signed claims.
+	attested, err := s.Add("antigravity", map[string]any{
+		"access_token": "a-x", "refresh_token": "r-x",
+		"id_token": loginJWT(map[string]any{"email": "mmq@example.test", "sub": "sub-mmq"}),
+	}, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(stage string) {
+		t.Helper()
+		profiles := map[string]Profile{}
+		for _, p := range s.List() {
+			profiles[p.ID] = p
+		}
+		if len(profiles) != 2 {
+			t.Fatalf("%s: profiles = %+v", stage, profiles)
+		}
+		if p := profiles[crossed.ID]; p.Writable {
+			t.Fatalf("%s: crossed copy stayed switchable: %+v", stage, p)
+		}
+		if p := profiles[attested.ID]; !p.Writable {
+			t.Fatalf("%s: attested record lost its switch: %+v", stage, p)
+		}
+	}
+	check("signed claims")
+	// Bare-token captures rewrite the true record's file without claims;
+	// its email|sub record still outranks the stamped copy.
+	bare, _ := json.Marshal(map[string]any{
+		"access_token": "a-x", "refresh_token": "r-x", "email": "mmq@example.test",
+	})
+	if err := os.WriteFile(s.CredentialPath("antigravity", attested.ID), append(bare, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	check("claims-less overwrite")
+}
