@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/egoist/mygo/ui"
+	"github.com/meimingqi222/devin-usage-metrics/internal/analytics"
 	"github.com/meimingqi222/devin-usage-metrics/internal/model"
 	"github.com/meimingqi222/devin-usage-metrics/internal/pricing"
 )
@@ -17,6 +18,10 @@ import (
 type sessionsUIState struct {
 	group, hideSubagents, showHidden bool
 	hidden, collapsed                map[string]bool
+	// requestsOpen and requestLimit: the selected session's request table.
+	requestsOpen bool
+	requestLimit int
+	transcript   transcriptState
 }
 
 func loadSessionUI() sessionsUIState {
@@ -107,6 +112,12 @@ type sessionUsage struct {
 	cost          float64
 	priced, turns int
 	ttft          []float64
+	// speedOut and speedMs sum the output and generation windows of the
+	// requests whose timing measures a speed; results counts each outcome.
+	speedOut, speedMs float64
+	results           [4]int
+	// turns are the session's indexes into allData().Turns.
+	turnIdx []int
 }
 
 func (a *App) sessionCost(s model.Session) (float64, int, int) {
@@ -125,10 +136,17 @@ func (a *App) sessionUsage(s model.Session) sessionUsage {
 			models[sessionIdentity{session.Agent, session.DeviceID, session.Key}] = session.DisplayModel()
 		}
 		var calculator pricing.Calculator
-		for _, turn := range d.Turns {
+		for i, turn := range d.Turns {
 			key := sessionIdentity{turn.Agent, turn.DeviceID, turn.SessionKey}
 			usage := a.sessionCosts[key]
 			usage.turns++
+			usage.turnIdx = append(usage.turnIdx, i)
+			w, r := analytics.Decode(turn.OutputTokens, turn.TTFTMs, turn.TotalTimeMs)
+			usage.results[r]++
+			if r == analytics.SpeedMeasured {
+				usage.speedOut += turn.OutputTokens
+				usage.speedMs += w
+			}
 			if turn.TTFTMs > 0 {
 				usage.ttft = append(usage.ttft, turn.TTFTMs)
 			}
@@ -360,6 +378,7 @@ func (a *App) sessionRow(c *ui.Context, s model.Session, modes bool) {
 	if r.Clicked() {
 		copy := s
 		a.selected = &copy
+		a.sessionsUI.requestsOpen, a.sessionsUI.requestLimit = false, requestPage
 	}
 	r.Children(func() {
 		ui.Text(c, time.Unix(s.LastActivityAt, 0).Format("01-02 15:04")).Width(80).FontSize(12).TextColor(c.Theme().TextMuted).NoWrap()
@@ -449,12 +468,21 @@ func (a *App) sessionDetail(c *ui.Context, s model.Session) {
 			sort.Float64s(ttft)
 			activity = fmt.Sprintf(a.t("%.0f agent messages · %d turns in window · median TTFT %.0f ms", "%.0f 条 agent 消息 · 窗口内 %d 轮 · TTFT 中位 %.0f ms"), s.AgentMessages, u.turns, ttft[len(ttft)/2])
 		}
-		for _, v := range [][2]string{{a.t("Session", "会话"), s.ID + " · " + s.Source + " · " + s.AgentMode}, {a.t("Workdir", "工作目录"), s.WorkingDirectory}, {a.t("Model", "模型"), sessionModelText(s)}, {a.t("Time", "时间"), time.Unix(s.CreatedAt, 0).Format(time.DateTime) + " → " + time.Unix(s.LastActivityAt, 0).Format(time.DateTime)}, {"Tokens", fmt.Sprintf(a.t("In %s · Out %s · Cache Write %s · Cache Read %s · Total %s", "输入 %s · 输出 %s · 缓存写入 %s · 缓存读取 %s · 总计 %s"), formatTokens(s.InputTokens), formatTokens(s.OutputTokens), formatTokens(s.CacheCreationTokens), formatTokens(s.CachedTokens), formatTokens(s.TotalTokens()))}, {a.t("Cost", "费用"), costText}, {a.t("Activity", "活动"), activity}} {
-			ui.Row(c).Gap(8).Children(func() {
-				ui.Text(c, v[0]).Width(84).FontSize(12).TextColor(c.Theme().TextMuted)
-				ui.Text(c, v[1]).Grow(1).FontSize(12)
+		row := func(k string, v func()) {
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, k).Width(84).Shrink(0).FontSize(12).TextColor(c.Theme().TextMuted)
+				v()
 			})
 		}
+		text := func(k, v string) { row(k, func() { ui.Text(c, v).Grow(1).FontSize(12) }) }
+		for _, v := range [][2]string{{a.t("Session", "会话"), s.ID + " · " + s.Source + " · " + s.AgentMode}, {a.t("Workdir", "工作目录"), s.WorkingDirectory}, {a.t("Model", "模型"), sessionModelText(s)}, {a.t("Time", "时间"), time.Unix(s.CreatedAt, 0).Format(time.DateTime) + " → " + time.Unix(s.LastActivityAt, 0).Format(time.DateTime)}, {"Tokens", fmt.Sprintf(a.t("In %s · Out %s · Cache Write %s · Cache Read %s · Total %s", "输入 %s · 输出 %s · 缓存写入 %s · 缓存读取 %s · 总计 %s"), formatTokens(s.InputTokens), formatTokens(s.OutputTokens), formatTokens(s.CacheCreationTokens), formatTokens(s.CachedTokens), formatTokens(s.TotalTokens()))}} {
+			text(v[0], v[1])
+		}
+		row(a.t("Cache hits", "缓存命中"), func() { a.sessionCacheHit(c, s) })
+		row(a.t("Output speed", "输出速度"), func() { a.sessionSpeed(c, u) })
+		text(a.t("Cost", "费用"), costText)
+		text(a.t("Activity", "活动"), activity)
+		a.sessionRequests(c, u)
 		ui.Row(c).Gap(8).Padding(8, 0, 0).BorderWidth(1, 0, 0, 0).BorderColor(c.Theme().Border.Alpha(.4)).Children(func() {
 			if textButton(c, a.t("Copy ID", "复制 ID"), true).Clicked() {
 				a.copy(c, s.ID)
@@ -466,6 +494,9 @@ func (a *App) sessionDetail(c *ui.Context, s model.Session) {
 			}
 			if textButton(c, a.t("Copy path", "复制路径"), true).Clicked() {
 				a.copy(c, s.WorkingDirectory)
+			}
+			if a.canShowTranscript(s) && textButton(c, a.t("Show conversation", "显示对话"), true).TextColor(c.Theme().Accent).Clicked() {
+				a.openTranscript(s)
 			}
 		})
 	})

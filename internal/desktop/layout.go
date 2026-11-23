@@ -105,6 +105,7 @@ func (a *App) View(c *ui.Context) {
 		})
 	})
 	a.settingsView(c)
+	a.transcriptDialog(c)
 	a.addAccountDialog(c)
 	a.accountSyncConfirms(c)
 	a.accountsConfirm(c)
