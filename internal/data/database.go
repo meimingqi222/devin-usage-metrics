@@ -555,8 +555,14 @@ func parseSQLAgent(ctx context.Context, d *model.Data, a model.Agent, db *sqlite
 			if c := num(v["cost"]); c > 0 {
 				t.RecordedCost = &c
 			}
-			start := first(get(v, "time", "created"), r["time_created"])
-			t.TotalTimeMs = max(0, num(get(v, "time", "completed"))-num(start))
+			start := num(first(get(v, "time", "created"), r["time_created"]))
+			end := num(first(get(v, "time", "streamed"), get(v, "time", "completed")))
+			if start > 0 && end >= start {
+				t.TotalTimeMs = end - start
+				if ft := num(get(v, "time", "firstToken")); ft >= start && ft <= end {
+					t.TTFTMs = ft - start
+				}
+			}
 			if s.AgentMode == "" {
 				s.AgentMode = str(v["mode"])
 			}

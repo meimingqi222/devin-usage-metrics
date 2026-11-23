@@ -139,3 +139,23 @@ func TestDecodeSeparatesStreamsFromBursts(t *testing.T) {
 		}
 	}
 }
+
+func TestFloorBoundsLongRepliesWithoutTTFT(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		out, total float64
+		window     float64
+		ok         bool
+	}{
+		{"long reply", 1500, 15000, 15000, true},
+		{"exact threshold", 1000, 1000, 1000, true},
+		{"too few tokens", 999, 10000, 0, false},
+		{"too short", 1200, 999, 0, false},
+		{"implausibly fast", 20000, 1000, 0, false},
+	} {
+		w, ok := analytics.Floor(c.out, c.total)
+		if w != c.window || ok != c.ok {
+			t.Errorf("%s: floor %v %v, want %v %v", c.name, w, ok, c.window, c.ok)
+		}
+	}
+}

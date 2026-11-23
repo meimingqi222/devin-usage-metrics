@@ -61,6 +61,25 @@ func ts(v any) int64 {
 	}
 	return n
 }
+
+const maxTurnDurationMs = 2 * 3600 * 1000
+
+func tsMs(v any) int64 {
+	if s, ok := v.(string); ok {
+		t, e := time.Parse(time.RFC3339Nano, s)
+		if e == nil {
+			return t.UnixMilli()
+		}
+	}
+	n := int64(num(v))
+	if n <= 0 {
+		return 0
+	}
+	if n > 10000000000 {
+		return n
+	}
+	return n * 1000
+}
 func first(v ...any) any {
 	for _, x := range v {
 		if x != nil {
@@ -690,6 +709,11 @@ func codexHome() string {
 	return home(".codex")
 }
 
+type codexTurnTrack struct {
+	count    int
+	firstIdx int
+}
+
 // fileParser accounts one JSONL transcript. Sessions span files, since a
 // resumed session continues in a new one; id, the active model and order
 // are the file's own, and records may switch id mid-file.
@@ -704,6 +728,13 @@ type fileParser struct {
 	// other agents' turns as they appear.
 	latest  map[string]model.Turn
 	ordered []model.Turn
+	// Timing state within the file for Claude Code and Codex.
+	claudeAskedMs    int64
+	claudeFirstAsked map[string]int64
+	codexTurnID      string
+	codexAskedMs     int64
+	codexTurns       map[string]*codexTurnTrack
+	codexSeen        map[string]bool
 }
 
 func newFileParser(a model.Agent, p string, sessions map[string]*model.Session) *fileParser {
@@ -716,7 +747,13 @@ func newFileParser(a model.Agent, p string, sessions map[string]*model.Session) 
 			id = id[i+1:]
 		}
 	}
-	f := &fileParser{a: a, p: p, id: id, stream: "main", sessions: sessions, latest: map[string]model.Turn{}}
+	f := &fileParser{
+		a: a, p: p, id: id, stream: "main", sessions: sessions,
+		latest:           map[string]model.Turn{},
+		claudeFirstAsked: map[string]int64{},
+		codexTurns:       map[string]*codexTurnTrack{},
+		codexSeen:        map[string]bool{},
+	}
 	if a == model.Claude && filepath.Base(filepath.Dir(p)) == "subagents" {
 		f.id = filepath.Base(filepath.Dir(filepath.Dir(p)))
 		f.stream = "subagent/" + strings.TrimSuffix(filepath.Base(p), ".jsonl")
@@ -777,13 +814,14 @@ func (f *fileParser) line(v obj) {
 	if kind == "custom-title" {
 		s.Title = compact(str(v["customTitle"]))
 	}
+	atMs := tsMs(v["timestamp"])
 	t := model.Turn{Agent: f.a, SessionKey: s.Key, CreatedAt: at, ContextStream: f.stream, ContextOrder: f.order - 1}
 	valid := false
 	switch f.a {
 	case model.Claude:
-		f.claude(v, s, t, kind, m)
+		f.claude(v, s, t, kind, m, atMs)
 	case model.Codex:
-		t, valid = f.codex(s, t, kind, payload)
+		t, valid = f.codex(s, t, kind, payload, atMs)
 	case model.Pi:
 		t, valid = pi(v, s, t, kind, m)
 	case model.Omp:
@@ -798,12 +836,18 @@ func (f *fileParser) line(v obj) {
 
 // claude keeps the last record of each message: streaming writes the same
 // message id several times with growing usage.
-func (f *fileParser) claude(v obj, s *model.Session, t model.Turn, kind string, m any) {
+func (f *fileParser) claude(v obj, s *model.Session, t model.Turn, kind string, m any, atMs int64) {
 	if x := str(v["entrypoint"]); x != "" {
 		s.Source = x
 	}
 	if x := str(v["effort"]); x != "" {
 		s.AgentMode = x
+	}
+	if kind == "user" {
+		if atMs > 0 {
+			f.claudeAskedMs = atMs
+		}
+		return
 	}
 	if kind != "assistant" {
 		return
@@ -827,10 +871,18 @@ func (f *fileParser) claude(v obj, s *model.Session, t model.Turn, kind string, 
 	if t.DedupKey == "" {
 		t.DedupKey = fmt.Sprintf("anon:%s:%d", f.p, f.order)
 	}
+	asked, ok := f.claudeFirstAsked[t.DedupKey]
+	if !ok {
+		asked = f.claudeAskedMs
+		f.claudeFirstAsked[t.DedupKey] = asked
+	}
+	if asked > 0 && atMs > asked && atMs-asked < maxTurnDurationMs {
+		t.TotalTimeMs = float64(atMs - asked)
+	}
 	f.latest[t.DedupKey] = t
 }
 
-func (f *fileParser) codex(s *model.Session, t model.Turn, kind string, payload any) (model.Turn, bool) {
+func (f *fileParser) codex(s *model.Session, t model.Turn, kind string, payload any, atMs int64) (model.Turn, bool) {
 	s.WorkingDirectory = str(first(get(payload, "cwd"), s.WorkingDirectory))
 	switch kind {
 	case "session_meta":
@@ -849,15 +901,52 @@ func (f *fileParser) codex(s *model.Session, t model.Turn, kind string, payload 
 		f.activeModel = str(get(payload, "model"))
 		s.SelectedModel = f.activeModel
 		s.AgentMode = str(first(get(payload, "collaboration_mode", "kind"), get(payload, "collaboration_mode")))
+		if tid := str(get(payload, "turn_id")); tid != "" {
+			f.codexTurnID = tid
+		}
 	case "response_item":
-		if s.Title == "" && str(get(payload, "role")) == "user" {
+		role := str(get(payload, "role"))
+		if s.Title == "" && role == "user" {
 			s.Title = text(get(payload, "content"))
 		}
-	case "event_msg":
-		if str(get(payload, "type")) == "user_message" && s.Title == "" {
-			s.Title = compact(str(get(payload, "message")))
+		itemType := str(get(payload, "type"))
+		if atMs > 0 && (role == "user" || itemType == "function_call_output" || itemType == "custom_tool_call_output") {
+			f.codexAskedMs = atMs
 		}
-		if str(get(payload, "type")) != "token_count" {
+	case "event_msg":
+		switch str(get(payload, "type")) {
+		case "task_started":
+			if tid := str(get(payload, "turn_id")); tid != "" {
+				f.codexTurnID = tid
+			}
+			if atMs > 0 {
+				f.codexAskedMs = atMs
+			}
+			return t, false
+		case "user_message":
+			if s.Title == "" {
+				s.Title = compact(str(get(payload, "message")))
+			}
+			if atMs > 0 {
+				f.codexAskedMs = atMs
+			}
+			return t, false
+		case "task_complete":
+			tid := str(get(payload, "turn_id"))
+			if tid == "" {
+				tid = f.codexTurnID
+			}
+			if track := f.codexTurns[tid]; track != nil && track.count == 1 && track.firstIdx < len(f.ordered) {
+				if dur := num(get(payload, "duration_ms")); dur > 0 {
+					f.ordered[track.firstIdx].TotalTimeMs = dur
+					if ft := num(get(payload, "time_to_first_token_ms")); ft > 0 && ft <= dur {
+						f.ordered[track.firstIdx].TTFTMs = ft
+					}
+				}
+			}
+			return t, false
+		case "token_count":
+		default:
 			return t, false
 		}
 		u := get(payload, "info", "last_token_usage")
@@ -873,6 +962,23 @@ func (f *fileParser) codex(s *model.Session, t model.Turn, kind string, payload 
 		t.OutputTokens = num(get(u, "output_tokens"))
 		t.CacheCreationTokens = num(get(u, "cache_write_input_tokens"))
 		t.Model = f.activeModel
+		if !f.codexSeen[t.DedupKey] {
+			f.codexSeen[t.DedupKey] = true
+			if f.codexAskedMs > 0 && atMs > f.codexAskedMs && atMs-f.codexAskedMs < maxTurnDurationMs {
+				t.TotalTimeMs = float64(atMs - f.codexAskedMs)
+			}
+			if atMs > 0 {
+				f.codexAskedMs = atMs
+			}
+			if f.codexTurnID != "" {
+				track := f.codexTurns[f.codexTurnID]
+				if track == nil {
+					track = &codexTurnTrack{firstIdx: len(f.ordered)}
+					f.codexTurns[f.codexTurnID] = track
+				}
+				track.count++
+			}
+		}
 		return t, true
 	}
 	return t, false
@@ -895,6 +1001,7 @@ func pi(v obj, s *model.Session, t model.Turn, kind string, m any) (model.Turn, 
 		t.RecordedCost = &cost
 	}
 	t.Model = modelName(str(get(m, "provider")), str(get(m, "model")))
+	t.TotalTimeMs = max(0, num(get(m, "durationMs")))
 	s.SelectedModel = t.Model
 	return t, true
 }

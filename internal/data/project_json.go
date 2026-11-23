@@ -32,9 +32,11 @@ var transcriptProjections = func() map[model.Agent]*jsonProjection {
 		p.fields["message"].fields["content"] = title
 		switch a {
 		case model.Codex:
-			p.fields["payload"] = keepJSON("id", "session_id", "cwd", "source", "model", "collaboration_mode", "role", "type", "message", "info")
+			p.fields["payload"] = keepJSON("id", "session_id", "cwd", "source", "model", "collaboration_mode", "role", "type", "message", "info", "turn_id", "duration_ms", "time_to_first_token_ms")
 			p.fields["payload"].fields["content"] = title
 			p.fields["payload"].fields["info"] = keepJSON("last_token_usage", "total_token_usage")
+		case model.Pi:
+			p.fields["message"].fields["durationMs"] = nil
 		case model.WorkBuddy:
 			p.fields["providerData"] = keepJSON("usage", "rawUsage", "agent", "messageId", "model", "requestModelId", "requestModelName")
 		}

@@ -189,3 +189,26 @@ func TestSessionDetailMetricsAndConversation(t *testing.T) {
 		t.Fatal("dialog stayed open")
 	}
 }
+
+func TestSessionDetailFloorSpeedWithoutTTFT(t *testing.T) {
+	a := fixture(t)
+	a.lang = "zh"
+	a.agent = model.Claude
+	now := time.Now()
+	s := model.Session{Agent: model.Claude, Key: "claude-code/floor", ID: "floor", Source: "cli", Title: "长回复下限测速验证", WorkingDirectory: "/projects/demo", SelectedModel: "claude-sonnet-4", DeviceID: a.localID, InputTokens: 2000, OutputTokens: 1700, AgentMessages: 2, CreatedAt: now.Add(-time.Minute).Unix(), LastActivityAt: now.Unix()}
+	turns := []model.Turn{
+		{Agent: model.Claude, SessionKey: s.Key, DeviceID: a.localID, Model: "claude-sonnet-4", CreatedAt: now.Add(-30 * time.Second).Unix(), InputTokens: 1000, OutputTokens: 1500, TotalTimeMs: 15000},
+		{Agent: model.Claude, SessionKey: s.Key, DeviceID: a.localID, Model: "claude-sonnet-4", CreatedAt: now.Unix(), InputTokens: 1000, OutputTokens: 200, TotalTimeMs: 4000},
+	}
+	a.storeLoaded(model.Claude, model.Data{Sessions: []model.Session{s}, Turns: turns})
+	tt := ui.NewTester(a.View, 1240, 860)
+	click(t, tt, "会话")
+	click(t, tt, s.Title)
+	click(t, tt, "展开")
+	tt.Frame()
+	for _, want := range []string{"≥ 100 tok/s", "· 1/2 条下限估算 · 含等待首 token"} {
+		if !tt.HasText(want) {
+			t.Fatalf("floor speed detail missing %q: %v", want, tt.Texts())
+		}
+	}
+}

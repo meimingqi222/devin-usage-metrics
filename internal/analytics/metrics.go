@@ -33,6 +33,8 @@ const (
 	maxDecodeSpeed = 10000
 	heldWindowMs   = 1000
 	heldShare      = 4
+	minFloorTokens = 1000
+	minFloorMs     = 1000
 )
 
 // Decode returns the generation window in ms of a request that wrote out
@@ -51,4 +53,14 @@ func Decode(out, ttft, total float64) (window float64, r SpeedResult) {
 		return 0, SpeedBurst
 	}
 	return w, SpeedMeasured
+}
+
+// Floor returns a lower-bound generation window in ms when a request recorded
+// total duration (including wait for the first token) without a usable TTFT.
+// Below minFloorTokens or minFloorMs the wait dominates too much to be useful.
+func Floor(out, total float64) (window float64, ok bool) {
+	if out < minFloorTokens || total < minFloorMs || out*1000 > maxDecodeSpeed*total {
+		return 0, false
+	}
+	return total, true
 }

@@ -170,18 +170,23 @@ func (a *App) speedWhy(r analytics.SpeedResult) string {
 func (a *App) sessionSpeed(c *ui.Context, u sessionUsage) {
 	t := c.Theme()
 	measured := u.results[analytics.SpeedMeasured]
-	if measured == 0 || u.speedMs <= 0 {
-		why := a.speedWhy(analytics.SpeedNoTiming)
-		if u.results[analytics.SpeedBurst] > 0 {
-			why = a.speedWhy(analytics.SpeedBurst)
-		} else if u.results[analytics.SpeedNoTTFT] > 0 {
-			why = a.speedWhy(analytics.SpeedNoTTFT)
-		}
-		ui.Text(c, "— · "+why).Grow(1).FontSize(12).TextColor(t.TextMuted)
+	if measured > 0 && u.speedMs > 0 {
+		ui.Text(c, fmt.Sprintf("%.0f tok/s", u.speedOut*1000/u.speedMs)).FontSize(12).TextColor(t.Accent)
+		ui.Text(c, fmt.Sprintf(a.t("· %d/%d requests timed · excludes the wait for the first token", "· %d/%d 条有可用计时 · 不含等待首 token"), measured, u.turns)).Grow(1).FontSize(12).TextColor(t.TextMuted)
 		return
 	}
-	ui.Text(c, fmt.Sprintf("%.0f tok/s", u.speedOut*1000/u.speedMs)).FontSize(12).TextColor(t.Accent)
-	ui.Text(c, fmt.Sprintf(a.t("· %d/%d requests timed · excludes the wait for the first token", "· %d/%d 条有可用计时 · 不含等待首 token"), measured, u.turns)).Grow(1).FontSize(12).TextColor(t.TextMuted)
+	if u.floorCount > 0 && u.floorMs > 0 {
+		ui.Text(c, fmt.Sprintf("≥ %.0f tok/s", u.floorOut*1000/u.floorMs)).FontSize(12).TextColor(t.Accent)
+		ui.Text(c, fmt.Sprintf(a.t("· %d/%d lower-bound · includes wait for first token", "· %d/%d 条下限估算 · 含等待首 token"), u.floorCount, u.turns)).Grow(1).FontSize(12).TextColor(t.TextMuted)
+		return
+	}
+	why := a.speedWhy(analytics.SpeedNoTiming)
+	if u.results[analytics.SpeedBurst] > 0 {
+		why = a.speedWhy(analytics.SpeedBurst)
+	} else if u.results[analytics.SpeedNoTTFT] > 0 {
+		why = a.speedWhy(analytics.SpeedNoTTFT)
+	}
+	ui.Text(c, "— · "+why).Grow(1).FontSize(12).TextColor(t.TextMuted)
 }
 
 // sessionRequests is the expandable table of the session's model calls in
@@ -248,6 +253,8 @@ func (a *App) sessionRequests(c *ui.Context, u sessionUsage) {
 				}
 				if w, r := analytics.Decode(turn.OutputTokens, turn.TTFTMs, turn.TotalTimeMs); r == analytics.SpeedMeasured {
 					cell(fmt.Sprintf("%.0f tok/s", turn.OutputTokens*1000/w), 7, t.Text, "")
+				} else if fw, ok := analytics.Floor(turn.OutputTokens, turn.TotalTimeMs); ok {
+					cell(fmt.Sprintf("≥ %.0f tok/s", turn.OutputTokens*1000/fw), 7, t.TextMuted, a.t("includes wait for first token; actual speed is at least this", "含等待首 token，真实速度不低于此值"))
 				} else {
 					cell("—", 7, t.TextMuted, a.speedWhy(r))
 				}

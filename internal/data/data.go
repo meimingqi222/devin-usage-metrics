@@ -122,8 +122,12 @@ func DeviceName() string {
 // snapshots. A change to the snapshot envelope must invalidate every importer.
 func snapshotVersion(agent model.Agent) int {
 	switch agent {
-	case model.Antigravity, model.Devin, model.Grok, model.OpenCode, model.MimoCode:
+	case model.OpenCode, model.MimoCode:
+		return 13
+	case model.Antigravity, model.Devin, model.Grok:
 		return 12
+	case model.Claude, model.Codex, model.Pi:
+		return 11
 	default:
 		return 10
 	}

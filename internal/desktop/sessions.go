@@ -114,7 +114,11 @@ type sessionUsage struct {
 	ttft          []float64
 	// speedOut and speedMs sum the output and generation windows of the
 	// requests whose timing measures a speed; results counts each outcome.
+	// floorOut/floorMs/floorCount hold lower-bound estimates (including TTFT)
+	// for long replies without TTFT.
 	speedOut, speedMs float64
+	floorOut, floorMs float64
+	floorCount        int
 	results           [4]int
 	// turns are the session's indexes into allData().Turns.
 	turnIdx []int
@@ -146,6 +150,10 @@ func (a *App) sessionUsage(s model.Session) sessionUsage {
 			if r == analytics.SpeedMeasured {
 				usage.speedOut += turn.OutputTokens
 				usage.speedMs += w
+			} else if fw, ok := analytics.Floor(turn.OutputTokens, turn.TotalTimeMs); ok {
+				usage.floorOut += turn.OutputTokens
+				usage.floorMs += fw
+				usage.floorCount++
 			}
 			if turn.TTFTMs > 0 {
 				usage.ttft = append(usage.ttft, turn.TTFTMs)

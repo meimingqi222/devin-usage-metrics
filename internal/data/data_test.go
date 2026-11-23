@@ -799,7 +799,7 @@ func TestParserUpdatesKeepUnchangedAgentSnapshots(t *testing.T) {
 		agent model.Agent
 		turns int
 	}{
-		{model.Pi, 1},
+		{model.WorkBuddy, 1},
 		{model.Grok, 0},
 	} {
 		old := map[string]any{"Version": 10, "At": time.Now().Unix(), "Data": model.Data{
@@ -1072,5 +1072,102 @@ func TestAntigravityStepTimes(t *testing.T) {
 		if g := got[at]; g != w {
 			t.Errorf("turn at %d: ttft/total %v, want %v", at, g, w)
 		}
+	}
+}
+
+func TestOpenCodeAndPiTiming(t *testing.T) {
+	h := env(t)
+	conn := db(t, h, ".local/share/opencode/opencode.db")
+	exec(t, conn, "CREATE TABLE session_v2(id TEXT,parent_id TEXT,directory TEXT,title TEXT,agent TEXT,model TEXT,time_created INTEGER,time_updated INTEGER)")
+	exec(t, conn, "INSERT INTO session_v2 VALUES ('s',NULL,'/project','v2','build','{}',100000000000,100000090000)")
+	exec(t, conn, "CREATE TABLE session_message(session_id TEXT,time_created INTEGER,type TEXT,data TEXT)")
+	// 1. Both firstToken and streamed present: TotalTimeMs uses streamed (excludes tool time after streamed).
+	exec(t, conn, "INSERT INTO session_message VALUES ('s',100000010000,'assistant',?)",
+		`{"model":{"id":"m"},"tokens":{"output":100},"time":{"created":100000010000,"firstToken":100000011200,"streamed":100000013000,"completed":100000025000}}`)
+	// 2. firstToken without streamed: falls back to completed.
+	exec(t, conn, "INSERT INTO session_message VALUES ('s',100000030000,'assistant',?)",
+		`{"model":{"id":"m"},"tokens":{"output":50},"time":{"created":100000030000,"firstToken":100000030800,"completed":100000032800}}`)
+	// 3. No firstToken: keeps TotalTimeMs, TTFTMs stays 0.
+	exec(t, conn, "INSERT INTO session_message VALUES ('s',100000040000,'assistant',?)",
+		`{"model":{"id":"m"},"tokens":{"output":50},"time":{"created":100000040000,"completed":100000044000}}`)
+	// 4. Out-of-range firstToken (> streamed): TotalTimeMs kept, TTFTMs ignored.
+	exec(t, conn, "INSERT INTO session_message VALUES ('s',100000050000,'assistant',?)",
+		`{"model":{"id":"m"},"tokens":{"output":50},"time":{"created":100000050000,"firstToken":100000055000,"streamed":100000052000,"completed":100000056000}}`)
+	d := data.Load(model.OpenCode, 0, 200000000, true)
+	check(t, d, 4)
+	got := map[int64][2]float64{}
+	for _, turn := range d.Turns {
+		got[turn.CreatedAt] = [2]float64{turn.TTFTMs, turn.TotalTimeMs}
+	}
+	want := map[int64][2]float64{
+		100000010: {1200, 3000},
+		100000030: {800, 2800},
+		100000040: {0, 4000},
+		100000050: {0, 2000},
+	}
+	for at, w := range want {
+		if g := got[at]; g != w {
+			t.Errorf("opencode turn at %d: ttft/total %v, want %v", at, g, w)
+		}
+	}
+
+	write(t, h, ".pi/agent/sessions/p/s.jsonl",
+		`{"type":"session","id":"s","timestamp":100}`+"\n"+
+			`{"type":"message","timestamp":101,"message":{"role":"assistant","provider":"p","model":"m","durationMs":2345,"usage":{"input":10,"output":20}}}`+"\n")
+	pd := data.Load(model.Pi, 0, 200, true)
+	check(t, pd, 1)
+	if pd.Turns[0].TTFTMs != 0 || pd.Turns[0].TotalTimeMs != 2345 {
+		t.Errorf("pi turn timing: ttft=%v total=%v, want 0/2345", pd.Turns[0].TTFTMs, pd.Turns[0].TotalTimeMs)
+	}
+}
+
+func TestClaudeAndCodexTiming(t *testing.T) {
+	h := env(t)
+	// Claude Code: streaming assistant lines for the same message id measure from
+	// the preceding user message to the final assistant line.
+	write(t, h, ".claude/projects/p/s.jsonl", strings.Join([]string{
+		`{"type":"user","timestamp":"2026-11-23T03:00:00.000Z","message":{"role":"user","content":"hi"}}`,
+		`{"type":"assistant","timestamp":"2026-11-23T03:00:02.500Z","message":{"id":"m1","model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":500}}}`,
+		`{"type":"assistant","timestamp":"2026-11-23T03:00:12.500Z","message":{"id":"m1","model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":1500}}}`,
+		`{"type":"user","timestamp":"2026-11-23T03:00:15.000Z","message":{"role":"user","content":"next"}}`,
+		`{"type":"assistant","timestamp":"2026-11-23T03:00:18.200Z","message":{"id":"m2","model":"claude-sonnet-4","usage":{"input_tokens":20,"output_tokens":300}}}`,
+	}, "\n")+"\n")
+	cd := data.Load(model.Claude, 0, 1800000000, true)
+	check(t, cd, 2)
+	if cd.Turns[0].TTFTMs != 0 || cd.Turns[0].TotalTimeMs != 12500 {
+		t.Errorf("claude m1 timing: ttft=%v total=%v, want 0/12500", cd.Turns[0].TTFTMs, cd.Turns[0].TotalTimeMs)
+	}
+	if cd.Turns[1].TTFTMs != 0 || cd.Turns[1].TotalTimeMs != 3200 {
+		t.Errorf("claude m2 timing: ttft=%v total=%v, want 0/3200", cd.Turns[1].TTFTMs, cd.Turns[1].TotalTimeMs)
+	}
+
+	// Codex:
+	// Turn 1 has a single model call (even with a duplicate token_count event):
+	// task_complete fills both TTFTMs and TotalTimeMs.
+	// Turn 2 has two model calls: task_complete does NOT overwrite per-call durations,
+	// each call keeps its own timestamp-delta TotalTimeMs.
+	write(t, h, ".codex/sessions/2026/11/23/rollout.jsonl", strings.Join([]string{
+		`{"timestamp":"2026-11-23T03:00:00.000Z","type":"session_meta","payload":{"id":"cx1","cwd":"/p"}}`,
+		`{"timestamp":"2026-11-23T03:00:01.000Z","type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5"}}`,
+		`{"timestamp":"2026-11-23T03:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}`,
+		`{"timestamp":"2026-11-23T03:00:08.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":600},"total_token_usage":{"input_tokens":100,"output_tokens":600}}}}`,
+		`{"timestamp":"2026-11-23T03:00:08.010Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":600},"total_token_usage":{"input_tokens":100,"output_tokens":600}}}}`,
+		`{"timestamp":"2026-11-23T03:00:08.500Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","duration_ms":7200,"time_to_first_token_ms":1200}}`,
+		`{"timestamp":"2026-11-23T03:01:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t2"}}`,
+		`{"timestamp":"2026-11-23T03:01:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":200,"output_tokens":400},"total_token_usage":{"input_tokens":300,"output_tokens":1000}}}}`,
+		`{"timestamp":"2026-11-23T03:01:10.000Z","type":"response_item","payload":{"type":"function_call_output"}}`,
+		`{"timestamp":"2026-11-23T03:01:22.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":250,"output_tokens":1200},"total_token_usage":{"input_tokens":550,"output_tokens":2200}}}}`,
+		`{"timestamp":"2026-11-23T03:01:22.500Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t2","duration_ms":22500,"time_to_first_token_ms":1500}}`,
+	}, "\n")+"\n")
+	xd := data.Load(model.Codex, 0, 1800000000, true)
+	check(t, xd, 3)
+	if xd.Turns[0].TTFTMs != 1200 || xd.Turns[0].TotalTimeMs != 7200 {
+		t.Errorf("codex single-call turn: ttft=%v total=%v, want 1200/7200", xd.Turns[0].TTFTMs, xd.Turns[0].TotalTimeMs)
+	}
+	if xd.Turns[1].TTFTMs != 0 || xd.Turns[1].TotalTimeMs != 5000 {
+		t.Errorf("codex multi-call turn[1]: ttft=%v total=%v, want 0/5000", xd.Turns[1].TTFTMs, xd.Turns[1].TotalTimeMs)
+	}
+	if xd.Turns[2].TTFTMs != 0 || xd.Turns[2].TotalTimeMs != 12000 {
+		t.Errorf("codex multi-call turn[2]: ttft=%v total=%v, want 0/12000", xd.Turns[2].TTFTMs, xd.Turns[2].TotalTimeMs)
 	}
 }
