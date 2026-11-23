@@ -1,0 +1,26 @@
+> go test ./internal/data -run '^(TestGrokModelUsagePreservesAttributionAndTotals|TestSQLiteImportersReadOnlyAndParentRollup|TestDevinAdaptiveBilling|TestOpenCodeReadsBothSchemasWithoutDuplicatingMigratedMessages)$' -count=1
+Sanitized excerpts from the pre-fix run
+--- FAIL: TestGrokModelUsagePreservesAttributionAndTotals
+    want 5 turns [returned 3]
+--- FAIL: TestSQLiteImportersReadOnlyAndParentRollup
+    --- FAIL: TestSQLiteImportersReadOnlyAndParentRollup/opencode
+        reasoning tokens or recorded cost dropped [OutputTokens:0]
+    --- FAIL: TestSQLiteImportersReadOnlyAndParentRollup/mimocode
+        reasoning tokens or recorded cost dropped [OutputTokens:0]
+--- FAIL: TestDevinAdaptiveBilling
+    hidden request lost its billing route [BillingModel empty]
+--- FAIL: TestOpenCodeReadsBothSchemasWithoutDuplicatingMigratedMessages
+    want 2 turns [returned 0]
+
+> go test ./internal/data -run '^TestGrok(ModelUsagePreservesAttributionAndTotals|AggregateTicksDoNotDoubleChargeModelBreakdown)$' -count=1
+Sanitized excerpts from the review run
+--- FAIL: TestGrokModelUsagePreservesAttributionAndTotals
+    turn 0: OutputTokens:8, want 6
+    turn 1: OutputTokens:11, want 9
+--- FAIL: TestGrokAggregateTicksDoNotDoubleChargeModelBreakdown
+    expected only the two model rows, got 3 turns and 0 errors
+
+> go test ./internal/syncclient -run '^TestPublishReplacesChangedTurnsOfLocalSessions$' -count=1
+--- FAIL: TestPublishReplacesChangedTurnsOfLocalSessions
+    old route still published for hidden Devin turn
+    published both routed and unrouted copies of the hidden Devin turn

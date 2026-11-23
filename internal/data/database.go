@@ -261,6 +261,11 @@ func parseDevin(ctx context.Context, d *model.Data, db *sqlite.DB, source string
 	for _, r := range rows {
 		id := str(r["id"])
 		ids[id] = true
+		selected := str(r["model"])
+		// Hidden sessions still contribute requests and need their billing route.
+		if selected == "adaptive" || selected == "devin/adaptive" {
+			adaptiveSessions[source+"/"+id] = true
+		}
 		if num(r["hidden"]) != 0 {
 			continue
 		}
@@ -269,8 +274,7 @@ func parseDevin(ctx context.Context, d *model.Data, db *sqlite.DB, source string
 		s.Key = source + "/" + id
 		s.Title = str(r["title"])
 		s.WorkingDirectory = str(r["working_directory"])
-		s.SelectedModel = str(r["model"])
-		adaptiveSessions[s.Key] = s.IsAdaptive()
+		s.SelectedModel = selected
 		s.AgentMode = str(r["agent_mode"])
 		s.CreatedAt = ts(r["created_at"])
 		s.LastActivityAt = ts(r["last_activity_at"])
@@ -457,17 +461,36 @@ func applyDevinRow(d *model.Data, r devinRow, seen map[string]bool, source strin
 	d.Turns = append(d.Turns, model.Turn{Agent: a, SessionKey: source + "/" + id, CreatedAt: at, Model: str(get(m, "generation_model")), InputTokens: num(get(u, "input_tokens")), OutputTokens: num(get(u, "output_tokens")), CacheReadTokens: num(get(u, "cache_read_tokens")), CacheCreationTokens: num(get(u, "cache_creation_tokens")), TTFTMs: max(0, num(get(u, "ttft_ms"))), TotalTimeMs: num(get(u, "total_time_ms")), DedupKey: key})
 }
 func parseSQLAgent(ctx context.Context, d *model.Data, a model.Agent, db *sqlite.DB) {
-	st, mt := "session", "message"
+	sessionSQL := []string{"SELECT * FROM session"}
+	messageSQL := []string{"SELECT * FROM message ORDER BY time_created, rowid"}
 	if a == model.OpenCode {
-		r := query(ctx, d, a, db, "schema", "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session_v2','session_message')")
-		if len(r) == 2 {
-			st = "session_v2"
-			mt = "session_message"
+		tables := map[string]bool{}
+		for _, r := range query(ctx, d, a, db, "schema", "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session','message','session_v2','session_message')") {
+			tables[str(r["name"])] = true
 		}
+		if tables["session_v2"] && tables["session_message"] {
+			sessionSQL[0] = "SELECT * FROM session_v2"
+			messageSQL[0] = "SELECT * FROM session_message ORDER BY time_created, rowid"
+			if tables["session"] && tables["message"] {
+				// Use one SQLite snapshot for both schemas while a migration
+				// may be moving live rows. Select orphan IDs through covering
+				// indexes before fetching their full legacy rows.
+				if _, err := db.Execute(ctx, "BEGIN"); err != nil {
+					fail(d, a, err)
+					return
+				}
+				defer db.Execute(context.WithoutCancel(ctx), "ROLLBACK")
+				sessionSQL = append(sessionSQL, "SELECT * FROM session WHERE id IN (SELECT old.id FROM session AS old WHERE NOT EXISTS (SELECT 1 FROM session_v2 AS new WHERE new.id=old.id))")
+				messageSQL = append(messageSQL, "SELECT * FROM message WHERE id IN (SELECT old.id FROM message AS old WHERE NOT EXISTS (SELECT 1 FROM session_message AS new WHERE new.id=old.id)) ORDER BY time_created, rowid")
+			}
+		}
+	}
+	if a == model.ZCode {
+		messageSQL[0] = "SELECT * FROM model_usage WHERE status='completed' OR input_tokens>0 OR output_tokens>0"
 	}
 	sessions := map[string]*model.Session{}
 	parents := map[string]string{}
-	for _, r := range query(ctx, d, a, db, "sessions", "SELECT * FROM "+st) {
+	readSession := func(r obj) {
 		id := str(r["id"])
 		s := session(a, id)
 		s.Title = str(r["title"])
@@ -484,6 +507,11 @@ func parseSQLAgent(ctx context.Context, d *model.Data, a model.Agent, db *sqlite
 			parents[id] = p
 		}
 	}
+	for _, sql := range sessionSQL {
+		for _, row := range query(ctx, d, a, db, "sessions", sql) {
+			readSession(row)
+		}
+	}
 	root := func(id string) string {
 		seen := map[string]bool{}
 		for parents[id] != "" && !seen[id] {
@@ -492,12 +520,7 @@ func parseSQLAgent(ctx context.Context, d *model.Data, a model.Agent, db *sqlite
 		}
 		return id
 	}
-	sql := "SELECT * FROM " + mt + " ORDER BY time_created, rowid"
-	if a == model.ZCode {
-		sql = "SELECT * FROM model_usage WHERE status='completed' OR input_tokens>0 OR output_tokens>0"
-	}
-	// Stream: message rows carry full message bodies.
-	each(ctx, d, a, db, "messages_or_usage", sql, func(r obj) {
+	readMessage := func(r obj) {
 		id := root(str(r["session_id"]))
 		s := sessions[id]
 		if s == nil {
@@ -526,7 +549,7 @@ func parseSQLAgent(ctx context.Context, d *model.Data, a model.Agent, db *sqlite
 			t.CreatedAt = ts(r["time_created"])
 			t.Model = modelName(str(first(get(v, "model", "providerID"), v["providerID"])), str(first(get(v, "model", "id"), v["modelID"])))
 			t.InputTokens = max(0, num(get(v, "tokens", "input")))
-			t.OutputTokens = max(0, num(get(v, "tokens", "output")))
+			t.OutputTokens = max(0, num(get(v, "tokens", "output"))) + max(0, num(get(v, "tokens", "reasoning")))
 			t.CacheReadTokens = max(0, num(get(v, "tokens", "cache", "read")))
 			t.CacheCreationTokens = max(0, num(get(v, "tokens", "cache", "write")))
 			if c := num(v["cost"]); c > 0 {
@@ -541,12 +564,12 @@ func parseSQLAgent(ctx context.Context, d *model.Data, a model.Agent, db *sqlite
 		if s.SelectedModel == "" {
 			s.SelectedModel = t.Model
 		}
-		observe(s, t.CreatedAt)
-		add(s, t)
-		if t.CreatedAt >= d.TurnsStart && t.CreatedAt < d.TurnsEnd {
-			d.Turns = append(d.Turns, t)
-		}
-	})
+		recordTurn(d, s, t)
+	}
+	// Stream: message rows carry full message bodies.
+	for _, sql := range messageSQL {
+		each(ctx, d, a, db, "messages_or_usage", sql, readMessage)
+	}
 	for id, s := range sessions {
 		if parents[id] == "" {
 			if s.Title == "" {
@@ -656,6 +679,16 @@ func antigravitySource(p string) string {
 	}
 	return "app"
 }
+
+// Keep ambiguous keys empty. In particular, one enum can cover several rollout
+// labels within a conversation.
+func addAGModel[K comparable](models map[K]string, key K, name string) {
+	if prior, ok := models[key]; ok && prior != name {
+		name = ""
+	}
+	models[key] = name
+}
+
 func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source string) {
 	a := model.Antigravity
 	s := session(a, id)
@@ -681,9 +714,25 @@ func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source strin
 			}
 		}
 	})
+	byMessageModel := map[string]string{}
+	byResponseModel := map[string]string{}
+	byEnumModel := map[uint64]string{}
 	each(ctx, d, a, db, "generation_metadata", "SELECT data FROM gen_metadata ORDER BY idx", func(r obj) {
-		if m := string(pb(blob(r["data"]), 1, 19).b); m != "" {
-			s.SelectedModel = m
+		gen := pb(blob(r["data"]), 1).b
+		name := string(pb(gen, 19).b)
+		if name == "" {
+			return
+		}
+		s.SelectedModel = name
+		usage := pb(gen, 4).b
+		if id := string(pb(usage, 7).b); id != "" {
+			addAGModel(byMessageModel, id, name)
+		}
+		if id := string(pb(usage, 11).b); id != "" {
+			addAGModel(byResponseModel, id, name)
+		}
+		if enum := pb(gen, 3).v; enum != 0 {
+			addAGModel(byEnumModel, enum, name)
 		}
 	})
 	var full, fallback []model.Turn
@@ -710,8 +759,7 @@ func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source strin
 		// Field 9 is the step's usage and each field 28 a retried attempt,
 		// whose usage is its field 2: {1: numeric model enum, 2: input, 3: output
 		// including thinking, 4: cache write, 5: cache read, 7: message ID,
-		// 9: thinking, 10: visible output, 11: response ID}. The model string
-		// lives on gen_metadata, stamped onto turns at emit.
+		// 9: thinking, 10: visible output, 11: response ID}.
 		var usages [][]byte
 		// own[i]: usages[i] is the step's own call (field 9), whose times
 		// the step records; a retried attempt's are not known.
@@ -735,8 +783,19 @@ func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source strin
 			t.CacheCreationTokens = float64(pb(u, 4).v)
 			t.CacheReadTokens = float64(pb(u, 5).v)
 			msg := string(pb(u, 7).b)
+			response := string(pb(u, 11).b)
+			t.Model = byMessageModel[msg]
+			if t.Model == "" {
+				t.Model = byResponseModel[response]
+			}
+			if enum := pb(u, 1).v; t.Model == "" && enum != 0 && len(byEnumModel) != 0 {
+				t.Model = byEnumModel[enum]
+				if t.Model == "" {
+					t.Model = "unknown"
+				}
+			}
 			if msg == "" {
-				msg = string(pb(u, 11).b)
+				msg = response
 			}
 			timed := own[ui]
 			if i, ok := byMessage[msg]; ok {
@@ -751,6 +810,9 @@ func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source strin
 						starts[i] = start
 					}
 					times(f, starts[i])
+				}
+				if f.Model == "" || (f.Model == "unknown" && t.Model != "") {
+					f.Model = t.Model
 				}
 				continue
 			}
@@ -778,14 +840,10 @@ func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source strin
 		full = fallback
 	}
 	for _, t := range full {
-		// Usage protobuf field 1 is a numeric enum, not a model string.
-		// Stamp the session's last selected model so Cost/tray/compaction
-		// do not treat Antigravity turns as unknown.
-		t.Model = s.SelectedModel
-		add(s, t)
-		if t.CreatedAt >= d.TurnsStart && t.CreatedAt < d.TurnsEnd {
-			d.Turns = append(d.Turns, t)
+		if t.Model == "" {
+			t.Model = s.SelectedModel
 		}
+		recordTurn(d, s, t)
 	}
 	if s.Title == "" {
 		s.Title = id
@@ -840,9 +898,7 @@ func dimRecord(d *model.Data, s *model.Session, t model.Turn) {
 	if s.SelectedModel == "" {
 		s.SelectedModel = t.Model
 	}
-	observe(s, t.CreatedAt)
-	add(s, t)
-	d.Turns = append(d.Turns, t)
+	recordTurn(d, s, t)
 }
 
 func dimKeep(d *model.Data, sessions map[string]*model.Session) {

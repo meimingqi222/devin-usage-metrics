@@ -1,14 +1,14 @@
-# Agent Note: Stamp Antigravity session model onto turns
+# Agent Note: Attribute Antigravity usage to the model that generated it
 
 Status: implemented
 
 ## Problem
 
-`parseAG` never set `Turn.Model`. Usage protobuf field 1 is a numeric enum, not a model string, so every Antigravity turn left the importer with an empty model. Analytics, CLI and session costs already fell back to the session's `SelectedModel` (`gemini-3-flash-a`, `gemini-4-argon-trial`, …). The tray priced `pricing.Cost(turn, turn.Model)` and compaction skipped empty-model turns, so local Antigravity history (thousands of turns, billions of cache-read tokens) showed as free in the menu while the usage page billed it.
+`parseAG` previously assigned every turn the session's last model. A real conversation that used `gemini-4-carbon`, `gemini-4-neon` and `gemini-4-hydrogen` therefore reported all its usage as `gemini-4-hydrogen`. When the importer originally left turn models empty, the tray and compaction also missed pricing that analytics and the CLI could resolve through the session model.
 
 ## Decision
 
-On emit, `internal/data/database.go::parseAG` stamps `t.Model = s.SelectedModel` from `gen_metadata`. That is the same session-level label analytics already used; per-turn model IDs are not in the protobuf as strings. `internal/data/data.go` `snapshotVersion` is 10 so cached turns without a model rebuild.
+`internal/data/database.go::parseAG` reads each generation record's model name at protobuf path `1.19` and matches it to step usage using the message or response ID from generation usage at `1.4`. The model enum at `1.3` supplies a fallback only when it has one known label within the conversation. A nonzero enum with no unambiguous match is displayed as `unknown` when the conversation has enum metadata. Old records with sparse metadata still fall back to the session label. The snapshot version in `internal/data/data.go` forces a reimport after the change.
 
 `internal/desktop/tray.go::trayEntriesOf` still falls back to `session.DisplayModel()` when a turn's model is empty, matching analytics/CLI. That covers old snapshots, remote sync payloads, and tests that construct Antigravity turns without a session model.
 
@@ -16,17 +16,18 @@ On emit, `internal/data/database.go::parseAG` stamps `t.Model = s.SelectedModel`
 
 **Leave turns empty and teach every Cost caller to pass the session model.** Analytics and CLI already did; the tray did not. A later Cost site (compaction, tray, CLI) will miss the fallback again.
 
-**Decode usage field 1 as the model.** Fixture and live blobs store a varint enum there, not `gemini-…`. Treating it as a string leaves the model empty.
+**Use the enum alone.** Live histories reuse one enum for multiple rollout labels. Matching the generation by message or response ID preserves the logged label.
 
-**Map each `gen_metadata` row onto steps by index.** Session `SelectedModel` is already the last selected model and matches current analytics/CLI billing. Per-step mapping would change totals without a stored per-turn string.
+**Join rows by index.** A generation can be recorded on several steps. A response ID identifies the same generation across those rows.
 
 ## Consequences
 
-Antigravity tray totals and compaction become priced after the snapshot rebuilds. Mid-session model switches still bill every turn at the session's last selected model, same as before. Turns whose session has no `SelectedModel` stay unpriced.
+Usage and pricing use the recorded model for each resolved turn, including retry attempts. Session summaries continue to use the last selected model.
 
 ## Verification
 
 - `internal/data/data_test.go::TestAntigravityFullUsageSuppressesEcho`
+- `internal/data/data_test.go::TestAntigravityAttributesUsageToEachModel`
 - `internal/desktop/tray_test.go::TestTrayAntigravitySessionModelPricesEmptyTurns`
 
-Proved: removed `t.Model = s.SelectedModel` → `TestAntigravityFullUsageSuppressesEcho` failed at the session-model assertion; restored `trayEntriesOf` to `pricing.Cost(turn, turn.Model)` → `TestTrayAntigravitySessionModelPricesEmptyTurns` failed at the priced-entry assertion; both guards restored and re-run green. Output saved to `docs/agent-notes-evidence/antigravity-turn-model-red.txt` and `docs/agent-notes-evidence/antigravity-tray-session-model-red.txt`.
+Proved: the old importer failed the mixed-model assertions by returning `gemini-4-hydrogen` for both Carbon labels and the unresolved records. See `docs/agent-notes-evidence/antigravity-model-attribution-red.txt`. The legacy fallback failures are recorded in `docs/agent-notes-evidence/antigravity-turn-model-red.txt` and `docs/agent-notes-evidence/antigravity-tray-session-model-red.txt`.

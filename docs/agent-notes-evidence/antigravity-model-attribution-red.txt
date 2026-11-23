@@ -1,0 +1,9 @@
+> go test ./internal/data -run '^TestAntigravityAttributesUsageToEachModel$' -count=1
+--- FAIL: TestAntigravityAttributesUsageToEachModel (0.15s)
+    data_test.go:521: turn 0 model = "gemini-4-hydrogen", want "gemini-4-carbon"
+    data_test.go:521: turn 1 model = "gemini-4-hydrogen", want "gemini-4-carbon-trial"
+    data_test.go:521: turn 3 model = "gemini-4-hydrogen", want "unknown"
+    data_test.go:521: turn 4 model = "gemini-4-hydrogen", want "unknown"
+FAIL
+FAIL	github.com/meimingqi222/devin-usage-metrics/internal/data	0.356s
+FAIL

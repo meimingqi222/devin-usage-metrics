@@ -145,6 +145,52 @@ func TestPiAndGrokRecordedCost(t *testing.T) {
 		t.Fatal(d)
 	}
 }
+
+func TestGrokModelUsagePreservesAttributionAndTotals(t *testing.T) {
+	h := env(t)
+	write(t, h, ".grok/sessions/g/summary.json", `{"info":{"id":"g"},"current_model_id":"grok-latest","created_at":90,"num_messages":3}`)
+	write(t, h, ".grok/sessions/g/updates.jsonl", `{"timestamp":100,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":100,"cachedReadTokens":20,"cacheCreationTokens":10,"outputTokens":15,"reasoningTokens":4,"costUsdTicks":1000,"modelUsage":{"grok-a":{"inputTokens":30,"cachedReadTokens":5,"cacheCreationTokens":10,"outputTokens":6,"reasoningTokens":2,"costUsdTicks":200},"grok-b":{"inputTokens":50,"cachedReadTokens":15,"outputTokens":9,"reasoningTokens":2,"costUsdTicks":500}}}}}}
+{"timestamp":101,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":3,"outputTokens":2,"modelUsage":{"grok-old":{}}}}}}
+{"timestamp":102,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":5,"outputTokens":1}}}}
+`)
+	d := data.Load(model.Grok, 0, 200, true)
+	check(t, d, 5)
+	for i, want := range []struct {
+		name                   string
+		input, output, cost    float64
+		cacheRead, cacheCreate float64
+	}{
+		{"grok-a", 15, 6, 200e-10, 5, 10},
+		{"grok-b", 35, 9, 500e-10, 15, 0},
+		{"unknown", 20, 0, 300e-10, 0, 0},
+		{"grok-old", 3, 2, 0, 0, 0},
+		{"grok-latest", 5, 1, 0, 0, 0},
+	} {
+		got := d.Turns[i]
+		cost := 0.0
+		if got.RecordedCost != nil {
+			cost = *got.RecordedCost
+		}
+		if got.Model != want.name || got.InputTokens != want.input || got.OutputTokens != want.output ||
+			got.CacheReadTokens != want.cacheRead || got.CacheCreationTokens != want.cacheCreate || cost != want.cost {
+			t.Errorf("turn %d: %+v cost=%g, want %+v", i, got, cost, want)
+		}
+	}
+	if s := d.Sessions[0]; s.AgentMessages != 3 || s.TotalTokens() != 126 {
+		t.Fatalf("wrong session totals: %+v", s)
+	}
+}
+
+func TestGrokAggregateTicksDoNotDoubleChargeModelBreakdown(t *testing.T) {
+	h := env(t)
+	write(t, h, ".grok/sessions/g/summary.json", `{"info":{"id":"g"},"created_at":90}`)
+	write(t, h, ".grok/sessions/g/updates.jsonl", `{"timestamp":100,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":30,"outputTokens":12,"costUsdTicks":1000,"modelUsage":{"grok-a":{"inputTokens":10,"outputTokens":4},"grok-b":{"inputTokens":20,"outputTokens":8}}}}}}
+`)
+	d := data.Load(model.Grok, 0, 200, true)
+	if len(d.Turns) != 2 || len(d.Errors) != 0 {
+		t.Fatalf("expected only the two model rows, got %d turns and %d errors", len(d.Turns), len(d.Errors))
+	}
+}
 func TestOmpTranscript(t *testing.T) {
 	h := env(t)
 	write(t, h, ".omp/agent/sessions/-work-code-app/2026-11-02T00-54-47-761Z_s1.jsonl", `{"type":"title","v":1,"title":"Fix login bug","source":"auto","updatedAt":"2026-11-02T00:55:00.000Z"}
@@ -349,7 +395,7 @@ func TestSQLiteImportersReadOnlyAndParentRollup(t *testing.T) {
 				exec(t, conn, "INSERT INTO model_usage VALUES ('child','completed',100,110,'m',12,3,4,5,6)")
 			} else {
 				exec(t, conn, "CREATE TABLE message(session_id TEXT,time_created INTEGER,data TEXT)")
-				exec(t, conn, "INSERT INTO message VALUES (?,?,?)", "child", 100, `{"role":"assistant","modelID":"m","providerID":"p","tokens":{"input":12,"output":-3,"cache":{"read":5,"write":4}},"cost":0.5}`)
+				exec(t, conn, "INSERT INTO message VALUES (?,?,?)", "child", 100, `{"role":"assistant","modelID":"m","providerID":"p","tokens":{"input":12,"output":-3,"reasoning":7,"cache":{"read":5,"write":4}},"cost":0.5}`)
 			}
 			conn.Close()
 			before, e := os.ReadFile(filepath.Join(h, p))
@@ -368,8 +414,8 @@ func TestSQLiteImportersReadOnlyAndParentRollup(t *testing.T) {
 			if a == model.ZCode && d.Turns[0].InputTokens != 7 {
 				t.Fatal(d)
 			}
-			if a != model.ZCode && (d.Turns[0].OutputTokens != 0 || d.Turns[0].RecordedCost == nil) {
-				t.Fatal(d)
+			if a != model.ZCode && (d.Turns[0].OutputTokens != 7 || d.Turns[0].RecordedCost == nil || *d.Turns[0].RecordedCost != 0.5) {
+				t.Fatalf("reasoning tokens or recorded cost dropped: %+v", d.Turns[0])
 			}
 		})
 	}
@@ -395,19 +441,32 @@ func TestDevinAdaptiveBilling(t *testing.T) {
 	conn := db(t, h, ".local/share/devin/cli/sessions.db")
 	exec(t, conn, "CREATE TABLE sessions(id TEXT,title TEXT,model TEXT,created_at INTEGER,last_activity_at INTEGER,hidden INTEGER)")
 	exec(t, conn, "INSERT INTO sessions VALUES ('s','routed','adaptive',90,200,0)")
+	exec(t, conn, "INSERT INTO sessions VALUES ('h','hidden','adaptive',90,200,1)")
 	exec(t, conn, "CREATE TABLE message_nodes(session_id TEXT,created_at INTEGER,chat_message TEXT)")
 	for i, name := range []string{"gpt-6-1-sol-low", "compactor"} {
 		body := fmt.Sprintf(`{"message_id":"m%d","metadata":{"generation_model":%q,"metrics":{"ttft_ms":1,"input_tokens":100,"output_tokens":20,"cache_read_tokens":300,"cache_creation_tokens":40}}}`, i, name)
 		exec(t, conn, "INSERT INTO message_nodes VALUES (?,?,?)", "s", 100+i, body)
 	}
+	exec(t, conn, "INSERT INTO message_nodes VALUES ('h',102,?)", `{"message_id":"hidden","metadata":{"generation_model":"gpt-6-1-sol-low","metrics":{"ttft_ms":1,"input_tokens":100,"output_tokens":20,"cache_read_tokens":300,"cache_creation_tokens":40}}}`)
 	d := data.Load(model.Devin, 0, 200, true)
-	check(t, d, 2)
+	check(t, d, 3)
 	if d.Turns[0].Model != "gpt-6-1-sol-low" || d.Turns[0].BillingModel != "adaptive" || d.Turns[1].BillingModel != "" {
 		t.Fatalf("display model and billing route were conflated: %+v", d.Turns)
 	}
 	cost, ok := pricing.Cost(d.Turns[0], "")
 	if !ok || cost < .00014-1e-10 || cost > .00014+1e-10 {
 		t.Fatalf("Devin adaptive priced using its upstream: %g, %v", cost, ok)
+	}
+	if tHidden := d.Turns[2]; len(d.Sessions) != 1 || tHidden.SessionKey != "cli/h" || tHidden.BillingModel != "adaptive" {
+		t.Fatalf("hidden request lost its billing route: %+v", tHidden)
+	}
+	now := time.Unix(102, 0).UTC()
+	var input float64
+	for _, bucket := range analytics.Build(d, analytics.Day, 0, model.Devin, "", now) {
+		input += bucket.ByModel["gpt-6-1-sol-low(adaptive)"].Input
+	}
+	if input != 200 {
+		t.Fatalf("adaptive model input = %g, want 200", input)
 	}
 }
 
@@ -467,6 +526,65 @@ func TestAntigravityFullUsageSuppressesEcho(t *testing.T) {
 		t.Fatal(d)
 	}
 }
+
+func TestAntigravityAttributesUsageToEachModel(t *testing.T) {
+	h := env(t)
+	conn := db(t, h, ".gemini/antigravity/conversations/mixed.db")
+	exec(t, conn, "CREATE TABLE trajectory_metadata_blob(id TEXT,data BLOB)")
+	exec(t, conn, "CREATE TABLE gen_metadata(idx INTEGER,data BLOB)")
+	exec(t, conn, "CREATE TABLE steps(idx INTEGER,step_type INTEGER,step_payload BLOB,metadata BLOB)")
+	uintField := func(field, value uint64) []byte {
+		return binary.AppendUvarint(binary.AppendUvarint(nil, field<<3), value)
+	}
+	bytesField := func(field uint64, value []byte) []byte {
+		key := binary.AppendUvarint(nil, field<<3|2)
+		return append(binary.AppendUvarint(key, uint64(len(value))), value...)
+	}
+	usage := func(enum uint64, message, response string, input uint64) []byte {
+		b := append(uintField(1, enum), uintField(2, input)...)
+		if message != "" {
+			b = append(b, bytesField(7, []byte(message))...)
+		}
+		if response != "" {
+			b = append(b, bytesField(11, []byte(response))...)
+		}
+		return b
+	}
+	gen := func(enum uint64, name, message, response string) []byte {
+		b := append(uintField(3, enum), bytesField(4, usage(enum, message, response, 0))...)
+		return bytesField(1, append(b, bytesField(19, []byte(name))...))
+	}
+	exec(t, conn, "INSERT INTO gen_metadata VALUES (0,?), (1,?), (2,?)",
+		gen(1427, "gemini-4-carbon", "a", "ra"),
+		gen(1427, "gemini-4-carbon-trial", "b", "rb"),
+		gen(1525, "gemini-4-hydrogen", "c", "rc"))
+	for i, result := range []struct {
+		field uint64
+		usage []byte
+	}{
+		{9, usage(1427, "a", "", 10)},
+		{9, usage(1427, "a", "", 12)}, // Echo of the first response.
+		{9, usage(1427, "", "rb", 20)},
+		{28, bytesField(2, usage(1525, "retry", "", 30))},
+		{9, usage(1427, "ambiguous", "", 40)},
+		{9, usage(1532, "unmapped", "", 50)},
+	} {
+		step := append(bytesField(1, uintField(1, uint64(100+i))), bytesField(result.field, result.usage)...)
+		exec(t, conn, "INSERT INTO steps VALUES (?,0,NULL,?)", i, step)
+	}
+	d := data.Load(model.Antigravity, 0, 200, true)
+	check(t, d, 5)
+	want := []string{"gemini-4-carbon", "gemini-4-carbon-trial", "gemini-4-hydrogen", "unknown", "unknown"}
+	for i, name := range want {
+		if d.Turns[i].Model != name {
+			t.Errorf("turn %d model = %q, want %q", i, d.Turns[i].Model, name)
+		}
+	}
+	if d.Turns[0].InputTokens != 12 || len(d.Sessions) != 1 || d.Sessions[0].SelectedModel != "gemini-4-hydrogen" || d.Sessions[0].InputTokens != 152 {
+		t.Fatalf("wrong deduplicated usage or session summary: %+v", d)
+	}
+}
+
 func TestAntigravityIncludesCLIStore(t *testing.T) {
 	h := env(t)
 	desktop := db(t, h, ".gemini/antigravity/conversations/desktop.db")
@@ -572,6 +690,37 @@ func TestOpenCodeV2AndDatabaseErrors(t *testing.T) {
 	}
 }
 
+func TestOpenCodeReadsBothSchemasWithoutDuplicatingMigratedMessages(t *testing.T) {
+	h := env(t)
+	conn := db(t, h, ".local/share/opencode/opencode.db")
+	exec(t, conn, "CREATE TABLE session(id TEXT PRIMARY KEY,parent_id TEXT,title TEXT,time_created INTEGER,time_updated INTEGER)")
+	exec(t, conn, "CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT)")
+	exec(t, conn, "CREATE TABLE session_v2(id TEXT PRIMARY KEY,parent_id TEXT,title TEXT,time_created INTEGER,time_updated INTEGER)")
+	exec(t, conn, "CREATE TABLE session_message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,type TEXT,data TEXT)")
+	exec(t, conn, "INSERT INTO session VALUES ('s',NULL,'old title',90,110),('legacy','s','legacy child',90,110)")
+	exec(t, conn, "INSERT INTO message VALUES ('overlap','s',100,?),('legacy-only','legacy',101,?)",
+		`{"role":"assistant","modelID":"old","tokens":{"output":2}}`,
+		`{"role":"assistant","modelID":"legacy","tokens":{"output":3,"reasoning":4}}`)
+	d := data.Load(model.OpenCode, 0, 200, true)
+	check(t, d, 2)
+	exec(t, conn, "INSERT INTO session_v2 VALUES ('s',NULL,'new title',90,110)")
+	exec(t, conn, "INSERT INTO session_message VALUES ('overlap','s',100,'assistant',?),('new-only','s',102,'assistant',?)",
+		`{"model":{"id":"new"},"tokens":{"output":5,"reasoning":1}}`,
+		`{"model":{"id":"new"},"tokens":{"output":8,"reasoning":2}}`)
+	d = data.Load(model.OpenCode, 0, 200, true)
+	check(t, d, 3)
+	if len(d.Sessions) != 1 || d.Sessions[0].Title != "new title" || d.Sessions[0].OutputTokens != 23 {
+		t.Fatalf("wrong merged session: %+v", d.Sessions)
+	}
+	var byModel = map[string]float64{}
+	for _, turn := range d.Turns {
+		byModel[turn.Model] += turn.OutputTokens
+	}
+	if len(byModel) != 2 || byModel["legacy"] != 7 || byModel["new"] != 16 {
+		t.Fatalf("wrong merged usage: %v", byModel)
+	}
+}
+
 func TestExpiredUnchangedAndDeletedFiles(t *testing.T) {
 	h := env(t)
 	line := `{"type":"assistant","timestamp":100,"message":{"id":"m","usage":{"input_tokens":2}}}` + "\n"
@@ -641,6 +790,29 @@ func TestWorkBuddyMissingSessionIDUsesFileNamePerRecord(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("record without sessionId inherited the previous record's ID")
+	}
+}
+
+func TestParserUpdatesKeepUnchangedAgentSnapshots(t *testing.T) {
+	h := env(t)
+	for _, tc := range []struct {
+		agent model.Agent
+		turns int
+	}{
+		{model.Pi, 1},
+		{model.Grok, 0},
+	} {
+		old := map[string]any{"Version": 10, "At": time.Now().Unix(), "Data": model.Data{
+			TurnsStart: 0, TurnsEnd: 200, Turns: []model.Turn{{Agent: tc.agent, CreatedAt: 100}},
+		}}
+		raw, err := json.Marshal(old)
+		if err != nil {
+			t.Fatal(err)
+		}
+		write(t, h, "cache/devin-usage-metrics/go-data-"+string(tc.agent)+".json", string(raw))
+		if d := data.Load(tc.agent, 0, 200, false); len(d.Turns) != tc.turns {
+			t.Errorf("%s: got %d cached turns, want %d", tc.agent, len(d.Turns), tc.turns)
+		}
 	}
 }
 

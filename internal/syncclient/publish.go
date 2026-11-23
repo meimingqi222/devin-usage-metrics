@@ -261,6 +261,22 @@ func exportRecords(id string, data model.Data, previous *devicePackage, retained
 			current[sessionKey{v.Agent, v.Key}] = true
 		}
 	}
+	// Hidden Devin sessions contribute turns without a session summary.
+	// Match the old unrouted identity exactly so their other published
+	// history survives when it is absent from the current collection.
+	var unrouted map[turnIdentity]bool
+	for _, v := range data.Turns {
+		if v.Agent != model.Devin || v.BillingModel != "adaptive" ||
+			(v.DeviceID != "" && v.DeviceID != id) || current[sessionKey{v.Agent, v.SessionKey}] {
+			continue
+		}
+		if unrouted == nil {
+			unrouted = map[turnIdentity]bool{}
+		}
+		v.DeviceID = id
+		v.BillingModel = ""
+		unrouted[identityOf(v)] = true
+	}
 	replaced := func(v model.Turn) bool {
 		return v.CreatedAt >= data.TurnsStart && v.CreatedAt < data.TurnsEnd && current[sessionKey{v.Agent, v.SessionKey}]
 	}
@@ -271,7 +287,10 @@ func exportRecords(id string, data model.Data, previous *devicePackage, retained
 			}
 			v.DeviceID = id
 			if v.CreatedAt >= retained {
-				turns[identityOf(v)] = v
+				key := identityOf(v)
+				if !published || !unrouted[key] {
+					turns[key] = v
+				}
 			}
 		}
 		for _, v := range ss {

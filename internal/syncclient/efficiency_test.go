@@ -441,11 +441,18 @@ func TestPublishReplacesChangedTurnsOfLocalSessions(t *testing.T) {
 	}
 	live := model.Session{Agent: model.Antigravity, Key: "live", CreatedAt: now, LastActivityAt: now}
 	gone := model.Session{Agent: model.Antigravity, Key: "gone", CreatedAt: now, LastActivityAt: now}
+	hidden := model.Turn{Agent: model.Devin, SessionKey: "cli/hidden", CreatedAt: now, Model: "gpt-6-1-sol-low", InputTokens: 4}
+	olderHidden := hidden
+	olderHidden.CreatedAt--
+	olderHidden.InputTokens = 5
 	load([]model.Session{live, gone}, []model.Turn{
 		{Agent: model.Antigravity, SessionKey: "live", CreatedAt: now, InputTokens: 1, CacheCreationTokens: 5},
 		{Agent: model.Antigravity, SessionKey: "gone", CreatedAt: now, InputTokens: 7},
+		hidden,
+		olderHidden,
 	})
-	load([]model.Session{live}, []model.Turn{{Agent: model.Antigravity, SessionKey: "live", CreatedAt: now, InputTokens: 2}})
+	hidden.BillingModel = "adaptive"
+	load([]model.Session{live}, []model.Turn{{Agent: model.Antigravity, SessionKey: "live", CreatedAt: now, InputTokens: 2}, hidden})
 	var h head
 	s.mu.Lock()
 	unmarshal(t, s.objects["v3-head-local.json"], &h)
@@ -458,8 +465,11 @@ func TestPublishReplacesChangedTurnsOfLocalSessions(t *testing.T) {
 	got := map[string]float64{}
 	for _, v := range read.Turns {
 		got[v.SessionKey] += v.InputTokens + v.CacheCreationTokens
+		if v.SessionKey == hidden.SessionKey && v.CreatedAt == now && v.BillingModel != "adaptive" {
+			t.Error("old route still published for hidden Devin turn")
+		}
 	}
-	if len(read.Turns) != 2 || got["live"] != 2 || got["gone"] != 7 {
+	if len(read.Turns) != 4 || got["live"] != 2 || got["gone"] != 7 || got[hidden.SessionKey] != 9 {
 		t.Fatalf("published turns %+v", read.Turns)
 	}
 }

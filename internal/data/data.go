@@ -118,8 +118,16 @@ func DeviceName() string {
 	return h
 }
 
-// Bump when parsing changes so persisted records cannot bypass importer fixes.
-const snapshotVersion = 11
+// Keep independent importer versions so parser changes rebuild only affected
+// snapshots. A change to the snapshot envelope must invalidate every importer.
+func snapshotVersion(agent model.Agent) int {
+	switch agent {
+	case model.Antigravity, model.Devin, model.Grok, model.OpenCode, model.MimoCode:
+		return 12
+	default:
+		return 10
+	}
+}
 
 type snapshot struct {
 	Version   int
@@ -225,13 +233,14 @@ func load(ctx context.Context, a model.Agent, start, end int64, lm loadMode) (re
 	decodeMS := stageMS(decodeStarted)
 	decodeSnapshot(decodeErr)
 	now := time.Now().Unix()
-	coversStart := old.Version == snapshotVersion && old.Data.TurnsStart <= start
+	version := snapshotVersion(a)
+	coversStart := old.Version == version && old.Data.TurnsStart <= start
 	covers := coversStart && old.Data.TurnsEnd >= min(end, now)
 	age := int64(-1)
 	if old.At > 0 {
 		age = max(0, now-old.At)
 	}
-	syncdiag.Log(ctx, "snapshot_result", "reason", snapshotReason(old, start, end, now, lm, readErr, decodeErr), "read_ms", readMS, "decode_ms", decodeMS, "bytes", len(b), "age_seconds", age, "covers_start", coversStart, "covers_end", covers, "fresh_sources", old.FreshSources, "read_error", syncdiag.ErrorCode(readErr), "decode_error", syncdiag.ErrorCode(decodeErr))
+	syncdiag.Log(ctx, "snapshot_result", "reason", snapshotReason(old, version, start, end, now, lm, readErr, decodeErr), "read_ms", readMS, "decode_ms", decodeMS, "bytes", len(b), "age_seconds", age, "covers_start", coversStart, "covers_end", covers, "fresh_sources", old.FreshSources, "read_error", syncdiag.ErrorCode(readErr), "decode_error", syncdiag.ErrorCode(decodeErr))
 	if lm == cachedLoad && covers && now-old.At <= 300 {
 		mode = "snapshot"
 		return filter(old.Data, start, end)
@@ -279,7 +288,7 @@ func load(ctx context.Context, a model.Agent, start, end int64, lm loadMode) (re
 	unchanged := maps.Equal(databases, old.Databases) && maps.Equal(sourceFiles, old.Files)
 	freshSources := len(d.Errors) == 0 && (refresh || old.FreshSources && covers && unchanged)
 	_, saved := syncdiag.Watch(ctx, "write_snapshot")
-	if e := atomicJSON(path, snapshot{Version: snapshotVersion, At: now, Data: d, Databases: databases, Files: sourceFiles, FreshSources: freshSources}); e != nil {
+	if e := atomicJSON(path, snapshot{Version: version, At: now, Data: d, Databases: databases, Files: sourceFiles, FreshSources: freshSources}); e != nil {
 		saved(e)
 		fail(&d, a, fmt.Errorf("save cache: %w", e))
 	} else {

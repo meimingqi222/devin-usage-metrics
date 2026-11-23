@@ -8,7 +8,7 @@ The real-history migration comparison matched daily tokens and costs while hidin
 
 ## Decision
 
-`internal/data/files.go` keeps summary-only Grok sessions without an error and only creates turns for events with a usage field. WorkBuddy resolves the filename fallback independently for every record, matching `src/local_sources.rs`. `internal/data/data.go` versions parsed snapshots with `snapshotVersion`; it rejects version 1 caches even while their TTL and source signatures still match. Future changes to parsed record semantics must bump this version.
+`internal/data/files.go` keeps summary-only Grok sessions without an error and only creates turns for events with a usage field. WorkBuddy resolves the filename fallback independently for every record, matching `src/local_sources.rs`. `internal/data/data.go` checks `snapshotVersion` for each agent. It rejects stale snapshots even while their TTL and source signatures still match. A parser-only change bumps the version for affected agents so other agents can reuse their snapshots.
 
 ## Alternatives considered
 
@@ -23,5 +23,6 @@ The first load after this parser change reparses local history. Device identity,
 - `internal/data/data_test.go::TestGrokOptionalUpdatesAndUsageMatchRust`
 - `internal/data/data_test.go::TestWorkBuddyMissingSessionIDUsesFileNamePerRecord`
 - `internal/data/data_test.go::TestLegacySnapshotCannotHideImporterFixes`
+- `internal/data/data_test.go::TestParserUpdatesKeepUnchangedAgentSnapshots`
 
 Proved: Before the fixes, the focused tests failed at the record-count and legacy-cache assertions. Output saved to `docs/agent-notes-evidence/go-importer-parity-red.txt`; all three tests pass after restoring the Rust behavior and rejecting old snapshots.

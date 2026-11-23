@@ -118,6 +118,17 @@ func add(s *model.Session, t model.Turn) {
 		s.RecordedCost = &v
 	}
 }
+
+// recordTurn accounts for a normalized source record in its session and in
+// the requested reporting window.
+func recordTurn(d *model.Data, s *model.Session, t model.Turn) {
+	observe(s, t.CreatedAt)
+	add(s, t)
+	if t.CreatedAt >= d.TurnsStart && t.CreatedAt < d.TurnsEnd {
+		d.Turns = append(d.Turns, t)
+	}
+}
+
 func files(d *model.Data, a model.Agent, roots []string, ext string) []string {
 	seen := map[string]bool{}
 	var paths []string
@@ -1046,10 +1057,7 @@ func (f *fileParser) account(d *model.Data, seen map[string]bool) {
 		if f.a == model.Claude && (t.CreatedAt < d.TurnsStart || t.CreatedAt >= d.TurnsEnd) {
 			continue
 		}
-		add(s, t)
-		if t.CreatedAt >= d.TurnsStart && t.CreatedAt < d.TurnsEnd {
-			d.Turns = append(d.Turns, t)
-		}
+		recordTurn(d, s, t)
 	}
 }
 
@@ -1153,31 +1161,82 @@ func parseGrok(d *model.Data, p string, sessions map[string]*model.Session, miss
 				t.CreatedAt = s.CreatedAt
 			}
 		}
-		t.CacheReadTokens = num(get(usage, "cachedReadTokens"))
-		t.InputTokens = max(0, num(get(usage, "inputTokens"))-t.CacheReadTokens)
-		t.OutputTokens = num(get(usage, "outputTokens"))
-		t.CacheCreationTokens = num(get(usage, "cacheCreationTokens"))
-		t.TotalTimeMs = num(get(usage, "apiDurationMs"))
-		if c := num(get(usage, "costUsdTicks")); c > 0 {
-			c /= 1e10
-			t.RecordedCost = &c
-		}
-		if m, ok := get(usage, "modelUsage").(map[string]any); ok {
-			var keys []string
-			for k := range m {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			if len(keys) > 0 {
-				t.Model = keys[0]
-			}
-		}
-		add(s, t)
-		observe(s, t.CreatedAt)
-		if t.CreatedAt >= d.TurnsStart && t.CreatedAt < d.TurnsEnd {
-			d.Turns = append(d.Turns, t)
-		}
+		recordGrokUsage(d, s, t, usage)
 	}
+}
+
+func grokUsage(t model.Turn, usage, fallback any) (model.Turn, float64) {
+	value := func(key string) float64 {
+		v := get(usage, key)
+		if v == nil && fallback != nil {
+			v = get(fallback, key)
+		}
+		return max(0, num(v))
+	}
+	input := value("inputTokens")
+	t.CacheReadTokens = value("cachedReadTokens")
+	t.CacheCreationTokens = value("cacheCreationTokens")
+	// Grok reports the full prompt, including both cache buckets.
+	t.InputTokens = max(0, input-t.CacheReadTokens-t.CacheCreationTokens)
+	// Grok's output counter already includes reasoning tokens.
+	t.OutputTokens = value("outputTokens")
+	t.TotalTimeMs = value("apiDurationMs")
+	return t, value("costUsdTicks")
+}
+
+func recordGrokUsage(d *model.Data, s *model.Session, base model.Turn, usage any) {
+	emit := func(t model.Turn, ticks float64) {
+		if ticks > 0 {
+			cost := ticks / 1e10
+			t.RecordedCost = &cost
+		}
+		recordTurn(d, s, t)
+	}
+	models, _ := get(usage, "modelUsage").(obj)
+	if len(models) == 1 {
+		for name, details := range models {
+			if name != "" {
+				base.Model = name
+			}
+			part, partTicks := grokUsage(base, details, usage)
+			emit(part, partTicks)
+		}
+		return
+	}
+	total, ticks := grokUsage(base, usage, nil)
+	if len(models) == 0 {
+		emit(total, ticks)
+		return
+	}
+
+	// The aggregate may include work omitted from the model breakdown.
+	// Keep those tokens once and leave their model unknown.
+	total.Model = "unknown"
+	for _, name := range slices.Sorted(maps.Keys(models)) {
+		part, partTicks := grokUsage(base, models[name], nil)
+		if !hasGrokTokens(part) && partTicks == 0 {
+			continue
+		}
+		part.Model = name
+		if name == "" {
+			part.Model = "unknown"
+		}
+		emit(part, partTicks)
+		total.InputTokens = max(0, total.InputTokens-part.InputTokens)
+		total.OutputTokens = max(0, total.OutputTokens-part.OutputTokens)
+		total.CacheReadTokens = max(0, total.CacheReadTokens-part.CacheReadTokens)
+		total.CacheCreationTokens = max(0, total.CacheCreationTokens-part.CacheCreationTokens)
+		ticks = max(0, ticks-partTicks)
+	}
+	// Aggregate-only ticks can describe the same requests that the model
+	// rows already price. Use the remainder only with unattributed tokens.
+	if hasGrokTokens(total) {
+		emit(total, ticks)
+	}
+}
+
+func hasGrokTokens(t model.Turn) bool {
+	return t.InputTokens+t.OutputTokens+t.CacheReadTokens+t.CacheCreationTokens > 0
 }
 
 // prefetched is one source decoded ahead of accounting: its lines, and the

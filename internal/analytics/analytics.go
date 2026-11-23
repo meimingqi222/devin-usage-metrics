@@ -130,11 +130,9 @@ func Build(data model.Data, p Period, page int, agent model.Agent, device string
 				}
 			}
 			label := name
-			adaptive := s.adaptive
-			if t.Agent == model.Omp {
-				// OMP records the route per turn, including model switches.
-				adaptive = t.IsAdaptive()
-			}
+			// Prefer a recorded route. Legacy Devin turns can still use the
+			// session route, while OMP records switches per turn.
+			adaptive := t.IsAdaptive() || (t.Agent != model.Omp && s.adaptive)
 			if adaptive && name != "unknown" && name != "compactor" && name != "adaptive" && name != "devin/adaptive" {
 				label += "(adaptive)"
 			}

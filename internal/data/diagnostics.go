@@ -51,14 +51,14 @@ func sourceResultError(d model.Data) error {
 	return nil
 }
 
-func snapshotReason(s snapshot, start, end, now int64, lm loadMode, readErr, decodeErr error) string {
+func snapshotReason(s snapshot, version int, start, end, now int64, lm loadMode, readErr, decodeErr error) string {
 	refresh, reuse := lm >= reloadLoad, lm == reloadLoad
 	switch {
 	case readErr != nil:
 		return "snapshot_unavailable"
 	case decodeErr != nil:
 		return "snapshot_invalid"
-	case s.Version != snapshotVersion:
+	case s.Version != version:
 		return "schema_changed"
 	case refresh && !reuse:
 		return "forced_rebuild"
