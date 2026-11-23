@@ -628,6 +628,15 @@ func pb(b []byte, path ...uint64) field {
 	}
 	return field{}
 }
+
+// pbTime reads a protobuf Timestamp {1: seconds, 2: nanos} as seconds; 0
+// when absent.
+func pbTime(b []byte) float64 {
+	if b == nil {
+		return 0
+	}
+	return float64(pb(b, 1).v) + float64(pb(b, 2).v)/1e9
+}
 func blob(v any) []byte {
 	if b, ok := v.(sqlite.BorrowedText); ok {
 		return b
@@ -678,29 +687,48 @@ func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source strin
 		}
 	})
 	var full, fallback []model.Turn
+	// starts[i] is the start, in seconds, of the first step of full[i].
+	var starts []float64
 	// A response can be recorded on more than one step; keep it once.
 	byMessage := map[string]int{}
 	each(ctx, d, a, db, "step_usage", "SELECT metadata FROM steps ORDER BY idx", func(r obj) {
 		b := blob(r["metadata"])
 		at := int64(pb(b, 1, 1).v)
 		observe(s, at)
+		// Step timestamps: 1 its start, 6 its first content, 7 its model's
+		// end. A first content outside start..end is not known.
+		start, firstAt, end := pbTime(pb(b, 1).b), pbTime(pb(b, 6).b), pbTime(pb(b, 7).b)
+		times := func(t *model.Turn, from float64) {
+			if from <= 0 || end < from {
+				return
+			}
+			t.TotalTimeMs = max(t.TotalTimeMs, (end-from)*1000)
+			if t.TTFTMs == 0 && firstAt >= from && firstAt <= end {
+				t.TTFTMs = (firstAt - from) * 1000
+			}
+		}
 		// Field 9 is the step's usage and each field 28 a retried attempt,
 		// whose usage is its field 2: {1: numeric model enum, 2: input, 3: output
 		// including thinking, 4: cache write, 5: cache read, 7: message ID,
 		// 9: thinking, 10: visible output, 11: response ID}. The model string
 		// lives on gen_metadata, stamped onto turns at emit.
 		var usages [][]byte
+		// own[i]: usages[i] is the step's own call (field 9), whose times
+		// the step records; a retried attempt's are not known.
+		var own []bool
 		protoWalk(b, func(f field) bool {
 			if f.n == 9 && f.b != nil {
 				usages = append(usages, f.b)
+				own = append(own, true)
 			} else if f.n == 28 && f.b != nil {
 				if u := pb(f.b, 2).b; u != nil {
 					usages = append(usages, u)
+					own = append(own, false)
 				}
 			}
 			return true
 		})
-		for _, u := range usages {
+		for ui, u := range usages {
 			t := model.Turn{Agent: a, SessionKey: s.Key, CreatedAt: at}
 			t.InputTokens = float64(pb(u, 2).v)
 			t.OutputTokens = float64(max(pb(u, 3).v, pb(u, 9).v+pb(u, 10).v))
@@ -710,16 +738,30 @@ func parseAG(ctx context.Context, d *model.Data, db *sqlite.DB, id, source strin
 			if msg == "" {
 				msg = string(pb(u, 11).b)
 			}
+			timed := own[ui]
 			if i, ok := byMessage[msg]; ok {
 				f := &full[i]
 				f.InputTokens = max(f.InputTokens, t.InputTokens)
 				f.OutputTokens = max(f.OutputTokens, t.OutputTokens)
 				f.CacheCreationTokens = max(f.CacheCreationTokens, t.CacheCreationTokens)
 				f.CacheReadTokens = max(f.CacheReadTokens, t.CacheReadTokens)
+				if timed {
+					// A response's later step keeps its first step's start.
+					if starts[i] == 0 {
+						starts[i] = start
+					}
+					times(f, starts[i])
+				}
 				continue
 			}
 			if msg != "" {
 				byMessage[msg] = len(full)
+			}
+			if timed {
+				times(&t, start)
+				starts = append(starts, start)
+			} else {
+				starts = append(starts, 0)
 			}
 			full = append(full, t)
 		}

@@ -2,6 +2,7 @@ package data_test
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -850,5 +851,54 @@ func TestDimDroppingDesktopDoesNotKeepStaleSessions(t *testing.T) {
 	check(t, d, 1)
 	if len(d.Sessions) != 1 || d.Sessions[0].Key != "dimcode-alpha/cli-1" {
 		t.Fatalf("stale desktop session remained: %+v", d.Sessions)
+	}
+}
+
+// pbTS encodes a protobuf Timestamp field: {1: seconds, 2: nanos}.
+func pbTS(field byte, sec, nanos uint64) []byte {
+	ts := binary.AppendUvarint([]byte{8}, sec)
+	if nanos > 0 {
+		ts = binary.AppendUvarint(append(ts, 16), nanos)
+	}
+	return append([]byte{field<<3 | 2, byte(len(ts))}, ts...)
+}
+
+func TestAntigravityStepTimes(t *testing.T) {
+	h := env(t)
+	conn := db(t, h, ".gemini/antigravity/conversations/s.db")
+	exec(t, conn, "CREATE TABLE trajectory_metadata_blob(id TEXT,data BLOB)")
+	exec(t, conn, "CREATE TABLE gen_metadata(idx INTEGER,data BLOB)")
+	exec(t, conn, "CREATE TABLE steps(idx INTEGER,step_type INTEGER,step_payload BLOB,metadata BLOB)")
+	usage := func(msg byte) []byte {
+		u := []byte{16, 4, 24, 7, 58, 1, msg}
+		return append([]byte{74, byte(len(u))}, u...)
+	}
+	step := func(parts ...[]byte) []byte {
+		var b []byte
+		for _, p := range parts {
+			b = append(b, p...)
+		}
+		return b
+	}
+	// Message a: starts at 100 s, first content at 101.5 s, ends at 110 s;
+	// a later step of the same response ends at 112 s.
+	exec(t, conn, "INSERT INTO steps VALUES (1,0,NULL,?)", step(pbTS(1, 100, 0), pbTS(6, 101, 5e8), pbTS(7, 110, 0), usage('a')))
+	exec(t, conn, "INSERT INTO steps VALUES (2,0,NULL,?)", step(pbTS(1, 111, 0), pbTS(6, 111, 0), pbTS(7, 112, 0), usage('a')))
+	// Message b: first content after the end is not known; its duration is.
+	exec(t, conn, "INSERT INTO steps VALUES (3,0,NULL,?)", step(pbTS(1, 120, 0), pbTS(6, 130, 0), pbTS(7, 125, 0), usage('b')))
+	// A retried attempt (field 28) gets no times of the step.
+	retry := []byte{16, 9, 24, 2, 58, 1, 'c'}
+	exec(t, conn, "INSERT INTO steps VALUES (4,0,NULL,?)", step(pbTS(1, 140, 0), pbTS(6, 141, 0), pbTS(7, 150, 0), []byte{226, 1, byte(len(retry) + 2), 18, byte(len(retry))}, retry))
+	d := data.Load(model.Antigravity, 0, 200, true)
+	check(t, d, 3)
+	got := map[int64][2]float64{}
+	for _, turn := range d.Turns {
+		got[turn.CreatedAt] = [2]float64{turn.TTFTMs, turn.TotalTimeMs}
+	}
+	want := map[int64][2]float64{100: {1500, 12000}, 120: {0, 5000}, 140: {0, 0}}
+	for at, w := range want {
+		if g := got[at]; g != w {
+			t.Errorf("turn at %d: ttft/total %v, want %v", at, g, w)
+		}
 	}
 }

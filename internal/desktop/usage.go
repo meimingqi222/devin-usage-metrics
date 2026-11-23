@@ -207,8 +207,8 @@ func (a *App) usageSummary(c *ui.Context, total analytics.Bucket, sessions int) 
 	}
 	volume, volumeUnit := tokenParts(total.Total())
 	hit, hitRate := "—", -1.0
-	if prompt := total.Input + total.Cached + total.CacheWrite; prompt > 0 {
-		hitRate = total.Cached / prompt
+	if r, ok := analytics.CacheHitRate(total.Input, total.Cached, total.CacheWrite); ok {
+		hitRate = r
 		hit = fmt.Sprintf("%.1f%%", hitRate*100)
 	}
 	saved := ""

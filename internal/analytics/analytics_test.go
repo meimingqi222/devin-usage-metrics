@@ -97,3 +97,45 @@ func TestSessionProjectionPreservesFallbackAndLastDuplicate(t *testing.T) {
 		t.Fatal("session fallback projection changed")
 	}
 }
+
+func TestCacheHitRateWeightsByPrompt(t *testing.T) {
+	if _, ok := analytics.CacheHitRate(0, 0, 0); ok {
+		t.Fatal("no prompt has no rate")
+	}
+	// A 1,000-token prompt fully cached and a 99,000-token prompt with no
+	// cache: per-request rates average to 50%, the session read 1%.
+	r, ok := analytics.CacheHitRate(0+99000, 1000+0, 0)
+	if !ok || r != 0.01 {
+		t.Fatalf("rate %v %v, want 0.01", r, ok)
+	}
+	// Cache writes are prompt tokens too.
+	if r, _ := analytics.CacheHitRate(1000, 3000, 1000); r != 0.6 {
+		t.Fatalf("rate %v, want 0.6", r)
+	}
+}
+
+func TestDecodeSeparatesStreamsFromBursts(t *testing.T) {
+	for _, c := range []struct {
+		name             string
+		out, ttft, total float64
+		window           float64
+		want             analytics.SpeedResult
+	}{
+		{"streamed", 1000, 900, 10900, 10000, analytics.SpeedMeasured},
+		{"no timing", 100, 0, 0, 0, analytics.SpeedNoTiming},
+		{"total only", 100, 0, 5000, 0, analytics.SpeedNoTTFT},
+		{"window just under 100 ms", 1, 50, 149, 0, analytics.SpeedBurst},
+		{"window of 100 ms", 1, 10, 110, 100, analytics.SpeedMeasured},
+		{"over 10,000 tok/s", 2001, 100, 300, 0, analytics.SpeedBurst},
+		// A sub-second window after a wait over four times as long.
+		{"held then released", 392, 8200, 8450, 0, analytics.SpeedBurst},
+		{"real Devin tool call", 75, 1642, 1693, 0, analytics.SpeedBurst},
+		{"total before first token", 10, 2000, 1500, 0, analytics.SpeedBurst},
+		{"nothing written", 0, 500, 5000, 0, analytics.SpeedBurst},
+	} {
+		w, r := analytics.Decode(c.out, c.ttft, c.total)
+		if w != c.window || r != c.want {
+			t.Errorf("%s: window %v result %v, want %v %v", c.name, w, r, c.window, c.want)
+		}
+	}
+}
