@@ -254,7 +254,7 @@ func isLanguageServerProcess(p processInfo) bool {
 }
 
 func isAgyExecutable(s string) bool {
-	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ToLower(strings.Trim(strings.TrimSpace(s), `"`))
 	base := s
 	if at := strings.LastIndexAny(s, `/\\`); at >= 0 {
 		base = s[at+1:]
@@ -319,9 +319,14 @@ func installPrefix(app antigravityApp) string {
 		return ""
 	}
 	lower := strings.ToLower(base)
-	if at := strings.Index(lower, ".app"); at >= 0 {
-		base = base[:at+4]
-	} else if !strings.HasSuffix(lower, string(filepath.Separator)) {
+	bundle := false
+	if runtime.GOOS == "darwin" {
+		if at := strings.Index(lower, ".app"); at >= 0 {
+			base = base[:at+4]
+			bundle = true
+		}
+	}
+	if !bundle && !strings.HasSuffix(lower, "/") && !strings.HasSuffix(lower, `\`) {
 		if at := strings.LastIndexAny(base, `/\\`); at >= 0 {
 			base = base[:at]
 		}
@@ -415,22 +420,43 @@ func discoverWindowsAntigravity(ctx context.Context) (antigravityApp, error) {
 }
 
 func windowsAntigravityInstalls(ide bool) []string {
-	classic := []string{
-		filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "Antigravity", "Antigravity.exe"),
-		filepath.Join(os.Getenv("ProgramFiles"), "Antigravity", "Antigravity.exe"),
+	type variant struct {
+		folder string
+		exes   []string
 	}
-	idePaths := []string{
-		filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "Antigravity IDE", "Antigravity IDE.exe"),
-		filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "Antigravity IDE", "antigravity-ide.exe"),
-		filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "Antigravity IDE", "antigravity_ide.exe"),
-		filepath.Join(os.Getenv("ProgramFiles"), "Antigravity IDE", "Antigravity IDE.exe"),
-		filepath.Join(os.Getenv("ProgramFiles"), "Antigravity IDE", "antigravity-ide.exe"),
-		filepath.Join(os.Getenv("ProgramFiles"), "Antigravity IDE", "antigravity_ide.exe"),
-	}
+	classic := variant{"Antigravity", []string{"Antigravity.exe", "antigravity.exe"}}
+	ideVariant := variant{"Antigravity IDE", []string{"Antigravity IDE.exe", "antigravity-ide.exe", "antigravity_ide.exe", "Antigravity.exe"}}
+	variants := []variant{classic, ideVariant}
 	if ide {
-		return append(idePaths, classic...)
+		variants = []variant{ideVariant, classic}
 	}
-	return append(classic, idePaths...)
+	programFiles := os.Getenv("ProgramFiles")
+	if programFiles == "" {
+		programFiles = `C:\Program Files`
+	}
+	programFilesX86 := os.Getenv("ProgramFiles(x86)")
+	if programFilesX86 == "" {
+		programFilesX86 = `C:\Program Files (x86)`
+	}
+	roots := []string{programFiles, programFilesX86}
+	if w64 := os.Getenv("ProgramW6432"); w64 != "" {
+		roots = append(roots, w64)
+	}
+	var out []string
+	for _, v := range variants {
+		for _, exe := range v.exes {
+			if local := os.Getenv("LOCALAPPDATA"); local != "" {
+				out = append(out,
+					filepath.Join(local, "Programs", v.folder, exe),
+					filepath.Join(local, v.folder, exe),
+				)
+			}
+			for _, root := range roots {
+				out = append(out, filepath.Join(root, v.folder, exe))
+			}
+		}
+	}
+	return out
 }
 
 func discoverAntigravityFromProcesses(procs []processInfo) antigravityApp {
@@ -478,9 +504,24 @@ func firstNonEmpty(values ...string) string {
 }
 
 func executableFromCommand(command string) string {
+	command = strings.TrimSpace(command)
+	if strings.HasPrefix(command, `"`) {
+		if end := strings.Index(command[1:], `"`); end >= 0 {
+			return command[1 : 1+end]
+		}
+	}
+	// Windows command lines need not quote or even still exist at their
+	// executable path (an update can replace it). The .exe suffix is the
+	// reliable token boundary there, including paths containing spaces.
+	withoutQuote := strings.TrimPrefix(command, `"`)
+	if len(withoutQuote) > 2 && withoutQuote[1] == ':' {
+		if at := strings.Index(strings.ToLower(withoutQuote), ".exe"); at >= 0 {
+			return withoutQuote[:at+len(".exe")]
+		}
+	}
 	fields := strings.Fields(command)
 	for n := len(fields); n > 0; n-- {
-		candidate := strings.Join(fields[:n], " ")
+		candidate := strings.Trim(strings.Join(fields[:n], " "), `"`)
 		if !strings.HasPrefix(candidate, "/") && !strings.Contains(candidate, `:\`) {
 			break
 		}
@@ -530,6 +571,8 @@ type windowsProcessJSON struct {
 
 func listWindowsProcesses(ctx context.Context) []processInfo {
 	const script = `Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine | ConvertTo-Json -Compress`
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
 	out, err := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", script).Output()
 	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
 		return nil
@@ -670,6 +713,7 @@ func chromiumUserDataDir(command string) string {
 }
 
 func isAntigravityIDEString(s string) bool {
+	s = strings.ToLower(s)
 	for _, marker := range []string{"antigravity ide", "antigravity-ide", "antigravity_ide", "antigravityide", "antigravity.ide"} {
 		if strings.Contains(s, marker) {
 			return true
@@ -789,8 +833,17 @@ func waitPidsGone(ctx context.Context, pids []int, timeout time.Duration) bool {
 
 func processAlive(ctx context.Context, pid int) bool {
 	if runtime.GOOS == "windows" {
-		out, err := exec.CommandContext(ctx, "tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/NH").Output()
-		return err == nil && strings.Contains(strings.ToLower(string(out)), strconv.Itoa(pid))
+		out, err := exec.CommandContext(ctx, "tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/FO", "CSV", "/NH").Output()
+		if err != nil {
+			return false
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			fields := strings.Split(strings.Trim(line, "\r\n"), `","`)
+			if len(fields) > 1 && strings.Trim(fields[1], `"`) == strconv.Itoa(pid) {
+				return true
+			}
+		}
+		return false
 	}
 	err := exec.CommandContext(ctx, "kill", "-0", strconv.Itoa(pid)).Run()
 	return err == nil
@@ -824,7 +877,9 @@ func startAntigravityApp(ctx context.Context, app antigravityApp) error {
 		return nil
 	case "windows":
 		if target := firstNonEmpty(app.exec, app.path); target != "" {
-			return exec.Command("cmd", "/c", "start", "", target).Run()
+			cmd := exec.Command(target)
+			cmd.Dir = filepath.Dir(target)
+			return cmd.Start()
 		}
 		if app.ide {
 			return exec.Command("cmd", "/c", "start", "", "Antigravity IDE").Run()

@@ -462,6 +462,64 @@ func TestLanguageServerWorkspacePathIsNotTargetIdentity(t *testing.T) {
 	}
 }
 
+func TestWindowsInstallPrefixMatchesLanguageServer(t *testing.T) {
+	app := antigravityApp{
+		ide:  true,
+		path: `C:\Users\me\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe`,
+	}
+	languageServer := processInfo{
+		pid:     42,
+		name:    "language_server.exe",
+		path:    `C:\Users\me\AppData\Local\Programs\Antigravity IDE\resources\bin\language_server.exe`,
+		command: `"C:\Users\me\AppData\Local\Programs\Antigravity IDE\resources\bin\language_server.exe"`,
+	}
+	if !matchesLanguageServerTarget(languageServer, app) {
+		t.Fatal("Windows IDE install-tree language server did not match its target")
+	}
+	other := languageServer
+	other.path = `C:\Users\me\AppData\Local\Programs\Antigravity\resources\bin\language_server.exe`
+	other.command = `"C:\Users\me\AppData\Local\Programs\Antigravity\resources\bin\language_server.exe"`
+	if matchesLanguageServerTarget(other, app) {
+		t.Fatal("Windows classic language server matched the IDE target")
+	}
+}
+
+func TestWindowsInstallCandidatesCoverUpstreamLocations(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", `C:\Users\me\AppData\Local`)
+	t.Setenv("ProgramFiles", `C:\Program Files`)
+	t.Setenv("ProgramFiles(x86)", `C:\Program Files (x86)`)
+	t.Setenv("ProgramW6432", `C:\Program Files`)
+	got := windowsAntigravityInstalls(true)
+	first := filepath.Join(`C:\Users\me\AppData\Local`, "Programs", "Antigravity IDE", "Antigravity IDE.exe")
+	if len(got) == 0 || got[0] != first {
+		t.Fatalf("first Windows IDE install candidate = %q, want %q", got[0], first)
+	}
+	x86 := filepath.Join(`C:\Program Files (x86)`, "Antigravity IDE", "Antigravity IDE.exe")
+	found := false
+	for _, path := range got {
+		if path == x86 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Windows install candidates miss the x86 Program Files location: %v", got)
+	}
+}
+
+func TestWindowsIDEProcessNameAndQuotedExecutable(t *testing.T) {
+	if !isAntigravityIDEString(`Antigravity IDE.exe`) {
+		t.Fatal("Windows IDE process name was not recognized case-insensitively")
+	}
+	command := `"C:\Users\me\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe" --reuse-window`
+	if got := executableFromCommand(command); got != `C:\Users\me\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe` {
+		t.Fatalf("quoted Windows executable = %q", got)
+	}
+	unquoted := `C:\Users\me\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe --reuse-window`
+	if got := executableFromCommand(unquoted); got != `C:\Users\me\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe` {
+		t.Fatalf("unquoted Windows executable = %q", got)
+	}
+}
+
 func TestAntigravityWorkspacePathDoesNotMakeClassicAnIDE(t *testing.T) {
 	p := processInfo{
 		name:    "Antigravity",
