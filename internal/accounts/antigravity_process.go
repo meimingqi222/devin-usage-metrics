@@ -23,17 +23,20 @@ import (
 // antigravityApp is the desktop client as found on this machine.
 type antigravityApp struct {
 	running bool
+	ide     bool
 	pids    []int
-	path    string
+	path    string // .app bundle on macOS, install/executable path elsewhere
+	exec    string // exact executable captured before the client is stopped
 }
 
 // These are variables so tests never touch a real Antigravity.
 var (
-	findAntigravity    = discoverAntigravity
-	stopAntigravity    = stopAntigravityApp
-	startAntigravity   = startAntigravityApp
-	languageServers    = listLanguageServers
-	killLanguageServer = killPids
+	findAntigravity       = discoverAntigravity
+	stopAntigravity       = stopAntigravityApp
+	startAntigravity      = startAntigravityApp
+	languageServers       = listLanguageServers
+	killLanguageServer    = killPids
+	writeSystemCredential = quota.WriteAntigravityKeychain
 )
 
 // SwitchApp switches Antigravity after quitting the desktop client. The
@@ -50,6 +53,39 @@ func (s *Store) SwitchApp(ctx context.Context, provider, id string, live quota.A
 	return err
 }
 
+// writeTargetSystemCredential writes the selected login to the system
+// credential store independently of which mirror discovery surfaced as the
+// live account. Antigravity 2.x and the agy language service treat that
+// store as authoritative; writing only oauth_creds.json or state.vscdb is
+// the upstream "switch looks successful but stays on the old account" case.
+func writeTargetSystemCredential(ctx context.Context, targetDoc map[string]any) error {
+	doc := adaptCredential("antigravity", targetDoc, "file", "keychain")
+	doc = switchDocument("antigravity", doc)
+	err := writeSystemCredential(doc)
+	syncdiag.Log(ctx, "account_switch_system_credential", "error", DiagnosticErrorCode(err))
+	if err != nil {
+		// Upstream keeps a legacy Linux client switchable when libsecret is
+		// absent or its D-Bus session is unreachable, provided the SQLite
+		// state mirror exists. Without that escape a pre-2.0 install would
+		// regress from a working SQLite switch to an unconditional error.
+		if runtime.GOOS == "linux" && hasAntigravityStateDB() {
+			syncdiag.Log(ctx, "account_switch_system_credential_fallback", "fallback", "state_db")
+			return nil
+		}
+		return fmt.Errorf("write Antigravity's system credential store: %w", err)
+	}
+	return nil
+}
+
+func hasAntigravityStateDB() bool {
+	for _, path := range antigravityStateDBs() {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) switchApp(ctx context.Context, provider, id string, live quota.Account) error {
 	if provider != "antigravity" {
 		return s.Switch(provider, id, live)
@@ -63,6 +99,7 @@ func (s *Store) switchApp(ctx context.Context, provider, id string, live quota.A
 		return errors.New("this account has no saved sign-in; sign in again")
 	}
 	targetEmail := s.ProfileEmail(provider, id)
+	backupAntigravityStateDBs()
 	if !app.running {
 		syncdiag.Log(ctx, "account_switch_mode", "mode", "client_closed")
 		// The client is closed: nothing competes for the stores. Write the
@@ -71,13 +108,16 @@ func (s *Store) switchApp(ctx context.Context, provider, id string, live quota.A
 		if err := s.Switch(provider, id, live); err != nil {
 			return err
 		}
+		if err := writeTargetSystemCredential(ctx, targetDoc); err != nil {
+			return err
+		}
 		return applyAntigravityMirrors(ctx, targetEmail, targetDoc)
 	}
-	// Native Antigravity keeps its window and an Electron supervisor:
-	// write the keychain, kill only language_server, and let the supervisor
-	// start a child with the new credential. Restarting the whole app
-	// re-triggers its first-run Security Notice.
-	if len(languageServers(ctx, app)) > 0 && !strings.Contains(strings.ToLower(app.path), "antigravity ide") {
+	// Classic Antigravity and the IDE both keep their window and a
+	// supervisor: write every credential store, kill only the language
+	// service (language_server or agy), and let the supervisor start a child
+	// with the new credential. A full restart remains the fallback.
+	if len(languageServers(ctx, app)) > 0 {
 		syncdiag.Log(ctx, "account_switch_mode", "mode", "language_service_restart")
 		// Capture the current login and write the target before stopping the
 		// child: the supervisor respawns it within seconds and the new child
@@ -85,12 +125,23 @@ func (s *Store) switchApp(ctx context.Context, provider, id string, live quota.A
 		if err := s.Switch(provider, id, live); err != nil {
 			return err
 		}
+		if err := writeTargetSystemCredential(ctx, targetDoc); err != nil {
+			return err
+		}
+		// Seed the state/file mirrors before stopping the child, matching
+		// upstream. The running client can hold the database briefly, so the
+		// post-kill write below remains the authoritative one.
+		preMirrorErr := applyAntigravityMirrors(ctx, targetEmail, targetDoc)
+		syncdiag.Log(ctx, "account_switch_mirrors_prekill", "error", DiagnosticErrorCode(preMirrorErr))
 		old := languageServers(ctx, app)
 		killLanguageServer(ctx, old)
 		// The child is gone; this write is the one the respawned child
 		// reads, and it must hold before reporting anything.
 		if err := s.Reapply(provider, id, live); err != nil {
 			return fmt.Errorf("assert the new sign-in after stopping the language service: %w", err)
+		}
+		if err := writeTargetSystemCredential(ctx, targetDoc); err != nil {
+			return err
 		}
 		// The running client keeps the state database locked at times; a
 		// failed mirror stays best-effort while the keychain is the truth
@@ -104,6 +155,9 @@ func (s *Store) switchApp(ctx context.Context, provider, id string, live quota.A
 			time.Sleep(time.Second)
 			if err := s.Reapply(provider, id, live); err != nil {
 				return fmt.Errorf("re-assert the new sign-in: %w", err)
+			}
+			if err := writeTargetSystemCredential(ctx, targetDoc); err != nil {
+				return err
 			}
 			mirrorErr := applyAntigravityMirrors(ctx, targetEmail, targetDoc)
 			syncdiag.Log(ctx, "account_switch_mirrors", "error", DiagnosticErrorCode(mirrorErr))
@@ -124,9 +178,13 @@ func (s *Store) switchApp(ctx context.Context, provider, id string, live quota.A
 	if werr := s.switchAfterQuit(provider, id, live); werr != nil {
 		return fmt.Errorf("write the selected sign-in: %w", werr)
 	}
+	if err := writeTargetSystemCredential(ctx, targetDoc); err != nil {
+		return err
+	}
 	if err := applyAntigravityMirrors(ctx, targetEmail, targetDoc); err != nil {
 		return err
 	}
+	sweepOrphanLanguageServers(ctx, app)
 	if err := startAntigravity(ctx, app); err != nil {
 		return fmt.Errorf("sign-in switched, but reopening Antigravity failed: %w", err)
 	}
@@ -137,31 +195,156 @@ func (s *Store) switchApp(ctx context.Context, provider, id string, live quota.A
 	return nil
 }
 
+// processInfo is the small cross-platform process snapshot the switcher
+// needs. Windows comes from CIM because tasklist has neither parent ids nor
+// command lines; Unix comes from ps.
+type processInfo struct {
+	pid, ppid  int
+	name, path string
+	command    string
+}
+
 func listLanguageServers(ctx context.Context, app antigravityApp) []int {
-	if runtime.GOOS == "windows" {
-		return nil
+	return selectLanguageServers(listSystemProcesses(ctx), app)
+}
+
+// selectLanguageServers follows the running client's process tree and only
+// then falls back to install-path matching. The tree walk is what upstream
+// relies on for IDE installs in custom directories: a broad path match can
+// miss those and leave the old language service holding the old account.
+func selectLanguageServers(procs []processInfo, app antigravityApp) []int {
+	descendants := map[int]bool{}
+	frontier := append([]int(nil), app.pids...)
+	for _, pid := range frontier {
+		descendants[pid] = true
 	}
-	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,command=").Output()
-	if err != nil {
-		return nil
+	for len(frontier) > 0 {
+		parent := frontier[len(frontier)-1]
+		frontier = frontier[:len(frontier)-1]
+		for _, p := range procs {
+			if p.ppid == parent && !descendants[p.pid] {
+				descendants[p.pid] = true
+				frontier = append(frontier, p.pid)
+			}
+		}
 	}
-	prefix := strings.TrimSuffix(app.path, string(filepath.Separator)) + string(filepath.Separator)
 	var pids []int
-	for _, line := range strings.Split(string(out), "\n") {
-		pidText, command, ok := strings.Cut(strings.TrimSpace(line), " ")
-		command = strings.TrimSpace(command)
-		if !ok || !strings.Contains(strings.ToLower(command), "language_server") {
-			continue
+	seen := map[int]bool{}
+	for _, p := range procs {
+		if descendants[p.pid] && isLanguageServerProcess(p) && !seen[p.pid] {
+			seen[p.pid] = true
+			pids = append(pids, p.pid)
 		}
-		if app.path != "" && !strings.HasPrefix(command, prefix) {
-			continue
-		}
-		pid, err := strconv.Atoi(strings.TrimSpace(pidText))
-		if err == nil {
-			pids = append(pids, pid)
+	}
+	if len(pids) > 0 {
+		return pids
+	}
+	for _, p := range procs {
+		if isLanguageServerProcess(p) && matchesLanguageServerTarget(p, app) && !seen[p.pid] {
+			seen[p.pid] = true
+			pids = append(pids, p.pid)
 		}
 	}
 	return pids
+}
+
+func isLanguageServerProcess(p processInfo) bool {
+	text := strings.ToLower(p.name + " " + p.path + " " + p.command)
+	return strings.Contains(text, "language_server") || isAgyExecutable(p.name) || isAgyExecutable(p.path) || isAgyExecutable(firstCommandToken(p.command))
+}
+
+func isAgyExecutable(s string) bool {
+	s = strings.ToLower(strings.Trim(strings.TrimSpace(s), `"`))
+	base := s
+	if at := strings.LastIndexAny(s, `/\\`); at >= 0 {
+		base = s[at+1:]
+	}
+	return base == "agy" || base == "agy.exe"
+}
+
+func firstCommandToken(command string) string {
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+// matchesLanguageServerTarget keeps classic and IDE language services
+// isolated. An agy hub belongs to the IDE; a standalone agy CLI is never a
+// hot-switch victim merely because it shares the executable name.
+func matchesLanguageServerTarget(p processInfo, app antigravityApp) bool {
+	lowerCommand := strings.ToLower(p.command)
+	if isAgyExecutable(p.name) || isAgyExecutable(p.path) || isAgyExecutable(firstCommandToken(p.command)) {
+		return app.ide && (strings.Contains(lowerCommand, "--hub") || strings.Contains(lowerCommand, "--app_data_dir=antigravity"))
+	}
+	exe := processExecutable(p)
+	if prefix := installPrefix(app); prefix != "" {
+		path, command := normalizeProcessPath(exe), normalizeProcessPath(firstCommandToken(p.command))
+		if strings.HasPrefix(path, prefix) || strings.HasPrefix(command, prefix) {
+			return true
+		}
+	}
+	// Workspace or file arguments are not client identity. Only the
+	// executable name/path may decide whether an orphaned language server
+	// belongs to this target; otherwise an editor opening a folder named
+	// antigravity-ide-demo can become a kill target.
+	identity := strings.ToLower(p.name + " " + exe)
+	if isAntigravityIDEString(identity) {
+		return app.ide
+	}
+	return strings.Contains(identity, "antigravity") && !app.ide
+}
+
+func processExecutable(p processInfo) string {
+	if p.path != "" {
+		return p.path
+	}
+	if exe := executableFromCommand(p.command); exe != "" {
+		return exe
+	}
+	return firstCommandToken(p.command)
+}
+
+func normalizeProcessPath(s string) string {
+	return strings.ReplaceAll(strings.ToLower(s), `\`, `/`)
+}
+
+func installPrefix(app antigravityApp) string {
+	base := app.path
+	if base == "" {
+		base = app.exec
+	}
+	if base == "" {
+		return ""
+	}
+	lower := strings.ToLower(base)
+	bundle := false
+	if runtime.GOOS == "darwin" {
+		if at := strings.Index(lower, ".app"); at >= 0 {
+			base = base[:at+4]
+			bundle = true
+		}
+	}
+	if !bundle && !strings.HasSuffix(lower, "/") && !strings.HasSuffix(lower, `\`) {
+		if at := strings.LastIndexAny(base, `/\\`); at >= 0 {
+			base = base[:at]
+		}
+	}
+	prefix := normalizeProcessPath(base)
+	return strings.TrimSuffix(prefix, "/") + "/"
+}
+
+// sweepOrphanLanguageServers removes the target client's leftover language
+// service before a full restart. A detached child can keep its old token and
+// the engine port after the main window exits, making the restart reopen on
+// the previous account.
+func sweepOrphanLanguageServers(ctx context.Context, app antigravityApp) {
+	for _, p := range listSystemProcesses(ctx) {
+		if isLanguageServerProcess(p) && matchesLanguageServerTarget(p, app) {
+			_ = signalProcess(ctx, p.pid, true)
+		}
+	}
 }
 
 func killPids(ctx context.Context, pids []int) {
@@ -213,57 +396,22 @@ func discoverAntigravity(ctx context.Context) (antigravityApp, error) {
 }
 
 func discoverUnixAntigravity(ctx context.Context) (antigravityApp, error) {
-	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,command=").Output()
-	if err != nil {
-		return antigravityApp{}, nil // no process list: treat as not running
-	}
-	var app antigravityApp
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		pidText, command, ok := strings.Cut(line, " ")
-		if !ok {
-			continue
-		}
-		pid, err := strconv.Atoi(strings.TrimSpace(pidText))
-		if err != nil || !isAntigravityMain(command) {
-			continue
-		}
-		app.running = true
-		app.pids = append(app.pids, pid)
-		if p := appBundle(command); p != "" {
-			app.path = p
-		}
-	}
-	return app, nil
+	return discoverAntigravityFromProcesses(listSystemProcesses(ctx)), nil
 }
 
 func discoverWindowsAntigravity(ctx context.Context) (antigravityApp, error) {
-	out, err := exec.CommandContext(ctx, "tasklist", "/FO", "CSV", "/NH").Output()
-	if err != nil {
-		return antigravityApp{}, nil
+	procs := listSystemProcesses(ctx)
+	if len(procs) == 0 {
+		return discoverWindowsAntigravityTasklist(ctx)
 	}
-	var app antigravityApp
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Split(strings.Trim(line, "\r\n"), `","`)
-		if len(fields) < 2 {
-			continue
-		}
-		name := strings.Trim(fields[0], `"`)
-		pid, err := strconv.Atoi(strings.Trim(fields[1], `"`))
-		if err != nil || !isAntigravityMain(name) {
-			continue
-		}
-		app.running = true
-		app.pids = append(app.pids, pid)
-	}
-	if app.running {
-		for _, p := range []string{
-			filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "Antigravity", "Antigravity.exe"),
-			filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "Antigravity IDE", "Antigravity IDE.exe"),
-			filepath.Join(os.Getenv("ProgramFiles"), "Antigravity", "Antigravity.exe"),
-		} {
+	app := discoverAntigravityFromProcesses(procs)
+	if app.running && app.path == "" {
+		for _, p := range windowsAntigravityInstalls(app.ide) {
 			if _, err := os.Stat(p); err == nil {
 				app.path = p
+				if app.exec == "" {
+					app.exec = p
+				}
 				break
 			}
 		}
@@ -271,28 +419,321 @@ func discoverWindowsAntigravity(ctx context.Context) (antigravityApp, error) {
 	return app, nil
 }
 
-func isAntigravityMain(s string) bool {
-	l := strings.ToLower(s)
-	if !strings.Contains(l, "antigravity") || strings.Contains(l, "agent usage metrics") {
-		return false
+func windowsAntigravityInstalls(ide bool) []string {
+	type variant struct {
+		folder string
+		exes   []string
 	}
-	for _, other := range []string{"antigravity tools", "antigravity-tools", "antigravity_manager", "antigravity-manager", "antigravity-cli", "updater", "auto-updater"} {
-		if strings.Contains(l, other) {
-			return false
+	classic := variant{"Antigravity", []string{"Antigravity.exe", "antigravity.exe"}}
+	ideVariant := variant{"Antigravity IDE", []string{"Antigravity IDE.exe", "antigravity-ide.exe", "antigravity_ide.exe", "Antigravity.exe"}}
+	variants := []variant{classic, ideVariant}
+	if ide {
+		variants = []variant{ideVariant, classic}
+	}
+	programFiles := os.Getenv("ProgramFiles")
+	if programFiles == "" {
+		programFiles = `C:\Program Files`
+	}
+	programFilesX86 := os.Getenv("ProgramFiles(x86)")
+	if programFilesX86 == "" {
+		programFilesX86 = `C:\Program Files (x86)`
+	}
+	roots := []string{programFiles, programFilesX86}
+	if w64 := os.Getenv("ProgramW6432"); w64 != "" {
+		roots = append(roots, w64)
+	}
+	var out []string
+	for _, v := range variants {
+		for _, exe := range v.exes {
+			if local := os.Getenv("LOCALAPPDATA"); local != "" {
+				out = append(out,
+					filepath.Join(local, "Programs", v.folder, exe),
+					filepath.Join(local, v.folder, exe),
+				)
+			}
+			for _, root := range roots {
+				out = append(out, filepath.Join(root, v.folder, exe))
+			}
 		}
 	}
-	for _, helper := range []string{"helper", "language_server", "plugin", "renderer", "gpu", "crashpad", "utility", "--type="} {
-		if strings.Contains(l, helper) {
-			return false
+	return out
+}
+
+func discoverAntigravityFromProcesses(procs []processInfo) antigravityApp {
+	var classic, ide antigravityApp
+	for _, p := range procs {
+		kind := antigravityProcessKind(p)
+		if kind == "" {
+			continue
+		}
+		app := &classic
+		if kind == "ide" {
+			app = &ide
+			app.ide = true
+		}
+		app.running = true
+		app.pids = append(app.pids, p.pid)
+		exe := p.path
+		if exe == "" {
+			exe = executableFromCommand(p.command)
+		}
+		if exe != "" && app.exec == "" {
+			app.exec = exe
+		}
+		if bundle := appBundle(firstNonEmpty(exe, p.command)); bundle != "" {
+			app.path = bundle
+		} else if app.path == "" {
+			app.path = exe
 		}
 	}
-	return true
+	// Upstream keeps the classic desktop client authoritative when both
+	// variants are running; the IDE is selected only when classic is absent.
+	if classic.running {
+		return classic
+	}
+	return ide
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func executableFromCommand(command string) string {
+	command = strings.TrimSpace(command)
+	if strings.HasPrefix(command, `"`) {
+		if end := strings.Index(command[1:], `"`); end >= 0 {
+			return command[1 : 1+end]
+		}
+	}
+	// Windows command lines need not quote or even still exist at their
+	// executable path (an update can replace it). The .exe suffix is the
+	// reliable token boundary there, including paths containing spaces.
+	withoutQuote := strings.TrimPrefix(command, `"`)
+	if len(withoutQuote) > 2 && withoutQuote[1] == ':' {
+		if at := strings.Index(strings.ToLower(withoutQuote), ".exe"); at >= 0 {
+			return withoutQuote[:at+len(".exe")]
+		}
+	}
+	fields := strings.Fields(command)
+	for n := len(fields); n > 0; n-- {
+		candidate := strings.Trim(strings.Join(fields[:n], " "), `"`)
+		if !strings.HasPrefix(candidate, "/") && !strings.Contains(candidate, `:\`) {
+			break
+		}
+		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func listSystemProcesses(ctx context.Context) []processInfo {
+	if runtime.GOOS == "windows" {
+		return listWindowsProcesses(ctx)
+	}
+	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,ppid=,command=").Output()
+	if err != nil {
+		return nil
+	}
+	var procs []processInfo
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		pid, err1 := strconv.Atoi(fields[0])
+		ppid, err2 := strconv.Atoi(fields[1])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		command := strings.Join(fields[2:], " ")
+		name := firstCommandToken(command)
+		if at := strings.LastIndexAny(name, `/\\`); at >= 0 {
+			name = name[at+1:]
+		}
+		procs = append(procs, processInfo{pid: pid, ppid: ppid, name: name, command: command})
+	}
+	return procs
+}
+
+type windowsProcessJSON struct {
+	ProcessID       int    `json:"ProcessId"`
+	ParentProcessID int    `json:"ParentProcessId"`
+	Name            string `json:"Name"`
+	ExecutablePath  string `json:"ExecutablePath"`
+	CommandLine     string `json:"CommandLine"`
+}
+
+func listWindowsProcesses(ctx context.Context) []processInfo {
+	const script = `Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine | ConvertTo-Json -Compress`
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", script).Output()
+	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+		return nil
+	}
+	var rows []windowsProcessJSON
+	if err := json.Unmarshal(out, &rows); err != nil {
+		var one windowsProcessJSON
+		if json.Unmarshal(out, &one) != nil || one.ProcessID == 0 {
+			return nil
+		}
+		rows = []windowsProcessJSON{one}
+	}
+	procs := make([]processInfo, 0, len(rows))
+	for _, row := range rows {
+		procs = append(procs, processInfo{pid: row.ProcessID, ppid: row.ParentProcessID, name: row.Name, path: row.ExecutablePath, command: firstNonEmpty(row.CommandLine, row.ExecutablePath, row.Name)})
+	}
+	return procs
+}
+
+func discoverWindowsAntigravityTasklist(ctx context.Context) (antigravityApp, error) {
+	out, err := exec.CommandContext(ctx, "tasklist", "/FO", "CSV", "/NH").Output()
+	if err != nil {
+		return antigravityApp{}, nil
+	}
+	var classic, ide antigravityApp
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Split(strings.Trim(line, "\r\n"), `","`)
+		if len(fields) < 2 {
+			continue
+		}
+		name := strings.Trim(fields[0], `"`)
+		pid, err := strconv.Atoi(strings.Trim(fields[1], `"`))
+		if err != nil || antigravityProcessKind(processInfo{name: name, command: name}) == "" {
+			continue
+		}
+		app := &classic
+		if isAntigravityIDEString(name) {
+			app = &ide
+			app.ide = true
+		}
+		app.running = true
+		app.pids = append(app.pids, pid)
+	}
+	app := classic
+	if !app.running {
+		app = ide
+	}
+	if app.running {
+		for _, p := range windowsAntigravityInstalls(app.ide) {
+			if _, err := os.Stat(p); err == nil {
+				app.path, app.exec = p, p
+				break
+			}
+		}
+	}
+	return app, nil
+}
+
+// antigravityProcessKind classifies only the executable identity, matching
+// upstream's rule that a workspace path or terminal command must never make
+// an unrelated editor an Antigravity client. Command-line arguments are used
+// only as a classic/IDE discriminator for custom IDE installs.
+func antigravityProcessKind(p processInfo) string {
+	exe := p.path
+	if exe == "" {
+		exe = executableFromCommand(p.command)
+	}
+	if exe == "" {
+		exe = firstCommandToken(p.command)
+	}
+	name := strings.ToLower(p.name)
+	exeLower := strings.ToLower(exe)
+	if name == "" {
+		name = exeLower
+		if at := strings.LastIndexAny(name, `/\\`); at >= 0 {
+			name = name[at+1:]
+		}
+	}
+	identity := name + " " + exeLower
+	if !strings.Contains(identity, "antigravity") {
+		return ""
+	}
+	for _, other := range []string{"antigravity tools", "antigravity-tools", "antigravitytools", "antigravity_manager", "antigravity-manager", "antigravitymanager", "antigravity manager", "antigravity-cli", "updater", "auto-updater", "agent usage metrics"} {
+		if strings.Contains(identity, other) {
+			return ""
+		}
+	}
+	if isHelperProcess(p, exe) {
+		return ""
+	}
+	if isAntigravityIDEString(identity) {
+		return "ide"
+	}
+	if isAntigravityIDEString(chromiumUserDataDir(strings.ToLower(p.command))) {
+		return "ide"
+	}
+	return "classic"
+}
+
+// isHelperProcess mirrors upstream's helper classifier: process flags can
+// mark a helper, but ordinary words such as "gpu" or "plugin" only count in
+// the executable identity. Otherwise a main window opened with a workspace
+// or flag containing one of those words disappears from discovery.
+func isHelperProcess(p processInfo, exe string) bool {
+	name := strings.ToLower(p.name)
+	args := strings.ToLower(p.command)
+	exeLower := strings.ToLower(firstNonEmpty(exe, p.path))
+	for _, marker := range []string{"--type=", "node-ipc", "nodeipc", "max-old-space-size", "node_modules", "--standalone", "--subclient_type", "--override_ide_name", "language_server"} {
+		if strings.Contains(args, marker) {
+			return true
+		}
+	}
+	for _, marker := range []string{"helper", "plugin", "renderer", "gpu", "crashpad", "utility", "audio", "sandbox", "language_server"} {
+		if strings.Contains(name, marker) {
+			return true
+		}
+	}
+	return strings.Contains(exeLower, "crashpad") || strings.Contains(exeLower, "helper") || strings.Contains(exeLower, "language_server") || isLanguageServerProcess(p)
+}
+
+// chromiumUserDataDir extracts the Chromium user-data-dir value after the
+// shell's quotes have been lost. Only that value may discriminate IDE from
+// classic; a workspace named antigravity-ide-demo must not change identity.
+func chromiumUserDataDir(command string) string {
+	at := strings.Index(command, "user-data-dir")
+	if at < 0 {
+		return ""
+	}
+	rest := strings.TrimLeft(command[at+len("user-data-dir"):], "=: ")
+	rest = strings.TrimPrefix(rest, `"`)
+	end := len(rest)
+	if at := strings.Index(rest, `" --`); at >= 0 {
+		end = at
+	} else if at := strings.Index(rest, " --"); at >= 0 {
+		end = at
+	}
+	return strings.TrimRight(rest[:end], `" `)
+}
+
+func isAntigravityIDEString(s string) bool {
+	s = strings.ToLower(s)
+	for _, marker := range []string{"antigravity ide", "antigravity-ide", "antigravity_ide", "antigravityide", "antigravity.ide"} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func appBundle(command string) string {
 	lower := strings.ToLower(command)
-	if at := strings.Index(lower, ".app"); at >= 0 {
-		return command[:at+4]
+	for at := strings.Index(lower, ".app"); at >= 0; {
+		end := at + len(".app")
+		if end == len(command) || command[end] == '/' || command[end] == '\\' {
+			return command[:end]
+		}
+		next := strings.Index(lower[end:], ".app")
+		if next < 0 {
+			break
+		}
+		at = end + next
 	}
 	return ""
 }
@@ -320,28 +761,34 @@ func stopAntigravityApp(ctx context.Context, app antigravityApp) error {
 // bringing up a window.
 func bundlePids(ctx context.Context, app antigravityApp) []int {
 	pids := append([]int(nil), app.pids...)
-	if runtime.GOOS == "windows" || app.path == "" {
-		return pids
-	}
-	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,command=").Output()
-	if err != nil {
-		return pids
-	}
-	prefix := strings.TrimSuffix(app.path, string(filepath.Separator)) + string(filepath.Separator)
 	seen := map[int]bool{}
 	for _, pid := range pids {
 		seen[pid] = true
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		pidText, command, ok := strings.Cut(strings.TrimSpace(line), " ")
-		command = strings.TrimSpace(command)
-		if !ok || !strings.HasPrefix(command, prefix) {
-			continue
+	procs := listSystemProcesses(ctx)
+	// Electron nests helpers several levels below the window process; take
+	// the whole descendant tree rather than only the bundle path.
+	frontier := append([]int(nil), app.pids...)
+	for len(frontier) > 0 {
+		parent := frontier[len(frontier)-1]
+		frontier = frontier[:len(frontier)-1]
+		for _, p := range procs {
+			if p.ppid == parent && !seen[p.pid] {
+				seen[p.pid] = true
+				pids = append(pids, p.pid)
+				frontier = append(frontier, p.pid)
+			}
 		}
-		pid, err := strconv.Atoi(strings.TrimSpace(pidText))
-		if err == nil && !seen[pid] {
-			seen[pid] = true
-			pids = append(pids, pid)
+	}
+	prefix := installPrefix(app)
+	if prefix == "" {
+		return pids
+	}
+	for _, p := range procs {
+		path, command := normalizeProcessPath(p.path), normalizeProcessPath(p.command)
+		if (strings.HasPrefix(path, prefix) || strings.HasPrefix(command, prefix)) && !seen[p.pid] {
+			seen[p.pid] = true
+			pids = append(pids, p.pid)
 		}
 	}
 	return pids
@@ -386,8 +833,17 @@ func waitPidsGone(ctx context.Context, pids []int, timeout time.Duration) bool {
 
 func processAlive(ctx context.Context, pid int) bool {
 	if runtime.GOOS == "windows" {
-		out, err := exec.CommandContext(ctx, "tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/NH").Output()
-		return err == nil && strings.Contains(strings.ToLower(string(out)), strconv.Itoa(pid))
+		out, err := exec.CommandContext(ctx, "tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/FO", "CSV", "/NH").Output()
+		if err != nil {
+			return false
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			fields := strings.Split(strings.Trim(line, "\r\n"), `","`)
+			if len(fields) > 1 && strings.Trim(fields[1], `"`) == strconv.Itoa(pid) {
+				return true
+			}
+		}
+		return false
 	}
 	err := exec.CommandContext(ctx, "kill", "-0", strconv.Itoa(pid)).Run()
 	return err == nil
@@ -396,34 +852,54 @@ func processAlive(ctx context.Context, pid int) bool {
 func startAntigravityApp(ctx context.Context, app antigravityApp) error {
 	switch runtime.GOOS {
 	case "darwin":
-		args := []string{"-a", app.path}
-		if strings.HasSuffix(strings.ToLower(app.path), ".app") {
-			args = []string{app.path}
-		}
-		if app.path == "" {
-			args = []string{"-a", "Antigravity"}
+		target := firstNonEmpty(app.path, app.exec)
+		if bundle := appBundle(target); bundle != "" {
+			target = bundle
 		}
 		// Do not use CommandContext here: its cancel after SwitchApp
 		// returns can kill a freshly launched client on some platforms.
-		if err := exec.Command("open", args...).Run(); err != nil {
-			if app.path != "" {
-				_ = exec.Command("open", "-n", app.path).Run()
+		if target != "" {
+			if strings.HasSuffix(strings.ToLower(target), ".app") {
+				if err := exec.Command("open", target).Run(); err != nil {
+					return err
+				}
+			} else if err := exec.Command(target).Start(); err != nil {
+				return err
 			}
+		} else if err := exec.Command("open", "-a", "Antigravity").Run(); err != nil {
+			return err
 		}
-		_ = exec.Command("osascript", "-e", `tell application "Antigravity" to activate`).Run()
+		name := "Antigravity"
+		if app.ide {
+			name = "Antigravity IDE"
+		}
+		_ = exec.Command("osascript", "-e", `tell application "`+name+`" to activate`).Run()
 		return nil
 	case "windows":
-		if app.path != "" {
-			return exec.Command("cmd", "/c", "start", "", app.path).Run()
+		if target := firstNonEmpty(app.exec, app.path); target != "" {
+			cmd := exec.Command(target)
+			cmd.Dir = filepath.Dir(target)
+			return cmd.Start()
+		}
+		if app.ide {
+			return exec.Command("cmd", "/c", "start", "", "Antigravity IDE").Run()
 		}
 		return exec.Command("cmd", "/c", "start", "", "Antigravity").Run()
 	default:
-		path := app.path
+		path := firstNonEmpty(app.exec, app.path)
 		if path == "" {
-			if found, err := exec.LookPath("antigravity"); err == nil {
-				path = found
-			} else {
-				path = "antigravity"
+			names := []string{"antigravity"}
+			if app.ide {
+				names = []string{"antigravity-ide", "antigravity_ide", "Antigravity IDE"}
+			}
+			for _, name := range names {
+				if found, err := exec.LookPath(name); err == nil {
+					path = found
+					break
+				}
+			}
+			if path == "" {
+				path = names[0]
 			}
 		}
 		return exec.Command(path).Start()
@@ -597,7 +1073,7 @@ func writeAntigravityState(ctx context.Context, email string, doc map[string]any
 		if _, err := os.Stat(path); err != nil {
 			continue
 		}
-		if err := writeAntigravityStateDB(ctx, path, entry, status); err != nil && firstErr == nil {
+		if err := writeAntigravityStateDB(ctx, path, entry, status, email); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -609,17 +1085,14 @@ func writeAntigravityState(ctx context.Context, email string, doc map[string]any
 // differently named folder; whichever exists gets the mirror.
 func antigravityStateDBs() []string {
 	var base string
-	var dirs []string
+	dirs := []string{"Antigravity", "Antigravity IDE", "antigravity-ide", "antigravity_ide"}
 	switch runtime.GOOS {
 	case "darwin":
 		base = filepath.Join(os.Getenv("HOME"), "Library", "Application Support")
-		dirs = []string{"Antigravity", "Antigravity IDE", "antigravity-ide"}
 	case "windows":
 		base = os.Getenv("APPDATA")
-		dirs = []string{"Antigravity", "Antigravity IDE"}
 	default:
 		base = filepath.Join(os.Getenv("HOME"), ".config")
-		dirs = []string{"Antigravity", "antigravity-ide", "antigravity_ide"}
 	}
 	out := make([]string, 0, len(dirs))
 	for _, d := range dirs {
@@ -628,7 +1101,15 @@ func antigravityStateDBs() []string {
 	return out
 }
 
-func writeAntigravityStateDB(ctx context.Context, path string, oauthEntry []byte, userStatus string) error {
+func backupAntigravityStateDBs() {
+	for _, path := range antigravityStateDBs() {
+		if raw, err := os.ReadFile(path); err == nil {
+			_ = writePrivate(path+".backup", raw)
+		}
+	}
+}
+
+func writeAntigravityStateDB(ctx context.Context, path string, oauthEntry []byte, userStatus, email string) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	db, err := sqlite.Open(ctx, path, sqlite.OpenOptions{})
@@ -676,8 +1157,20 @@ func writeAntigravityStateDB(ctx context.Context, path string, oauthEntry []byte
 		return err
 	}
 	// A switch without the flag shows the first-run Security Notice on the
-	// next reconnect.
-	return set("antigravityOnboarding", "true")
+	// next reconnect. The IDE additionally keys that notice and its login
+	// state off these onboarding rows; upstream writes both families.
+	if err := set("antigravityOnboarding", "true"); err != nil {
+		return err
+	}
+	if email != "" {
+		// These rows are advisory mirrors, so a locked row must not undo the
+		// authoritative token write above.
+		_ = set("agy.onboarding.lastLoginUsername", email)
+		_ = set("agy.onboarding.lastLoginIsGcpTos", "false")
+		_ = set("jetski.onboarding.lastLoginUsername", email)
+		_ = set("jetski.onboarding.lastLoginIsGcpTos", "false")
+	}
+	return nil
 }
 
 func readAntigravityTopic(ctx context.Context, db *sqlite.DB) []byte {

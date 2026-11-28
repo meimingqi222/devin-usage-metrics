@@ -1,6 +1,7 @@
 package quota
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -219,6 +220,7 @@ func keyWriteDoc(provider, service string, d object) error {
 		if err != nil {
 			return errors.New("keychain credentials encode failed")
 		}
+		_ = winCredDelete(antigravityWinCredTarget())
 		if err := winCredWrite(antigravityWinCredTarget(), keychainAccountFor(provider), data); err != nil {
 			return errors.New("keychain update failed")
 		}
@@ -263,6 +265,59 @@ func keychainValue(provider string, d object) (string, error) {
 	return string(data), nil
 }
 
+// WriteAntigravityKeychain writes Antigravity's system credential store
+// directly. A switch cannot depend on which mirror discovery happened to
+// surface as the live account: when the file or state database was surfaced,
+// writing only that mirror left the client reading the previous keychain
+// sign-in. Tests never touch the real system store; the switch path injects
+// a fake writer instead.
+func WriteAntigravityKeychain(d object) error {
+	if testing.Testing() {
+		return nil
+	}
+	if runtime.GOOS == "linux" {
+		return writeLinuxAntigravitySecret(d)
+	}
+	return keyWriteDoc("antigravity", "gemini", d)
+}
+
+// writeLinuxAntigravitySecret mirrors Antigravity Tools' Linux Secret
+// Service write: agy reads the login collection, while other tools read the
+// default collection, so both are kept in sync and either one may fail.
+func writeLinuxAntigravitySecret(d object) error {
+	data, err := json.Marshal(d)
+	if err != nil {
+		return errors.New("keychain credentials encode failed")
+	}
+	loginErr := secretToolStore(data, "/org/freedesktop/secrets/collection/login")
+	defaultErr := secretToolStore(data, "")
+	if loginErr != nil && defaultErr != nil {
+		return loginErr
+	}
+	return nil
+}
+
+func secretToolStore(data []byte, collection string) error {
+	args := []string{"store"}
+	if collection != "" {
+		args = append(args, "--collection="+collection, "--label=Password for 'antigravity' on 'gemini'")
+	} else {
+		args = append(args, "--label=gemini")
+	}
+	args = append(args, "service", "gemini", "username", "antigravity")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "secret-tool", args...)
+	cmd.Stdin = bytes.NewReader(data)
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return errors.New("keyring write timed out; the D-Bus session bus is unreachable")
+		}
+		return errors.New("secret-tool keyring write failed; install libsecret-tools or check the Secret Service")
+	}
+	return nil
+}
+
 func keychainAccountName(service string) string {
 	b, err := security("find-generic-password", "-s", service)
 	if err != nil {
@@ -301,17 +356,27 @@ func keyWrite(s string, d object) error {
 }
 
 func antigravityStatePaths() []string {
+	state := func(base, dir string) string {
+		return filepath.Join(base, dir, "User", "globalStorage", "state.vscdb")
+	}
+	variants := []string{"Antigravity", "Antigravity IDE", "antigravity-ide", "antigravity_ide"}
+	paths := make([]string, 0, len(variants))
+	base := ""
 	switch runtime.GOOS {
 	case "windows":
-		if appData := os.Getenv("APPDATA"); appData != "" {
-			return []string{filepath.Join(appData, "Antigravity", "User", "globalStorage", "state.vscdb")}
-		}
+		base = os.Getenv("APPDATA")
 	case "darwin":
-		return []string{homePath("Library/Application Support/Antigravity/User/globalStorage/state.vscdb")}
+		base = homePath("Library/Application Support")
 	default:
-		return []string{homePath(".config/Antigravity/User/globalStorage/state.vscdb")}
+		base = homePath(".config")
 	}
-	return nil
+	if base == "" {
+		return nil
+	}
+	for _, variant := range variants {
+		paths = append(paths, state(base, variant))
+	}
+	return paths
 }
 
 // Discover never performs network requests. Keychain is touched only with explicit consent.
@@ -321,9 +386,11 @@ func Discover(allowKeychain bool) []Account {
 		rel := map[string]string{"claude": ".claude/.credentials.json", "codex": ".codex/auth.json", "grok": ".grok/auth.json", "antigravity": ".gemini/oauth_creds.json"}[p]
 		path := homePath(rel)
 		if p == "antigravity" && runtime.GOOS == "windows" && os.Getenv("APPDATA") != "" {
-			state := filepath.Join(os.Getenv("APPDATA"), "Antigravity", "User", "globalStorage", "state.vscdb")
-			if _, err := readAntigravityStateToken(state); err == nil {
-				path = state
+			for _, state := range antigravityStatePaths() {
+				if _, err := readAntigravityStateToken(state); err == nil {
+					path = state
+					break
+				}
 			}
 		}
 		label := map[string]string{"claude": "Claude", "codex": "Codex", "grok": "Grok", "antigravity": "Antigravity"}[p]

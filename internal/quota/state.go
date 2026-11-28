@@ -127,13 +127,18 @@ func readAntigravityStateToken(path string) (object, error) {
 // keeps an in-memory copy and writes it back on shutdown, so the switch path
 // quits it first; this only puts the credential in the database.
 func WriteAntigravityStateToken(path string, doc object) error {
-	tok := antigravityTokenEntry(doc)
-	if tok == "" {
+	entry := antigravityTokenEntry(doc)
+	if len(entry) == 0 {
 		return errors.New("credential has no Antigravity token fields")
 	}
 	if _, err := os.Stat(path); err != nil {
 		return err
 	}
+	var current []byte
+	if raw, err := readStateValue(path, "antigravityUnifiedStateSync.oauthToken"); err == nil {
+		current, _ = base64.StdEncoding.DecodeString(raw)
+	}
+	topic := mergeAntigravityTopic(current, entry)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	db, err := sqlite.Open(ctx, path, sqlite.OpenOptions{})
@@ -144,14 +149,29 @@ func WriteAntigravityStateToken(path string, doc object) error {
 	if _, err = db.Execute(ctx, "PRAGMA busy_timeout=2000"); err != nil {
 		return err
 	}
-	_, err = db.Execute(ctx, "INSERT OR REPLACE INTO ItemTable(key,value) VALUES(?,?)", "antigravityUnifiedStateSync.oauthToken", tok)
+	_, err = db.Execute(ctx, "INSERT OR REPLACE INTO ItemTable(key,value) VALUES(?,?)", "antigravityUnifiedStateSync.oauthToken", base64.StdEncoding.EncodeToString(topic))
 	return err
 }
 
-// antigravityTokenEntry encodes a credential document as the state database's
-// oauth token row: a base64 protobuf holding the opaque tokens beside a
-// timestamp and the id token.
-func antigravityTokenEntry(doc object) string {
+// mergeAntigravityTopic replaces only oauthTokenInfoSentinelKey. The topic
+// is a map of independent sentinel rows; overwriting it used to drop the
+// client's other state and a restart could restore enough stale state to
+// undo the switch.
+func mergeAntigravityTopic(current, replacement []byte) []byte {
+	var out []byte
+	for _, entry := range stateFields(current, 1) {
+		if string(stateFirst(entry, 1)) == "oauthTokenInfoSentinelKey" {
+			continue
+		}
+		out = append(out, pbStateLen(1, entry)...)
+	}
+	return append(out, replacement...)
+}
+
+// antigravityTokenEntry encodes a credential document as one Topic.data
+// entry: a base64 protobuf holding the opaque tokens beside a timestamp and
+// the id token.
+func antigravityTokenEntry(doc object) []byte {
 	token := obj(doc["token"])
 	if token == nil {
 		token = doc
@@ -163,7 +183,7 @@ func antigravityTokenEntry(doc object) string {
 		idToken = str(token["id_token"])
 	}
 	if access == "" || refresh == "" {
-		return ""
+		return nil
 	}
 	seconds := int64(0)
 	if exp, ok := stateExpiry(token["expiry"]); ok {
@@ -184,8 +204,7 @@ func antigravityTokenEntry(doc object) string {
 	}
 	row := pbStateString(1, base64.StdEncoding.EncodeToString(info))
 	entry := append(pbStateString(1, "oauthTokenInfoSentinelKey"), pbStateLen(2, row)...)
-	topic := pbStateLen(1, entry)
-	return base64.StdEncoding.EncodeToString(topic)
+	return pbStateLen(1, entry)
 }
 
 func stateExpiry(v any) (time.Time, bool) {

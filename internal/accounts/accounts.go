@@ -1666,17 +1666,25 @@ func adaptCredential(provider string, doc map[string]any, from, to string) map[s
 		var value any = expiry
 		if ok {
 			value = exp.UTC().Format(time.RFC3339Nano)
+		} else {
+			value = time.Now().UTC().Format(time.RFC3339Nano)
 		}
-		return map[string]any{
+		out := map[string]any{
 			"token": map[string]any{
 				"access_token": access, "token_type": "Bearer",
-				"refresh_token": refresh, "expiry": value,
+				"refresh_token": refresh, "expiry": value, "expires_in": int64(3599),
 			},
-			"auth_method": "consumer", "id_token": idToken,
-			// The client names the signed-in account by this field;
-			// Antigravity Tools writes it too.
-			"id_token_email": antigravityEmailOf(doc, idToken),
+			"auth_method": "consumer",
 		}
+		if idToken != "" {
+			out["id_token"] = idToken
+		}
+		// The client names the signed-in account by this field;
+		// Antigravity Tools writes it too.
+		if email := antigravityEmailOf(doc, idToken); email != "" {
+			out["id_token_email"] = email
+		}
+		return out
 	}
 	var value any = expiry
 	if ok {
