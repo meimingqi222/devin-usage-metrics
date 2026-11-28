@@ -393,6 +393,118 @@ func TestSwitchAppRestartCapturesPreviousLogin(t *testing.T) {
 	}
 }
 
+// TestSwitchAppWritesSystemCredentialFromFileMirror pins the upstream dual
+// write: even when discovery surfaced oauth_creds.json as the live mirror,
+// the desktop client's authoritative system credential store receives the
+// target. Writing only the file is the silent "switch did nothing" case.
+func TestSwitchAppWritesSystemCredentialFromFileMirror(t *testing.T) {
+	h := fixture(t)
+	write(t, h, ".gemini/oauth_creds.json", antigravityDoc("a1", "ra1", "a@example.com"))
+	s := Open()
+	if err := s.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	target, err := s.Add("antigravity", map[string]any{
+		"token":    map[string]any{"access_token": "b1", "refresh_token": "rb1"},
+		"id_token": loginJWT(map[string]any{"email": "b@example.com", "sub": "sub-b"}),
+	}, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFind, oldStop, oldStart, oldLS, oldWrite := findAntigravity, stopAntigravity, startAntigravity, languageServers, writeSystemCredential
+	defer func() {
+		findAntigravity, stopAntigravity, startAntigravity, languageServers, writeSystemCredential = oldFind, oldStop, oldStart, oldLS, oldWrite
+	}()
+	languageServers = func(context.Context, antigravityApp) []int { return nil }
+	findAntigravity = func(context.Context) (antigravityApp, error) {
+		return antigravityApp{running: true, pids: []int{1}, path: "/Applications/Antigravity.app"}, nil
+	}
+	stopAntigravity = func(context.Context, antigravityApp) error { return nil }
+	startAntigravity = func(context.Context, antigravityApp) error { return nil }
+	var system map[string]any
+	writeSystemCredential = func(doc map[string]any) error {
+		system = doc
+		return nil
+	}
+	if err := s.SwitchApp(context.Background(), "antigravity", target.ID, live(t, "antigravity")); err != nil {
+		t.Fatal(err)
+	}
+	if system == nil {
+		t.Fatal("system credential store was not written")
+	}
+	token := obj(system["token"])
+	if token == nil || token["refresh_token"] != "rb1" || token["access_token"] != "b1" {
+		t.Fatalf("system credential has wrong tokens: %#v", system)
+	}
+	if token["expires_in"] != int64(3599) || str(token["expiry"]) == "" {
+		t.Fatalf("system credential is missing client token metadata: %#v", token)
+	}
+	if system["auth_method"] != "consumer" || system["id_token_email"] != "b@example.com" {
+		t.Fatalf("system credential is not the client keychain shape: %#v", system)
+	}
+	if _, ok := system["email"]; ok {
+		t.Fatalf("app-only naming field leaked into the system credential: %#v", system)
+	}
+}
+
+func TestLanguageServerWorkspacePathIsNotTargetIdentity(t *testing.T) {
+	p := processInfo{
+		pid:     42,
+		name:    "language_server",
+		path:    "/usr/local/bin/language_server",
+		command: "/usr/local/bin/language_server --workspace=/work/antigravity-ide-demo",
+	}
+	if matchesLanguageServerTarget(p, antigravityApp{path: "/Applications/Antigravity.app"}) {
+		t.Fatal("workspace argument made an unrelated language server a classic-client target")
+	}
+	if matchesLanguageServerTarget(p, antigravityApp{ide: true, path: "/Applications/Antigravity IDE.app"}) {
+		t.Fatal("workspace argument made an unrelated language server an IDE target")
+	}
+}
+
+func TestAntigravityWorkspacePathDoesNotMakeClassicAnIDE(t *testing.T) {
+	p := processInfo{
+		name:    "Antigravity",
+		path:    `/Applications/Antigravity.app/Contents/MacOS/Antigravity`,
+		command: `/Applications/Antigravity.app/Contents/MacOS/Antigravity --user-data-dir=/users/me/library/application support/antigravity --folder-uri=/work/antigravity-ide-demo`,
+	}
+	if got := antigravityProcessKind(p); got != "classic" {
+		t.Fatalf("workspace path changed client kind to %q", got)
+	}
+}
+
+// TestAntigravityIDEHotSwitchFindsAgyDescendant covers the current upstream
+// shape: the IDE language service may be agy rather than language_server and
+// may live outside the install tree, so it is found through the client
+// process tree. A standalone agy CLI outside that tree is left alone.
+func TestAntigravityIDEHotSwitchFindsAgyDescendant(t *testing.T) {
+	dir := t.TempDir()
+	exeDir := filepath.Join(dir, "Custom Antigravity IDE")
+	if err := os.MkdirAll(exeDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(exeDir, "Antigravity IDE")
+	if err := os.WriteFile(exe, []byte(""), 0700); err != nil {
+		t.Fatal(err)
+	}
+	procs := []processInfo{
+		{pid: 10, ppid: 1, name: "Antigravity IDE", command: exe + " --reuse-window"},
+		{pid: 11, ppid: 10, name: "agy", path: "/home/tester/.gemini/bin/agy", command: "agy --hub --app_data_dir=antigravity"},
+		{pid: 12, ppid: 99, name: "agy", path: "/home/tester/.gemini/bin/agy", command: "agy"},
+	}
+	app := discoverAntigravityFromProcesses(procs)
+	if !app.running || !app.ide || app.exec == "" {
+		t.Fatalf("IDE was not discovered with its executable: %+v", app)
+	}
+	got := selectLanguageServers(procs, app)
+	if len(got) != 1 || got[0] != 11 {
+		t.Fatalf("language service descendants = %v, want only the IDE agy hub", got)
+	}
+	if matchesLanguageServerTarget(procs[2], app) {
+		t.Fatal("standalone agy CLI matched as an IDE language service")
+	}
+}
+
 // TestVerifySwitched accepts a refreshed access token for the same account
 // and rejects a different login.
 func TestVerifySwitched(t *testing.T) {
@@ -545,6 +657,9 @@ func TestWriteAntigravityStateMergesTopicAndClearsStaleKeys(t *testing.T) {
 	}
 	if values["antigravityOnboarding"] != "true" {
 		t.Fatalf("onboarding flag was not written: %q", values["antigravityOnboarding"])
+	}
+	if values["agy.onboarding.lastLoginUsername"] != "b@example.com" || values["jetski.onboarding.lastLoginUsername"] != "b@example.com" {
+		t.Fatalf("IDE onboarding rows were not written: %v", values)
 	}
 }
 

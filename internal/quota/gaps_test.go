@@ -141,6 +141,32 @@ func TestAntigravityStateWriteRoundTrip(t *testing.T) {
 	t.Fatal("token entry missing")
 }
 
+// TestAntigravityStateWritePreservesTopicEntries pins the live state write:
+// replacing the oauth token must not delete the other sentinel rows in the
+// unified-state topic. Losing them let the client restore stale state over a
+// switch.
+func TestAntigravityStateWritePreservesTopicEntries(t *testing.T) {
+	row := pbStateString(1, base64.StdEncoding.EncodeToString(pbStateString(3, "keep-me")))
+	otherEntry := append(pbStateString(1, "otherSentinelKey"), pbStateLen(2, row)...)
+	oldRow := pbStateString(1, base64.StdEncoding.EncodeToString(pbStateString(1, "old")))
+	oldEntry := append(pbStateString(1, "oauthTokenInfoSentinelKey"), pbStateLen(2, oldRow)...)
+	current := append(pbStateLen(1, oldEntry), pbStateLen(1, otherEntry)...)
+	merged := mergeAntigravityTopic(current, pbStateLen(1, oldEntry))
+	var sawOther bool
+	oauthEntries := 0
+	for _, entry := range stateFields(merged, 1) {
+		switch string(stateFirst(entry, 1)) {
+		case "otherSentinelKey":
+			sawOther = true
+		case "oauthTokenInfoSentinelKey":
+			oauthEntries++
+		}
+	}
+	if !sawOther || oauthEntries != 1 {
+		t.Fatalf("merged topic lost rows: other=%v oauth_entries=%d", sawOther, oauthEntries)
+	}
+}
+
 // writeAntigravityStateFixture creates the state database rows Antigravity's
 // client writes: an oauth token entry and the account name beside it.
 func writeAntigravityStateFixture(t *testing.T, p, access, refresh string) {
